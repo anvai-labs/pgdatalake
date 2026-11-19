@@ -138,6 +138,71 @@ Design rules:
   `lakehouse.optimize_auto_min_gain` (default 10× files examined →
   tasks), during low-traffic windows only.
 
+### 2.2 Research grounding & cross-engine lessons
+
+*(Added 2026-11-19; the design above validated against the literature and
+against sibling-engine practice.)*
+
+**Cost-model-driven compaction policy.** The LSM compaction literature
+(Dostoevsky, SIGMOD 2017; Spooky, VLDB 2022; Sarkar's compaction-design
+work) establishes that compaction scheduling must come from an explicit
+cost model trading write amplification against read cost, not fixed
+thresholds. Applied here: the `plan` mode's tier choice (minor vs major)
+is derived from a measured amplification model — bytes to rewrite vs
+expected read-pruning gain under the observed predicate mix — rather than
+magic ratios; the `optimize_auto_min_gain` ratio is the first
+approximation and the model refines it.
+
+**Hilbert vs Z-order.** Faloutsos & Jagadish (analysis of the Hilbert
+space-filling curve) and later analytical comparisons prove Hilbert
+preserves multi-dimensional locality better than Z-order bit
+interleaving — a 2D range query touches one Hilbert cluster but two
+Z-order clusters, and the gap widens with dimensionality (Hudi/Delta
+practitioner results agree). Design consequence: `sort_by` accepts both
+`zorder(cols)` (cheap) and `hilbert(cols)` (better locality); the
+planner prefers `hilbert` when the workload's predicate dimensionality
+is ≥ 3, `zorder` below that or when CPU is the binding constraint.
+
+**Reclustering decoupled from transactions, policy decoupled from key
+selection.** Snowflake (SIGMOD 2016) runs reclustering as a background
+service separated from DML — validating our maintenance-worker design —
+and recent work on workload-aware incremental reclustering argues for
+separating the clustering-key SELECTION from the reclustering POLICY.
+That is exactly the `analyze_layout` / `plan` split: key selection is a
+statistics problem, scheduling is a policy problem with its own GUCs.
+
+**Encoding selection is per-column-chunk, and layout choice is a cost
+model.** The empirical columnar-format evaluation (Zeng et al.,
+VLDB 2024) and the BtrBlocks line show greedy per-chunk encoding
+selection beats fixed encodings; Durner et al. (VLDB 2023) give an
+object-store cost model where optimal file size and parallelism derive
+from GET costs and I/O patterns. Design consequence: `optimize`'s
+target-file-size suggestion comes from a GET-cost model (fixture- and
+cloud-profile aware), not a constant; per-column-chunk parquet encoding
+selection is a flagged M5 extension on the writer, not part of optimize.
+
+**Cross-engine lessons adopted from a sibling columnar engine
+(proximaDB)** — validated against its `UnifiedColumnarCompaction` /
+`write_fence` / sidecar machinery:
+- *Post-rewrite continuity assertion*: after any optimize rewrite,
+  assert manifest sequence-number continuity and snapshot-graph
+  integrity (analog of VersionContinuityMode Strict) — part of the exec
+  mode's post-commit validation, matching the doc 10 §4 PyIceberg audit.
+- *Sidecars migrate and validate atomically with their data files*
+  (codebook-sidecar pattern): our DVs (puffin blobs referenced from
+  manifests) and any bloom sidecars must be rewritten/validated in the
+  same commit as the files they annotate; optimize must never leave a
+  sidecar pointing at a rewritten-away file.
+- *Ship-dark gating*: auto mode ships OFF and is byte-identical when
+  off (write-fence discipline); enabling it changes scheduling, never
+  semantics.
+- *Deterministic rewritten-file naming*: data files produced by
+  optimize encode table-UUID + origin so orphan GC can classify
+  residue without catalog access.
+- *Layering*: optimize is a thin orchestrator over `rewrite_data_files`
+  (the one compaction core), exactly as engine wrappers delegate to the
+  unified columnar compactor.
+
 ## 3. Safety rules
 
 - Orphan removal refuses files newer than `orphan_grace_period` (default 3d,
