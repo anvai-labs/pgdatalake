@@ -39,10 +39,11 @@ pub struct ScanSession {
     plan: ScanPlan,
     file_paths: Vec<CString>,
     s3: S3Options,
+    deletes: crate::parquet::LoadedDeletes,
 }
 
 impl ScanSession {
-    fn from_plan(plan: ScanPlan, s3: S3Options) -> Self {
+    fn from_plan(plan: ScanPlan, s3: S3Options, deletes: crate::parquet::LoadedDeletes) -> Self {
         Self {
             file_paths: plan
                 .tasks
@@ -51,6 +52,7 @@ impl ScanSession {
                 .collect(),
             plan,
             s3,
+            deletes,
         }
     }
 
@@ -143,7 +145,13 @@ pub unsafe extern "C" fn pg_datalake_scan_new(
         };
         client
             .scan_table(&ns_levels, &table, predicate.as_ref(), selector.as_ref())
-            .map(|(p, s3)| ScanSession::from_plan(p, s3))
+            .and_then(|(p, s3)| {
+                // slice 20: load the snapshot's delete files up front (they
+                // are small relative to data; every read of this scan needs
+                // them)
+                crate::scan::load_row_deletes(&p, Some(&s3))
+                    .map(|d| ScanSession::from_plan(p, s3, d))
+            })
             .map_err(|e| e.to_string())
     });
     let session = result.unwrap_or_else(|panic| {
@@ -312,10 +320,29 @@ pub unsafe extern "C" fn pg_datalake_rows_open(
             .to_string();
         let (io, key) =
             crate::scan::open_for(&file_path, Some(&s.s3_options())).map_err(|e| e.to_string())?;
-        let rows = if projection.is_empty() {
+        // slice 20: apply this task's delete set (position positions for the
+        // file + sequence-applicable equality deletes)
+        let task = s
+            .plan
+            .tasks
+            .get(task_idx as usize)
+            .ok_or_else(|| format!("task {task_idx} out of range"))?;
+        let row_deletes = s
+            .deletes
+            .for_task(
+                &file_path,
+                task.sequence_number,
+                task.entry.data_file.partition.is_some(),
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = if projection.is_empty() && row_deletes.equality.is_empty() {
             crate::parquet::ParquetRows::open_all(&io, &key).map_err(|e| e.to_string())?
         } else {
-            crate::parquet::ParquetRows::open(&io, &key, &projection).map_err(|e| e.to_string())?
+            if projection.is_empty() {
+                return Err("delete application requires a projection (M1)".to_string());
+            }
+            crate::parquet::ParquetRows::open_with_deletes(&io, &key, &projection, row_deletes)
+                .map_err(|e| e.to_string())?
         };
         let column_names = rows
             .column_names()
@@ -480,6 +507,55 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("metadata")).unwrap();
 
+        // slice 20: real data parquet (3 rows) + a position-delete parquet
+        // removing absolute position 1 (id=2)
+        {
+            use arrow::array::Int64Array;
+            use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+            use arrow::record_batch::RecordBatch;
+            use std::sync::Arc;
+            std::fs::create_dir_all(dir.path().join("table").join("data")).unwrap();
+
+            let schema = ArrowSchema::new(vec![Field::new("id", DataType::Int64, false)]);
+            let batch = RecordBatch::try_new(
+                Arc::new(schema),
+                vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+            )
+            .unwrap();
+            let f = std::fs::File::create(dir.path().join("table").join("data").join("a.parquet"))
+                .unwrap();
+            let mut w = parquet::arrow::ArrowWriter::try_new(f, batch.schema(), None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+
+            let del_schema = ArrowSchema::new(vec![
+                Field::new("file_path", DataType::Utf8, false),
+                Field::new("pos", DataType::Int64, false),
+            ]);
+            let del_batch = RecordBatch::try_new(
+                Arc::new(del_schema),
+                vec![
+                    Arc::new(arrow::array::StringArray::from(vec![format!(
+                        "file://{}/table/data/a.parquet",
+                        dir.path().display()
+                    )])),
+                    Arc::new(Int64Array::from(vec![1i64])),
+                ],
+            )
+            .unwrap();
+            let df = std::fs::File::create(
+                dir.path()
+                    .join("table")
+                    .join("data")
+                    .join("del-pos.parquet"),
+            )
+            .unwrap();
+            let mut dw =
+                parquet::arrow::ArrowWriter::try_new(df, del_batch.schema(), None).unwrap();
+            dw.write(&del_batch).unwrap();
+            dw.close().unwrap();
+        }
+
         // manifest with one ADDED file
         let schema = AvroSchema::parse_str(crate::manifest::MANIFEST_ENTRY_SCHEMA_V2).unwrap();
         let mut writer = Writer::new(&schema, Vec::new());
@@ -495,7 +571,10 @@ mod tests {
             ("content".into(), Value::Int(0)),
             (
                 "file_path".into(),
-                Value::String("file:///table/data/a.parquet".into()),
+                Value::String(format!(
+                    "file://{}/table/data/a.parquet",
+                    dir.path().display()
+                )),
             ),
             ("file_format".into(), Value::String("parquet".into())),
             ("partition".into(), Value::Union(0, Box::new(Value::Null))),
@@ -565,6 +644,79 @@ mod tests {
         )
         .unwrap();
 
+        // slice 20: a second manifest holding the position-delete file
+        // (content = 1) — it must NOT become a scan task
+        let mut del_writer = Writer::new(&schema, Vec::new());
+        let mut del_entry = Record::new(&schema).unwrap();
+        del_entry.put("status", Value::Int(1));
+        del_entry.put("snapshot_id", Value::Long(42));
+        del_entry.put("sequence_number", Value::Union(1, Box::new(Value::Long(2))));
+        del_entry.put(
+            "file_sequence_number",
+            Value::Union(1, Box::new(Value::Long(2))),
+        );
+        let del_data_file = Value::Record(vec![
+            ("content".into(), Value::Int(1)),
+            (
+                "file_path".into(),
+                Value::String(format!(
+                    "file://{}/table/data/del-pos.parquet",
+                    dir.path().display()
+                )),
+            ),
+            ("file_format".into(), Value::String("parquet".into())),
+            ("partition".into(), Value::Union(0, Box::new(Value::Null))),
+            ("record_count".into(), Value::Long(1)),
+            ("file_size_in_bytes".into(), Value::Long(4096)),
+            (
+                "column_sizes".into(),
+                Value::Union(1, Box::new(Value::Array(vec![]))),
+            ),
+            (
+                "value_counts".into(),
+                Value::Union(1, Box::new(Value::Array(vec![]))),
+            ),
+            (
+                "null_value_counts".into(),
+                Value::Union(1, Box::new(Value::Array(vec![]))),
+            ),
+            (
+                "nan_value_counts".into(),
+                Value::Union(1, Box::new(Value::Array(vec![]))),
+            ),
+            (
+                "lower_bounds".into(),
+                Value::Union(0, Box::new(Value::Null)),
+            ),
+            (
+                "upper_bounds".into(),
+                Value::Union(0, Box::new(Value::Null)),
+            ),
+            (
+                "key_metadata".into(),
+                Value::Union(0, Box::new(Value::Null)),
+            ),
+            (
+                "split_offsets".into(),
+                Value::Union(0, Box::new(Value::Null)),
+            ),
+            (
+                "equality_ids".into(),
+                Value::Union(0, Box::new(Value::Null)),
+            ),
+            (
+                "sort_order_id".into(),
+                Value::Union(0, Box::new(Value::Null)),
+            ),
+        ]);
+        del_entry.put("data_file", del_data_file);
+        del_writer.append(del_entry).unwrap();
+        std::fs::write(
+            dir.path().join("metadata").join("mn2.avro"),
+            del_writer.into_inner().unwrap(),
+        )
+        .unwrap();
+
         // empty manifest list
         let lschema = AvroSchema::parse_str(crate::manifest::MANIFEST_LIST_SCHEMA_V2).unwrap();
         let lwriter = Writer::new(&lschema, Vec::new());
@@ -596,6 +748,25 @@ mod tests {
         mrec.put("sequence_number", Some(1i64));
         mrec.put("min_sequence_number", Some(1i64));
         lwriter.append(mrec).unwrap();
+        let mut mrec2 = Record::new(&lschema).unwrap();
+        mrec2.put(
+            "manifest_path",
+            format!("file://{}/metadata/mn2.avro", dir.path().display()),
+        );
+        mrec2.put("manifest_length", 100i64);
+        mrec2.put("partition_spec_id", 0i32);
+        mrec2.put("added_snapshot_id", 42i64);
+        mrec2.put("added_files_count", Some(1i64));
+        mrec2.put("existing_files_count", Some(0i64));
+        mrec2.put("deleted_files_count", Some(0i64));
+        mrec2.put("added_rows_count", Some(1i64));
+        mrec2.put("existing_rows_count", Some(0i64));
+        mrec2.put("deleted_rows_count", Some(0i64));
+        mrec2.put("partitions", None::<Value>);
+        mrec2.put("key_metadata", None::<Value>);
+        mrec2.put("sequence_number", Some(2i64));
+        mrec2.put("min_sequence_number", Some(2i64));
+        lwriter.append(mrec2).unwrap();
         std::fs::write(
             dir.path().join("metadata").join("mn-list.avro"),
             lwriter.into_inner().unwrap(),
@@ -684,6 +855,29 @@ mod tests {
         assert!(f.to_string_lossy().ends_with("a.parquet"));
         assert_eq!(unsafe { pg_datalake_scan_task_rows(session, 0) }, 77);
         assert_eq!(unsafe { pg_datalake_scan_task_rows(session, 99) }, 0);
+
+        // slice 20: rows_open applies the position deletes — the delete
+        // manifest entry is NOT a task (count stayed 1) and reading task 0
+        // skips absolute position 1 (id=2)
+        {
+            let proj = CString::new("id").unwrap();
+            let rows = unsafe {
+                pg_datalake_rows_open(session, 0, proj.as_ptr(), err.as_mut_ptr(), err.len())
+            };
+            assert!(!rows.is_null(), "rows_open: {:?}", unsafe {
+                CStr::from_ptr(err.as_ptr()).to_string_lossy()
+            });
+            let mut ids = Vec::new();
+            while unsafe { pg_datalake_rows_next(rows) } {
+                let n = unsafe { pg_datalake_rows_column_count(rows) };
+                assert_eq!(n, 1);
+                let v = unsafe { pg_datalake_rows_col_text(rows, 0) };
+                assert!(!v.is_null());
+                ids.push(unsafe { CStr::from_ptr(v) }.to_string_lossy().into_owned());
+            }
+            unsafe { pg_datalake_rows_close(rows) };
+            assert_eq!(ids, vec!["1", "3"], "position delete removed id=2");
+        }
         unsafe {
             pg_datalake_scan_free(session);
         }

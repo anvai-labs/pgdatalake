@@ -52,6 +52,27 @@ lakehouse.write_mode`. v1 reads must apply **v2 position deletes, v2 equality
 deletes, and v3 deletion vectors** from foreign tables (that's what other engines
 produce); v1 managed writes produce DVs (v3) or COW only.
 
+*(Slice 20 amendment, 2026-11-19 — read-side v2 delete application implemented
+in pgdatalake-core.)* Plan separates delete files (manifest `content` 1/2)
+into `delete_tasks` — they are never planned as data scans. Delete files
+load at scan planning (eager; small relative to data) into
+`LoadedDeletes`, sliced per data file at row-read time:
+
+- **Position deletes**: exact per-file application — absolute row positions
+  keyed by the delete file's `file_path` column; file-scoped (no sequence
+  rule, per spec).
+- **Equality deletes**: applied to data files with a strictly lower
+  sequence number than the delete file (Iceberg v2 applicability).
+  M1 scope: **unpartitioned data files only** — a partitioned data file
+  under an eq-delete snapshot errors loudly (partition-scoped application
+  is a later slice; silently applying across partitions could over-delete).
+- **v3 deletion vectors**: later slice (Puffin DV blobs; read half of the
+  gate matrix).
+
+Interop note: PyIceberg 0.12 `table.delete()` performs COW rewrites (no
+delete files); MoR delete fixtures for live verification come from
+Spark/Trino in the M1 conformance gate, or from our own M2 writer.
+
 DV write format: Puffin blob with `deletion-vector-v1` spec (v3), referenced from
 snapshot summary → manifest entries. Bloom-filter acceleration (table property
 `write.dv.filter.bloom`), default on for tables > 1GB.

@@ -55,6 +55,73 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// One equality-delete tuple: a data row dies when every listed column
+/// matches this entry's value (slice 20, doc 07). `sequence_number` is the
+/// delete file's effective sequence — it applies only to data files with a
+/// strictly lower sequence (Iceberg v2 applicability).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EqDeleteMatch {
+    pub columns: Vec<String>,
+    pub values: Vec<CellValue>,
+    pub sequence_number: i64,
+}
+
+/// Delete filters applied while iterating rows of one data file (slice 20).
+#[derive(Debug, Default, Clone)]
+pub struct RowDeletes {
+    /// Absolute row positions to skip — v2 position deletes for THIS data
+    /// file (keyed per file at load time).
+    pub positions: std::collections::BTreeSet<u64>,
+    /// Equality delete tuples (applied to unpartitioned data files only in
+    /// M1; partition-scoped application is a later slice).
+    pub equality: Vec<EqDeleteMatch>,
+}
+
+/// Delete files loaded for one scan (session-level); sliced into a
+/// per-data-file [`RowDeletes`] at rows-open time.
+#[derive(Debug, Default, Clone)]
+pub struct LoadedDeletes {
+    /// data file path -> deleted absolute positions
+    pub positions_by_file: std::collections::BTreeMap<String, std::collections::BTreeSet<u64>>,
+    /// equality delete tuples (from every eq delete file of the snapshot)
+    pub equality: Vec<EqDeleteMatch>,
+}
+
+impl LoadedDeletes {
+    /// The delete set for one data file. Applicability rules (doc 07,
+    /// slice 20): position deletes are file-scoped (exact path match);
+    /// equality deletes apply only to data files with a strictly lower
+    /// sequence number, and only to unpartitioned data files in M1 —
+    /// partition-scoped application errors loudly rather than silently
+    /// mis-deleting across partitions.
+    pub fn for_task(
+        &self,
+        file_path: &str,
+        task_sequence_number: i64,
+        partitioned: bool,
+    ) -> Result<RowDeletes, StorageError> {
+        if partitioned && !self.equality.is_empty() {
+            return Err(StorageError::Config(format!(
+                "equality deletes on partitioned data file {file_path} are not supported yet \
+                 (partition-scoped application is a later M1 slice)"
+            )));
+        }
+        Ok(RowDeletes {
+            positions: self
+                .positions_by_file
+                .get(file_path)
+                .cloned()
+                .unwrap_or_default(),
+            equality: self
+                .equality
+                .iter()
+                .filter(|m| m.sequence_number > task_sequence_number)
+                .cloned()
+                .collect(),
+        })
+    }
+}
+
 /// Projected row iterator over one parquet object.
 #[derive(Debug)]
 pub struct ParquetRows {
@@ -64,6 +131,14 @@ pub struct ParquetRows {
     column_names: Vec<String>,
     column_indices: Vec<usize>,
     num_rows_in_current: usize,
+    /// Absolute position of the current row within the FILE (position
+    /// deletes are file-scoped, doc 07).
+    batch_start_abs: u64,
+    deletes: RowDeletes,
+    /// Arrow schema indices for each equality-delete column (parallel to
+    /// `deletes.equality[*].columns`); eq columns may lie outside the
+    /// projection — they are read internally, never exposed.
+    eq_col_indices: Vec<Vec<usize>>,
 }
 
 impl ParquetRows {
@@ -71,13 +146,45 @@ impl ParquetRows {
     /// requested order). Unknown columns are a Config error (doc 03 §5:
     /// schema drift surfaces cleanly).
     pub fn open(io: &StorageIo, key: &str, projection: &[&str]) -> Result<Self, StorageError> {
+        Self::open_internal(io, key, projection, RowDeletes::default())
+    }
+
+    /// Open with delete filters applied (slice 20, doc 07). Equality-delete
+    /// columns outside the projection join the internal read set (never
+    /// exposed); an eq column missing from the file is a Config error.
+    pub fn open_with_deletes(
+        io: &StorageIo,
+        key: &str,
+        projection: &[&str],
+        deletes: RowDeletes,
+    ) -> Result<Self, StorageError> {
+        Self::open_internal(io, key, projection, deletes)
+    }
+
+    fn open_internal(
+        io: &StorageIo,
+        key: &str,
+        projection: &[&str],
+        deletes: RowDeletes,
+    ) -> Result<Self, StorageError> {
         let raw = io.get_bytes(key)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(raw))
             .map_err(|e| StorageError::Decode(format!("parquet open: {e}")))?;
         let arrow_schema = builder.schema().clone();
 
-        let mut column_indices = Vec::with_capacity(projection.len());
-        for name in projection {
+        // internal read set: projection first, then any equality-delete
+        // columns not already projected
+        let mut read_names: Vec<String> = projection.iter().map(|s| s.to_string()).collect();
+        for eq in &deletes.equality {
+            for c in &eq.columns {
+                if !read_names.contains(c) {
+                    read_names.push(c.clone());
+                }
+            }
+        }
+
+        let mut column_indices = Vec::with_capacity(read_names.len());
+        for name in &read_names {
             let idx = arrow_schema
                 .fields()
                 .iter()
@@ -95,6 +202,26 @@ impl ParquetRows {
             column_indices.push(idx);
         }
 
+        // eq columns resolve against the arrow schema independently (they
+        // may be projected or internal)
+        let mut eq_col_indices = Vec::with_capacity(deletes.equality.len());
+        for eq in &deletes.equality {
+            let mut idxs = Vec::with_capacity(eq.columns.len());
+            for c in &eq.columns {
+                let idx = arrow_schema
+                    .fields()
+                    .iter()
+                    .position(|f| f.name() == c)
+                    .ok_or_else(|| {
+                        StorageError::Config(format!(
+                            "equality delete column {c:?} not in parquet schema"
+                        ))
+                    })?;
+                idxs.push(idx);
+            }
+            eq_col_indices.push(idxs);
+        }
+
         let reader = builder
             .build()
             .map_err(|e| StorageError::Decode(format!("parquet reader: {e}")))?;
@@ -104,12 +231,15 @@ impl ParquetRows {
 
         let column_names = projection.iter().map(|s| s.to_string()).collect();
         Ok(Self {
-            num_rows_in_current: batches.first().map(|b| b.num_rows()).unwrap_or(0),
+            num_rows_in_current: 0,
             batches: batches.into_iter(),
             current: None,
             row: 0,
             column_names,
             column_indices,
+            batch_start_abs: 0,
+            deletes,
+            eq_col_indices,
         })
     }
 
@@ -132,12 +262,15 @@ impl ParquetRows {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| StorageError::Decode(format!("parquet read: {e}")))?;
         Ok(Self {
-            num_rows_in_current: batches.first().map(|b| b.num_rows()).unwrap_or(0),
+            num_rows_in_current: 0,
             batches: batches.into_iter(),
             current: None,
             row: 0,
             column_names: names,
             column_indices: indices,
+            batch_start_abs: 0,
+            deletes: RowDeletes::default(),
+            eq_col_indices: Vec::new(),
         })
     }
 
@@ -155,14 +288,23 @@ impl ParquetRows {
         loop {
             if self.current.is_some() && self.row + 1 < self.num_rows_in_current {
                 self.row += 1;
+                if self.current_row_deleted() {
+                    continue;
+                }
                 return true;
             }
             match self.batches.next() {
                 Some(batch) => {
+                    // finish the previous batch's contribution to the file
+                    // absolute positions (0 on the first load)
+                    self.batch_start_abs += self.num_rows_in_current as u64;
                     self.num_rows_in_current = batch.num_rows();
                     self.current = Some(batch);
                     self.row = 0;
                     if self.num_rows_in_current == 0 {
+                        continue;
+                    }
+                    if self.current_row_deleted() {
                         continue;
                     }
                     return true;
@@ -170,6 +312,38 @@ impl ParquetRows {
                 None => return false,
             }
         }
+    }
+
+    /// Is the currently-selected row killed by a delete (slice 20)?
+    /// Position deletes match the file-absolute position; equality deletes
+    /// match when every listed column equals the delete tuple.
+    fn current_row_deleted(&self) -> bool {
+        let abs = self.batch_start_abs + self.row as u64;
+        if self.deletes.positions.contains(&abs) {
+            return true;
+        }
+        for (eq_idx, eq) in self.deletes.equality.iter().enumerate() {
+            let mut all = true;
+            for (c_i, want) in eq.values.iter().enumerate() {
+                let batch = self.current.as_ref().expect("current row");
+                let arr_idx = self.eq_col_indices[eq_idx][c_i];
+                let col = batch.column(arr_idx);
+                use arrow::array::Array as _;
+                let got = if col.is_null(self.row) {
+                    CellValue::Null
+                } else {
+                    cell_from_arrow(col, self.row)
+                };
+                if got != *want {
+                    all = false;
+                    break;
+                }
+            }
+            if all {
+                return true;
+            }
+        }
+        false
     }
 
     /// Cell `col_idx` of the current row. Out-of-range column or a call
@@ -414,5 +588,103 @@ mod tests {
         .unwrap();
         let err = ParquetRows::open(&io, "a.parquet", &["nope"]).unwrap_err();
         assert!(matches!(err, StorageError::Config(_)), "{err}");
+    }
+
+    /// Write an N-row single-column (id long) parquet fixture; returns the
+    /// values written. Slice 20 delete tests.
+    fn write_ids(dir: &std::path::Path, name: &str, ids: &[i64]) -> String {
+        let schema = ArrowSchema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(Int64Array::from(ids.to_vec()))],
+        )
+        .unwrap();
+        let file = std::fs::File::create(dir.join(name)).unwrap();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        ids.to_vec()
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// TDD anchor (M1 slice 20): position deletes skip exact absolute row
+    /// positions (v2 (file_path, pos) delete files).
+    #[test]
+    fn position_deletes_skip_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        write_ids(dir.path(), "a.parquet", &[1, 2, 3, 4, 5]);
+        let io = StorageIo::open(
+            &parse_location(&format!("file://{}", dir.path().display())).unwrap(),
+            None,
+        )
+        .unwrap();
+
+        let mut deletes = RowDeletes::default();
+        deletes.positions.insert(1); // id=2
+        deletes.positions.insert(4); // id=5
+
+        let mut rows = ParquetRows::open_with_deletes(&io, "a.parquet", &["id"], deletes).unwrap();
+        let mut seen = Vec::new();
+        while rows.next() {
+            match rows.value(0) {
+                CellValue::Int64(v) => seen.push(v),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(seen, vec![1, 3, 4]);
+    }
+
+    /// TDD anchor (M1 slice 20): equality deletes drop rows matching any
+    /// delete tuple on the listed columns; the eq column may be outside the
+    /// projection (it is read internally, not exposed).
+    #[test]
+    fn equality_deletes_drop_matching_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        // data: id 1..=5 with a name column
+        let schema = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
+            ],
+        )
+        .unwrap();
+        let path = dir.path().join("data.parquet");
+        let f = std::fs::File::create(&path).unwrap();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(f, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let io = StorageIo::open(
+            &parse_location(&format!("file://{}", dir.path().display())).unwrap(),
+            None,
+        )
+        .unwrap();
+
+        // eq delete: any row with id == 3 dies
+        let mut deletes = RowDeletes::default();
+        deletes.equality.push(EqDeleteMatch {
+            columns: vec!["id".into()],
+            values: vec![CellValue::Int64(3)],
+            sequence_number: 1,
+        });
+
+        // project name only: the eq column (id) is read internally
+        let mut rows =
+            ParquetRows::open_with_deletes(&io, "data.parquet", &["name"], deletes).unwrap();
+        let mut seen = Vec::new();
+        while rows.next() {
+            match rows.value(0) {
+                CellValue::Str(v) => seen.push(v),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(seen, vec!["a", "b", "d", "e"]);
     }
 }

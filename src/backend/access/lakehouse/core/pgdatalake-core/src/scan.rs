@@ -26,6 +26,9 @@ pub struct ScanTask {
 pub struct ScanPlan {
     pub snapshot_id: i64,
     pub tasks: Vec<ScanTask>,
+    /// Delete files (v2 position/equality deletes) surviving in the
+    /// snapshot — never data tasks; the row readers apply them (slice 20).
+    pub delete_tasks: Vec<ScanTask>,
     /// Sum of record_count over surviving DATA files (delete files add rows
     /// at read time; the row-count story is completed by the delete slice).
     pub total_rows: i64,
@@ -351,6 +354,7 @@ pub fn plan_scan(
                 return Ok(ScanPlan {
                     snapshot_id: md.current_snapshot_id.unwrap_or_default(),
                     tasks: Vec::new(),
+                    delete_tasks: Vec::new(),
                     total_rows: 0,
                     data_files: 0,
                     files_before_pruning: 0,
@@ -366,6 +370,7 @@ pub fn plan_scan(
 
     let schema = md.current_schema();
     let mut tasks = Vec::new();
+    let mut delete_tasks = Vec::new();
     let mut total_rows = 0i64;
     let mut data_files = 0usize;
     let mut files_before_pruning = 0usize;
@@ -403,25 +408,102 @@ pub fn plan_scan(
                 }
             }
             files_after_pruning += 1;
-            if e.data_file.content == crate::manifest::DataContent::Data {
-                total_rows += e.data_file.record_count;
-                data_files += 1;
-            }
-            tasks.push(ScanTask {
+            let task = ScanTask {
                 sequence_number: e.sequence_number.or(mle.sequence_number).unwrap_or(0),
                 entry: e,
-            });
+            };
+            // slice 20: delete files are never data tasks — the row readers
+            // load and apply them separately
+            if task.entry.data_file.content != crate::manifest::DataContent::Data {
+                delete_tasks.push(task);
+                continue;
+            }
+            total_rows += task.entry.data_file.record_count;
+            data_files += 1;
+            tasks.push(task);
         }
     }
 
     Ok(ScanPlan {
         snapshot_id: snapshot.snapshot_id,
         tasks,
+        delete_tasks,
         total_rows,
         data_files,
         files_before_pruning,
         files_after_pruning,
     })
+}
+
+/// Load the snapshot's v2 delete files (slice 20, doc 07): position-delete
+/// parquet has the (file_path, pos) schema — positions map per data file;
+/// equality-delete parquet has one column per eq field — every row is a
+/// delete tuple carrying the delete file's sequence number. M1 loads
+/// eagerly at scan planning (delete files are small relative to data).
+pub fn load_row_deletes(
+    plan: &ScanPlan,
+    s3: Option<&S3Options>,
+) -> Result<crate::parquet::LoadedDeletes, StorageError> {
+    use crate::parquet::{CellValue, EqDeleteMatch, LoadedDeletes};
+
+    let mut loaded = LoadedDeletes::default();
+    for t in &plan.delete_tasks {
+        let (io, key) = open_for(&t.entry.data_file.file_path, s3)?;
+        let mut rows = crate::parquet::ParquetRows::open_all(&io, &key)?;
+        match t.entry.data_file.content {
+            crate::manifest::DataContent::PositionDeletes => {
+                let names = rows.column_names().to_vec();
+                let fp_i = names.iter().position(|n| n == "file_path").ok_or_else(|| {
+                    StorageError::Decode(format!(
+                        "position delete file {} has no file_path column",
+                        t.entry.data_file.file_path
+                    ))
+                })?;
+                let pos_i = names.iter().position(|n| n == "pos").ok_or_else(|| {
+                    StorageError::Decode(format!(
+                        "position delete file {} has no pos column",
+                        t.entry.data_file.file_path
+                    ))
+                })?;
+                while rows.next() {
+                    let fp = match rows.value(fp_i) {
+                        CellValue::Str(s) => s,
+                        v => {
+                            return Err(StorageError::Decode(format!(
+                                "position delete file {}: file_path is not a string: {v:?}",
+                                t.entry.data_file.file_path
+                            )))
+                        }
+                    };
+                    let pos = match rows.value(pos_i) {
+                        CellValue::Int64(p) if p >= 0 => p as u64,
+                        v => {
+                            return Err(StorageError::Decode(format!(
+                                "position delete file {}: pos is not a row number: {v:?}",
+                                t.entry.data_file.file_path
+                            )))
+                        }
+                    };
+                    loaded.positions_by_file.entry(fp).or_default().insert(pos);
+                }
+            }
+            crate::manifest::DataContent::EqualityDeletes => {
+                let names = rows.column_names().to_vec();
+                while rows.next() {
+                    let values: Vec<CellValue> = (0..names.len()).map(|i| rows.value(i)).collect();
+                    loaded.equality.push(EqDeleteMatch {
+                        columns: names.clone(),
+                        values,
+                        sequence_number: t.sequence_number,
+                    });
+                }
+            }
+            crate::manifest::DataContent::Data => {
+                unreachable!("delete_tasks only holds delete files")
+            }
+        }
+    }
+    Ok(loaded)
 }
 
 #[cfg(test)]
@@ -453,6 +535,23 @@ mod tests {
         name: &str,
         files: &[(i32, &str, i64)],
     ) -> Result<(), StorageError> {
+        build_manifest_content(
+            dir,
+            name,
+            &files
+                .iter()
+                .map(|(s, p, r)| (*s, *p, *r, 0i32))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Manifest with explicit data-file `content` values (0 data, 1 position
+    /// deletes, 2 equality deletes) — slice 20 delete-file tests.
+    fn build_manifest_content(
+        dir: &std::path::Path,
+        name: &str,
+        files: &[(i32, &str, i64, i32)],
+    ) -> Result<(), StorageError> {
         let schema = AvroSchema::parse_str(crate::manifest::MANIFEST_ENTRY_SCHEMA_V2).unwrap();
         let AvroSchema::Record(top_rec) = &schema else {
             panic!("manifest is not a record");
@@ -480,7 +579,7 @@ mod tests {
         };
         let kv_schema = (*arr.items).clone();
         let mut writer = Writer::new(&schema, Vec::new());
-        for (status, path, rows) in files {
+        for (status, path, rows, content) in files {
             let mut entry = Record::new(&schema).unwrap();
             entry.put("status", Value::Int(*status));
             entry.put("snapshot_id", Value::Long(42));
@@ -493,7 +592,7 @@ mod tests {
                 Value::Union(1, Box::new(Value::Long(1))),
             );
             let data_file = Value::Record(vec![
-                ("content".into(), Value::Int(0)),
+                ("content".into(), Value::Int(*content)),
                 ("file_path".into(), Value::String(path.to_string())),
                 ("file_format".into(), Value::String("parquet".into())),
                 (
@@ -812,6 +911,73 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, StorageError::NotFound(_)), "{err}");
+    }
+
+    /// TDD anchor (M1 slice 20): delete files (content 1 = position deletes,
+    /// 2 = equality deletes) are separated from data tasks into
+    /// `delete_tasks` — they must never be planned as data scans.
+    #[test]
+    fn separates_delete_files_from_data_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("metadata")).unwrap();
+
+        build_manifest(
+            dir.path().join("metadata").as_path(),
+            "mn-data.avro",
+            &[(1, "file:///table/data/a.parquet", 100)],
+        )
+        .unwrap();
+        build_manifest_content(
+            dir.path().join("metadata").as_path(),
+            "mn-posdel.avro",
+            &[(1, "file:///table/data/deletes-pos.parquet", 2, 1)],
+        )
+        .unwrap();
+        build_manifest_content(
+            dir.path().join("metadata").as_path(),
+            "mn-eqdel.avro",
+            &[(1, "file:///table/data/deletes-eq.parquet", 1, 2)],
+        )
+        .unwrap();
+        build_manifest_list(
+            dir.path().join("metadata").as_path(),
+            &[
+                ("mn-data.avro", 1, 0, 0),
+                ("mn-posdel.avro", 1, 0, 0),
+                ("mn-eqdel.avro", 1, 0, 0),
+            ],
+        )
+        .unwrap();
+
+        let list_path = dir.path().join("metadata").join("mn-list.avro");
+        let metadata_json = format!(
+            r#"{{
+                "format-version": 2,
+                "table-uuid": "9c12d441-03fe-11ed-8122-d358e75d12eb",
+                "location": "file://{}",
+                "schemas": [{{"type": "struct", "schema-id": 0, "fields": [
+                    {{"id": 1, "name": "id", "required": true, "type": "long"}}]}}],
+                "current-schema-id": 0,
+                "snapshots": [
+                    {{"snapshot-id": 42, "timestamp-ms": 1000,
+                      "manifest-list": "file://{}",
+                      "summary": {{"operation": "append"}}}}
+                ],
+                "current-snapshot-id": 42
+            }}"#,
+            dir.path().display(),
+            list_path.display(),
+        );
+        let md: TableMetadata = serde_json::from_str(&metadata_json).unwrap();
+
+        let plan = plan_scan(&md, None, None, None).expect("plan_scan");
+        assert_eq!(plan.tasks.len(), 1, "only the data file is a task");
+        assert_eq!(plan.delete_tasks.len(), 2, "both delete files collected");
+        assert_eq!(plan.total_rows, 100, "delete files add no rows");
+        assert_eq!(
+            plan.tasks[0].entry.data_file.file_path,
+            "file:///table/data/a.parquet"
+        );
     }
 
     /// TDD anchor (M1 slice 8): identity-transform partition pruning —

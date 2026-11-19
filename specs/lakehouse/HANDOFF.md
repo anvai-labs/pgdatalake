@@ -147,6 +147,30 @@
     rationale, original sketch kept as Superseded); RULES §3 grammar
     plumbing row added (kwlist/parse_clause/parse_relation/analyze/
     parsenodes RTE field/catversion).
+  - slice 20 v2 delete application: plan_scan separates delete files
+    (manifest content 1/2) into ScanPlan.delete_tasks (never data tasks);
+    load_row_deletes reads them eagerly at scan_new -> LoadedDeletes
+    (positions_by_file from (file_path,pos) parquet + EqDeleteMatch
+    tuples with the delete's sequence number). rows_open slices
+    LoadedDeletes per data file: position deletes exact per-file;
+    equality deletes only when delete seq > data seq and, in M1, only
+    for UNPARTITIONED data files (partitioned + eq deletes -> loud
+    Config error; partition-scoped application deferred). ParquetRows
+    gained open_with_deletes + absolute-position tracking across batches
+    (batch_start_abs) + eq columns join the INTERNAL read set when not
+    projected. FFI end-to-end test: mock catalog + REAL position-delete
+    parquet -> rows 1,3 (id=2 removed) through pg_datalake_rows_open.
+    LIVE: PyIceberg 0.12 table.delete() is COW (rewrites the data file,
+    no delete files) — the live transcript proves COW-rewrite read compat
+    (analytics.events_del: 10 appended -> delete -> FDW reads 8 rows,
+    pre-delete snapshot via FOR VERSION AS OF reads 10); live MoR
+    fixtures come from Spark/Trino at the M1 gate or our M2 writer.
+    GOTCHA: lakekeeper serves per-table config s3.endpoint=http://s3:9000
+    (container-scoped) which BEATS pyiceberg client/table properties —
+    host-side pyiceberg writes must run inside the compose network
+    (docker run --network pgdatalake_default with the venv mounted at
+    its absolute path; see scripts note in retro). SPEC: 06-execution.md
+    §3 amended (slice 20 amendment). 46 cargo tests + 4 regress groups.
   - **Next slices**: M1 conformance
     gate (Trino-written tables, TPC-DS subset, perf vs doc 10 §5) ->
     smoke ceremony -> M1 retro + tag milestone/m1.
