@@ -28,7 +28,7 @@ lakehouse-down:
 
 lakehouse-check:
 	@echo "cargo test -p pgdatalake-core"
-	cargo test --manifest-path $(CURDIR)/../backend/access/lakehouse/core/Cargo.toml
+	cargo test --manifest-path $(CURDIR)/../../backend/access/lakehouse/core/Cargo.toml
 	@echo "meson test (setup + regress + lakehouse suites)"
 	meson test -C $(CURDIR)/../../../build --suite setup
 	meson test -C $(CURDIR)/../../../build --suite regress
