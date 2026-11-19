@@ -114,10 +114,16 @@
     Gather/2 workers, count=3000 distinct=3000, WHERE under parallelism
     exact. M1 limitation: one foreign scan per query for the shared
     static pointer (documented, revisit when multi-scan queries matter).
-  - **Next slices**: time travel (FOR TIMESTAMP/VERSION AS OF, doc 02
-    §4 — the allowlisted gram.y patch, biggest core touch so far) ->
-    M1 conformance gate (Trino-written tables, TPC-DS subset, perf vs
-    doc 10 §5) -> smoke ceremony -> M1 retro + tag milestone/m1.
+  - slice 18 snapshot pinning: FDW option snapshot_id -> FFI
+    scan_new(snapshot_id) -> plan_scan snapshot selection. LIVE:
+    table pinned to first pyiceberg snapshot reads 1000 rows while
+    current reads 3000 — time-separated reads verified.
+  - **Next slices**: FOR TIMESTAMP/VERSION AS OF grammar (slice 19, the
+    allowlisted gram.y patch — syntax sugar over the now-existing
+    pinning plumbing; parse hook must reach the FDW via a
+    parse/planner channel, see doc 02 §4) -> M1 conformance gate
+    (Trino-written tables, TPC-DS subset, perf vs doc 10 §5) -> smoke
+    ceremony -> M1 retro + tag milestone/m1.
 - Core-allowlist patches so far: meson_options.txt,
   src/backend/access/meson.build, root Makefile (each committed with
   `[core-allowlist]` rationale).
