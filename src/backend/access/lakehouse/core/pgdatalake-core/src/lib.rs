@@ -12,4 +12,5 @@
 #![deny(unsafe_code)]
 #![warn(clippy::all)]
 
+pub mod catalog;
 pub mod ffi;
