@@ -209,6 +209,37 @@
   - **Next slices**: M1 conformance
     gate (Trino-written tables, TPC-DS subset, perf vs doc 10 §5) ->
     smoke ceremony -> M1 retro + tag milestone/m1.
+- **M2 slice plan (written 2026-11-19, before M1 close; per doc 07 §2
+  commit protocol + doc 01 §2 module layout)**:
+  - slice 24 — Rust Parquet writer: columnar batch accumulator ->
+    arrow RecordBatch -> parquet bytes (deps already have
+    parquet/arrow 54 + ArrowWriter) -> StorageIo put; target-file-size
+    splitting; unit tests on file:// stores. Sets up `optimize`'s
+    rewrite machinery for M4.
+  - slice 25 — REST commit protocol: commitTable PUT with requirements
+    [AssertTableUUID, AssertRefSnapshotId(main, base), AssertRefSeq...
+    per Iceberg REST spec], conflict classification + bounded retry
+    (lakehouse.commit_retries), 409 -> re-plan delta; unit-tested
+    against the tiny_http mock catalog (409 path included).
+  - slice 26 — `USING lakehouse` TableAM skeleton: pg_am.dat
+    [core-allowlist] row + catversion bump; tableam handler struct with
+    scan callbacks DELEGATING to the existing FDW scan pipeline;
+    CREATE TABLE ... USING lakehouse FORMAT iceberg round-trip in
+    regress (metadata-only table, no writes yet).
+  - slice 27 — INSERT: per-txn batch accumulator (tuple→columnar),
+    pre-commit flush per doc 07 §2 steps 1-5, own-writes overlay
+    visibility, abort = orphan files (GC'd later); regress INSERT
+    visible-after-commit + rollback-invisible.
+  - slice 28 — UPDATE/DELETE as COW (rewrite affected files, reuse
+    slice-20 delete reading for concurrent reads), TRUNCATE (empty
+    snapshot commit); regress vs heap parity.
+  - slice 29 — MERGE + M2 gate: Trino reads a table WE wrote (the
+    compose trino service is already in place for exactly this);
+    smoke ceremony + tag milestone/m2.
+  - Principle to honor throughout: one catalog, one visibility
+    (00-goals #3) — managed tables are ordinary pg_class rows; the
+    remote catalog is source of truth; local reconciliation via
+    metadata_ttl.
 - Core-allowlist patches so far: meson_options.txt,
   src/backend/access/meson.build, root Makefile (each committed with
   `[core-allowlist]` rationale).
