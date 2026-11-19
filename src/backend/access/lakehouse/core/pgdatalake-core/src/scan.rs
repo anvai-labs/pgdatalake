@@ -33,13 +33,30 @@ pub struct ScanPlan {
     pub data_files: usize,
 }
 
-/// A minimal scan predicate. Slice 8 supports Eq over identity-transform
-/// partitions (conservative: non-identity transforms are never pruned);
-/// range predicates and metrics/bounds pruning land in later slices.
+/// A scan predicate. Slice 8: Eq over identity-transform partitions
+/// (conservative — non-identity transforms are never pruned). Slice 14:
+/// Eq/Lt/Le/Gt/Ge bounds pruning over parquet column stats; non-identity
+/// transforms, unknown fields and missing bounds always KEEP the file.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScanPredicate {
     And(Vec<ScanPredicate>),
     Eq {
+        field: String,
+        value: serde_json::Value,
+    },
+    Lt {
+        field: String,
+        value: serde_json::Value,
+    },
+    Le {
+        field: String,
+        value: serde_json::Value,
+    },
+    Gt {
+        field: String,
+        value: serde_json::Value,
+    },
+    Ge {
         field: String,
         value: serde_json::Value,
     },
@@ -73,6 +90,144 @@ fn partition_matches(
             }
         }
         ScanPredicate::And(preds) => preds.iter().all(|p| partition_matches(spec, partition, p)),
+        // range predicates (Lt/Le/Gt/Ge) are bounds-pruned, not
+        // partition-pruned (slice 8 covers identity-Eq only)
+        _ => true,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum BoundVal {
+    Num(f64),
+    Str(String),
+}
+
+/// Decode a parquet-stat bound bytes slice per the iceberg field type.
+/// Unsupported types -> None (field is never bounds-pruned, conservative).
+fn decode_bound(bytes: &[u8], ty: &crate::catalog::metadata::IcebergType) -> Option<BoundVal> {
+    use crate::catalog::metadata::IcebergType as IT;
+    let le_i64 =
+        |b: &[u8]| -> Option<i64> { b.try_into().ok().map(|a: [u8; 8]| i64::from_le_bytes(a)) };
+    let le_i32 = |b: &[u8]| -> Option<i64> {
+        b.try_into()
+            .ok()
+            .map(|a: [u8; 4]| i32::from_le_bytes(a) as i64)
+    };
+    Some(match ty {
+        IT::Int => BoundVal::Num(le_i32(bytes)? as f64),
+        IT::Long | IT::Timestamp | IT::Timestamptz => BoundVal::Num(le_i64(bytes)? as f64),
+        IT::Float => {
+            let b: [u8; 4] = bytes.try_into().ok()?;
+            BoundVal::Num(f32::from_le_bytes(b) as f64)
+        }
+        IT::Double => {
+            let b: [u8; 8] = bytes.try_into().ok()?;
+            BoundVal::Num(f64::from_le_bytes(b))
+        }
+        IT::String => BoundVal::Str(String::from_utf8_lossy(bytes).into_owned()),
+        _ => return None,
+    })
+}
+
+/// Coerce a JSON predicate literal into the bound-comparable form.
+fn coerce_value(v: &serde_json::Value) -> Option<BoundVal> {
+    Some(match v {
+        serde_json::Value::Number(n) => BoundVal::Num(n.as_f64()?),
+        serde_json::Value::String(s) => BoundVal::Str(s.clone()),
+        _ => return None,
+    })
+}
+
+fn cmp_bound<'a>(bound: Option<&'a BoundVal>, other: &'a BoundVal) -> Option<std::cmp::Ordering> {
+    match (bound?, other) {
+        (BoundVal::Num(a), BoundVal::Num(b)) => a.partial_cmp(b),
+        (BoundVal::Str(a), BoundVal::Str(b)) => Some(a.as_bytes().cmp(b.as_bytes())),
+        // numeric/string mismatch: incomparable -> never prune
+        _ => None,
+    }
+}
+
+/// Can this predicate still match, given the file's column bounds?
+/// Conservative by construction: missing bounds/ids/type mismatches keep.
+fn bounds_keep(
+    data_file: &crate::manifest::DataFile,
+    schema: &crate::catalog::metadata::Schema,
+    pred: &ScanPredicate,
+) -> bool {
+    use crate::catalog::metadata::IcebergType as IT;
+    use std::cmp::Ordering as CmpOrd;
+    let field = match pred {
+        ScanPredicate::And(preds) => {
+            return preds.iter().all(|p| bounds_keep(data_file, schema, p))
+        }
+        ScanPredicate::Eq { field, .. }
+        | ScanPredicate::Lt { field, .. }
+        | ScanPredicate::Le { field, .. }
+        | ScanPredicate::Gt { field, .. }
+        | ScanPredicate::Ge { field, .. } => field,
+    };
+    let Some(f) = schema.fields.iter().find(|f| &f.name == field) else {
+        return true;
+    };
+    if !matches!(
+        f.r#type,
+        IT::Int | IT::Long | IT::Float | IT::Double | IT::String | IT::Timestamp | IT::Timestamptz
+    ) {
+        return true;
+    }
+    let lower = data_file
+        .lower_bounds
+        .get(&f.id)
+        .and_then(|b| decode_bound(b, &f.r#type));
+    let upper = data_file
+        .upper_bounds
+        .get(&f.id)
+        .and_then(|b| decode_bound(b, &f.r#type));
+    let value = match pred {
+        ScanPredicate::Eq { value, .. }
+        | ScanPredicate::Lt { value, .. }
+        | ScanPredicate::Le { value, .. }
+        | ScanPredicate::Gt { value, .. }
+        | ScanPredicate::Ge { value, .. } => value,
+        _ => unreachable!(),
+    };
+    let value = match coerce_value(value) {
+        Some(v) => v,
+        None => return true,
+    };
+    match pred {
+        ScanPredicate::Eq { .. } => !matches!(
+            (
+                cmp_bound(lower.as_ref(), &value),
+                cmp_bound(upper.as_ref(), &value)
+            ),
+            (Some(CmpOrd::Greater), _) | (_, Some(CmpOrd::Less))
+        ),
+        ScanPredicate::Lt { .. } => match lower {
+            None => true,
+            Some(ref b) => cmp_bound(Some(b), &value)
+                .map(|o| o == std::cmp::Ordering::Less)
+                .unwrap_or(true),
+        },
+        ScanPredicate::Le { .. } => match lower {
+            None => true,
+            Some(ref b) => cmp_bound(Some(b), &value)
+                .map(|o| o != std::cmp::Ordering::Greater)
+                .unwrap_or(true),
+        },
+        ScanPredicate::Gt { .. } => match upper {
+            None => true,
+            Some(ref b) => cmp_bound(Some(b), &value)
+                .map(|o| o == std::cmp::Ordering::Greater)
+                .unwrap_or(true),
+        },
+        ScanPredicate::Ge { .. } => match upper {
+            None => true,
+            Some(ref b) => cmp_bound(Some(b), &value)
+                .map(|o| o != std::cmp::Ordering::Less)
+                .unwrap_or(true),
+        },
+        ScanPredicate::And(_) => unreachable!("handled above"),
     }
 }
 
@@ -141,6 +296,7 @@ pub fn plan_scan(
     let list_bytes = list_io.get_bytes(&list_key)?;
     let list_entries = parse_manifest_list(&list_bytes)?;
 
+    let schema = md.current_schema();
     let mut tasks = Vec::new();
     let mut total_rows = 0i64;
     let mut data_files = 0usize;
@@ -162,11 +318,17 @@ pub fn plan_scan(
             if e.status == crate::manifest::ManifestEntryStatus::Deleted {
                 continue;
             }
-            if let (Some(spec), Some(pred)) = (spec, predicate) {
-                if let Some(partition) = &e.data_file.partition {
+            if let Some(pred) = predicate {
+                if let (Some(spec), Some(partition)) = (spec, &e.data_file.partition) {
                     if !partition_matches(spec, partition, pred) {
                         continue;
                     }
+                }
+                let Some(schema) = schema else {
+                    continue;
+                };
+                if !bounds_keep(&e.data_file, schema, pred) {
+                    continue;
                 }
             }
             if e.data_file.content == crate::manifest::DataContent::Data {
@@ -552,5 +714,106 @@ mod tests {
         ]);
         let plan = plan_scan(&md, None, None, Some(&pred)).expect("plan and");
         assert_eq!(plan.tasks.len(), 0);
+    }
+
+    /// TDD anchor (M1 slice 14): bounds pruning — predicates compared to
+    /// manifest lower/upper bounds (parquet column stats, slice 6) skip
+    /// files that cannot match. Conservative: missing bounds/ids always
+    /// keep. Eq inside bounds keeps; numeric Lt with upper bound < value
+    /// drops; And requires all parts to keep.
+    #[test]
+    fn bounds_pruning_skips_unmatchable_files() {
+        use crate::catalog::metadata::{Field, IcebergType, Schema, TableMetadata};
+        use std::collections::BTreeMap;
+
+        let mk_entry = |lower: Option<i64>, upper: Option<i64>| crate::manifest::ManifestEntry {
+            status: crate::manifest::ManifestEntryStatus::Added,
+            snapshot_id: 42,
+            sequence_number: None,
+            file_sequence_number: None,
+            data_file: crate::manifest::DataFile {
+                content: crate::manifest::DataContent::Data,
+                file_path: format!("file:///d/{lower:?}.parquet"),
+                file_format: "parquet".into(),
+                partition: Some(serde_json::json!({})),
+                record_count: 10,
+                file_size_in_bytes: 1,
+                column_sizes: BTreeMap::new(),
+                value_counts: BTreeMap::new(),
+                null_value_counts: BTreeMap::new(),
+                nan_value_counts: BTreeMap::new(),
+                lower_bounds: lower
+                    .map(|v| BTreeMap::from([(1i64, v.to_le_bytes().to_vec())]))
+                    .unwrap_or_default(),
+                upper_bounds: upper
+                    .map(|v| BTreeMap::from([(1i64, v.to_le_bytes().to_vec())]))
+                    .unwrap_or_default(),
+                key_metadata: None,
+                split_offsets: None,
+                equality_ids: None,
+                sort_order_id: None,
+            },
+        };
+        let schema_fn = |fields: Vec<crate::catalog::metadata::Field>| Schema {
+            struct_type: crate::catalog::metadata::IcebergTypeMarker::Struct,
+            schema_id: 0,
+            fields,
+        };
+        let id_schema = schema_fn(vec![Field {
+            id: 1,
+            name: "id".into(),
+            required: true,
+            r#type: IcebergType::Long,
+            doc: None,
+        }]);
+
+        let md = TableMetadata {
+            format_version: crate::catalog::metadata::FormatVersion::V2,
+            table_uuid: uuid::Uuid::nil(),
+            location: "s3://t".into(),
+            last_sequence_number: None,
+            schemas: vec![id_schema.clone()],
+            current_schema_id: 0,
+            snapshots: vec![],
+            current_snapshot_id: None,
+            properties: BTreeMap::new(),
+            partition_specs: vec![],
+            default_partition_spec_id: None,
+        };
+
+        let in_bounds = mk_entry(Some(0), Some(100));
+        let above = mk_entry(Some(500), Some(900));
+        let no_bounds = mk_entry(None, None);
+
+        // eq 50: in-bounds file keeps, above drops, no-bounds keeps
+        let pred = ScanPredicate::Eq {
+            field: "id".into(),
+            value: serde_json::json!(50),
+        };
+        assert!(bounds_keep(&in_bounds.data_file, &id_schema, &pred));
+        assert!(!bounds_keep(&above.data_file, &id_schema, &pred));
+        assert!(bounds_keep(&no_bounds.data_file, &id_schema, &pred));
+
+        // gt 150: above keeps (upper 900 > 150), in-bounds drops (upper 100 < 150)
+        let pred = ScanPredicate::Gt {
+            field: "id".into(),
+            value: serde_json::json!(150),
+        };
+        assert!(bounds_keep(&above.data_file, &id_schema, &pred));
+        assert!(!bounds_keep(&in_bounds.data_file, &id_schema, &pred));
+
+        // And(eq, gt 150): in-bounds file drops (gt part fails)
+        let pred = ScanPredicate::And(vec![
+            ScanPredicate::Eq {
+                field: "id".into(),
+                value: serde_json::json!(50),
+            },
+            ScanPredicate::Gt {
+                field: "id".into(),
+                value: serde_json::json!(150),
+            },
+        ]);
+        assert!(!bounds_keep(&in_bounds.data_file, &id_schema, &pred));
+        let _ = md;
     }
 }
