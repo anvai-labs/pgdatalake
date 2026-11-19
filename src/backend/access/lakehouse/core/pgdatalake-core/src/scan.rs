@@ -7,7 +7,7 @@
 //! -> task list (ADDED + EXISTING entries; DELETED dropped). Partition and
 //! metrics pruning are the next slice; the FFI exposes this to the FDW.
 
-use crate::catalog::metadata::TableMetadata;
+use crate::catalog::metadata::{SnapshotSelector, TableMetadata};
 use crate::manifest::{parse_manifest, parse_manifest_list, ManifestEntry};
 use crate::storage::{parse_location, Location, S3Options, StorageError, StorageIo};
 
@@ -327,31 +327,37 @@ pub(crate) fn open_for(
     }
 }
 
-/// Plan a scan of the given table metadata. `snapshot_id = None` selects the
-/// current snapshot; pinning an unknown id is a NotFound (doc 02 §2 pin
-/// semantics). `s3` carries connection options for locations that need them
-/// (file:// local fixtures pass None).
+/// Plan a scan of the given table metadata. `selector = None` selects the
+/// current snapshot; a selector that resolves to nothing is a NotFound
+/// (doc 02 §2 pin semantics — `FOR … AS OF`, slice 19). `s3` carries
+/// connection options for locations that need them (file:// local fixtures
+/// pass None).
 pub fn plan_scan(
     md: &TableMetadata,
-    snapshot_id: Option<i64>,
+    selector: Option<&SnapshotSelector>,
     s3: Option<&S3Options>,
     predicate: Option<&ScanPredicate>,
 ) -> Result<ScanPlan, StorageError> {
-    let snapshot = match snapshot_id.or(md.current_snapshot_id) {
-        Some(id) => md.snapshot(id).ok_or_else(|| {
-            StorageError::NotFound(format!("snapshot {id} not in table metadata"))
+    let snapshot = match selector {
+        Some(sel) => md.resolve_snapshot(sel).ok_or_else(|| {
+            StorageError::NotFound(format!("time-travel selector {sel:?} matches no snapshot"))
         })?,
-        None => {
+        None => match md.current_snapshot_id {
+            Some(id) => md.snapshot(id).ok_or_else(|| {
+                StorageError::NotFound(format!("snapshot {id} not in table metadata"))
+            })?,
             // empty table (no snapshots at all): SELECT plans to zero tasks
-            return Ok(ScanPlan {
-                snapshot_id: md.current_snapshot_id.unwrap_or_default(),
-                tasks: Vec::new(),
-                total_rows: 0,
-                data_files: 0,
-                files_before_pruning: 0,
-                files_after_pruning: 0,
-            });
-        }
+            None => {
+                return Ok(ScanPlan {
+                    snapshot_id: md.current_snapshot_id.unwrap_or_default(),
+                    tasks: Vec::new(),
+                    total_rows: 0,
+                    data_files: 0,
+                    files_before_pruning: 0,
+                    files_after_pruning: 0,
+                });
+            }
+        },
     };
 
     let (list_io, list_key) = open_for(&snapshot.manifest_list, s3)?;
@@ -549,6 +555,16 @@ mod tests {
         dir: &std::path::Path,
         manifests: &[(&str, i64, i64, i64)],
     ) -> Result<(), StorageError> {
+        build_manifest_list_named(dir, "mn-list.avro", manifests)
+    }
+
+    /// Same, but under an explicit filename — lets a test pin two snapshots
+    /// to *different* manifest lists (slice 19 selector tests).
+    fn build_manifest_list_named(
+        dir: &std::path::Path,
+        name: &str,
+        manifests: &[(&str, i64, i64, i64)],
+    ) -> Result<(), StorageError> {
         let schema = AvroSchema::parse_str(crate::manifest::MANIFEST_LIST_SCHEMA_V2).unwrap();
         let mut writer = Writer::new(&schema, Vec::new());
         for (name, added, existing, deleted) in manifests {
@@ -572,7 +588,7 @@ mod tests {
             rec.put("min_sequence_number", Some(34i64));
             writer.append(rec).unwrap();
         }
-        std::fs::write(dir.join("mn-list.avro"), writer.into_inner().unwrap())
+        std::fs::write(dir.join(name), writer.into_inner().unwrap())
             .map_err(|e| StorageError::Config(format!("write fixture: {e}")))?;
         Ok(())
     }
@@ -686,7 +702,115 @@ mod tests {
             "current-snapshot-id": 42
         }"#;
         let md: TableMetadata = serde_json::from_str(metadata_json).unwrap();
-        let err = plan_scan(&md, Some(999), None, None).unwrap_err();
+        let err =
+            plan_scan(&md, Some(&SnapshotSelector::Id { value: 999 }), None, None).unwrap_err();
+        assert!(matches!(err, StorageError::NotFound(_)), "{err}");
+    }
+
+    /// TDD anchor (M1 slice 19): FOR TIMESTAMP/TAG AS OF selectors pin the
+    /// plan to the right snapshot's tasks — a timestamp selects the latest
+    /// snapshot at or before it, a tag resolves through the refs map, and a
+    /// selector that matches no snapshot is a NotFound error.
+    #[test]
+    fn time_travel_selectors_pin_plan_to_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("metadata")).unwrap();
+
+        // snapshot 42's manifest has file a.parquet (100 rows); snapshot 43's
+        // has b.parquet (30 rows). Each snapshot gets its own manifest list.
+        build_manifest(
+            dir.path().join("metadata").as_path(),
+            "mn1.avro",
+            &[(1, "file:///table/data/a.parquet", 100)],
+        )
+        .unwrap();
+        build_manifest(
+            dir.path().join("metadata").as_path(),
+            "mn2.avro",
+            &[(0, "file:///table/data/b.parquet", 30)],
+        )
+        .unwrap();
+        build_manifest_list(
+            dir.path().join("metadata").as_path(),
+            &[("mn1.avro", 1, 0, 0)],
+        )
+        .unwrap();
+
+        let metadata_json = format!(
+            r#"{{
+                "format-version": 2,
+                "table-uuid": "9c12d441-03fe-11ed-8122-d358e75d12eb",
+                "location": "file://{}",
+                "schemas": [{{"type": "struct", "schema-id": 0, "fields": [
+                    {{"id": 1, "name": "id", "required": true, "type": "long"}}]}}],
+                "current-schema-id": 0,
+                "snapshots": [
+                    {{"snapshot-id": 42, "timestamp-ms": 1000,
+                      "manifest-list": "file://{}", "summary": {{"operation": "append"}}}},
+                    {{"snapshot-id": 43, "timestamp-ms": 2000,
+                      "manifest-list": "file://{}", "summary": {{"operation": "append"}}}}
+                ],
+                "current-snapshot-id": 43,
+                "refs": {{"first": {{"snapshot-id": 42, "type": "tag"}}}}
+            }}"#,
+            dir.path().display(),
+            dir.path().join("metadata").join("mn-list.avro").display(),
+            dir.path()
+                .join("metadata")
+                .join("mn-list-43.avro")
+                .display(),
+        );
+
+        // build the second manifest list under its own name
+        build_manifest_list_named(
+            dir.path().join("metadata").as_path(),
+            "mn-list-43.avro",
+            &[("mn2.avro", 0, 1, 0)],
+        )
+        .unwrap();
+
+        let md: TableMetadata = serde_json::from_str(&metadata_json).unwrap();
+
+        // FOR TIMESTAMP AS OF: at/before 1000ms -> snapshot 42 -> a.parquet
+        let plan = plan_scan(
+            &md,
+            Some(&SnapshotSelector::Ts { value_ms: 1500 }),
+            None,
+            None,
+        )
+        .expect("ts selector");
+        assert_eq!(plan.snapshot_id, 42);
+        assert_eq!(plan.total_rows, 100);
+
+        // FOR VERSION AS OF (id) at the newest snapshot -> b.parquet
+        let plan = plan_scan(&md, Some(&SnapshotSelector::Id { value: 43 }), None, None)
+            .expect("id selector");
+        assert_eq!(plan.snapshot_id, 43);
+        assert_eq!(plan.total_rows, 30);
+
+        // FOR TAG AS OF: ref name -> snapshot 42's tasks
+        let plan = plan_scan(
+            &md,
+            Some(&SnapshotSelector::Ref {
+                name: "first".into(),
+            }),
+            None,
+            None,
+        )
+        .expect("ref selector");
+        assert_eq!(plan.snapshot_id, 42);
+        assert_eq!(plan.total_rows, 100);
+
+        // selector matching no snapshot (unknown ref) is a NotFound error
+        let err = plan_scan(
+            &md,
+            Some(&SnapshotSelector::Ref {
+                name: "nope".into(),
+            }),
+            None,
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, StorageError::NotFound(_)), "{err}");
     }
 
@@ -939,6 +1063,7 @@ mod tests {
             properties: BTreeMap::new(),
             partition_specs: vec![],
             default_partition_spec_id: None,
+            refs: BTreeMap::new(),
         };
 
         let in_bounds = mk_entry(Some(0), Some(100));
@@ -1081,6 +1206,7 @@ mod tests {
             properties: BTreeMap::new(),
             partition_specs: vec![],
             default_partition_spec_id: None,
+            refs: BTreeMap::new(),
         };
         let pred = predicate_from_json(&serde_json::json!({"op": "lt", "field": "id", "value": 5}))
             .unwrap();

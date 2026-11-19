@@ -100,7 +100,7 @@ pub unsafe extern "C" fn pg_datalake_scan_new(
     s3_access_key: *const c_char,
     s3_secret_key: *const c_char,
     predicate_json: *const c_char,
-    snapshot_id: i64,
+    snapshot_selector_json: *const c_char,
     err_buf: *mut c_char,
     err_len: usize,
 ) -> *mut ScanSession {
@@ -129,14 +129,20 @@ pub unsafe extern "C" fn pg_datalake_scan_new(
         let client =
             CatalogClient::new(&endpoint, &warehouse, &token, &s3).map_err(|e| e.to_string())?;
         let ns_levels: Vec<&str> = namespace.split('.').collect();
-        // snapshot_id 0 = current snapshot (time travel: slice 18)
-        let snapshot_id = if snapshot_id > 0 {
-            Some(snapshot_id)
-        } else {
+        // NULL/empty selector = current snapshot (time travel: slices 18/19)
+        let sel_json = unsafe { borrow_string(snapshot_selector_json) };
+        let selector = if sel_json.is_empty() {
             None
+        } else {
+            let v: serde_json::Value = serde_json::from_str(&sel_json)
+                .map_err(|e| format!("snapshot selector JSON: {e}"))?;
+            Some(
+                serde_json::from_value::<crate::catalog::metadata::SnapshotSelector>(v)
+                    .map_err(|e| format!("snapshot selector: {e}"))?,
+            )
         };
         client
-            .scan_table(&ns_levels, &table, predicate.as_ref(), snapshot_id)
+            .scan_table(&ns_levels, &table, predicate.as_ref(), selector.as_ref())
             .map(|(p, s3)| ScanSession::from_plan(p, s3))
             .map_err(|e| e.to_string())
     });
@@ -622,8 +628,9 @@ mod tests {
         let md_path = dir.path().join("metadata").join("00000-x.metadata.json");
         std::thread::spawn(move || {
             // serve config + loadTable pairs; enough for the session
-            // variants in this test (plain + predicate + failure paths)
-            for _ in 0..6 {
+            // variants in this test (plain + predicate + selector + failure
+            // paths)
+            for _ in 0..8 {
                 let Some(req) = server.recv().ok() else {
                     break;
                 };
@@ -662,7 +669,7 @@ mod tests {
                 std::ptr::null(),
                 std::ptr::null(),
                 std::ptr::null(),
-                0,
+                std::ptr::null(),
                 err.as_mut_ptr(),
                 err.len(),
             )
@@ -684,6 +691,7 @@ mod tests {
         // predicate JSON prunes at plan time: id > 100 drops the only file
         // (bounds 1..3) -> zero tasks, no error
         let pred = CString::new(r#"{"op":"gt","field":"id","value":100}"#).unwrap();
+        let sel_ok = CString::new(r#"{"kind":"id","value":42}"#).unwrap();
         let pruned = unsafe {
             pg_datalake_scan_new(
                 endpoint.as_ptr(),
@@ -695,7 +703,7 @@ mod tests {
                 std::ptr::null(),
                 std::ptr::null(),
                 pred.as_ptr(),
-                0,
+                std::ptr::null(),
                 err.as_mut_ptr(),
                 err.len(),
             )
@@ -708,6 +716,53 @@ mod tests {
             pg_datalake_scan_free(pruned);
             pg_datalake_scan_free(std::ptr::null_mut()); // no-op
         }
+
+        // slice 19: a snapshot selector JSON pins the scan (id form), and a
+        // selector matching no snapshot is a NULL + error message
+        let pinned = unsafe {
+            pg_datalake_scan_new(
+                endpoint.as_ptr(),
+                warehouse.as_ptr(),
+                token.as_ptr(),
+                namespace.as_ptr(),
+                table.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                sel_ok.as_ptr(),
+                err.as_mut_ptr(),
+                err.len(),
+            )
+        };
+        assert!(!pinned.is_null(), "pinned error: {:?}", unsafe {
+            CStr::from_ptr(err.as_ptr()).to_string_lossy()
+        });
+        assert_eq!(unsafe { pg_datalake_scan_task_count(pinned) }, 1);
+        unsafe {
+            pg_datalake_scan_free(pinned);
+        }
+
+        let sel_bad = CString::new(r#"{"kind":"id","value":999}"#).unwrap();
+        let unpinned = unsafe {
+            pg_datalake_scan_new(
+                endpoint.as_ptr(),
+                warehouse.as_ptr(),
+                token.as_ptr(),
+                namespace.as_ptr(),
+                table.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                sel_bad.as_ptr(),
+                err.as_mut_ptr(),
+                err.len(),
+            )
+        };
+        assert!(unpinned.is_null());
+        let msg = unsafe { CStr::from_ptr(err.as_ptr()).to_string_lossy() };
+        assert!(msg.contains("matches no snapshot"), "{msg}");
 
         // failure path: unreachable endpoint -> NULL + populated err buffer
         let bad = CString::new("http://127.0.0.1:9").unwrap();
@@ -722,7 +777,7 @@ mod tests {
                 std::ptr::null(),
                 std::ptr::null(),
                 std::ptr::null(),
-                0,
+                std::ptr::null(),
                 err.as_mut_ptr(),
                 err.len(),
             )

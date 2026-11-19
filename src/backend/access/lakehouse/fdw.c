@@ -68,16 +68,19 @@ typedef struct LakehouseShared
 	pg_atomic_uint64 next_task;
 }			LakehouseShared;
 
-/* process-local pointer to the parallel shared state (set by the DSM
+/*
+ * process-local pointer to the parallel shared state (set by the DSM
  * hooks; NULL in serial plans). One foreign scan per query is an M1
- * limitation, documented in the retro. */
-static LakehouseShared *lakehouse_shared_state = NULL;
+ * limitation, documented in the retro.
+ */
+static LakehouseShared * lakehouse_shared_state = NULL;
 
 /* per-executor-node state */
 typedef struct LakehouseExecState
 {
 	LakehouseOptions opts;
 	char	   *predicate_json; /* translated quals (slice 15) */
+	char	   *rte_selector;	/* time travel pin from fdw_private (slice 19) */
 	bool		parallel;		/* running as a parallel worker (slice 17) */
 	ScanSession *session;
 	RowsHandle *rows;
@@ -141,6 +144,7 @@ lakehouse_fdw_handler(PG_FUNCTION_ARGS)
 	routine->ReInitializeDSMForeignScan = lakehouse_InitializeDSMForeignScan;
 	routine->InitializeWorkerForeignScan = lakehouse_InitializeWorkerForeignScan;
 	routine->ShutdownForeignScan = lakehouse_ShutdownForeignScan;
+
 	/*
 	 * Our reader is process-local (no shared connections), so every
 	 * foreign-table scan is parallel safe (slice 17, doc 06 §3). Without
@@ -224,11 +228,27 @@ ExtractOptions(Oid foreigntableid, LakehouseOptions * opts)
 	}
 }
 
+static char *BuildSelectorJson(const char *sel);
+
 static ScanSession *
-OpenSession(LakehouseOptions * opts)
+OpenSession(LakehouseOptions * opts, const char *rte_selector)
 {
 	char		errbuf[1024];
 	ScanSession *session;
+	char	   *sel_json;
+
+	/*
+	 * Selector priority (slice 19): the query-level FOR ... AS OF pin wins
+	 * over the table's snapshot_id option (a default), which falls back to
+	 * the current snapshot.
+	 */
+	if (rte_selector != NULL && rte_selector[0] != '\0')
+		sel_json = BuildSelectorJson(rte_selector);
+	else if (opts->snapshot_id != NULL)
+		sel_json = psprintf("{\"kind\":\"id\",\"value\":" INT64_FORMAT "}",
+							pg_strtoint64(opts->snapshot_id));
+	else
+		sel_json = "";
 
 	errbuf[0] = '\0';
 	session = pg_datalake_scan_new(opts->endpoint,
@@ -240,14 +260,55 @@ OpenSession(LakehouseOptions * opts)
 								   opts->s3_access_key,
 								   opts->s3_secret_key,
 								   opts->predicate_json ? opts->predicate_json : "",
-								   opts->snapshot_id ? pg_strtoint64(opts->snapshot_id) : 0,
+								   sel_json,
 								   errbuf,
 								   sizeof(errbuf));
 	if (session == NULL)
+	{
+		if (sel_json[0] != '\0')
+			ereport(ERROR,
+					(errcode(ERRCODE_CONNECTION_EXCEPTION),
+					 errmsg("lakehouse: could not plan scan with selector %s: %s",
+							sel_json, errbuf)));
 		ereport(ERROR,
 				(errcode(ERRCODE_CONNECTION_EXCEPTION),
 				 errmsg("lakehouse: could not plan scan: %s", errbuf)));
+	}
 	return session;
+}
+
+/*
+ * Canonical RTE selector string (RTE.lakehouse_snapshot, slice 19:
+ * "ts:<epoch-ms>" / "id:<snapshot-id>" / "ref:<name>") -> selector JSON for
+ * the FFI. The C-side canonical form is validated at parse-analysis time
+ * (parse_clause.c), so the value parts are known-safe here.
+ */
+static char *
+BuildSelectorJson(const char *sel)
+{
+	StringInfoData buf;
+	const char *p;
+
+	Assert(sel != NULL && sel[0] != '\0');
+	initStringInfo(&buf);
+	if (strncmp(sel, "ts:", 3) == 0)
+		appendStringInfo(&buf, "{\"kind\":\"ts\",\"value-ms\":%s}", sel + 3);
+	else if (strncmp(sel, "id:", 3) == 0)
+		appendStringInfo(&buf, "{\"kind\":\"id\",\"value\":%s}", sel + 3);
+	else if (strncmp(sel, "ref:", 4) == 0)
+	{
+		appendStringInfoString(&buf, "{\"kind\":\"ref\",\"name\":\"");
+		for (p = sel + 4; *p != '\0'; p++)
+		{
+			if (*p == '"' || *p == '\\')
+				appendStringInfoChar(&buf, '\\');
+			appendStringInfoChar(&buf, *p);
+		}
+		appendStringInfoString(&buf, "\"}");
+	}
+	else
+		elog(ERROR, "unrecognized lakehouse snapshot selector \"%s\"", sel);
+	return buf.data;
 }
 
 static void
@@ -256,11 +317,14 @@ lakehouse_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 {
 	LakehouseOptions opts;
 	ScanSession *session;
+	RangeTblEntry *rte;
 	uint64		task_count;
 	double		total_rows = 0;
 
 	ExtractOptions(foreigntableid, &opts);
-	session = OpenSession(&opts);
+	/* query-level time travel pin (slice 19) */
+	rte = root->simple_rte_array[baserel->relid];
+	session = OpenSession(&opts, rte->lakehouse_snapshot);
 	task_count = pg_datalake_scan_task_count(session);
 	for (uint64 i = 0; i < task_count; i++)
 		total_rows += (double) pg_datalake_scan_task_rows(session, i);
@@ -291,8 +355,8 @@ lakehouse_GetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
 
 	/*
 	 * Partial path for parallel scans (slice 17, doc 06 §3): tasks are
-	 * claimed atomically from shared state, so workers divide the task
-	 * list dynamically. Two workers M1 default; tune via GUC later.
+	 * claimed atomically from shared state, so workers divide the task list
+	 * dynamically. Two workers M1 default; tune via GUC later.
 	 */
 	ForeignPath *partial;
 
@@ -502,13 +566,24 @@ lakehouse_GetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 	 */
 	{
 		char	   *pred_private = pred_json ? pstrdup(pred_json) : pstrdup("");
+		RangeTblEntry *rte = root->simple_rte_array[baserel->relid];
+		char	   *sel_private;
+
+		/*
+		 * slice 19: the query-level time travel pin rides in fdw_private
+		 * (plan -> executor) as the second element; empty string = none.
+		 */
+		sel_private = rte->lakehouse_snapshot
+			? pstrdup(rte->lakehouse_snapshot)
+			: pstrdup("");
 
 		/*
 		 * qpqual = ALL clauses: pruning is file-level conservative, the
 		 * executor enforces the exact per-row filter on top (doc 06 s4)
 		 */
 		return make_foreignscan(tlist, scan_clauses, baserel->relid,
-								NIL, list_make1(makeString(pred_private)),
+								NIL, list_make2(makeString(pred_private),
+												makeString(sel_private)),
 								NIL, NIL, outer_plan);
 	}
 }
@@ -562,8 +637,8 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 	state->projection_csv = proj.data;
 
 	/*
-	 * slice 15: translated-quals JSON rides in fdw_private (plan -> executor)
-	 * as a single makeString element.
+	 * slice 15/19: translated-quals JSON + time travel selector ride in
+	 * fdw_private (plan -> executor) as makeString elements.
 	 */
 	state->parallel = IsParallelWorker();
 	if (node->ss.ps.plan != NIL)
@@ -577,6 +652,14 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 			state->predicate_json = pred_private[0] != '\0'
 				? pstrdup(pred_private)
 				: NULL;
+			if (list_length(fscan->fdw_private) >= 2)
+			{
+				char	   *sel_private = strVal(lsecond(fscan->fdw_private));
+
+				state->rte_selector = sel_private[0] != '\0'
+					? pstrdup(sel_private)
+					: NULL;
+			}
 		}
 	}
 	state->opts = opts;
@@ -592,7 +675,7 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 	/* predicate_json must be set on opts BEFORE OpenSession (slice 15) */
 	if (state->predicate_json != NULL)
 		state->opts.predicate_json = state->predicate_json;
-	state->session = OpenSession(&state->opts);
+	state->session = OpenSession(&state->opts, state->rte_selector);
 	state->task_count = pg_datalake_scan_task_count(state->session);
 	state->rows = NULL;
 	state->current_task = 0;
@@ -741,7 +824,7 @@ lakehouse_ReScanForeignScan(ForeignScanState *node)
 		pg_datalake_scan_free(state->session);
 	}
 	/* fresh plan: the remote snapshot may have moved since the last scan */
-	state->session = OpenSession(&state->opts);
+	state->session = OpenSession(&state->opts, state->rte_selector);
 	state->task_count = pg_datalake_scan_task_count(state->session);
 	state->current_task = 0;
 }

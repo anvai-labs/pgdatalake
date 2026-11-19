@@ -93,7 +93,7 @@ impl CatalogClient {
         namespace: &[&str],
         table: &str,
         predicate: Option<&ScanPredicate>,
-        snapshot_id: Option<i64>,
+        selector: Option<&crate::catalog::metadata::SnapshotSelector>,
     ) -> Result<(ScanPlan, S3Options), crate::storage::StorageError> {
         let cfg = self
             .rest
@@ -107,7 +107,7 @@ impl CatalogClient {
         let s3 = self.s3_client.merged(&cfg);
         let (io, key) = crate::scan::open_for(&lt.metadata_location, Some(&s3))?;
         let md = fetch_metadata(&io, &key)?;
-        let plan = crate::scan::plan_scan(&md, snapshot_id, Some(&s3), predicate)?;
+        let plan = crate::scan::plan_scan(&md, selector, Some(&s3), predicate)?;
         Ok((plan, s3))
     }
 }

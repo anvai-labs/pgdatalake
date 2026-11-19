@@ -213,6 +213,41 @@ pub struct Snapshot {
     pub summary: BTreeMap<String, String>,
 }
 
+/// An entry of the metadata `refs` map (named snapshot pointers: tags and
+/// branches). Branch-only fields (`min-snapshots-to-keep`,
+/// `max-snapshot-age-ms`) are read-tolerated but unused by reads.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct SnapshotRef {
+    pub snapshot_id: i64,
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub min_snapshots_to_keep: Option<i32>,
+    #[serde(default)]
+    pub max_snapshot_age_ms: Option<i64>,
+}
+
+/// Time-travel selector (slice 19): how a `FOR … AS OF` clause picks the
+/// snapshot a scan reads. This is the wire form the FFI passes down as
+/// selector JSON — `{"kind": "id", "value": 42}`, `{"kind": "ts",
+/// "value-ms": 1712345678000}`, `{"kind": "ref", "name": "audit-tag"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum SnapshotSelector {
+    /// FOR VERSION AS OF <snapshot id>
+    Id { value: i64 },
+    /// FOR TIMESTAMP AS OF <ts>: epoch milliseconds (resolved from the SQL
+    /// literal at parse-analysis time, so views/rules store a stable value).
+    Ts {
+        #[serde(rename = "value-ms")]
+        value_ms: i64,
+    },
+    /// FOR TAG AS OF <name>: resolves through the metadata `refs` map
+    /// (tags and branches both name a snapshot).
+    Ref { name: String },
+}
+
 /// Parsed Iceberg table metadata (metadata.json). Unknown keys are ignored
 /// for forward tolerance; v3-first means v3 additions are typed here, and
 /// v2 documents parse into the same model.
@@ -236,6 +271,8 @@ pub struct TableMetadata {
     pub partition_specs: Vec<PartitionSpec>,
     #[serde(default)]
     pub default_partition_spec_id: Option<i32>,
+    #[serde(default)]
+    pub refs: BTreeMap<String, SnapshotRef>,
 }
 
 impl TableMetadata {
@@ -262,6 +299,26 @@ impl TableMetadata {
     /// The partition spec with the given id, or None (doc 03 §5: no panics).
     pub fn partition_spec(&self, id: i32) -> Option<&PartitionSpec> {
         self.partition_specs.iter().find(|s| s.spec_id == id)
+    }
+
+    /// Resolve a time-travel selector to a snapshot (slice 19). A timestamp
+    /// picks the latest snapshot at or before it (the snapshot that was
+    /// current at that time); a ref resolves through the refs map; an id is
+    /// an exact lookup. None = selector matches no snapshot (the caller
+    /// maps this to NotFound — no panics across the FFI).
+    pub fn resolve_snapshot(&self, selector: &SnapshotSelector) -> Option<&Snapshot> {
+        match selector {
+            SnapshotSelector::Id { value } => self.snapshot(*value),
+            SnapshotSelector::Ts { value_ms } => self
+                .snapshots
+                .iter()
+                .filter(|s| s.timestamp_ms <= *value_ms)
+                .max_by_key(|s| s.timestamp_ms),
+            SnapshotSelector::Ref { name } => self
+                .refs
+                .get(name)
+                .and_then(|r| self.snapshot(r.snapshot_id)),
+        }
     }
 }
 
@@ -490,5 +547,92 @@ mod tests {
         let md: TableMetadata = serde_json::from_str(json).expect("parse");
         assert!(md.current_schema().is_none());
         assert!(md.snapshot(1).is_none());
+    }
+
+    /// TDD anchor (M1 slice 19): `refs` parse and time-travel selector
+    /// resolution — an id picks the exact snapshot; a timestamp picks the
+    /// latest snapshot at or before that time (Iceberg "snapshot current at
+    /// timestamp" semantics); a ref resolves through the refs map. Unknown
+    /// ids/refs and too-early timestamps yield None (plan_scan maps them to
+    /// NotFound — doc 03 §5).
+    #[test]
+    fn resolves_time_travel_selectors() {
+        let json = r#"{
+            "format-version": 2,
+            "table-uuid": "9c12d441-03fe-11ed-8122-d358e75d12eb",
+            "location": "s3://warehouse/t",
+            "schemas": [{"type": "struct", "schema-id": 0, "fields": []}],
+            "current-schema-id": 0,
+            "snapshots": [
+                {"snapshot-id": 10, "timestamp-ms": 1000,
+                 "manifest-list": "file:///m10.avro",
+                 "summary": {"operation": "append"}},
+                {"snapshot-id": 11, "timestamp-ms": 2000,
+                 "manifest-list": "file:///m11.avro",
+                 "summary": {"operation": "append"}},
+                {"snapshot-id": 12, "timestamp-ms": 3000,
+                 "manifest-list": "file:///m12.avro",
+                 "summary": {"operation": "append"}}
+            ],
+            "current-snapshot-id": 12,
+            "refs": {
+                "audit-tag": {"snapshot-id": 10, "type": "tag"},
+                "main": {"snapshot-id": 12, "type": "branch"}
+            }
+        }"#;
+        let md: TableMetadata = serde_json::from_str(json).expect("parse refs");
+
+        assert_eq!(md.refs["audit-tag"].snapshot_id, 10);
+        assert_eq!(md.refs["audit-tag"].kind, "tag");
+        assert_eq!(md.refs["main"].kind, "branch");
+
+        // id: exact match only
+        assert_eq!(
+            md.resolve_snapshot(&SnapshotSelector::Id { value: 11 })
+                .unwrap()
+                .snapshot_id,
+            11
+        );
+        assert!(md
+            .resolve_snapshot(&SnapshotSelector::Id { value: 999 })
+            .is_none());
+
+        // ts: latest snapshot at or before the timestamp
+        assert_eq!(
+            md.resolve_snapshot(&SnapshotSelector::Ts { value_ms: 2500 })
+                .unwrap()
+                .snapshot_id,
+            11
+        );
+        assert_eq!(
+            md.resolve_snapshot(&SnapshotSelector::Ts { value_ms: 1000 })
+                .unwrap()
+                .snapshot_id,
+            10
+        );
+        assert_eq!(
+            md.resolve_snapshot(&SnapshotSelector::Ts { value_ms: 99_999 })
+                .unwrap()
+                .snapshot_id,
+            12
+        );
+        assert!(md
+            .resolve_snapshot(&SnapshotSelector::Ts { value_ms: 999 })
+            .is_none());
+
+        // ref: via the refs map; unknown ref or dangling ref-id is None
+        assert_eq!(
+            md.resolve_snapshot(&SnapshotSelector::Ref {
+                name: "audit-tag".into()
+            })
+            .unwrap()
+            .snapshot_id,
+            10
+        );
+        assert!(md
+            .resolve_snapshot(&SnapshotSelector::Ref {
+                name: "nope".into()
+            })
+            .is_none());
     }
 }

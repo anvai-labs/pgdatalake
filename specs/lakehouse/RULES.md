@@ -41,6 +41,7 @@ reference.
 |---|---|
 | bootstrap catalogs | `src/include/catalog/pg_am.dat` (+ catversion bump) |
 | grammar | `src/backend/parser/gram.y` (iceberg `FOR … AS OF` clause, `USING lakehouse FORMAT iceberg`), `src/backend/nodes/*` if a new node needed |
+| grammar plumbing | `src/include/parser/kwlist.h`, `src/backend/parser/parse_clause.c` (+ `.h`), `src/backend/parser/parse_relation.c`, `src/backend/parser/analyze.c`, `src/include/nodes/parsenodes.h` (one RTE field), `src/include/nodes/primnodes.h`, `src/include/catalog/catversion.h` (bump with parsed-tree changes) — lakehouse time travel `FOR … AS OF` resolution only (slice 19 amendment 2026-11-19); keep each touch to a small, commented hook |
 | reloptions | `src/backend/access/common/reloptions.c`, `src/include/utils/rel.h` |
 | GUCs | `src/backend/utils/misc/guc_tables.c`, `postgresql.conf.sample` |
 | autovacuum dispatch | `src/backend/postmaster/autovacuum.c` |

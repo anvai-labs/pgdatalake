@@ -100,17 +100,59 @@ delete).
 ## 4. Time travel & refs (both table kinds)
 
 ```sql
-SELECT * FROM analytics.events
-  FOR TIMESTAMP AS OF '2026-11-01 00:00+00';   -- syntax via parser hook in AM/FDW
-SELECT * FROM analytics.events FOR VERSION AS OF 8995342215659429317;
-SELECT * FROM analytics.events FOR TAG AS OF 'weekly-2026-45';
+SELECT id FROM analytics.events
+  WHERE id < 100
+  FOR TIMESTAMP AS OF '2026-11-01 00:00+00';
+SELECT id FROM analytics.events FOR VERSION AS OF 8995342215659429317;
+SELECT id FROM analytics.events FOR TAG AS OF 'weekly-2026-45';
 SELECT lakehouse.rollback('analytics.events', to_snapshot => 8995342215659429317);
 ```
 
-Implemented as a planner-level hook producing a snapshot-pinned scan descriptor;
-works identically for managed and external tables. `FOR …` clause is added in the
-`select_no_parens` grammar path *within the allowlisted core patch* — kept to ~15
-lines of grammar + a `ParseNamespaceItem` field, marked `[core-allowlist]`.
+*(Amended 2026-11-19, slice 19 — implementation replaces the original
+"parser hook + ParseNamespaceItem field" sketch below.)*
+
+**Implemented surface (slice 19).** The `FOR … AS OF` clause parses in the
+**locking-clause position** (same slot as `FOR UPDATE`: after WHERE/ORDER BY,
+before LIMIT). It cannot attach to a single table_ref: after a from-item a
+bare `FOR` already starts the row-locking clause, and LALR(1) cannot
+distinguish the two — so the pin is a query-level clause instead.
+
+Semantics:
+
+- The pin applies to **every lakehouse foreign table of that SELECT**
+  (plain tables are simply unpinned; other FDWs ignore it). One pin per
+  SELECT — it rides in `SelectStmt.lockingClause` as a raw `DefElem`, and
+  consumers of that list skip `DefElem` entries.
+- Per-table pinning stays available via the `snapshot_id` foreign-table
+  option (slice 18); a query-level `FOR … AS OF` wins over it.
+- `FOR TIMESTAMP AS OF` accepts one constant timestamp string (resolved at
+  parse-analysis time via `timestamptz_in` into epoch milliseconds, so a
+  stored view's meaning does not drift with the session timezone); it
+  selects the **latest snapshot at or before** that timestamp.
+- `FOR VERSION AS OF` accepts an integer snapshot id (int64; ids beyond
+  int32 lex as float literals and are validated at parse time).
+- `FOR TAG AS OF` accepts a quoted ref name — tags and branches both name a
+  snapshot (the metadata `refs` map is the source of truth).
+- A selector matching no snapshot (unknown id/ref, timestamp before the
+  first snapshot) fails at plan time with `object not found`; invalid
+  literals fail at parse-analysis time.
+- The pin survives rule storage (views/rules keep it verbatim — the RTE
+  carries the canonical selector string `ts:<ms>` / `id:<n>` / `ref:<name>`).
+- Not applicable to bare `VALUES` or to set operations (the grammar only
+  accepts it in the plain-select position).
+
+Implemented in the `[core-allowlist]` patch: `gram.y` (one alternative in
+`for_locking_clause`, ~12 lines), `kwlist.h` (`TAG` unreserved keyword),
+`parse_clause.c` (selector resolution + `applyLakehouseTimeTravel`),
+`parse_relation.c` (DefElem skip in `isLockedRefname`), `analyze.c`
+(DefElem skips + apply call), RTE field `lakehouse_snapshot`
+(`parsenodes.h` + `outfuncs/readfuncs`), catversion bump.
+
+*(Original design — superseded:)* planner-level hook producing a
+snapshot-pinned scan descriptor; works identically for managed and external
+tables. `FOR …` clause was sketched as ~15 lines of grammar plus a
+`ParseNamespaceItem` field. The TableAM (managed tables) path will consume
+the same RTE field once M2 lands; external-table semantics above are final.
 
 ## 5. GUCs
 

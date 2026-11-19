@@ -104,7 +104,7 @@ pg_lakehouse_scan_files(PG_FUNCTION_ARGS)
 									   s3_access_key,
 									   s3_secret_key,
 									   NULL,
-									   0,
+									   NULL,
 									   errbuf,
 									   sizeof(errbuf));
 		if (session == NULL)
