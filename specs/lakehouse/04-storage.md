@@ -1,6 +1,6 @@
 # 04 — Object Storage File IO: S3, ADLS Gen2, GCS, MinIO
 
-All byte-level IO goes through one abstraction in `pgiceberg-core` backed by the
+All byte-level IO goes through one abstraction in `pgdatalake-core` backed by the
 `object_store` crate (Apache Arrow project, same engine behind DataFusion), with a
 Postgres-facing **IO context** so that every read/write runs under the right
 resource accounting (statement timeout, `maintenance_work_mem` for writers,
@@ -16,7 +16,7 @@ cancel/die checks per batch for backend, per-task for bgworkers).
 | `gs://` | GCS | `gs://anvai-warehouse/tbl/…` |
 | `file://` | local FS | MinIO on localhost, tests |
 
-S3 endpoint override (`iceberg.s3.endpoint` per catalog option or GUC) is how MinIO
+S3 endpoint override (`lakehouse.s3.endpoint` per catalog option or GUC) is how MinIO
 and R2 are reached: `endpoint = 'http://minio.local:9000'`, `path_style_access =
 true` (required for MinIO). This makes MinIO a pure config difference — **the
 CI matrix runs the identical tests against MinIO that prod runs against S3**.
@@ -43,7 +43,7 @@ atomicity server-side.
 - Range GETs sized to row-group footer granularity: footers fetched first
   (last `footer_read_size` = 256KB, extend on miss), column chunks fetched per
   row-group group of parallel tasks.
-- Prefetch depth: `iceberg.io.prefetch = 4` concurrent chunk GETs per task; cancel
+- Prefetch depth: `lakehouse.io.prefetch = 4` concurrent chunk GETs per task; cancel
   (`CHECK_FOR_INTERRUPTS`) honored between chunk boundaries, never mid-request.
 - Retry policy: exponential backoff with jitter, honor `Retry-After` on 503,
   S3 `SlowDown`, and ADLS `ServerBusy` (503); max 5 retries → ERROR
@@ -73,7 +73,7 @@ Credentials are **resolved at connection of the IO context**, not at GUC set tim
 (doc 09). Store-scoped GUCs per catalog option take precedence:
 
 ```sql
-SELECT iceberg.alter_catalog('minio', options => '{
+SELECT lakehouse.alter_catalog('minio', options => '{
   "endpoint": "http://minio.local:9000",
   "path_style_access": true,
   "region": "us-east-1",
@@ -83,9 +83,9 @@ SELECT iceberg.alter_catalog('minio', options => '{
 
 | Store | Options | GUC fallback |
 |---|---|---|
-| S3/MinIO | endpoint, region, path_style_access, credential_ref, request_payer, checksum_algorithm | `iceberg.s3.*` |
-| ADLS | account_url, filesystem, authority_host, credential_ref, azure_tenant_id | `iceberg.adls.*` |
-| GCS | endpoint, bucket_bound_host, credential_ref, target_service_account | `iceberg.gcs.*` |
+| S3/MinIO | endpoint, region, path_style_access, credential_ref, request_payer, checksum_algorithm | `lakehouse.s3.*` |
+| ADLS | account_url, filesystem, authority_host, credential_ref, azure_tenant_id | `lakehouse.adls.*` |
+| GCS | endpoint, bucket_bound_host, credential_ref, target_service_account | `lakehouse.gcs.*` |
 
 Virtual-host vs path style auto-detect: path style when endpoint is IP/localhost.
 GCS `gs://` bucket mapping through ADLS-style hierarchical namespaces is rejected
@@ -95,12 +95,12 @@ early with a clear message.
 
 | Name | Default | Effect |
 |---|---|---|
-| `iceberg.io.prefetch` | 4 | concurrent chunk reads per scan task |
+| `lakehouse.io.prefetch` | 4 | concurrent chunk reads per scan task |
 | `write.part_size` | 16MB | multipart part size |
 | `write.target_file_size` | 128MB | Parquet file roll-over target |
 | `write.row_group_size` | 1M rows | Parquet row-group rows |
 | `write.parquet_page_size` | 1MB | Parquet page bytes |
-| `iceberg.io.max_concurrency` | 64 | process-wide in-flight object ops cap (semaphore) |
+| `lakehouse.io.max_concurrency` | 64 | process-wide in-flight object ops cap (semaphore) |
 
 The process-wide semaphore exists because Postgres backends are processes: without
 a cap, 100 backends × 4 prefetch = 400 concurrent connections per store — most

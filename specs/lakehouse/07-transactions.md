@@ -8,8 +8,8 @@ are different systems; this doc pins the exact semantics we commit to.
 
 | Scope | Heap behavior | Iceberg behavior (managed & external) |
 |---|---|---|
-| Statement | sees a snapshot at statement start | sees the **catalog ref snapshot pinned at statement start** (or transaction start with `iceberg.mvcc = transaction`) |
-| Transaction | consistent across statements | re-pins per statement by default; `SET iceberg.mvcc = transaction` pins at `BEGIN` (snapshot-honest REPEATABLE READ-like) |
+| Statement | sees a snapshot at statement start | sees the **catalog ref snapshot pinned at statement start** (or transaction start with `lakehouse.mvcc = transaction`) |
+| Transaction | consistent across statements | re-pins per statement by default; `SET lakehouse.mvcc = transaction` pins at `BEGIN` (snapshot-honest REPEATABLE READ-like) |
 | Own uncommitted writes | visible via self-MVCC | visible via an **in-transaction overlay**: staged batches + a local delete-set are read back before commit |
 | Other backends' uncommitted writes | invisible | invisible (only committed snapshots are readable — same as heap) |
 | REPEATABLE READ / SERIALIZABLE | full PG semantics | pinned-at-BEGIN snapshot; SERIALIZABLE adds **conflict detection on commit** (§3) |
@@ -17,7 +17,7 @@ are different systems; this doc pins the exact semantics we commit to.
 The overlay (own uncommitted writes visible to own reads) is mandatory —
 `INSERT … RETURNING`, `UPDATE … WHERE id IN (SELECT …)`, triggers reading the
 mutating table all depend on it. Implemented as an AM-private ephemeral row store
-per (rel, xid) in backend-local memory (+ spill files > `iceberg.overlay_spill_mb`,
+per (rel, xid) in backend-local memory (+ spill files > `lakehouse.overlay_spill_mb`,
 default 64MB, in `pg_tmp`), deleted at commit/abort.
 
 ## 2. Commit protocol (managed write, single table)
@@ -27,16 +27,16 @@ PRE-COMMIT (at CommitTransaction):
   1. flush staged batches → Parquet data files / DV blobs in <location>/data
   2. build Iceberg commit: AppendFiles / OverwriteFiles / (Eq)DeleteFiles
      + requirements [AssertRefSnapshotId(main, base_snapshot)]
-  3. commitTable via catalog, retry ≤ iceberg.commit_retries w/ backoff
+  3. commitTable via catalog, retry ≤ lakehouse.commit_retries w/ backoff
        - on requirement conflict: re-plan the delta (re-read affected files'
          current state), rebuild commit, retry (bounded)
 COMMIT:
-  4. mark pg_iceberg_table snapshot pointer, invalidate relcache for self
-  5. WAL: only the pg_class/pg_iceberg_table catalog row updates (normal WAL)
+  4. mark pg_lakehouse_table snapshot pointer, invalidate relcache for self
+  5. WAL: only the pg_class/pg_lakehouse_table catalog row updates (normal WAL)
 POST-COMMIT (async):
   6. reportMetrics to catalog
 ABORT:
-  7. staged files are orphans → orphan GC after iceberg.orphan_grace_period
+  7. staged files are orphans → orphan GC after lakehouse.orphan_grace_period
 ```
 
 **Failure windows are explicit:**
@@ -44,7 +44,7 @@ ABORT:
 - crash between (3) and (4): the Iceberg commit succeeded; on next metadata
   load Postgres reconciles (remote catalog is source of truth). A user-visible
   anomaly window exists between the remote commit and local reconciliation —
-  bounded by `iceberg.metadata_ttl`; remote-committed data becomes visible then.
+  bounded by `lakehouse.metadata_ttl`; remote-committed data becomes visible then.
   This is the same guarantee class as every other multi-system Iceberg writer.
 - catalog commit fails after retries: transaction aborts; data files orphaned.
   **No partial commit ever exists remotely** — that is Iceberg's core guarantee
@@ -66,7 +66,7 @@ ABORT:
   across mixed engine tables). A WARNING is emitted once per session when a
   SERIALIZABLE transaction mixes heap and iceberg writes.
 - **Row locking**: `SELECT … FOR UPDATE` on iceberg tables → ERROR v1
-  (no row locks exist in Iceberg); advisory locks + `iceberg.lock_table()` helper
+  (no row locks exist in Iceberg); advisory locks + `lakehouse.lock_table()` helper
   (a dedicated Iceberg table for application-level locks) cover the need (v2).
 
 ## 4. Multi-table atomicity
@@ -86,7 +86,7 @@ ABORT:
   compensation rule. Mixed heap+iceberg transactions: **heap commits first**, then
   iceberg remote commits; if the remote phase fails, the heap part is already
   committed → we report ERROR `iceberg_commit_failed_partial` with the journal id
-  for manual/automated repair (`iceberg.repair_transaction(journal_id)`).
+  for manual/automated repair (`lakehouse.repair_transaction(journal_id)`).
   This is a documented, unavoidable boundary of two independent commit systems —
   honest and rare (only non-REST catalogs + mixed tables).
 

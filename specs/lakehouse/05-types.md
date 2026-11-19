@@ -18,15 +18,15 @@ rejected at DDL with a suggestion.
 | `time` | `time without time zone` | `time` | micros-from-midnight |
 | `timestamp` | `timestamp without time zone` | `timestamp` | |
 | `timestamptz` | `timestamp with time zone` | `timestamptz` | v3 supports nanos; PG is µs — see §2 |
-| `nanotimestamp`/`nanotimestamptz` (v3) | `timestamp(6)` + WARNING on write (truncation) | read: exact ns retained in Parquet stats, returned truncated | documented truncation, `iceberg.nanosecond_mode = truncate|error` |
+| `nanotimestamp`/`nanotimestamptz` (v3) | `timestamp(6)` + WARNING on write (truncation) | read: exact ns retained in Parquet stats, returned truncated | documented truncation, `lakehouse.nanosecond_mode = truncate|error` |
 | `string` | `text` | `text` | PG `varchar(n)` writes as string; length constraint NOT enforced by Iceberg — enforced by PG-side CHECK that we synthesize (managed tables) or warn (external) |
 | `uuid` | `uuid` | `uuid` | |
 | `fixed[L]` | `bytea` with CHECK (octet_length = L) | `bytea` (CREATE) | no PG-native fixed-length binary; length via synthesized constraint |
 | `binary` | `bytea` | `bytea` | |
 | `list<T>` | `T[]` | `T[]` | 0-based PG arrays vs 0-based list — compatible for 1-D; nested arrays → `list<list<T>>` |
-| `map<K,V>` | `jsonb` (v1) / `iceberg.map<K,V>` (v2 domain type) | explicit cast required | see §3 |
-| `struct<F1 T1,…>` | composite type (managed: auto `CREATE TYPE …_row`; external: `iceberg.struct` pseudo) | composite type | field names preserved |
-| `variant` (v3) | `jsonb` (read) / write via `iceberg.variant_unshredded` cast (v2) | deferred | fast-follow |
+| `map<K,V>` | `jsonb` (v1) / `lakehouse.map<K,V>` (v2 domain type) | explicit cast required | see §3 |
+| `struct<F1 T1,…>` | composite type (managed: auto `CREATE TYPE …_row`; external: `lakehouse.struct` pseudo) | composite type | field names preserved |
+| `variant` (v3) | `jsonb` (read) / write via `lakehouse.variant_unshredded` cast (v2) | deferred | fast-follow |
 
 Integer width policy: PG `smallint` has no Iceberg counterpart — maps to `int`
 (widening, safe on read; on write, value range checked, overflow → error).
@@ -35,13 +35,13 @@ Unsigned types don't exist in PG; Iceberg's are all signed. Good.
 ## 2. Precision rules
 
 - `timestamptz`: PG stores µs since epoch UTC. Iceberg `timestamptz` (v2) is µs;
-  v3 adds `nanotimestamptz`. Read: if ns field ≠ 0 and `iceberg.nanosecond_mode =
+  v3 adds `nanotimestamptz`. Read: if ns field ≠ 0 and `lakehouse.nanosecond_mode =
   truncate` (default), truncate with a DEBUG log; `= error` raises
   `iceberg_precision_loss`. Never round.
 - `numeric`: PG numeric has no fixed precision internally; Iceberg requires
   `(P,S)`. Unconstrained `numeric` columns are rejected on CREATE with hint
   `numeric(38,S)`; a computed scale from existing data is suggested by
-  `iceberg.suggest_type()` helper.
+  `lakehouse.suggest_type()` helper.
 - PG `money`, `interval`, `inet`, `cidr`, `macaddr`, `xml`, `json` (see below),
   `bit`, `varbit`, `tsvector`, `geometric`, `circle` etc.: **no mapping, rejected
   at CREATE** with suggestion (`jsonb` for json, `text` for xml/inet when the user
@@ -53,8 +53,8 @@ v1: `map<K,V>` ↔ `jsonb`. Object keys become JSON string keys (K must be strin
 on read; non-string-keyed maps are read as JSON arrays of `{"key":…, "value":…}`
 pairs — lossy, documented). This unblocks adoption without inventing syntax.
 
-v2: introduce **domain types** `iceberg.map(keytype anyelement, valtype anyelement)`
-and `iceberg.struct(...)` stored as `jsonb` underneath but carrying type identity,
+v2: introduce **domain types** `lakehouse.map(keytype anyelement, valtype anyelement)`
+and `lakehouse.struct(...)` stored as `jsonb` underneath but carrying type identity,
 so casts and operator classes behave. This is additive Postgres-level machinery
 (no core changes).
 
@@ -93,9 +93,9 @@ Iceberg (field-ID preserved) — data files untouched.
 ## 6. Migration helper
 
 ```sql
-SELECT * FROM iceberg.suggest_type('local_tbl');          -- report + DDL suggestion
-SELECT iceberg.migrate_table('local_tbl', dest => 's3://wh/tbl',
+SELECT * FROM lakehouse.suggest_type('local_tbl');          -- report + DDL suggestion
+SELECT lakehouse.migrate_table('local_tbl', dest => 's3://wh/tbl',
                              catalog => 'prod', batch => '100000');
 -- copies a heap table into a new managed Iceberg table in batches,
--- resumable via pg_iceberg.maintenance_log
+-- resumable via pg_lakehouse.maintenance_log
 ```

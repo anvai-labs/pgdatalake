@@ -10,7 +10,7 @@ What exists, what we learn from each, and why this fork's design differs.
 | **Amazon Aurora PostgreSQL** (2026) | managed direct query of Iceberg/Parquet in S3 | Confirms the external-table use case is the wedge feature. Closed; no managed-table story for on-prem. |
 | **Broadcom PXF `iceberg_pxf_fdw`** | read-only FDW, Greenplum lineage | Read-only + JVM. Our FDW is native and read-write. |
 | **DuckDB httpfs + iceberg extension** | read-only Iceberg scan, no catalogs | The reference for scan-planning simplicity; its manifest pruning design informs doc 06. |
-| **Trino/Presto Iceberg connector** | the gold standard: full REST/Glue/HMS coverage, COW+MOR, compaction | Feature checklist source (their `system` metadata tables → our `pg_iceberg` views; their `ALTER TABLE EXECUTE` → our function surface). |
+| **Trino/Presto Iceberg connector** | the gold standard: full REST/Glue/HMS coverage, COW+MOR, compaction | Feature checklist source (their `system` metadata tables → our `pg_lakehouse` views; their `ALTER TABLE EXECUTE` → our function surface). |
 | **Apache Paimon / Hudi** | alternative lake formats | Not targets; but their merge-on-read durability bugs are cautionary reading for doc 07. |
 | **Zero-stack option: postgres_fdw → Thrive/trino-gateway** | query Trino from PG | Two-engine latency + no managed tables. Explicitly what users try to escape. |
 

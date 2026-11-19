@@ -2,7 +2,14 @@
 
 ## Goals
 
-1. **Iceberg as a native storage engine.** `CREATE TABLE … USING iceberg` stores the
+0. **Format-generic lakehouse, iceberg-first.** The shared core
+   (`pgdatalake-core`) and the SQL surface (`lakehouse` schema, `USING
+   lakehouse` TableAM with a `FORMAT` reloption, `pg_lakehouse` views,
+   `lakehouse.*` GUCs) are table-format-agnostic: Delta Lake, plain
+   Parquet/Avro and engine integrations (DataFusion, Polars) are future
+   FORMAT layers, not rewrites. Iceberg-specific concepts never leak into
+   generic naming. *(Added 2026-11-19 with the naming generalization.)*
+1. **Iceberg as a native storage engine.** `CREATE TABLE … USING lakehouse FORMAT iceberg` stores the
    table as a real Apache Iceberg table (Parquet data files, `metadata.json`,
    manifests, snapshot protocol) in object storage. Any Iceberg engine (Spark, Trino,
    Flink, DuckDB, Snowflake) must be able to read tables this fork writes, and vice
@@ -53,8 +60,8 @@
    use them before patching core.
 3. **Honest semantics.** Any place Iceberg behavior differs from heap (visibility,
    durability windows, conflict behavior) is surfaced in docs, `EXPLAIN`, and where
-   feasible in SQL-visible state (e.g., `pg_iceberg.snapshot_of(rel)`).
-4. **Small core delta.** New code lives in `src/backend/access/iceberg/` +
+   feasible in SQL-visible state (e.g., `pg_lakehouse.snapshot_of(rel)`).
+4. **Small core delta.** New code lives in `src/backend/access/lakehouse/` +
    `src/include/access/iceberg/` + a linked Rust core library; core-file patches are
    confined to a reviewed allowlist (see [RULES.md](RULES.md)).
 5. **MinIO is the CI baseline.** Every feature must pass against MinIO first; cloud

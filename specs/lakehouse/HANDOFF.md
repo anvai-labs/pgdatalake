@@ -9,10 +9,10 @@
 - `origin` = `https://github.com/anvai-labs/postgres` (PRIVATE, gh account
   `vjsingh1984`, token has admin:org). `upstream` = `postgres/postgres`.
   `main`-equivalent (`master`) pushed and verified.
-- `specs/iceberg/` — full design doc set (README has the reading order; start
+- `specs/lakehouse/` — full design doc set (README has the reading order; start
   there). Key decisions already made, do not relitigate without a spec revision:
-  - **D1**: managed tables = TableAM (`USING iceberg`); external = FDW;
-    both share one Rust core `pgiceberg-core` (arrow-rs, object_store, REST).
+  - **D1**: managed tables = TableAM (`USING lakehouse FORMAT iceberg`); external = FDW;
+    both share one Rust core `pgdatalake-core` (arrow-rs, object_store, REST).
   - **D2**: Rust core as static library via C ABI; DuckDB embedding rejected
     (see `11-related-work.md`).
   - Iceberg v3 target, v2 delete-read compatibility; REST catalog is the
@@ -24,14 +24,14 @@
 
 ## First actions for the new session
 
-1. Read `specs/iceberg/README.md` → `00-goals.md` → `01-architecture.md`.
-2. `git checkout -b iceberg-dev` (off `master`), push to origin
+1. Read `specs/lakehouse/README.md` → `00-goals.md` → `01-architecture.md`.
+2. `git checkout -b lakehouse-dev` (off `master`), push to origin
    (RULES.md §1 — also create `main` if desired: `git branch -m master main`
    is NOT done yet; decide and align RULES.md §1 wording with reality).
 3. Execute M0 from `12-roadmap.md`: Rust workspace skeleton at
-   `src/backend/access/iceberg/core/`, cbindgen header step, meson
-   `-Diceberg=auto`, CI with MinIO+Lakekeeper fixtures, stub
-   `iceberg_version()` SQL function.
+   `src/backend/access/lakehouse/core/`, cbindgen header step, meson
+   `-Ddatalake=auto`, CI with MinIO+Lakekeeper fixtures, stub
+   `lakehouse.version()` SQL function.
 4. Build PG locally first to establish the baseline:
    `./configure --prefix=$PWD/build/pg20 && make -j16 world && make check`.
 
@@ -49,5 +49,5 @@
 
 ## Rules
 
-`specs/iceberg/RULES.md` is binding: allowlist-limited core edits, branch
+`specs/lakehouse/RULES.md` is binding: allowlist-limited core edits, branch
 layout, style, secrets. Follow it.

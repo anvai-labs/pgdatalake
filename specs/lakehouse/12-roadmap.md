@@ -5,22 +5,22 @@ another's gate. Rough sizing assumes 1–2 engineers + this agent.
 
 ## M0 — Repo & build foundation (days)
 - [ ] `main` mirrors upstream `master` (done: pushed 2026-11-19, `61f6021b110`)
-- [ ] Branch `iceberg-dev` for integration work
-- [ ] Rust workspace `src/backend/access/iceberg/core/` with empty `pgiceberg-core`
-      crate, `cbindgen` header generation, meson feature `-Diceberg=auto`
+- [ ] Branch `lakehouse-dev` for integration work
+- [ ] Rust workspace `src/backend/access/lakehouse/core/` with empty `pgdatalake-core`
+      crate, `cbindgen` header generation, meson feature `-Ddatalake=auto`
 - [ ] CI: build PG with feature on (ubuntu, cargo toolchain pinned), MinIO +
       Lakekeeper docker-compose fixture
-- **Gate**: `meson setup build -Diceberg=enabled && ninja && meson test --suite
+- **Gate**: `meson setup build -Ddatalake=enabled && ninja && meson test --suite
   regress` green on CI (meson-only tree: autoconf `make check` cannot coexist
   with meson in the same checkout, and the upstream `parallel_schedule` suite
-  runs unchanged under `meson test`); `SELECT iceberg.iceberg_version()`
+  runs unchanged under `meson test`); `SELECT lakehouse.version()`
   returns from a stub catalog module.
 
 ## M1 — Read path, external tables (2–4 weeks)
 - REST catalog client (config/loadTable, OAuth2 + token refresh, SigV4)
 - Metadata model v2+v3 (schema, snapshots, manifests, partition specs)
 - MinIO/S3 file IO (read only), range GETs, footer parsing
-- `iceberg_fdw`: `CREATE FOREIGN TABLE`, projection + basic qual pushdown
+- `lakehouse_fdw`: `CREATE FOREIGN TABLE`, projection + basic qual pushdown
   (partition & metrics pruning), parallel scans, batch→slot conversion
 - Type matrix read-side (doc 05) incl. v2 eq/pos delete application
 - **Gate**: conformance suite read-half green on MinIO+REST; Trino-written table
@@ -28,7 +28,7 @@ another's gate. Rough sizing assumes 1–2 engineers + this agent.
   showing file/row-group pruning.
 
 ## M2 — Managed tables, writes (3–5 weeks)
-- `iceberg` TableAM: CREATE/ALTER/DROP, `pg_am` bootstrap row + allowlist patches
+- `lakehouse` TableAM: CREATE/ALTER/DROP, `pg_am` bootstrap row + allowlist patches
 - Write path: batch accumulator, Parquet writer, snapshot commit protocol with
   requirements + retry (doc 07 §2), overlay for own-writes visibility
 - INSERT, UPDATE (COW), DELETE (COW), TRUNCATE, MERGE
@@ -38,7 +38,7 @@ another's gate. Rough sizing assumes 1–2 engineers + this agent.
   shows zero partial-visibility violations.
 
 ## M3 — Semantics & cloud parity (2–4 weeks)
-- `iceberg.mvcc` models, RR/SERIALIZABLE conflict semantics, journal two-phase
+- `lakehouse.mvcc` models, RR/SERIALIZABLE conflict semantics, journal two-phase
   commit for non-REST catalogs, mixed heap+iceberg transactions
 - ADLS Gen2 + GCS IO paths, full auth chains (doc 09), Azurite + fake-gcs parity
 - Time travel (`FOR TIMESTAMP/VERSION/TAG`), branches/tags, rollback
@@ -49,7 +49,7 @@ another's gate. Rough sizing assumes 1–2 engineers + this agent.
 ## M4 — Maintenance & production hardening (2–3 weeks)
 - Autovacuum integration, compaction (binpack+sort), expire_snapshots,
   remove_orphan_files, ANALYZE two-phase statistics
-- `pg_iceberg` metadata views + table_health
+- `pg_lakehouse` metadata views + table_health
 - Glue catalog, Nessie native, REST profiles (Polaris/Unity/S3 Tables quirks)
 - oss-fuzz metadata targets; perf gates (doc 10 §5) measured & passing
 - **Gate**: 7-day soak with continuous mixed DML+maintenance on MinIO — no
@@ -58,8 +58,8 @@ another's gate. Rough sizing assumes 1–2 engineers + this agent.
 ## M5 — The seamless layer (ongoing)
 - Deletion vectors as managed write mode (merge-on-read), bloom-filtered DV reads
 - `metadata_only` plans (count/min/max from Parquet stats), metadata cache tuning
-- variant type read/write, `iceberg.map`/`struct` domain types (doc 05 v2)
-- Logical decoding from commit journal; `iceberg.migrate_table` GA
+- variant type read/write, `lakehouse.map`/`struct` domain types (doc 05 v2)
+- Logical decoding from commit journal; `lakehouse.migrate_table` GA
 - Upstream PR extraction of `[core-allowlist]` patches (the fork's exit strategy:
   everything that can move upstream, does)
 

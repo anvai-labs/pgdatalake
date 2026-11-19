@@ -29,9 +29,9 @@ just in cloud runs.
 
 ## 3. PostgreSQL regression suites
 
-- `src/test/regress/iceberg/` — SQL/expected pairs (join iceberg vs heap,
+- `src/test/regress/lakehouse/` — SQL/expected pairs (join iceberg vs heap,
   EXPLAIN plans, time travel, type matrix, error cases with SQLSTATE checks).
-- isolation tests (`src/test/isolation/iceberg/`) — concurrent DML commit races
+- isolation tests (`src/test/isolation/lakehouse/`) — concurrent DML commit races
   (AssertRefSnapshotId retry paths), RR pinning, overlay visibility, compaction
   vs DML.
 - `TAP` tests for bgworker maintenance, crash recovery (kill -9 between commit
@@ -62,19 +62,19 @@ just in cloud runs.
 | Metadata planning on 2000-manifest table | < 300ms warm |
 
 Regressions > 10% on two consecutive runs block merge; `perf/` directory holds
-the harness (`make perf-iceberg`).
+the harness (`make perf-lakehouse`).
 
 ## 6. Developer loop
 
 ```bash
-make iceberg-up          # docker compose: minio + lakekeeper + azurite + fake-gcs
-make iceberg-check       # cargo test -p pgiceberg-core + regess iceberg subset
-make iceberg-conformance # interop suite vs pyiceberg (uv-managed venv)
-make iceberg-down
+make lakehouse-up          # docker compose: minio + lakekeeper + azurite + fake-gcs
+make lakehouse-check       # cargo test -p pgdatalake-core + regress lakehouse subset
+make lakehouse-conformance # interop suite vs pyiceberg (uv-managed venv)
+make lakehouse-down
 ```
-All fixtures in `src/test/iceberg/fixtures/`, no network at unit-test time.
+All fixtures in `src/test/lakehouse/fixtures/`, no network at unit-test time.
 
-These root targets are forwarded to `src/test/iceberg/` by a small block in the
+These root targets are forwarded to `src/test/lakehouse/` by a small block in the
 root `Makefile` (`[core-allowlist]`, 2026-11-19) — it is only reachable in
 meson-only trees (no `GNUmakefile`), which is the supported build mode; see
 RULES.md §9 for the meson-vs-autoconf note.

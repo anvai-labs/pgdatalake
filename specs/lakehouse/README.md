@@ -1,9 +1,14 @@
-# PostgreSQL × Apache Iceberg — Fork Design Specs
+# PostgreSQL Lakehouse (`pgdatalake`) — Fork Design Specs
 
 This directory contains the design specifications for making this PostgreSQL fork
-(`anvai-labs/postgres`, tracking `postgres/postgres` master) work **seamlessly with
-Apache Iceberg tables** — both **external tables** that already live in an Iceberg
-catalog, and **internal managed tables** whose on-disk format *is* Iceberg.
+(`anvai-labs/postgres`, tracking `postgres/postgres` master) a **native lakehouse**:
+query and manage open table-format tables (external tables that already live in a
+catalog, and internal managed tables whose on-disk format *is* the table format).
+**Apache Iceberg is the first and initially only FORMAT**, implemented on the
+format-generic `pgdatalake-core` Rust core; Delta, Parquet/Avro files and engine
+integrations (DataFusion, Polars) are future FORMAT layers by design — hence the
+generic `lakehouse` SQL surface chosen up front (2026-11-19; see
+01-architecture.md, RULES.md §4).
 
 ## Goal
 
@@ -11,14 +16,14 @@ A user of this fork should be able to do all of the following with plain SQL:
 
 ```sql
 -- 1. Point Postgres at an Iceberg catalog (REST, Glue, Nessie, Polaris, Unity, JDBC, Hadoop)
-SELECT iceberg.create_catalog('prod', type => 'rest', endpoint => 'https://rest.iceberg.example.com/v1');
+SELECT lakehouse.create_catalog('prod', type => 'rest', endpoint => 'https://rest.lakehouse.example.com/v1');
 
 -- 2. Attach an EXISTING Iceberg table (external): full read, DML where the engine allows
 CREATE FOREIGN TABLE analytics.events () SERVER prod OPTIONS (table 'warehouse.events');
 
 -- 3. Create a MANAGED table stored natively as Iceberg on S3 / ADLS / GCS / MinIO
 CREATE TABLE public.sessions (sid bigint, uid int, payload jsonb, at timestamptz)
-  USING iceberg
+  USING lakehouse FORMAT iceberg
   LOCATION 's3://anvai-warehouse/public/sessions'
   CATALOG prod;
 
@@ -28,7 +33,8 @@ CREATE TABLE public.sessions (sid bigint, uid int, payload jsonb, at timestamptz
 
 Iceberg becomes a first-class storage engine of Postgres: catalog clients, file IO for
 S3/ADLS/GCS/MinIO, a Parquet execution path, Postgres-native transaction semantics,
-maintenance infrastructure, and type mapping.
+maintenance infrastructure, and type mapping — all behind the format-generic core so
+later formats inherit them.
 
 ## Reading order
 
@@ -54,4 +60,10 @@ maintenance infrastructure, and type mapping.
 
 - 2026-11-19: fork created (private repo `anvai-labs/postgres`), specs drafted at
   PostgreSQL master `61f6021b110` (PG 20 dev, `CATALOG_VERSION_NO 202611121`).
-- Implementation not started. Start at [12-roadmap.md](12-roadmap.md) M0.
+- 2026-11-19: **naming generalized** — core `pgdatalake-core`, SQL surface
+  `lakehouse` (`USING lakehouse FORMAT iceberg`); specs renamed from
+  `specs/iceberg/` to `specs/lakehouse/` before M1 starts, to avoid a sweeping
+  rename later. Upstream baseline: `make check` 243/243 green on master.
+- M0 in progress: meson `-Ddatalake` feature, `pgdatalake-core` Rust workspace,
+  `lakehouse` extension with `lakehouse.version()`, docker fixtures, CI.
+  Start at [12-roadmap.md](12-roadmap.md) M0.

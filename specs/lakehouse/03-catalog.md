@@ -3,7 +3,7 @@
 The catalog is the source of truth for table existence, schema, and current
 snapshot. Postgres keeps only a **cache** of it (relcache entry per attached
 table), never authoritative metadata, with one exception: managed tables carry a
-`pg_iceberg_table` row so a dropped/renamed Postgres table can be reconciled
+`pg_lakehouse_table` row so a dropped/renamed Postgres table can be reconciled
 against the remote catalog at next refresh.
 
 ## 1. Priority order
@@ -35,7 +35,7 @@ Implement the Iceberg REST openapi spec exactly:
 - **Multi-table atomic commit**: `POST /v1/{ns}/transactions` (`CommitTransactionRequest`)
   implemented for catalogs advertising support; on non-supporting catalogs, our
   cross-table commit strategy degrades per doc 07 §4 (staged sequential commits with
-  a transaction journal in `pg_iceberg_table`).
+  a transaction journal in `pg_lakehouse_table`).
 - View endpoints, `registerTable`, plan-table endpoints: v2.
 
 Header/feature negotiation table lives in code as a
@@ -59,12 +59,12 @@ code paths.
 
 - Per-table metadata cache keyed by `(catalog_oid, table_identity, branch)`;
   entries hold `TableMetadata` (parsed), manifest-list handle, and a `loaded_at`.
-- TTL: `iceberg.metadata_ttl` (default 10s) **plus** proactive invalidation for
+- TTL: `lakehouse.metadata_ttl` (default 10s) **plus** proactive invalidation for
   managed tables (we know when we commit). External tables are eventually-consistent
   by design: an out-of-date snapshot read by Postgres is a documented consequence,
   mitigated by `AssertRefSnapshotId` on write attempts (we never write on a stale
   read snapshot — we re-plan instead).
-- Memory: metadata cache is bounded by `iceberg.metadata_cache_mb` (default 256MB,
+- Memory: metadata cache is bounded by `lakehouse.metadata_cache_mb` (default 256MB,
   shared via DSA), LRU eviction. Manifests are streamed, not retained, except
   during planning.
 
@@ -72,7 +72,7 @@ code paths.
 
 | Failure | Behavior |
 |---|---|
-| Catalog unreachable at plan time | ERROR (fail fast); retryable at executor via `iceberg.commit_retries` only for commits |
+| Catalog unreachable at plan time | ERROR (fail fast); retryable at executor via `lakehouse.commit_retries` only for commits |
 | Catalog unreachable at commit time | Transaction stays open, commit retried with backoff; on exhaustion → ERROR, staged files orphaned, cleaned by orphan GC |
 | Remote table deleted under us | `loadTable` 404 → rel marked invalid; SELECT errors `iceberg_table_dropped`, DDL hint to re-attach |
 | Schema drift by another engine | On next metadata load: if schema is *compatible* (additive), transparently adapted; if incompatible (type narrowed / column dropped that we use) → ERROR with diff printout |

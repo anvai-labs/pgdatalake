@@ -33,7 +33,7 @@ performance, never correctness.
 | Row-group stats | footer min/max per chunk | both |
 | LIMIT without ORDER BY | task-count short-circuit | both |
 | LIMIT with matching sort order | Iceberg SortOrder-aware short-circuit (v2) | both |
-| Aggregates min/max/count on metrics (`iceberg.metadata_only`) | GUC-gated metadata-only plans answering from statistics (v2) | both |
+| Aggregates min/max/count on metrics (`lakehouse.metadata_only`) | GUC-gated metadata-only plans answering from statistics (v2) | both |
 | Joins → co-partitioned hash join (partition column equality) | distribution hint (v3) | both |
 
 Not pushed down: text search, JSONB ops (unless variant — fast-follow), function
@@ -48,7 +48,7 @@ calls, volatile quals. Residual evaluation remains in Postgres in all cases.
 | `equality_delete` (write-only) | emitted on UPDATE via `MERGE`-style when `write_mode = mor_eq` | read applies eq-deletes (slowest read) | interop with engines that expect eq-del semantics |
 
 Default by table DDL; overridable per statement via `SET LOCAL
-iceberg.write_mode`. v1 reads must apply **v2 position deletes, v2 equality
+lakehouse.write_mode`. v1 reads must apply **v2 position deletes, v2 equality
 deletes, and v3 deletion vectors** from foreign tables (that's what other engines
 produce); v1 managed writes produce DVs (v3) or COW only.
 
@@ -64,12 +64,12 @@ snapshot summary → manifest entries. Bloom-filter acceleration (table property
   `utf8→text` pointer handoff only when Arrow buffers outlive the slot — they
   don't, so `text` is copied to PG palloc'd memory; acceptable v1, convert to
   batch-scoped detoast-style arena in v2).
-- Batch size: `iceberg.scan_batch_rows` = 16384 default. Each batch is one
+- Batch size: `lakehouse.scan_batch_rows` = 16384 default. Each batch is one
   `CHECK_FOR_INTERRUPTS()` window; long row-groups chunk at batch boundary.
-- Worker memory bounded by `iceberg.scan_batch_rows × max_row_width` estimate;
-  executor resource queue (`iceberg.work_mem_reserve`) optionally reserves
+- Worker memory bounded by `lakehouse.scan_batch_rows × max_row_width` estimate;
+  executor resource queue (`lakehouse.work_mem_reserve`) optionally reserves
   `work_mem` per worker like a sort node (v2).
-- Writers accumulate batches in `iceberg.write_buffer_mb` (default 256MB/backend)
+- Writers accumulate batches in `lakehouse.write_buffer_mb` (default 256MB/backend)
   then spill-free roll files. Large single transactions targeting one file-set are
   streamed: no full-rowset materialization ever (this is the key difference from
   naive FDW INSERT loops).
@@ -100,5 +100,5 @@ There are no B-tree indexes on Iceberg tables. The substitutes exposed as
 - **Iceberg SortOrder** (range-scan benefit, merge-friendly compaction),
 - v2: secondary index properties via Puffin `bloom` filters per column.
 
-`CREATE INDEX` on a USING iceberg table → ERROR with hint listing the above.
+`CREATE INDEX` on a USING lakehouse FORMAT iceberg table → ERROR with hint listing the above.
 `ANALYZE` refreshes pg_statistic from Parquet metadata + sample rows (doc 08).
