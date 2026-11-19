@@ -50,11 +50,21 @@ another's gate. Rough sizing assumes 1–2 engineers + this agent.
 ## M4 — Maintenance & production hardening (2–3 weeks)
 - Autovacuum integration, compaction (binpack+sort), expire_snapshots,
   remove_orphan_files, ANALYZE two-phase statistics
+- `lakehouse.optimize` orchestrator (doc 08 §2.1, designed 2026-11-19):
+  three modes — analyze (read-only stats: cardinality/skew/entropy/
+  layout correlation per column), plan (dry run recommending tier,
+  actions, partition transforms, zorder columns, estimated gains from
+  measured data), exec (apply, observable outcomes) — with HBase-style
+  minor (incremental binpack + delete application) and major (full
+  re-layout) tiers; snapshot isolation + optimistic commit instead of
+  table locks; auto mode off by default, policy-gated
 - `pg_lakehouse` metadata views + table_health
 - Glue catalog, Nessie native, REST profiles (Polaris/Unity/S3 Tables quirks)
 - oss-fuzz metadata targets; perf gates (doc 10 §5) measured & passing
 - **Gate**: 7-day soak with continuous mixed DML+maintenance on the S3 fixture — no
-  invariant violations, compaction keeps small_files_pct < 30 under load.
+  invariant violations, compaction keeps small_files_pct < 30 under load; a
+  major-tier `optimize` run on an intentionally de-optimized layout measurably
+  restores pruning (files examined→tasks ratio ≥ 10×) and byte reduction.
 
 ## M5 — The seamless layer (ongoing)
 - Deletion vectors as managed write mode (merge-on-read), bloom-filtered DV reads
