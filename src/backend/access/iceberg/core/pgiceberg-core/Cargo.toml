@@ -1,0 +1,11 @@
+[package]
+name = "pgiceberg-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "pgiceberg_core"
+# staticlib: linked into the `iceberg` extension module (specs/iceberg/01 §2,
+# decision D2). rlib: needed for cargo test.
+crate-type = ["staticlib", "rlib"]

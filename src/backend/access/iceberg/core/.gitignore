@@ -1,0 +1,2 @@
+# Local `cargo test` runs (meson builds use --target-dir in the build tree).
+target/

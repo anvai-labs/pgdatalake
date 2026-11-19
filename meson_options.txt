@@ -218,3 +218,11 @@ option('ZSTD', type: 'string', value: 'zstd',
 
 option('ZIC', type: 'string', value: 'zic',
   description: 'Path to zic binary, when cross-compiling')
+
+# Apache Iceberg storage engine support (specs/iceberg). Builds the
+# pgiceberg-core Rust static library and the iceberg extension module.
+# 'auto' silently disables when the Rust toolchain is unavailable.
+option('iceberg',
+       type: 'combo', choices: ['auto', 'enabled', 'disabled'],
+       value: 'auto',
+       description: 'Apache Iceberg storage engine support')
