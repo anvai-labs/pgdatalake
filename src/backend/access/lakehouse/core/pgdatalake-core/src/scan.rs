@@ -298,7 +298,8 @@ pub fn predicate_from_json(v: &serde_json::Value) -> Result<ScanPredicate, Strin
 /// file:// FILE locations the local store must be rooted at the parent
 /// directory with the file name as the key; S3 locations carry the full
 /// bucket-relative key already.
-pub(crate) fn open_for(
+/// Open an object-store location; exposed for examples/diagnostics.
+pub fn open_for(
     path_uri: &str,
     s3: Option<&S3Options>,
 ) -> Result<(StorageIo, String), StorageError> {
