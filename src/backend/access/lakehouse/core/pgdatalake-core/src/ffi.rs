@@ -230,6 +230,12 @@ fn render_row(rows: &mut crate::parquet::ParquetRows) -> (Vec<CString>, Vec<bool
                 vals.push(CString::new(n.to_string()).unwrap_or_default());
                 nulls.push(false);
             }
+            crate::parquet::CellValue::TimestampMicros(us) => {
+                vals.push(
+                    CString::new(crate::parquet::format_timestamp_micros(us)).unwrap_or_default(),
+                );
+                nulls.push(false);
+            }
             crate::parquet::CellValue::Float64(f) => {
                 vals.push(CString::new(f.to_string()).unwrap_or_default());
                 nulls.push(false);

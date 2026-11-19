@@ -77,16 +77,24 @@ pub fn parse_manifest_list(bytes: &[u8]) -> Result<Vec<ManifestListEntry>, Stora
 
 fn entry_from_value(v: &apache_avro::types::Value) -> Result<ManifestListEntry, StorageError> {
     if let apache_avro::types::Value::Record(fields) = v {
+        // counts/ids are `long` per spec; real writers (pyiceberg 0.12)
+        // sometimes emit `int` — accept the Avro promotion (slice 12 interop)
         let get_i64 = |k: &str| -> Result<Option<i64>, StorageError> {
-            match fields.iter().find(|(fk, _)| fk == k) {
-                Some((_, apache_avro::types::Value::Union(_, inner))) => match inner.as_ref() {
+            let as_i64 = |v: &apache_avro::types::Value| -> Result<Option<i64>, StorageError> {
+                match v {
                     apache_avro::types::Value::Long(n) => Ok(Some(*n)),
+                    apache_avro::types::Value::Int(n) => Ok(Some(*n as i64)),
                     apache_avro::types::Value::Null => Ok(None),
                     other => Err(StorageError::Decode(format!("{k}: {other:?}"))),
-                },
-                Some((_, apache_avro::types::Value::Long(n))) => Ok(Some(*n)),
-                Some((_, apache_avro::types::Value::Null)) => Ok(None),
-                other => Err(StorageError::Decode(format!("{k}: {other:?}"))),
+                }
+            };
+            match fields.iter().find(|(fk, _)| fk == k) {
+                Some((_, apache_avro::types::Value::Union(_, inner))) => as_i64(inner),
+                plain => {
+                    let default_null = apache_avro::types::Value::Null;
+                    let v = plain.map(|(_, v)| v).unwrap_or(&default_null);
+                    as_i64(v)
+                }
             }
         };
         let get_str = |k: &str| -> Result<String, StorageError> {
@@ -303,8 +311,16 @@ fn manifest_entry_from_value(v: &apache_avro::types::Value) -> Result<ManifestEn
         },
         other => return Err(StorageError::Decode(format!("status: {other:?}"))),
     };
+    // pyiceberg writes snapshot_id as a nullable union; accept bare
+    // Int/Long too (same promotion rules as the manifest-list counts)
     let snapshot_id = match find("snapshot_id") {
+        Some((_, V::Union(_, inner))) => match inner.as_ref() {
+            V::Long(n) => *n,
+            V::Int(n) => *n as i64,
+            other => return Err(StorageError::Decode(format!("snapshot_id: {other:?}"))),
+        },
         Some((_, V::Long(n))) => *n,
+        Some((_, V::Int(n))) => *n as i64,
         other => return Err(StorageError::Decode(format!("snapshot_id: {other:?}"))),
     };
     let opt_long = |k: &str| -> Result<Option<i64>, StorageError> {
@@ -390,12 +406,21 @@ fn manifest_entry_from_value(v: &apache_avro::types::Value) -> Result<ManifestEn
             Some((_, V::Union(_, inner))) => match inner.as_ref() {
                 V::Null => Ok(None),
                 V::Array(items) => {
+                    // spec says int; pyiceberg writes long — accept promotion
                     let mut out = Vec::with_capacity(items.len());
                     for it in items {
-                        let V::Int(i) = it else {
-                            return Err(StorageError::Decode(format!("{k} item: {it:?}")));
-                        };
-                        out.push(*i);
+                        match it {
+                            V::Int(i) => out.push(*i),
+                            V::Long(l) => {
+                                let v = i32::try_from(*l).map_err(|e| {
+                                    StorageError::Decode(format!("{k} item {l}: {e}"))
+                                })?;
+                                out.push(v);
+                            }
+                            other => {
+                                return Err(StorageError::Decode(format!("{k} item: {other:?}")))
+                            }
+                        }
                     }
                     Ok(Some(out))
                 }
@@ -628,5 +653,41 @@ mod tests {
         assert_eq!(e.data_file.column_sizes.get(&1), Some(&1024));
         assert_eq!(e.data_file.null_value_counts.get(&2), Some(&3));
         assert_eq!(e.data_file.split_offsets, Some(vec![4]));
+    }
+
+    /// Interop regression (slice 12): PyIceberg 0.12 writes manifest-list
+    /// counts as Avro INT in some versions; the reader must accept both
+    /// INT and LONG per Avro promotion rules (spec says long, real writers
+    /// vary — be liberal in what you accept for counts).
+    #[test]
+    fn parses_int_typed_counts_from_pyiceberg() {
+        use apache_avro::types::Record;
+        use apache_avro::Writer;
+        // counts declared as int in the writer schema (pyiceberg shape)
+        let schema_str = MANIFEST_LIST_SCHEMA_V2
+            .replace(
+                "\"added_files_count\", \"type\": [\"null\", \"long\"]",
+                "\"added_files_count\", \"type\": [\"null\", \"int\"]",
+            )
+            .replace(
+                "\"added_rows_count\", \"type\": [\"null\", \"long\"]",
+                "\"added_rows_count\", \"type\": [\"null\", \"int\"]",
+            );
+        let schema = AvroSchema::parse_str(&schema_str).unwrap();
+        let mut writer = Writer::new(&schema, Vec::new());
+        let mut rec = Record::new(&schema).unwrap();
+        rec.put("manifest_path", "s3://warehouse/t/mn.avro");
+        rec.put("manifest_length", 8221i64);
+        rec.put("partition_spec_id", 0i32);
+        rec.put("added_snapshot_id", 42i64);
+        rec.put("added_files_count", Some(1i32));
+        rec.put("added_rows_count", Some(100i32));
+        rec.put("sequence_number", Some(1i64));
+        writer.append(rec).unwrap();
+
+        let entries = parse_manifest_list(&writer.into_inner().unwrap()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].added_files_count, Some(1));
+        assert_eq!(entries[0].added_rows_count, Some(100));
     }
 }
