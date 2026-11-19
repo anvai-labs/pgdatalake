@@ -14,6 +14,7 @@ use std::ffi::{c_char, CStr, CString};
 
 use crate::scan::ScanPlan;
 use crate::session::{CatalogClient, S3ClientOptions};
+use crate::storage::S3Options;
 
 /// Static, NUL-terminated version string of the core, in the form
 /// `pgdatalake-core <major>.<minor>.<patch> (<milestone>)`.
@@ -37,10 +38,11 @@ fn version_cstr() -> &'static CStr {
 pub struct ScanSession {
     plan: ScanPlan,
     file_paths: Vec<CString>,
+    s3: S3Options,
 }
 
 impl ScanSession {
-    fn from_plan(plan: ScanPlan) -> Self {
+    fn from_plan(plan: ScanPlan, s3: S3Options) -> Self {
         Self {
             file_paths: plan
                 .tasks
@@ -48,7 +50,12 @@ impl ScanSession {
                 .map(|t| CString::new(t.entry.data_file.file_path.as_str()).unwrap_or_default())
                 .collect(),
             plan,
+            s3,
         }
+    }
+
+    fn s3_options(&self) -> S3Options {
+        self.s3.clone()
     }
 }
 
@@ -114,7 +121,7 @@ pub unsafe extern "C" fn pg_datalake_scan_new(
         let ns_levels: Vec<&str> = namespace.split('.').collect();
         client
             .scan_table(&ns_levels, &table)
-            .map(ScanSession::from_plan)
+            .map(|(p, s3)| ScanSession::from_plan(p, s3))
             .map_err(|e| e.to_string())
     });
     let session = result.unwrap_or_else(|panic| {
@@ -193,6 +200,210 @@ pub unsafe extern "C" fn pg_datalake_scan_task_rows(session: *mut ScanSession, i
             .map(|t| t.entry.data_file.record_count)
             .unwrap_or(0),
         None => 0,
+    }
+}
+
+/// A projected row iterator over one planned task's parquet file.
+pub struct RowsHandle {
+    rows: crate::parquet::ParquetRows,
+    column_names: Vec<CString>,
+    current_row: Vec<CString>,
+    current_null: Vec<bool>,
+}
+
+/// Render the current row into C strings; nulls become empty strings with
+/// the null flag set in parallel.
+fn render_row(rows: &mut crate::parquet::ParquetRows) -> (Vec<CString>, Vec<bool>) {
+    let mut vals = Vec::with_capacity(rows.column_names().len());
+    let mut nulls = Vec::with_capacity(rows.column_names().len());
+    for i in 0..rows.column_names().len() {
+        match rows.value(i) {
+            crate::parquet::CellValue::Null => {
+                vals.push(CString::new("").unwrap_or_default());
+                nulls.push(true);
+            }
+            crate::parquet::CellValue::Bool(b) => {
+                vals.push(CString::new(if b { "t" } else { "f" }).unwrap_or_default());
+                nulls.push(false);
+            }
+            crate::parquet::CellValue::Int64(n) => {
+                vals.push(CString::new(n.to_string()).unwrap_or_default());
+                nulls.push(false);
+            }
+            crate::parquet::CellValue::Float64(f) => {
+                vals.push(CString::new(f.to_string()).unwrap_or_default());
+                nulls.push(false);
+            }
+            crate::parquet::CellValue::Str(s) => {
+                vals.push(CString::new(s).unwrap_or_default());
+                nulls.push(false);
+            }
+            crate::parquet::CellValue::Bytes(b) => {
+                // text form: hex — typed binary Datum conversion is the FDW's job
+                let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+                vals.push(CString::new(hex).unwrap_or_default());
+                nulls.push(false);
+            }
+        }
+    }
+    (vals, nulls)
+}
+
+/// Open a projected row iterator over task `task_idx` of `session`.
+/// `projection` is a comma-separated column-name list (empty = all columns).
+/// Returns NULL + err_buf on failure.
+///
+/// # Safety
+/// Same pointer rules as pg_datalake_scan_new; `rows` returned here must be
+/// freed exactly once with pg_datalake_rows_close, and is invalid after the
+/// session is freed.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_rows_open(
+    session: *mut ScanSession,
+    task_idx: u64,
+    projection: *const c_char,
+    err_buf: *mut c_char,
+    err_len: usize,
+) -> *mut RowsHandle {
+    let result = std::panic::catch_unwind(|| -> Result<RowsHandle, String> {
+        let Some(s) = session.as_ref() else {
+            return Err("NULL scan session".into());
+        };
+        let projection = borrow_string(projection);
+        let projection: Vec<&str> = if projection.is_empty() {
+            Vec::new()
+        } else {
+            projection.split(',').map(|c| c.trim()).collect()
+        };
+        let file_path = s
+            .plan
+            .tasks
+            .get(task_idx as usize)
+            .map(|t| t.entry.data_file.file_path.as_str())
+            .ok_or_else(|| format!("task {task_idx} out of range"))?
+            .to_string();
+        let (io, key) =
+            crate::scan::open_for(&file_path, Some(&s.s3_options())).map_err(|e| e.to_string())?;
+        let rows = if projection.is_empty() {
+            crate::parquet::ParquetRows::open_all(&io, &key).map_err(|e| e.to_string())?
+        } else {
+            crate::parquet::ParquetRows::open(&io, &key, &projection).map_err(|e| e.to_string())?
+        };
+        let column_names = rows
+            .column_names()
+            .iter()
+            .map(|n| CString::new(n.as_str()).unwrap_or_default())
+            .collect();
+        Ok(RowsHandle {
+            rows,
+            column_names,
+            current_row: Vec::new(),
+            current_null: Vec::new(),
+        })
+    });
+    let handle = result.unwrap_or_else(|panic| {
+        Err(if let Some(x) = panic.downcast_ref::<&str>() {
+            format!("pgdatalake-core panic: {x}")
+        } else if let Some(x) = panic.downcast_ref::<String>() {
+            format!("pgdatalake-core panic: {x}")
+        } else {
+            "pgdatalake-core panic".to_string()
+        })
+    });
+    match handle {
+        Ok(h) => Box::into_raw(Box::new(h)),
+        Err(e) => {
+            unsafe { set_err(err_buf, err_len, &e) };
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Advance to the next row; true while a row is available. Column accessors
+/// below refer to the row this selects.
+///
+/// # Safety
+/// `rows` must be a live handle from pg_datalake_rows_open.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_rows_next(rows: *mut RowsHandle) -> bool {
+    let Some(h) = rows.as_mut() else {
+        return false;
+    };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if h.rows.next() {
+            let (vals, nulls) = render_row(&mut h.rows);
+            h.current_row = vals;
+            h.current_null = nulls;
+            true
+        } else {
+            false
+        }
+    }))
+    .unwrap_or(false)
+}
+
+/// Column count of the projection.
+///
+/// # Safety
+/// `rows` must be a live handle from pg_datalake_rows_open.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_rows_column_count(rows: *mut RowsHandle) -> u64 {
+    match rows.as_ref() {
+        Some(h) => h.rows.column_names().len() as u64,
+        None => 0,
+    }
+}
+
+/// Name of column `idx`; NULL when out of range.
+///
+/// # Safety
+/// `rows` must be a live handle from pg_datalake_rows_open.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_rows_column_name(
+    rows: *mut RowsHandle,
+    idx: u64,
+) -> *const c_char {
+    match rows.as_ref().and_then(|h| h.column_names.get(idx as usize)) {
+        Some(c) => c.as_ptr(),
+        None => std::ptr::null(),
+    }
+}
+
+/// Whether column `idx` of the current row is NULL.
+///
+/// # Safety
+/// `rows` must be a live handle from pg_datalake_rows_open.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_rows_col_null(rows: *mut RowsHandle, idx: u64) -> bool {
+    match rows.as_ref() {
+        Some(h) => h.current_null.get(idx as usize).copied().unwrap_or(true),
+        None => true,
+    }
+}
+
+/// Text form of column `idx` of the current row; NULL for NULL cells.
+///
+/// # Safety
+/// `rows` must be a live handle from pg_datalake_rows_open.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_rows_col_text(
+    rows: *mut RowsHandle,
+    idx: u64,
+) -> *const c_char {
+    match rows.as_ref().and_then(|h| h.current_row.get(idx as usize)) {
+        Some(c) => c.as_ptr(),
+        None => std::ptr::null(),
+    }
+}
+
+/// Free a rows handle. NULL is a no-op.
+///
+/// # Safety
+/// `rows` must be NULL or a pointer returned by pg_datalake_rows_open.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_rows_close(rows: *mut RowsHandle) {
+    if !rows.is_null() {
+        drop(Box::from_raw(rows));
     }
 }
 

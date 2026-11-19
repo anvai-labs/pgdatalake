@@ -95,12 +95,13 @@ impl CatalogClient {
         self
     }
 
-    /// config -> loadTable -> metadata -> plan. Returns the planned snapshot.
+    /// config -> loadTable -> metadata -> plan. Returns the plan plus the
+    /// effective storage options (needed later to open task files).
     pub fn scan_table(
         &self,
         namespace: &[&str],
         table: &str,
-    ) -> Result<ScanPlan, crate::storage::StorageError> {
+    ) -> Result<(ScanPlan, S3Options), crate::storage::StorageError> {
         let cfg = self
             .rest
             .fetch_config(Some(&self.warehouse))
@@ -113,7 +114,8 @@ impl CatalogClient {
         let s3 = self.s3_client.merged(&cfg);
         let (io, key) = crate::scan::open_for(&lt.metadata_location, Some(&s3))?;
         let md = fetch_metadata(&io, &key)?;
-        crate::scan::plan_scan(&md, None, Some(&s3), self.predicate.as_ref())
+        let plan = crate::scan::plan_scan(&md, None, Some(&s3), self.predicate.as_ref())?;
+        Ok((plan, s3))
     }
 }
 
@@ -194,7 +196,7 @@ mod tests {
             &S3ClientOptions::default(),
         )
         .unwrap();
-        let plan = client.scan_table(&["analytics"], "events").expect("scan");
+        let (plan, _s3) = client.scan_table(&["analytics"], "events").expect("scan");
         assert_eq!(plan.snapshot_id, 42);
         assert_eq!(plan.tasks.len(), 0, "fresh table: empty manifest list");
     }

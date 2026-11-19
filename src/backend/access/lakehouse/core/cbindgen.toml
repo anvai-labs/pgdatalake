@@ -15,4 +15,12 @@ include = [
     "pg_datalake_scan_task_count",
     "pg_datalake_scan_task_file",
     "pg_datalake_scan_task_rows",
+    "RowsHandle",
+    "pg_datalake_rows_open",
+    "pg_datalake_rows_next",
+    "pg_datalake_rows_column_count",
+    "pg_datalake_rows_column_name",
+    "pg_datalake_rows_col_null",
+    "pg_datalake_rows_col_text",
+    "pg_datalake_rows_close",
 ]
