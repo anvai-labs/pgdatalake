@@ -22,6 +22,14 @@
    metadata + Parquet statistics — *not* local B-trees), `ANALYZE`/statistics,
    EXPLAIN visibility, psql introspection (`\d+`), information about snapshots,
    autovacuum-style background maintenance.
+   **One catalog, one visibility (principle, 2026-11-19):** lakehouse tables —
+   managed and external alike — are ordinary rows in the *regular Postgres
+   catalogs* (`pg_class`, `information_schema`, `psql \d`), so visibility,
+   permissions, dumps and every existing Postgres tool behave identically to
+   heap tables. Lakehouse-native detail (snapshots, branches, partition specs)
+   augments, never replaces: `psql \d+` output, `pg_lakehouse.*` views,
+   `EXPLAIN` nodes. The remote Iceberg catalog remains the source of truth;
+   Postgres caches and reconciles (doc 03 §4), it never forks visibility.
 4. **Transaction semantics that are Postgres-honest.** Snapshot Isolation is the
    contract for Iceberg tables; every deviation from heap behavior (e.g., read
    visibility within a statement, cross-table commit atomicity) is documented and
