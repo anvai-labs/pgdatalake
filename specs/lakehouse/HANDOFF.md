@@ -101,11 +101,16 @@
     ARRAYS of {key:int, value} records (raw avro dump confirmed); parser
     accepts both shapes; fixtures updated to spec shape.
   - 40 cargo tests + 3 regress groups.
-  - **Next slices**: EXPLAIN pruned-task evidence polish (show skipped
-    count explicitly) -> parallel scans (ForeignScan parallel API) ->
-    time travel (FOR TIMESTAMP/VERSION, doc 02 §4, allowlisted grammar
-    patch) -> M1 conformance gate (Trino-written tables, TPC-DS subset,
-    perf vs doc 10 §5).
+  - slice 16 EXPLAIN pruned evidence: ScanPlan.files_before/after_pruning
+    + FFI accessors; EXPLAIN shows 'Iceberg files examined: N' and
+    'Iceberg files pruned: M' (omitted when nothing pruned). LIVE:
+    WHERE id<5 -> examined 3 / pruned 2 / tasks 1.
+  - 41 cargo tests + 3 regress groups.
+  - **Next slices**: parallel scans (ForeignScan partial paths + task
+    claiming via parallel state, doc 06 §3) -> time travel (FOR
+    TIMESTAMP/VERSION AS OF, doc 02 §4 — the allowlisted gram.y patch,
+    biggest core touch so far) -> M1 conformance gate (Trino-written
+    tables, TPC-DS subset, perf vs doc 10 §5) -> smoke ceremony.
 - Core-allowlist patches so far: meson_options.txt,
   src/backend/access/meson.build, root Makefile (each committed with
   `[core-allowlist]` rationale).
