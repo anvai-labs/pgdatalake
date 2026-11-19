@@ -32,7 +32,9 @@ ERROR:  FOR VERSION AS OF requires a snapshot id literal
 LINE 1: SELECT count(*) FROM lakehouse_ft FOR VERSION AS OF 'not-a-n...
                                           ^
 SELECT count(*) FROM lakehouse_ft FOR VERSION AS OF 1.5;
-ERROR:  lakehouse: could not plan scan with selector {"kind":"id","value":1.5}: snapshot selector: invalid type: floating point `1.5`, expected i64
+ERROR:  FOR VERSION AS OF requires an integer snapshot id
+LINE 1: SELECT count(*) FROM lakehouse_ft FOR VERSION AS OF 1.5;
+                                          ^
 SELECT count(*) FROM lakehouse_ft FOR TAG AS OF 42;
 ERROR:  FOR TAG AS OF requires a quoted tag or branch name
 LINE 1: SELECT count(*) FROM lakehouse_ft FOR TAG AS OF 42;
