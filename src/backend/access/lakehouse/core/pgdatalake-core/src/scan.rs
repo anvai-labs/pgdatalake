@@ -80,7 +80,10 @@ fn partition_matches(
 /// file:// FILE locations the local store must be rooted at the parent
 /// directory with the file name as the key; S3 locations carry the full
 /// bucket-relative key already.
-fn open_for(path_uri: &str, s3: Option<&S3Options>) -> Result<(StorageIo, String), StorageError> {
+pub(crate) fn open_for(
+    path_uri: &str,
+    s3: Option<&S3Options>,
+) -> Result<(StorageIo, String), StorageError> {
     let loc = parse_location(path_uri)?;
     match &loc {
         Location::S3 { key, .. } => Ok((StorageIo::open(&loc, s3)?, key.clone())),

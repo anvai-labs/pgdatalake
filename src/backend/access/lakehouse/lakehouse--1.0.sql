@@ -10,3 +10,17 @@ CREATE SCHEMA IF NOT EXISTS lakehouse;
 CREATE FUNCTION lakehouse.version() RETURNS text
 AS 'MODULE_PATHNAME', 'pg_lakehouse_version'
 LANGUAGE C STABLE PARALLEL SAFE;
+
+-- M1 slice 9: scan planning over a REST-catalog table (FFI-backed SRF).
+CREATE FUNCTION lakehouse.scan_files(
+    endpoint      text,
+    warehouse     text,
+    token         text,
+    namespace     text,
+    table_name    text,
+    s3_endpoint   text default null,
+    s3_access_key text default null,
+    s3_secret_key text default null)
+RETURNS TABLE(file_path text, record_count bigint)
+AS 'MODULE_PATHNAME', 'pg_lakehouse_scan_files'
+LANGUAGE C VOLATILE STRICT;

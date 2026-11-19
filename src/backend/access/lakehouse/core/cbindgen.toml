@@ -9,4 +9,10 @@ include_guard = "PGDATALAKE_CORE_H"
 [export]
 include = [
     "pg_datalake_core_version",
+    "ScanSession",
+    "pg_datalake_scan_new",
+    "pg_datalake_scan_free",
+    "pg_datalake_scan_task_count",
+    "pg_datalake_scan_task_file",
+    "pg_datalake_scan_task_rows",
 ]

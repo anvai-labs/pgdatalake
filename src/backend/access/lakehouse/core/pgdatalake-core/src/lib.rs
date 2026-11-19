@@ -16,4 +16,5 @@ pub mod catalog;
 pub mod ffi;
 pub mod manifest;
 pub mod scan;
+pub mod session;
 pub mod storage;
