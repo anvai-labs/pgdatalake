@@ -4,13 +4,22 @@
 
 | Tier | Stores | Catalogs | Runs where |
 |---|---|---|---|
-| **CI-fast** (every commit, < 20 min) | MinIO (docker), file:// | REST (in-process Lakekeeper container), Hadoop on local FS | GitHub Actions |
-| **CI-matrix** (nightly) | MinIO + Azurite + fake-gcs-server | REST × profiles (generic, Nessie REST, Polaris-style auth mock), Glue (emulated via moto), Hadoop | GitHub Actions nightly |
+| **CI-fast** (every commit, < 20 min) | SeaweedFS S3 (docker; see Superseded note below), file:// | REST (in-process Lakekeeper container), Hadoop on local FS | GitHub Actions |
+| **CI-matrix** (nightly) | SeaweedFS S3 + Azurite + fake-gcs-server | REST × profiles (generic, Nessie REST, Polaris-style auth mock), Glue (emulated via moto), Hadoop | GitHub Actions nightly |
 | **CI-cloud** (weekly / pre-release) | real S3, ADLS Gen2, GCS | real Glue, real Nessie, Polaris sandbox, S3 Tables | org cloud account, secrets via OIDC federation |
 
 Azurite and fake-gcs-server are mandatory parity targets — cloud-only code paths
 (auth, listing semantics, checksum headers) must be exercised in CI-fast, not
 just in cloud runs.
+
+*(Superseded 2026-11-19: the CI fixture S3 store was originally MinIO. MinIO
+deleted its Docker Hub images in Sept 2026 and quay.io now requires auth for
+anonymous pulls, so CI-fast/CI-matrix use **SeaweedFS S3** (`chrislusf/
+seaweedfs`, upstream first-party image) with the same fake access keys and
+endpoint override. Production support for real MinIO deployments is unchanged
+— it is plain S3 API with endpoint override (doc 04 §); only the *docker
+fixture* swapped. Revisit if Iceberg workloads hit SeaweedFS-specific gaps
+(listing semantics, checksum headers).)*
 
 ## 2. Conformance suite (the acceptance bar)
 
@@ -54,9 +63,9 @@ just in cloud runs.
 
 | Metric | Gate |
 |---|---|
-| Scan throughput 1-column predicate, 10GB table, MinIO local | ≥ 60% of DuckDB-on-S3 single-node baseline |
-| Point INSERT commit latency (1 row, warm catalog) | < 150ms p50 against MinIO |
-| 1000-batch bulk load (10M rows) | ≥ 50 MB/s/backend into MinIO |
+| Scan throughput 1-column predicate, 10GB table, fixture S3 local | ≥ 60% of DuckDB-on-S3 single-node baseline |
+| Point INSERT commit latency (1 row, warm catalog) | < 150ms p50 against the fixture S3 |
+| 1000-batch bulk load (10M rows) | ≥ 50 MB/s/backend into the fixture S3 |
 | Compaction 500 small files → 50 | < 5 min, 8 workers |
 | Parallel scan scaling | ≥ 5× on 8 workers vs 1 (task-parallel table) |
 | Metadata planning on 2000-manifest table | < 300ms warm |
@@ -67,7 +76,7 @@ the harness (`make perf-lakehouse`).
 ## 6. Developer loop
 
 ```bash
-make lakehouse-up          # docker compose: minio + lakekeeper + azurite + fake-gcs
+make lakehouse-up          # docker compose: SeaweedFS s3 + lakekeeper + azurite + fake-gcs
 make lakehouse-check       # cargo test -p pgdatalake-core + regress lakehouse subset
 make lakehouse-conformance # interop suite vs pyiceberg (uv-managed venv)
 make lakehouse-down

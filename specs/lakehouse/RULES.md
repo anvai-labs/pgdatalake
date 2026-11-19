@@ -126,7 +126,7 @@ every tagged release.
 
 1. **Cold-room smoke test** — from a FRESH clone, no warm caches:
    - `git clone` the repo, check out the release/branch ref
-   - `make lakehouse-up` (MinIO + Lakekeeper + Azurite + fake-gcs fixtures)
+   - `make lakehouse-up` (SeaweedFS S3 + Lakekeeper + Azurite + fake-gcs fixtures)
    - `meson setup build -Ddatalake=enabled && ninja`
    - upstream regress suite via `meson test --suite setup && meson test
      --suite regress` (must stay 100% green — a fork that breaks upstream
@@ -139,7 +139,7 @@ every tagged release.
      `make check`.)*
    - `make lakehouse-check` + the milestone's conformance subset (`doc 10`)
    - one MANUAL psql transcript per milestone's headline feature (M1: attach +
-     query a MinIO table; M2: CREATE USING lakehouse FORMAT iceberg + round-trip DML; …) —
+     query a fixture-S3 table; M2: CREATE USING lakehouse FORMAT iceberg + round-trip DML; …) —
      humans see the feature work, not just CI.
 2. **Acceptance-gate audit** — walk the milestone's gate checklist from
    `12-roadmap.md` item by item; each item gets PASS/FAIL with evidence

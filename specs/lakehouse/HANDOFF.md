@@ -1,53 +1,75 @@
 # HANDOFF.md — State for the Next Session
 
-*Written 2026-11-19. Working directory: `/home/vsingh/code/postgres`.*
+*Updated 2026-11-19. Working directory: `/home/vsingh/code/postgres`.*
 
 ## What exists
 
 - Repo: `/home/vsingh/code/postgres`, clone of `postgres/postgres` master
-  (`61f6021b110`, PG 20 dev, `CATALOG_VERSION_NO 202611121`).
-- `origin` = `https://github.com/anvai-labs/postgres` (PRIVATE, gh account
-  `vjsingh1984`, token has admin:org). `upstream` = `postgres/postgres`.
-  `main`-equivalent (`master`) pushed and verified.
-- `specs/lakehouse/` — full design doc set (README has the reading order; start
-  there). Key decisions already made, do not relitigate without a spec revision:
-  - **D1**: managed tables = TableAM (`USING lakehouse FORMAT iceberg`); external = FDW;
-    both share one Rust core `pgdatalake-core` (arrow-rs, object_store, REST).
-  - **D2**: Rust core as static library via C ABI; DuckDB embedding rejected
-    (see `11-related-work.md`).
-  - Iceberg v3 target, v2 delete-read compatibility; REST catalog is the
-    primary, Glue/Nessie/Hadoop secondary; JDBC deferred.
-  - Transaction model fully specified in `07-transactions.md` (overlay,
-    optimistic commit with requirements, journal 2PC for non-REST catalogs,
-    honest mixed-transaction limits).
-- Nothing implemented yet. No Rust workspace, no code, no CI.
+  (`61f6021b110`, PG 20 dev). `origin` = `anvai-labs/postgres` (private),
+  `upstream` = `postgres/postgres`.
+- **Branch layout**: `main` = fork base (upstream master + specs commits, merge
+  sync per RULES §1 as amended); `lakehouse-dev` = integration branch (renamed
+  from `iceberg-dev` 2026-11-19). NOTE: GitHub's default branch is still
+  `master` on the remote — flipping it to `main` via `gh repo edit` was denied
+  by the harness and `origin/master` still exists; do that manually
+  (`gh repo edit anvai-labs/postgres --default-branch main`, then
+  `git push origin --delete master`).
+- **Naming (decided 2026-11-19, user)**: format-generic lakehouse. Rust core
+  `pgdatalake-core` (C ABI `pg_datalake_*`, `libpgdatalake_core.a`), SQL
+  surface `lakehouse` (schema/extension/`USING lakehouse FORMAT iceberg`),
+  views `pg_lakehouse`, GUCs `lakehouse.*`, SQLSTATE `LD0`, meson
+  `-Ddatalake=auto`, branch/tests/fixtures/make-targets all `lakehouse*`.
+  Iceberg is a FORMAT layer, not the product name. Don't relitigate.
+- **M0 done (see 12-roadmap.md M0 + retro/m0.md)**:
+  - meson feature `-Ddatalake`, `src/backend/access/lakehouse/` (Rust core +
+    C glue + `lakehouse` extension with `lakehouse.version()`).
+  - meson-only build (autoconf tree is distcleaned; `make check` = upstream
+    regress suite via `meson test --suite regress`; both builds can't coexist
+    in one source tree).
+  - TDD'd regress test `src/test/regress/lakehouse/` + cargo test; upstream
+    regress suite 243/243 green under meson.
+  - docker fixtures `src/test/lakehouse/docker-compose.yml` (SeaweedFS S3, Lakekeeper,
+    Azurite, fake-gcs; fake creds). `make lakehouse-up/down`.
+  - CI `.github/workflows/datalake-ci.yml` (additive; upstream pg-ci.yml
+    untouched).
+- Core-allowlist patches so far: meson_options.txt,
+  src/backend/access/meson.build, root Makefile (each committed with
+  `[core-allowlist]` rationale).
 
-## First actions for the new session
+## First actions for the next session (M1)
 
-1. Read `specs/lakehouse/README.md` → `00-goals.md` → `01-architecture.md`.
-2. `git checkout -b lakehouse-dev` (off `master`), push to origin
-   (RULES.md §1 — also create `main` if desired: `git branch -m master main`
-   is NOT done yet; decide and align RULES.md §1 wording with reality).
-3. Execute M0 from `12-roadmap.md`: Rust workspace skeleton at
-   `src/backend/access/lakehouse/core/`, cbindgen header step, meson
-   `-Ddatalake=auto`, CI with MinIO+Lakekeeper fixtures, stub
-   `lakehouse.version()` SQL function.
-4. Build PG locally first to establish the baseline:
-   `./configure --prefix=$PWD/build/pg20 && make -j16 world && make check`.
+1. Read `specs/lakehouse/README.md` → `00-goals.md` → `01-architecture.md`;
+   naming amendment notes in RULES §4 / 01 D1-D2.
+2. Verify CI green on GitHub Actions (datalake-ci on lakehouse-dev).
+3. Start M1 per `12-roadmap.md`: REST catalog client + metadata model in
+   `pgdatalake-core`, `lakehouse_fdw` read path, S3 fixtures in tests.
+   TDD per RULES §8; weekly upstream sync per RULES §2 before starting.
 
 ## Gotchas found while exploring the tree
 
-- This checkout has NO `PG_VERSION` at root (git worktree style layout, version
-  from configure: master = 20dev).
-- `configure` requires autoconf 2.69 if regenerating (don't regenerate; use
-  the committed `configure`).
-- Upstream now uses meson as primary build system — put the Rust build step in
-  meson first, autoconf Makefile second (or autoconf-only if we keep effort
-  minimal for M0).
-- `src/backend/access/table/` is the TableAM core; `src/backend/access/heap/`
-  is the reference AM implementation to copy structure from.
+- `cc`/`python3` in PATH resolve to anaconda/conda-forge toolchains; conda gcc
+  has its own sysroot (no readline headers). Build with `CC=/usr/bin/gcc`.
+  meson picks anaconda python — works, but mind version-sensitive tooling.
+- meson setup FAILS if autoconf configure artifacts exist in the source tree
+  (GNUmakefile conflict check) — stay meson-only, or distclean first.
+- `pgindent` needs `pg_bsd_indent` in PATH + perltidy; pg_bsd_indent can be
+  built manually (gcc -I src/include -I build/src/include
+  src/tools/pg_bsd_indent/*.c build/src/port/libpgport.a
+  build/src/common/libpgcommon.a). perltidy not yet installed.
+- `pg_regress --inputdir <dir>` expects `<dir>/sql/` and `<dir>/expected/`
+  subdirs; psql column headers are CENTERED — take expected output from the
+  results file after eyeballing correctness.
+- Upstream `pg_mod_args`/`backend_mod_code` are defined *after*
+  `subdir('access')`; `src/backend/access/lakehouse/meson.build` assembles
+  module args from earlier-defined components (see file comment).
+- meson cannot `link_with` a custom_target: link the static lib via
+  `link_args` + `link_depends` (see lakehouse/meson.build).
+- `#[no_mangle]` is an unsafe attribute: crate uses `deny(unsafe_code)` with
+  `allow` only in `ffi.rs` (RULES §4).
+- Fixture creds are fake (`lakehouse-test`/`lakehouse-test-password` etc.);
+  never use real cloud credentials outside OIDC-federated CI (RULES §6).
 
 ## Rules
 
 `specs/lakehouse/RULES.md` is binding: allowlist-limited core edits, branch
-layout, style, secrets. Follow it.
+layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.

@@ -1,4 +1,4 @@
-# Apache Iceberg test fixtures (specs/lakehouse/10-testing.md §1, CI-fast tier).
+# Lakehouse test fixtures (specs/lakehouse/10-testing.md §1, CI-fast tier).
 #
 #   make lakehouse-up    (from repo root, or run via docker compose -f ... up --wait)
 #
@@ -6,45 +6,53 @@
 # never replace them with real cloud credentials; real clouds are exercised
 # via OIDC-federated CI runs only.
 #
+# Store note (amendment 2026-11-19, specs/lakehouse/10-testing.md §1): MinIO
+# deleted its Docker Hub images in Sept 2026 (quay.io pulls now require auth),
+# so the S3-compatible fixture store is SeaweedFS (`chrislusf/seaweedfs`,
+# upstream first-party image). Everything talks to it through the plain S3
+# API with endpoint override, same as MinIO; swap if real gaps appear.
+#
 # M0 brings the containers up and documents endpoints; REST/table traffic
 # against them starts in M1.
 
 name: pgdatalake
 
 services:
-  # Object store: S3-compatible (MinIO) + parity targets Azurite (ADLS Gen2)
-  # and fake-gcs-server (GCS), so store-specific code paths (auth, listing
-  # semantics, checksum headers) can be exercised in CI-fast from M3 on.
-  minio:
-    image: minio/minio:latest
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: lakehouse-test
-      MINIO_ROOT_PASSWORD: lakehouse-test-password
+  # Object store: S3-compatible (SeaweedFS) + parity targets Azurite (ADLS
+  # Gen2) and fake-gcs-server (GCS), so store-specific code paths (auth,
+  # listing semantics, checksum headers) can be exercised in CI-fast from M3.
+  s3:
+    image: chrislusf/seaweedfs:latest
+    command: >-
+      server -dir /data -ip 0.0.0.0
+      -s3 -s3.port 9000 -s3.config /etc/seaweedfs/s3.config
+      -master.volumeSizeLimitMB 8192
     ports:
       - "9000:9000"
-      - "9001:9001"
+    # master API (9333) stays container-internal; healthcheck uses it
     volumes:
-      - minio-data:/data
+      - s3-data:/data
+      - ./fixtures/seaweedfs-s3.config.json:/etc/seaweedfs/s3.config:ro
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9333/cluster/status"]
       interval: 2s
       timeout: 5s
       retries: 30
 
-  # Create the fixture bucket and a second access key for tests.
-  minio-setup:
-    image: minio/mc:latest
+  # Create the fixture bucket; proves the access keys actually work.
+  s3-setup:
+    image: rclone/rclone:latest
     depends_on:
-      minio:
+      s3:
         condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set local http://minio:9000 lakehouse-test lakehouse-test-password &&
-      mc mb -p local/warehouse &&
-      mc admin user add local lakehouse-reader lakehouse-reader-password &&
-      echo 'minio fixture ready'
-      "
+    environment:
+      RCLONE_CONFIG_S3_TYPE: s3
+      RCLONE_CONFIG_S3_PROVIDER: Other
+      RCLONE_CONFIG_S3_ACCESS_KEY_ID: lakehouse-test
+      RCLONE_CONFIG_S3_SECRET_ACCESS_KEY: lakehouse-test-password
+      RCLONE_CONFIG_S3_ENDPOINT: http://s3:9000
+      RCLONE_CONFIG_S3_NO_CHECK_BUCKET: "true"
+    command: mkdir s3:warehouse
 
   azurite:
     image: mcr.microsoft.com/azure-storage/azurite:latest
@@ -80,21 +88,17 @@ services:
       retries: 30
 
   lakekeeper-migrate:
-    image: lakekeeper/lakekeeper:latest
-    command:
-      - migrate
-      - --runtime-config-postgres-hostname=lakekeeper-db
-      - --runtime-config-postgres-port=5432
-      - --runtime-config-postgres-user=lakekeeper
-      - --runtime-config-postgres-password=lakekeeper-password
-      - --runtime-config-postgres-dbname=catalog
-      - --runtime-config-postgres-sslmode=disable
+    image: quay.io/lakekeeper/catalog:latest-main
+    command: migrate
+    environment:
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://lakekeeper:lakekeeper-password@lakekeeper-db:5432/catalog
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://lakekeeper:lakekeeper-password@lakekeeper-db:5432/catalog
     depends_on:
       lakekeeper-db:
         condition: service_healthy
 
   lakekeeper:
-    image: lakekeeper/lakekeeper:latest
+    image: quay.io/lakekeeper/catalog:latest-main
     command: serve
     depends_on:
       lakekeeper-db:
@@ -102,20 +106,13 @@ services:
       lakekeeper-migrate:
         condition: service_completed_successfully
     environment:
-      LAKEKEEPER__POSTGRES__HOSTNAME: lakekeeper-db
-      LAKEKEEPER__POSTGRES__PORT: "5432"
-      LAKEKEEPER__POSTGRES__USER: lakekeeper
-      LAKEKEEPER__POSTGRES__PASSWORD: lakekeeper-password
-      LAKEKEEPER__POSTGRES__DBNAME: catalog
-      LAKEKEEPER__POSTGRES__SSLMODE: disable
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://lakekeeper:lakekeeper-password@lakekeeper-db:5432/catalog
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://lakekeeper:lakekeeper-password@lakekeeper-db:5432/catalog
     ports:
       - "8181:8181"
-    healthcheck:
-      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8181/health || exit 1"]
-      interval: 2s
-      timeout: 5s
-      retries: 30
+    # NOTE: image is distroless (no sh/curl/wget) — no in-container healthcheck;
+    # verify readiness via `curl http://localhost:8181/health` from the host.
 
 volumes:
-  minio-data:
+  s3-data:
   lakekeeper-db-data:

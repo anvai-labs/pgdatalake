@@ -8,7 +8,7 @@ another's gate. Rough sizing assumes 1–2 engineers + this agent.
 - [ ] Branch `lakehouse-dev` for integration work
 - [ ] Rust workspace `src/backend/access/lakehouse/core/` with empty `pgdatalake-core`
       crate, `cbindgen` header generation, meson feature `-Ddatalake=auto`
-- [ ] CI: build PG with feature on (ubuntu, cargo toolchain pinned), MinIO +
+- [ ] CI: build PG with feature on (ubuntu, cargo toolchain pinned), S3-compatible fixture (SeaweedFS, see doc 10) +
       Lakekeeper docker-compose fixture
 - **Gate**: `meson setup build -Ddatalake=enabled && ninja && meson test --suite
   regress` green on CI (meson-only tree: autoconf `make check` cannot coexist
@@ -23,8 +23,8 @@ another's gate. Rough sizing assumes 1–2 engineers + this agent.
 - `lakehouse_fdw`: `CREATE FOREIGN TABLE`, projection + basic qual pushdown
   (partition & metrics pruning), parallel scans, batch→slot conversion
 - Type matrix read-side (doc 05) incl. v2 eq/pos delete application
-- **Gate**: conformance suite read-half green on MinIO+REST; Trino-written table
-  queryable; TPC-DS subset (q1–q10) runs against a 10GB MinIO table with EXPLAIN
+- **Gate**: conformance suite read-half green on the S3 fixture + REST; Trino-written table
+  queryable; TPC-DS subset (q1–q10) runs against a 10GB fixture-S3 table with EXPLAIN
   showing file/row-group pruning.
 
 ## M2 — Managed tables, writes (3–5 weeks)
@@ -52,7 +52,7 @@ another's gate. Rough sizing assumes 1–2 engineers + this agent.
 - `pg_lakehouse` metadata views + table_health
 - Glue catalog, Nessie native, REST profiles (Polaris/Unity/S3 Tables quirks)
 - oss-fuzz metadata targets; perf gates (doc 10 §5) measured & passing
-- **Gate**: 7-day soak with continuous mixed DML+maintenance on MinIO — no
+- **Gate**: 7-day soak with continuous mixed DML+maintenance on the S3 fixture — no
   invariant violations, compaction keeps small_files_pct < 30 under load.
 
 ## M5 — The seamless layer (ongoing)
