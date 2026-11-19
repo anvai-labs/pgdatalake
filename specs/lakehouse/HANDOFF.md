@@ -87,11 +87,25 @@
     + bounds_keep() over manifest column stats (conservative: missing
     bounds/ids/types always keep; field-id resolution via current
     schema); plan_scan prunes partitions AND bounds.
-  - **Next slices**: FDW qual->predicate translation (parse executor
-    quals into ScanPredicate in C via the FFI seam, so WHERE actually
-    skips files) -> EXPLAIN shows pruned task counts -> parallel scans
-    (ForeignScan parallel API) -> time travel (FOR TIMESTAMP/VERSION,
-    doc 02 §4, allowlisted grammar patch) -> M1 conformance gate.
+  - slice 15 FDW qual->predicate translation: TranslateQual (Var-op-Const,
+    =/</<=/>/>= with flipped-op inversion; per-type value conversion —
+    int/date days, timestamp(s)/tstz micros matching bounds width,
+    floats, text with JSON escaping) -> predicate JSON via FFI ->
+    plan_scan pruning; ALL clauses stay in qpqual (pruning conservative,
+    executor enforces exact per-row filter); live bugs fixed: RestrictInfo
+    vs plain-Expr (translate after extract_actual_clauses), double
+    extract segfault, predicate/opts ordering (pruning silently skipped +
+    wrong counts), qpqual slot (Filter never applied). LIVE: EXPLAIN shows
+    tasks: 1 (pruned from 3) for WHERE id<5; count(*)=4 exact.
+  - pyiceberg manifest metric maps fixed: real manifests encode metrics as
+    ARRAYS of {key:int, value} records (raw avro dump confirmed); parser
+    accepts both shapes; fixtures updated to spec shape.
+  - 40 cargo tests + 3 regress groups.
+  - **Next slices**: EXPLAIN pruned-task evidence polish (show skipped
+    count explicitly) -> parallel scans (ForeignScan parallel API) ->
+    time travel (FOR TIMESTAMP/VERSION, doc 02 §4, allowlisted grammar
+    patch) -> M1 conformance gate (Trino-written tables, TPC-DS subset,
+    perf vs doc 10 §5).
 - Core-allowlist patches so far: meson_options.txt,
   src/backend/access/meson.build, root Makefile (each committed with
   `[core-allowlist]` rationale).
