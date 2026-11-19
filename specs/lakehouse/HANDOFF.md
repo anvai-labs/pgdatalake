@@ -78,11 +78,16 @@
     no chrono). LIVE: SELECT count/min/max/WHERE through the FDW over
     PyIceberg-written data — full read path works end-to-end.
   - 36 cargo tests + 3 regress groups.
-  - **Next slices**: EXPLAIN task counts (ExplainForeignScan hook) ->
-    projection/qual pushdown (doc 06 §4) -> parallel scans (task-parallel
-    via ForeignScan parallel API) -> M1 conformance gate (Trino-written
-    tables via gen_fixtures, TPC-DS subset with pruning evidence, perf
-    numbers vs doc 10 §5).
+  - slice 13 EXPLAIN visibility (ExplainForeignScan: table/endpoint/
+    task count/rows/projection/pushdown status) + projection pushdown
+    from targetlist+qual Vars + live BUG FIX: local quals were in the
+    fdw_recheck_quals slot (never evaluated on plain scans — WHERE
+    returned all rows); moved to qpqual, verified live (4/3000/2100).
+  - **Next slices**: qual->parquet predicate pushdown (bounds via manifest
+    lower/upper stats, doc 06 §4) -> parallel scans (task-parallel
+    ForeignScan parallel API) -> time travel (FOR TIMESTAMP/VERSION, doc
+    02 §4) -> M1 conformance gate (Trino-written tables, TPC-DS subset,
+    perf vs doc 10 §5).
 - Core-allowlist patches so far: meson_options.txt,
   src/backend/access/meson.build, root Makefile (each committed with
   `[core-allowlist]` rationale).
