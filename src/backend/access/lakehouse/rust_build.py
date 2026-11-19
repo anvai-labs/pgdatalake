@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Build pgiceberg-core for the meson build (specs/iceberg/01-architecture.md §5).
+"""Build pgdatalake-core for the meson build (specs/lakehouse/01-architecture.md §5).
 
-Invoked by a meson custom_target in src/backend/access/iceberg/meson.build.
+Invoked by a meson custom_target in src/backend/access/lakehouse/meson.build.
 Runs `cargo build --release` for the workspace and `cbindgen` for the C header,
 then copies both artifacts into the meson build directory. Rebuild scheduling
 is coarse (build_always_stale on the meson side); cargo's own caching makes the
@@ -38,9 +38,9 @@ run(['cargo', 'build', '--release',
      '--target-dir', target_dir])
 
 run(['cbindgen',
-     '--crate', 'pgiceberg-core',
+     '--crate', 'pgdatalake-core',
      '--config', manifest_dir / 'cbindgen.toml',
-     '--output', out_dir / 'pgiceberg_core.h'])
+     '--output', out_dir / 'pg_datalake_core.h'])
 
-shutil.copy2(target_dir / 'release' / 'libpgiceberg_core.a',
-             out_dir / 'libpgiceberg_core.a')
+shutil.copy2(target_dir / 'release' / 'libpgdatalake_core.a',
+             out_dir / 'libpgdatalake_core.a')

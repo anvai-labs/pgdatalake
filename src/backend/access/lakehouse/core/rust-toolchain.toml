@@ -1,4 +1,4 @@
-# Pin the Rust toolchain for pgiceberg-core (specs/iceberg/12-roadmap.md M0:
+# Pin the Rust toolchain for pgdatalake-core (specs/lakehouse/12-roadmap.md M0:
 # "cargo toolchain pinned"). Bump deliberately, in a commit that notes it.
 [toolchain]
 channel = "1.100.0"

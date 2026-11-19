@@ -1,4 +1,0 @@
-# pgiceberg-core is linked into a shared PostgreSQL extension module, so every
-# object must be position independent (specs/iceberg/01-architecture.md D2).
-[build]
-rustflags = ["-C", "relocation-model=pic"]

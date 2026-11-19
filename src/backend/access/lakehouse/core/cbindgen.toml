@@ -1,0 +1,12 @@
+# cbindgen configuration for pgdatalake-core (specs/lakehouse/01-architecture.md
+# decision D2). The generated header lands in the meson build dir; a checked-in
+# stable copy moves to src/include/access/lakehouse/pg_datalake_core.h once the API
+# settles (planned M1, doc 01 §2).
+language = "C"
+no_includes = true
+include_guard = "PGDATALAKE_CORE_H"
+
+[export]
+include = [
+    "pg_datalake_core_version",
+]

@@ -15,15 +15,16 @@ subdir('table')
 subdir('tablesample')
 subdir('transam')
 
-# Apache Iceberg (specs/iceberg): optional feature; 'auto' disables itself
-# when the Rust toolchain (cargo, cbindgen) is unavailable.
-iceberg_opt = get_option('iceberg')
-iceberg_build = iceberg_opt != 'disabled'
-if iceberg_build
-  iceberg_cargo = find_program('cargo', required: iceberg_opt == 'enabled')
-  iceberg_cbindgen = find_program('cbindgen', required: iceberg_opt == 'enabled')
-  iceberg_build = iceberg_cargo.found() and iceberg_cbindgen.found()
+# Format-generic lakehouse storage engine (specs/lakehouse): optional
+# feature; 'auto' disables itself when the Rust toolchain (cargo, cbindgen)
+# is unavailable.
+datalake_opt = get_option('datalake')
+datalake_build = datalake_opt != 'disabled'
+if datalake_build
+  datalake_cargo = find_program('cargo', required: datalake_opt == 'enabled')
+  datalake_cbindgen = find_program('cbindgen', required: datalake_opt == 'enabled')
+  datalake_build = datalake_cargo.found() and datalake_cbindgen.found()
 endif
-if iceberg_build
-  subdir('iceberg')
+if datalake_build
+  subdir('lakehouse')
 endif

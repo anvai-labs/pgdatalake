@@ -15,12 +15,12 @@
 # a single-target, empty rule to make the other targets non-default.
 all:
 
-# --- Apache Iceberg fork targets (specs/iceberg/10-testing.md §6) ---
-# Forwarded to src/test/iceberg/. Reachable in meson-only checkouts (no
+# --- Format-generic lakehouse fork targets (specs/lakehouse/10-testing.md §6) ---
+# Forwarded to src/test/lakehouse/. Reachable in meson-only checkouts (no
 # GNUmakefile); see RULES.md §9 for the meson-vs-autoconf build note.
-.PHONY: iceberg-up iceberg-down iceberg-check iceberg-conformance perf-iceberg
-iceberg-up iceberg-down iceberg-check iceberg-conformance perf-iceberg:
-	@$(MAKE) -C src/test/iceberg $@
+.PHONY: lakehouse-up lakehouse-down lakehouse-check lakehouse-conformance perf-lakehouse
+lakehouse-up lakehouse-down lakehouse-check lakehouse-conformance perf-lakehouse:
+	@$(MAKE) -C src/test/lakehouse $@
 
 all check install installdirs installcheck installcheck-parallel uninstall clean distclean maintainer-clean dist distcheck world check-world install-world installcheck-world:
 	@if [ ! -f GNUmakefile ] ; then \
