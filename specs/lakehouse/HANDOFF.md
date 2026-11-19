@@ -118,39 +118,36 @@
     scan_new(snapshot_id) -> plan_scan snapshot selection. LIVE:
     table pinned to first pyiceberg snapshot reads 1000 rows while
     current reads 3000 — time-separated reads verified.
-  - **Slice 19 implementation sketch** (FOR AS OF grammar — do it FIRST
-    next session; all pinning plumbing already exists via the
-    snapshot_id option):
-      1. parsenodes.h: add to RangeVar
-         `Node *lakehouse_snapshot;` (raw parse tree: A_Const text
-         [TIMESTAMP] / A_Const int [VERSION] / A_Const string [TAG];
-         NULL otherwise). One-line field, catversion bump not needed
-         (parsed trees are not on disk).
-      2. gram.y (~15 lines): in table_ref, after `relation_expr
-         opt_alias_clause`, add lakehouse_time_travel opt rules:
-         FOR TIMESTAMP AS OF a_expr / FOR VERSION AS OF a_expr / FOR
-         TAG AS OF Sconst — attach to the RangeVar before returning.
-         Mark the block [core-allowlist] per RULES §3.
-      3. transformFromClauseItem (parse_clause.c / parse_relation.c —
-         GRAY ZONE: keep the touch to one small hook, or alternatively
-         resolve the A_Const in the FDW itself by reading the raw node
-         from rte->... — decide at implementation time; the leaner
-         option is having transformRangeSubselect-style code in
-         parse_relation set rte->... but rte (RangeTblEntry) changes
-         are bigger. Preferred lean path: resolve the raw node during
-         ExtractOptions time is impossible (planner sees only RTE), so
-         the FDW planner hook reads it via root->simple_rte_array —
-         which does NOT carry RangeVar. DECISION NEEDED: cleanest is
-         storing the resolved snapshot on ParseNamespaceItem
-         (pns_...new field) and reading it in GetForeignRelSize via
-         baserel->fdw_private built in GetForeignPaths from
-         root->parse->rtable? — prototype before committing to a path.
-      4. FDW: state->snapshot_id filled from the carried value instead
-         of the (still supported) snapshot_id option.
-      5. Regress: src/test/regress/lakehouse/sql/time_travel.sql with
-         the deterministic error cases (bad snapshot id -> error text),
-         live cases stay in the example + fixture transcript.
-  - **Next slices**: slice 19 grammar (sketch above) -> M1 conformance
+  - slice 19 time travel grammar (SELECT ... FOR TIMESTAMP/VERSION/TAG
+    AS OF): the design DECISION — the clause lives in the LOCKING-CLAUSE
+    position (per-table attachment is impossible: after a from-item a
+    bare FOR starts FOR UPDATE and LALR(1) cannot disambiguate; bison
+    %expect 0 rejects it). The pin rides in SelectStmt.lockingClause as
+    a raw DefElem; consumers of that list skip DefElem entries
+    (analyze.c x2 error paths + main loop, parse_relation.c
+    isLockedRefname). applyLakehouseTimeTravel (parse_clause.c) resolves
+    the DefElem into a canonical selector string on RTE.lakehouse_snapshot
+    ("ts:<ms>" / "id:<n>" / "ref:<name>") for every foreign-table RTE of
+    the level — timestamps via timestamptz_in at parse time (rules/views
+    store epoch ms, timezone-stable); big ids lex as Float and are
+    validated with pg_strtoint64_safe. FDW carries the selector in
+    fdw_private[2], OpenSession prefers it over the snapshot_id option,
+    plan-time errors name the selector (regress-observable). Rust core:
+    SnapshotSelector enum (Id/Ts/Ref) + metadata refs map + resolve
+    (ts = latest snapshot <= ts; ref = refs map lookup); FFI takes
+    selector JSON instead of i64. catversion bumped (parsed trees in
+    rules). LIVE: 3 snapshots x 1000 rows — VERSION AS OF id -> 2000,
+    TIMESTAMP AS OF between snapshots -> 1000, TAG AS OF 'main' -> 3000,
+    pin wins over table option, stored view keeps pin, EXPLAIN pruning
+    within pinned snapshot. NEW regress group time_travel (deterministic:
+    parse validation, VALUES/setop/locking non-applicability, plain-table
+    no-op, rule round-trip via selector-named plan errors). 44 cargo
+    tests + 4 regress groups.
+    SPEC: 02-sql-surface.md §4 amended (implemented surface + LALR(1)
+    rationale, original sketch kept as Superseded); RULES §3 grammar
+    plumbing row added (kwlist/parse_clause/parse_relation/analyze/
+    parsenodes RTE field/catversion).
+  - **Next slices**: M1 conformance
     gate (Trino-written tables, TPC-DS subset, perf vs doc 10 §5) ->
     smoke ceremony -> M1 retro + tag milestone/m1.
 - Core-allowlist patches so far: meson_options.txt,
