@@ -14,3 +14,4 @@
 
 pub mod catalog;
 pub mod ffi;
+pub mod storage;
