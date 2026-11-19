@@ -20,6 +20,8 @@
 #include "access/htup_details.h"
 #include "fmgr.h"
 #include "commands/defrem.h"
+#include "commands/explain.h"
+#include "commands/explain_format.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
 #include "optimizer/planmain.h"
@@ -29,7 +31,9 @@
 #include "utils/lsyscache.h"
 #include "utils/fmgrprotos.h"
 #include "tcop/tcopprot.h"
+#include "executor/tuptable.h"
 #include "miscadmin.h"
+#include "nodes/nodes.h"
 #include "optimizer/optimizer.h"
 #include "utils/builtins.h"
 #include "utils/rel.h"
@@ -81,6 +85,8 @@ static void lakehouse_BeginForeignScan(ForeignScanState *node, int eflags);
 static TupleTableSlot *lakehouse_IterateForeignScan(ForeignScanState *node);
 static void lakehouse_ReScanForeignScan(ForeignScanState *node);
 static void lakehouse_EndForeignScan(ForeignScanState *node);
+static void lakehouse_ExplainForeignScan(ForeignScanState *node,
+										 ExplainState *es);
 
 PG_FUNCTION_INFO_V1(lakehouse_fdw_handler);
 
@@ -96,6 +102,7 @@ lakehouse_fdw_handler(PG_FUNCTION_ARGS)
 	routine->IterateForeignScan = lakehouse_IterateForeignScan;
 	routine->ReScanForeignScan = lakehouse_ReScanForeignScan;
 	routine->EndForeignScan = lakehouse_EndForeignScan;
+	routine->ExplainForeignScan = lakehouse_ExplainForeignScan;
 
 	PG_RETURN_POINTER(routine);
 }
@@ -238,9 +245,13 @@ lakehouse_GetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 						 List *tlist, List *scan_clauses, Plan *outer_plan)
 {
 	/* keep all quals local (no pushdown yet, doc 06 §4) */
+	/*
+	 * local quals go in qpqual so the executor filters returned rows
+	 * (pushdown to parquet predicates is a later slice, doc 06 s4)
+	 */
 	scan_clauses = extract_actual_clauses(scan_clauses, false);
-	return make_foreignscan(tlist, NIL, baserel->relid,
-							NIL, NIL, NIL, scan_clauses, outer_plan);
+	return make_foreignscan(tlist, scan_clauses, baserel->relid,
+							NIL, NIL, NIL, NIL, outer_plan);
 }
 
 static void
@@ -380,6 +391,36 @@ lakehouse_IterateForeignScan(ForeignScanState *node)
 		state->rows = NULL;
 		state->current_task++;
 	}
+}
+
+/*
+ * EXPLAIN visibility (00-goals #3, doc 01 §4): show what the scan will
+ * actually do — catalog endpoint, table identity, task count, rows.
+ */
+static void
+lakehouse_ExplainForeignScan(ForeignScanState *node, ExplainState *es)
+{
+	LakehouseExecState *state = (LakehouseExecState *) node->fdw_state;
+	uint64		rows = 0;
+
+	if (state == NULL)
+		return;
+	for (uint64 i = 0; i < state->task_count; i++)
+		rows += (uint64) pg_datalake_scan_task_rows(state->session, i);
+
+	ExplainPropertyText("Lakehouse table", state->opts.namespace[0]
+						? psprintf("%s.%s", state->opts.namespace,
+								   state->opts.table)
+						: state->opts.table, es);
+	ExplainPropertyText("Lakehouse endpoint", state->opts.endpoint, es);
+	ExplainPropertyInteger("Iceberg scan tasks", NULL,
+						   (int64) state->task_count, es);
+	ExplainPropertyInteger("Iceberg rows (parquet metadata)", NULL,
+						   (int64) rows, es);
+	ExplainPropertyText("Projection", state->projection_csv[0]
+						? state->projection_csv : "(all columns)", es);
+	ExplainPropertyText("Pushdown", "projection only; quals evaluated locally (M1)",
+						es);
 }
 
 static void
