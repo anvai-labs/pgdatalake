@@ -3,12 +3,13 @@
 Each milestone ends with the named acceptance gate; no milestone overlaps
 another's gate. Rough sizing assumes 1–2 engineers + this agent.
 
-## M0 — Repo & build foundation (days)
-- [ ] `main` mirrors upstream `master` (done: pushed 2026-11-19, `61f6021b110`)
-- [ ] Branch `lakehouse-dev` for integration work
-- [ ] Rust workspace `src/backend/access/lakehouse/core/` with empty `pgdatalake-core`
+## M0 — Repo & build foundation (days) — DONE 2026-11-19, tag `milestone/m0`
+- [x] `main` as fork base (upstream `master` at fork creation `61f6021b110`,
+      merge-synced with upstream per RULES §1 amendment)
+- [x] Branch `lakehouse-dev` for integration work
+- [x] Rust workspace `src/backend/access/lakehouse/core/` with empty `pgdatalake-core`
       crate, `cbindgen` header generation, meson feature `-Ddatalake=auto`
-- [ ] CI: build PG with feature on (ubuntu, cargo toolchain pinned), S3-compatible fixture (SeaweedFS, see doc 10) +
+- [x] CI: build PG with feature on (ubuntu, cargo toolchain pinned), S3-compatible fixture (SeaweedFS, see doc 10) +
       Lakekeeper docker-compose fixture
 - **Gate**: `meson setup build -Ddatalake=enabled && ninja && meson test --suite
   regress` green on CI (meson-only tree: autoconf `make check` cannot coexist
