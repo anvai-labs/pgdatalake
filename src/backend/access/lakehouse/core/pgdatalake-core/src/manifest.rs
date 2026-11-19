@@ -450,6 +450,10 @@ fn manifest_entry_from_value(v: &apache_avro::types::Value) -> Result<ManifestEn
             None | Some((_, V::Null)) => Ok(None),
             Some((_, V::Union(_, inner))) => match inner.as_ref() {
                 V::Null => Ok(None),
+                // single-int optional fields (sort_order_id): Trino writes
+                // Int inside the union; pyiceberg writes Array or Null
+                V::Int(i) => Ok(Some(vec![*i])),
+                V::Long(l) => Ok(Some(vec![*l as i32])),
                 V::Array(items) => {
                     // spec says int; pyiceberg writes long — accept promotion
                     let mut out = Vec::with_capacity(items.len());
@@ -471,6 +475,11 @@ fn manifest_entry_from_value(v: &apache_avro::types::Value) -> Result<ManifestEn
                 }
                 o => Err(StorageError::Decode(format!("{k}: {o:?}"))),
             },
+            // Trino writes optional-typed fields (sort_order_id etc.) with a
+            // PLAIN int schema and plain Int values — no union (M1 interop
+            // gate, Trino-written manifests)
+            Some((_, V::Int(i))) => Ok(Some(vec![*i])),
+            Some((_, V::Long(l))) => Ok(Some(vec![*l as i32])),
             o => Err(StorageError::Decode(format!("{k}: {o:?}"))),
         }
     };

@@ -191,6 +191,21 @@
     05-types.md §1; Trino/Spark-written fixed reads fine. PyIceberg
     table.delete() is COW (slice 20 note). 49 cargo tests + 4 regress
     groups.
+  - slice 22 Trino interop (M1 gate item DONE): trino service in
+    docker-compose (profile "trino", host port 18081 — 8080 is taken on
+    the dev host; config fixtures/trino-catalog.properties: REST catalog
+    over lakekeeper + native S3 filesystem). LIVE: Trino writes
+    day-partitioned trino_smoke.events (bigint/varchar/decimal/
+    timestamp/boolean), DELETEs id=2 via an MoR POSITION-DELETE file
+    (verified content=1 in $manifests); our FDW reads exactly ids {1,3}
+    — agreeing with Trino's own view — and FOR VERSION AS OF matches
+    Trino on every historical snapshot (Trino's two-phase commit writes
+    an empty first append snapshot; both engines read 0). INTEROP FIX:
+    Trino writes single-valued optional manifest fields as plain Int
+    inside the Avro union (sort_order_id hit it live) — manifest parser
+    accepts Int/Long singles in unions alongside pyiceberg's shapes.
+    SPEC: 10-testing.md §2 interop-gate status amended (outstanding:
+    Spark eq-deletes, Trino codec matrix, Trino-reads-our-writes at M2).
   - **Next slices**: M1 conformance
     gate (Trino-written tables, TPC-DS subset, perf vs doc 10 §5) ->
     smoke ceremony -> M1 retro + tag milestone/m1.

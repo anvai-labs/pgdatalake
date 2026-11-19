@@ -36,6 +36,21 @@ fixture* swapped. Revisit if Iceberg workloads hit SeaweedFS-specific gaps
   - We read a Spark-written table with eq-deletes.
   - We read a table written by Trino with zstd/lz4/gzip/snappy/none codecs.
 
+*(Slice 22 status, 2026-11-19.)* The **Trino writer fixture** is part of the
+compose stack now (`docker compose -p pgdatalake up -d trino`, profile
+`trino`, REST catalog over Lakekeeper; config in
+`fixtures/trino-catalog.properties`). Verified live for the M1 gate:
+Trino-written day-partitioned table (bigint/varchar/decimal/timestamp/
+boolean) reads correctly through the FDW **including Trino's MoR
+position-delete file** (Trino DELETE + our delete application agree with
+Trino's own counts), and snapshot time travel matches Trino's view of
+each historical snapshot. Interop fix required: Trino writes
+single-valued optional manifest fields (e.g. `sort_order_id`) as plain
+`Int` inside the Avro union — the manifest parser accepts that alongside
+pyiceberg's shapes. Outstanding gate variants: Spark-written eq-deletes
+(eq path is unit-covered), Trino codec matrix, and "Trino reads a table
+we wrote" (needs our M2 writer).
+
 ## 3. PostgreSQL regression suites
 
 - `src/test/regress/lakehouse/` — SQL/expected pairs (join iceberg vs heap,

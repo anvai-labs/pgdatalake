@@ -113,6 +113,28 @@ services:
     # NOTE: image is distroless (no sh/curl/wget) — no in-container healthcheck;
     # verify readiness via `curl http://localhost:8181/health` from the host.
 
+  # Trino writer for the interop gates (M1: "Trino reads a table we wrote" /
+  # "we read a Trino-written table"). One-shot exec service — start with
+  #   docker compose -p pgdatalake run --rm trino
+  # and drive it via `trino --server http://localhost:8080` in another shell,
+  # or keep it running with `up -d trino`. Profiles off by default so the
+  # regular fixture stack stays light.
+  trino:
+    image: trinodb/trino:latest
+    profiles: ["trino"]
+    depends_on:
+      lakekeeper:
+        condition: service_started
+    volumes:
+      - ./fixtures/trino-catalog.properties:/etc/trino/catalog/iceberg.properties:ro
+      - trino-data:/data
+    environment:
+      # fixture-stack JVM footprint
+      JAVA_TOOL_OPTIONS: "-Xmx1G"
+    ports:
+      - "18081:8080"
+
 volumes:
   s3-data:
   lakekeeper-db-data:
+  trino-data:
