@@ -44,9 +44,18 @@
     tokio(rt)/object_store(aws,http)/flate2/uuid/urlencoding; tiny_http +
     tempfile in dev-deps (unit tests use in-process mocks + local store —
     no network at unit-test time, doc 10 §1).
-  - **Next slices**: manifest-list/manifest Avro parsing (apache-avro dep) ->
-    scan planning (partition + metrics pruning) -> FFI boundary + FDW C glue
-    -> first `CREATE FOREIGN TABLE` SQL surface + regress tests.
+  - slice 5 manifest-list Avro reader (apache-avro dep; embedded writer
+    schema VALIDATED against required fields — doc 10 §4 fuzz hardening);
+  - slice 6 manifest data-file reader (entry status, delete-file content
+    types, column-stats maps by field id; partition opaque until pruning);
+  - slice 7 plan_scan() — snapshot selection -> manifest-list -> manifests
+    -> ScanTask list (DELETED dropped, sequence numbers resolved, row/file
+    aggregates); fully offline-tested via file:// fixtures;
+  - 27 cargo tests; apache-avro dep added.
+  - **Next slices**: partition-spec-aware pruning (resolve opaque partition
+    JSON + bounds predicates, doc 06 §2) -> FFI boundary (pg_datalake_* C
+    structs, panic-free, RULES §4) + FDW C glue -> first `CREATE FOREIGN
+    TABLE` SQL surface + regress tests -> EXPLAIN.
 - Core-allowlist patches so far: meson_options.txt,
   src/backend/access/meson.build, root Makefile (each committed with
   `[core-allowlist]` rationale).
