@@ -82,3 +82,58 @@ outside the table, stop and redesign — or raise it in a spec revision first.
 Material deviations from specs/iceberg require: update the doc, note the old
 decision as superseded with date and reason in a `## Superseded` section (never
 delete history of a decision), reference in the commit message.
+
+## 8. TDD discipline (mandatory, every feature/bugfix — no exceptions)
+
+The Red–Green–Clean loop is the unit of work. Religious observance:
+
+1. **RED** — write the failing test FIRST: a `src/test/regress/iceberg/*.sql`
+   + `.out` pair, an isolation test, a TAP test, or a `cargo test` case. Run it,
+   watch it fail, paste the failure into the commit branch notes.
+2. **GREEN** — the *minimum* implementation that makes it pass. No speculative
+   abstractions, no drive-by refactors.
+3. **CLEAN** — `pgindent` the C, `cargo fmt && cargo clippy -D warnings` the
+   Rust, re-run the full fast CI tier.
+4. **Commit rule**: test and implementation live in the SAME commit. A commit
+   that changes behavior without a test in the same diff does not get pushed to
+   `iceberg-dev`. Bug fixes get a test that reproduces the bug first.
+
+Exceptions (documented, not silent): build/bootstrap scaffolding (M0 meson
+files, docker fixtures) may ship without tests, but each milestone gate (§9)
+must close the coverage.
+
+## 9. Smoke-test ceremony (mandatory at EVERY release / milestone checkpoint)
+
+Nothing is "done" until this ceremony runs, in order, and its transcript is
+committed. It happens at each roadmap gate (M0–M5 in `12-roadmap.md`) and at
+every tagged release.
+
+1. **Cold-room smoke test** — from a FRESH clone, no warm caches:
+   - `git clone` the repo, check out the release/branch ref
+   - `make iceberg-up` (MinIO + Lakekeeper + Azurite + fake-gcs fixtures)
+   - `meson setup build -Diceberg=enabled && ninja`
+   - `make check` (upstream suite must stay 100% green — a fork that breaks
+     upstream behavior fails the smoke test even if iceberg tests pass)
+   - `make iceberg-check` + the milestone's conformance subset (`doc 10`)
+   - one MANUAL psql transcript per milestone's headline feature (M1: attach +
+     query a MinIO table; M2: CREATE USING iceberg + round-trip DML; …) —
+     humans see the feature work, not just CI.
+2. **Acceptance-gate audit** — walk the milestone's gate checklist from
+   `12-roadmap.md` item by item; each item gets PASS/FAIL with evidence
+   (command output, test counts, perf numbers vs the `doc 10 §5` gates).
+3. **Spec sync** — reconcile code vs `specs/iceberg/`: every deviation becomes
+   either a code fix or a §7 amendment in this checkpoint. Specs that say what
+   code doesn't do are treated as bugs.
+4. **Upstream drift check** — `git fetch upstream`, count new upstream commits,
+   note any that touch allowlist files (§3); record rebase risk for next cycle.
+5. **Tag & release notes** — tag `milestone/mN` (pre-M5) or `vX.Y.Z`
+   (releases); release notes MUST state: what works, known gaps, perf-gate
+   table, upstream base commit, and the smoke-test transcript hash.
+6. **Retrospective** — write `specs/iceberg/retro/mN.md`: decisions kept vs
+   superseded, core-allowlist patch count (target: never grows without a
+   §3 review), test counts, what the TDD loop caught late, process changes for
+   the next milestone. Commit all artifacts in one
+   `checkpoint(mN): smoke ceremony + retro` commit.
+
+Skipping any step voids the checkpoint: the milestone is not done, the release
+does not ship, and the next milestone does not start.
