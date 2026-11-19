@@ -83,11 +83,15 @@
     from targetlist+qual Vars + live BUG FIX: local quals were in the
     fdw_recheck_quals slot (never evaluated on plain scans — WHERE
     returned all rows); moved to qpqual, verified live (4/3000/2100).
-  - **Next slices**: qual->parquet predicate pushdown (bounds via manifest
-    lower/upper stats, doc 06 §4) -> parallel scans (task-parallel
-    ForeignScan parallel API) -> time travel (FOR TIMESTAMP/VERSION, doc
-    02 §4) -> M1 conformance gate (Trino-written tables, TPC-DS subset,
-    perf vs doc 10 §5).
+  - slice 14 bounds-based predicate pushdown: ScanPredicate Lt/Le/Gt/Ge
+    + bounds_keep() over manifest column stats (conservative: missing
+    bounds/ids/types always keep; field-id resolution via current
+    schema); plan_scan prunes partitions AND bounds.
+  - **Next slices**: FDW qual->predicate translation (parse executor
+    quals into ScanPredicate in C via the FFI seam, so WHERE actually
+    skips files) -> EXPLAIN shows pruned task counts -> parallel scans
+    (ForeignScan parallel API) -> time travel (FOR TIMESTAMP/VERSION,
+    doc 02 §4, allowlisted grammar patch) -> M1 conformance gate.
 - Core-allowlist patches so far: meson_options.txt,
   src/backend/access/meson.build, root Makefile (each committed with
   `[core-allowlist]` rationale).
