@@ -35,6 +35,9 @@
 #include "tcop/tcopprot.h"
 #include "executor/tuptable.h"
 #include "miscadmin.h"
+#include "access/parallel.h"
+#include "port/atomics.h"
+#include "utils/injection_point.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/nodes.h"
 #include "optimizer/optimizer.h"
@@ -58,11 +61,23 @@ typedef struct LakehouseOptions
 	char	   *predicate_json; /* translated quals (slice 15) */
 }			LakehouseOptions;
 
+/* shared task-claim counter for parallel scans (slice 17) */
+typedef struct LakehouseShared
+{
+	pg_atomic_uint64 next_task;
+}			LakehouseShared;
+
+/* process-local pointer to the parallel shared state (set by the DSM
+ * hooks; NULL in serial plans). One foreign scan per query is an M1
+ * limitation, documented in the retro. */
+static LakehouseShared *lakehouse_shared_state = NULL;
+
 /* per-executor-node state */
 typedef struct LakehouseExecState
 {
 	LakehouseOptions opts;
 	char	   *predicate_json; /* translated quals (slice 15) */
+	bool		parallel;		/* running as a parallel worker (slice 17) */
 	ScanSession *session;
 	RowsHandle *rows;
 	uint64		current_task;
@@ -91,6 +106,17 @@ static void lakehouse_BeginForeignScan(ForeignScanState *node, int eflags);
 static TupleTableSlot *lakehouse_IterateForeignScan(ForeignScanState *node);
 static void lakehouse_ReScanForeignScan(ForeignScanState *node);
 static void lakehouse_EndForeignScan(ForeignScanState *node);
+static Size lakehouse_EstimateDSMForeignScan(ForeignScanState *node,
+											 ParallelContext *pcxt);
+static void lakehouse_InitializeDSMForeignScan(ForeignScanState *node,
+											   ParallelContext *pcxt,
+											   void *coordinate);
+static void lakehouse_InitializeWorkerForeignScan(ForeignScanState *node,
+												  shm_toc *toc,
+												  void *coordinate);
+static void lakehouse_ShutdownForeignScan(ForeignScanState *node);
+static bool lakehouse_IsForeignScanParallelSafe(PlannerInfo *root,
+												RelOptInfo *baserel, RangeTblEntry *rte);
 static void lakehouse_ExplainForeignScan(ForeignScanState *node,
 										 ExplainState *es);
 
@@ -109,6 +135,18 @@ lakehouse_fdw_handler(PG_FUNCTION_ARGS)
 	routine->ReScanForeignScan = lakehouse_ReScanForeignScan;
 	routine->EndForeignScan = lakehouse_EndForeignScan;
 	routine->ExplainForeignScan = lakehouse_ExplainForeignScan;
+	routine->EstimateDSMForeignScan = lakehouse_EstimateDSMForeignScan;
+	routine->InitializeDSMForeignScan = lakehouse_InitializeDSMForeignScan;
+	routine->ReInitializeDSMForeignScan = lakehouse_InitializeDSMForeignScan;
+	routine->InitializeWorkerForeignScan = lakehouse_InitializeWorkerForeignScan;
+	routine->ShutdownForeignScan = lakehouse_ShutdownForeignScan;
+	/*
+	 * Our reader is process-local (no shared connections), so every
+	 * foreign-table scan is parallel safe (slice 17, doc 06 §3). Without
+	 * this hook the planner disables parallel paths for foreign tables
+	 * entirely (allpaths.c set_rel_size).
+	 */
+	routine->IsForeignScanParallelSafe = lakehouse_IsForeignScanParallelSafe;
 
 	PG_RETURN_POINTER(routine);
 }
@@ -244,6 +282,24 @@ lakehouse_GetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
 								   10.0 * baserel->rows * cpu_operator_cost,
 								   NIL, NULL, NULL, NIL, NIL);
 	add_path(baserel, &path->path);
+
+	/*
+	 * Partial path for parallel scans (slice 17, doc 06 §3): tasks are
+	 * claimed atomically from shared state, so workers divide the task
+	 * list dynamically. Two workers M1 default; tune via GUC later.
+	 */
+	ForeignPath *partial;
+
+	partial = create_foreignscan_path(root, baserel, NULL,
+									  baserel->rows, 0,
+									  0.0,
+									  (10.0 * baserel->pages +
+									   10.0 * baserel->rows * cpu_operator_cost) / 2.0,
+									  NIL, NULL, NULL, NIL, NIL);
+	partial->path.parallel_workers = 2;
+	/* parallel_aware: workers get the DSM hook and claim tasks atomically */
+	partial->path.parallel_aware = true;
+	add_partial_path(baserel, &partial->path);
 }
 
 /*
@@ -503,6 +559,7 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 	 * slice 15: translated-quals JSON rides in fdw_private (plan -> executor)
 	 * as a single makeString element.
 	 */
+	state->parallel = IsParallelWorker();
 	if (node->ss.ps.plan != NIL)
 	{
 		ForeignScan *fscan = (ForeignScan *) node->ss.ps.plan;
@@ -551,7 +608,18 @@ lakehouse_IterateForeignScan(ForeignScanState *node)
 			char		errbuf[1024];
 			const char *file;
 
-			if (state->current_task >= state->task_count)
+			if (lakehouse_shared_state != NULL)
+			{
+				/* parallel: atomically claim the next task (slice 17) */
+				uint64		claimed =
+					pg_atomic_fetch_add_u64(&lakehouse_shared_state->next_task,
+											1);
+
+				if (claimed >= state->task_count)
+					return ExecClearTuple(slot);
+				state->current_task = claimed;
+			}
+			else if (state->current_task >= state->task_count)
 				return ExecClearTuple(slot);
 
 			errbuf[0] = '\0';
@@ -670,6 +738,47 @@ lakehouse_ReScanForeignScan(ForeignScanState *node)
 	state->session = OpenSession(&state->opts);
 	state->task_count = pg_datalake_scan_task_count(state->session);
 	state->current_task = 0;
+}
+
+static bool
+lakehouse_IsForeignScanParallelSafe(PlannerInfo *root, RelOptInfo *baserel,
+									RangeTblEntry *rte)
+{
+	/* process-local reads over object storage: always safe (doc 06 §3) */
+	return true;
+}
+
+static Size
+lakehouse_EstimateDSMForeignScan(ForeignScanState *node, ParallelContext *pcxt)
+{
+	return sizeof(LakehouseShared);
+}
+
+static void
+lakehouse_InitializeDSMForeignScan(ForeignScanState *node,
+								   ParallelContext *pcxt, void *coordinate)
+{
+	LakehouseShared *shared = (LakehouseShared *) coordinate;
+
+	pg_atomic_init_u64(&shared->next_task, 0);
+	lakehouse_shared_state = shared;
+}
+
+static void
+lakehouse_InitializeWorkerForeignScan(ForeignScanState *node, shm_toc *toc,
+									  void *coordinate)
+{
+	LakehouseShared *shared = (LakehouseShared *) coordinate;
+
+	/* runs BEFORE Begin in workers; Iterate picks this up lazily */
+	lakehouse_shared_state = shared;
+}
+
+static void
+lakehouse_ShutdownForeignScan(ForeignScanState *node)
+{
+	/* process-local pointer; each worker's copy dies with the process */
+	lakehouse_shared_state = NULL;
 }
 
 static void
