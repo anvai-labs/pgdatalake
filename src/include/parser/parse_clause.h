@@ -17,6 +17,7 @@
 #include "parser/parse_node.h"
 
 extern void transformFromClause(ParseState *pstate, List *frmList);
+extern void applyLakehouseTimeTravel(ParseState *pstate, List *locking_clause);
 extern int	setTargetTable(ParseState *pstate, RangeVar *relation,
 						   bool inh, bool alsoSource, AclMode requiredPerms);
 

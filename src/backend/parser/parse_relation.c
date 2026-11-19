@@ -2696,7 +2696,12 @@ isLockedRefname(ParseState *pstate, const char *refname)
 
 	foreach(l, pstate->p_locking_clause)
 	{
-		LockingClause *lc = (LockingClause *) lfirst(l);
+		LockingClause *lc;
+
+		/* lakehouse time travel pins are DefElems, not row locks (slice 19) */
+		if (!IsA(lfirst(l), LockingClause))
+			continue;
+		lc = (LockingClause *) lfirst(l);
 
 		if (lc->lockedRels == NIL)
 		{

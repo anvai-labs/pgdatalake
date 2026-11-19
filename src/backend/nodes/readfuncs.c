@@ -439,6 +439,8 @@ _readRangeTblEntry(ReadNodeContext *ctx)
 	READ_BOOL_FIELD(inFromCl);
 	READ_NODE_FIELD(securityQuals);
 
+	READ_STRING_FIELD(lakehouse_snapshot);
+
 	READ_DONE();
 }
 
