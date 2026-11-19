@@ -40,3 +40,25 @@ fi
 # 3. Smoke the catalog config endpoint the way the Rust client calls it.
 curl -sf "$LK/catalog/v1/config?warehouse=$WH_NAME" > /dev/null
 echo "lakekeeper: bootstrapped, warehouse '$WH_NAME' ready, /v1/config OK"
+
+# 4. Fixture table analytics.events (idempotent: exists tolerated) —
+# used by slice-3 verification (`cargo run --example fetch_config`).
+PREFIX=$(curl -sf "$LK/catalog/v1/config?warehouse=$WH_NAME" | python3 -c "import json,sys; print(json.load(sys.stdin)['defaults']['prefix'])")
+curl -sf -X POST "$LK/catalog/v1/$PREFIX/namespaces" \
+  -H 'Content-Type: application/json' \
+  -d '{"namespace": ["analytics"]}' > /dev/null 2>&1 || true
+CODE=$(curl -s -o /tmp/lk-tbl-create.json -w '%{http_code}' -X POST \
+  "$LK/catalog/v1/$PREFIX/namespaces/analytics/tables" \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "events", "schema": {"type": "struct", "schema-id": 0,
+       "identifier-field-ids": [1], "fields": [
+         {"id": 1, "name": "id", "required": true, "type": "long"},
+         {"id": 2, "name": "at", "required": false, "type": "timestamptz"}]},
+       "properties": {}}')
+if [ "$CODE" = 200 ] || [ "$CODE" = 409 ]; then
+  echo "lakekeeper: table analytics.events ready (HTTP $CODE)"
+else
+  cat /tmp/lk-tbl-create.json 2>/dev/null; echo
+  echo "lakekeeper-setup: table creation failed (HTTP $CODE)" >&2
+  exit 1
+fi

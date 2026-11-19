@@ -59,3 +59,17 @@ mod tests {
         assert!(cfg.overrides.is_empty());
     }
 }
+
+/// Response of loadTable (Iceberg REST spec `LoadTableResult`).
+/// `metadata` is the deprecated in-band metadata field; when a server
+/// includes it we parse it eagerly (v3-first model) — otherwise the caller
+/// fetches `metadata_location` over file IO.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoadTableResult {
+    #[serde(rename = "metadata-location")]
+    pub metadata_location: String,
+    #[serde(default)]
+    pub config: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub metadata: Option<crate::catalog::metadata::TableMetadata>,
+}

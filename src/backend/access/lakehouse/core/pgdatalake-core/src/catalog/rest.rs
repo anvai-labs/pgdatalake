@@ -29,6 +29,9 @@ pub struct RestCatalog {
     endpoint: String,
     tokens: Box<dyn TokenProvider>,
     inner: reqwest::blocking::Client,
+    /// Table-route prefix from the config response (`overrides.prefix` in
+    /// the Iceberg REST spec); set via with_prefix() or fetch_config().
+    prefix: std::sync::Mutex<Option<String>>,
 }
 
 /// Wire type for the config response; alias to the domain type.
@@ -43,6 +46,9 @@ struct ConfigWire {
 #[derive(Debug)]
 pub enum RestError {
     Http(String),
+    /// 404 from loadTable/dropTable etc. — distinct because the caller can
+    /// react (doc 03 §5: remote table deleted under us → rel invalid).
+    NotFound(String),
     Decode(String),
 }
 
@@ -50,6 +56,7 @@ impl std::fmt::Display for RestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RestError::Http(m) => write!(f, "REST catalog HTTP error: {m}"),
+            RestError::NotFound(m) => write!(f, "REST catalog object not found: {m}"),
             RestError::Decode(m) => write!(f, "REST catalog decode error: {m}"),
         }
     }
@@ -66,7 +73,55 @@ impl RestCatalog {
                 .timeout(Duration::from_secs(30))
                 .build()
                 .map_err(|e| RestError::Http(e.to_string()))?,
+            prefix: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Set the table-route prefix explicitly (normally stored automatically
+    /// by fetch_config from the response's `overrides.prefix`).
+    pub fn with_prefix(self, prefix: &str) -> Self {
+        *self.prefix.lock().expect("prefix mutex poisoned") = Some(prefix.to_string());
+        self
+    }
+
+    /// `GET /v1/{prefix}/namespaces/{ns}/tables/{table}` — loadTable
+    /// (doc 03 §2). Namespace levels are URL-encoded and joined by %1F per
+    /// the Iceberg REST spec; the table name is URL-encoded too. Uses the
+    /// stored prefix when present.
+    pub fn load_table(
+        &self,
+        namespace: &[&str],
+        table: &str,
+    ) -> Result<super::types::LoadTableResult, RestError> {
+        let prefix = self.prefix.lock().expect("prefix mutex poisoned").clone();
+        let ns = namespace
+            .iter()
+            .map(|c| urlencoding::encode(c))
+            .collect::<Vec<_>>()
+            .join("%1F");
+        // branch/snapshot pinning via query params lands with time travel (doc 02 §4)
+        let url = format!(
+            "{}/v1{}/namespaces/{ns}/tables/{}",
+            self.endpoint,
+            prefix.as_ref().map(|p| format!("/{p}")).unwrap_or_default(),
+            urlencoding::encode(table),
+        );
+        let resp = self
+            .inner
+            .get(&url)
+            .bearer_auth(self.tokens.token())
+            .send()
+            .map_err(|e| RestError::Http(e.to_string()))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(RestError::NotFound(format!("GET {url} -> {status}")));
+        }
+        if !status.is_success() {
+            return Err(RestError::Http(format!("GET {url} -> {status}")));
+        }
+        let wire: super::types::LoadTableResult =
+            resp.json().map_err(|e| RestError::Decode(e.to_string()))?;
+        Ok(wire)
     }
 
     /// `GET /v1/config` — server capabilities and config defaults/overrides.
@@ -90,10 +145,20 @@ impl RestCatalog {
             return Err(RestError::Http(format!("GET {url} -> {status}")));
         }
         let wire: ConfigWire = resp.json().map_err(|e| RestError::Decode(e.to_string()))?;
-        Ok(CatalogConfig {
+        let cfg = CatalogConfig {
             defaults: wire.defaults,
             overrides: wire.overrides,
-        })
+        };
+        // Effective config = defaults overlaid by overrides (doc 03 §2 merge
+        // order: overrides > table properties > defaults > client). Table
+        // properties and client settings are applied by later layers; the
+        // table-route prefix resolves from the merged server view.
+        let mut effective = cfg.defaults.clone();
+        effective.extend(cfg.overrides.clone());
+        if let Some(prefix) = effective.get("prefix") {
+            *self.prefix.lock().expect("prefix mutex poisoned") = Some(prefix.clone());
+        }
+        Ok(cfg)
     }
 }
 
@@ -181,6 +246,77 @@ mod tests {
             "/v1/config?warehouse=analytics%2Feu%20table"
         );
         assert!(cfg.defaults.is_empty());
+    }
+
+    /// loadTable (doc 03 §2): GET /v1/{prefix}/namespaces/{ns}/tables/{tbl}
+    /// with namespace levels joined by %1F and components URL-encoded; the
+    /// catalog prefix comes from the config response (fetch_config stores it).
+    #[test]
+    fn load_table_builds_spec_path_and_parses_result() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let url_seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+
+        let server_thread = {
+            let url_seen = std::sync::Arc::clone(&url_seen);
+            std::thread::spawn(move || {
+                let req = server.recv().unwrap();
+                *url_seen.lock().unwrap() = req.url().to_string();
+                let body = r#"{
+                    "metadata-location": "s3://warehouse/analytics/events/metadata/00001-abc.metadata.json",
+                    "config": {"s3.endpoint": "http://s3:9000"}
+                }"#;
+                let resp = tiny_http::Response::from_string(body).with_header(
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                        .unwrap(),
+                );
+                let _ = req.respond(resp);
+            })
+        };
+
+        let catalog =
+            RestCatalog::new(&format!("http://{addr}"), Box::new(StaticToken("t".into())))
+                .unwrap()
+                .with_prefix("01a1f4b1-b095-7361");
+        let lt = catalog
+            .load_table(&["analytics", "eu"], "events 2026")
+            .expect("load_table");
+
+        server_thread.join().unwrap();
+        assert_eq!(
+            *url_seen.lock().unwrap(),
+            "/v1/01a1f4b1-b095-7361/namespaces/analytics%1Feu/tables/events%202026"
+        );
+        assert_eq!(
+            lt.metadata_location,
+            "s3://warehouse/analytics/events/metadata/00001-abc.metadata.json"
+        );
+        assert_eq!(
+            lt.config.get("s3.endpoint").map(String::as_str),
+            Some("http://s3:9000")
+        );
+    }
+
+    /// A remote-dropped table (404, doc 03 §5) is a distinct error so the
+    /// caller can mark the rel invalid instead of surfacing a generic error.
+    #[test]
+    fn load_table_404_is_not_found() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let server_thread = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            let resp = tiny_http::Response::from_string(
+                r#"{"error": {"message": "table not found", "type": "NoSuchTableException"}}"#,
+            )
+            .with_status_code(404);
+            let _ = req.respond(resp);
+        });
+
+        let catalog =
+            RestCatalog::new(&format!("http://{addr}"), Box::new(StaticToken("t".into()))).unwrap();
+        let err = catalog.load_table(&["ns"], "gone").unwrap_err();
+        server_thread.join().unwrap();
+        assert!(matches!(err, RestError::NotFound(_)), "{err}");
     }
 
     /// Non-2xx responses surface as Http errors with the status code.
