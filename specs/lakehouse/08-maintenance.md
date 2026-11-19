@@ -55,52 +55,88 @@ date range; an identity-partitioned rewrite pruned 18,230 of 18,240 files.
 Layout is metadata, not physics — Iceberg partition values live in manifest
 entries, so re-layouting is just a rewrite + snapshot commit.)*
 
-Two surfaces on top of `rewrite_data_files`:
+`lakehouse.optimize` is the **orchestrator**: one call figures out on its own
+what the table needs — vacuum-level cleanup, compaction, and re-layout —
+following the HBase minor/major compaction model:
+
+| Tier | Scope | What it runs | Interference |
+|---|---|---|---|
+| **minor** | recently-changed files only (small files, files carrying delete files/DVs) | bin-pack compaction + delete application in place | none — readers keep their pinned snapshot; concurrent writers only race at commit (optimistic, doc 07 retry) |
+| **major** | entire table | full re-layout: partition spec change + zorder/sort rewrite (the `analyze_layout` suggestion) + delete application + small-file packing | advisory lock between optimizers; run in maintenance windows; readers still unblocked (snapshot isolation), writers may retry |
+
+**Why no full-table lock**: snapshot isolation already gives better-than-lock
+semantics — a rewrite commits a NEW snapshot and never mutates data a reader
+is reading, so the only contention point is the final optimistic commit
+(requirements + retry, doc 07). Locking the table for a multi-hour COW would
+block writers for its whole duration to protect a microsecond commit.
+`optimize` takes a `pg_advisory_lock` on the table OID for the *duration of
+optimization* so two optimizers never race, and passes
+`AssertRefSnapshotId`-style requirements so a concurrent DML commit fails
+the optimizer's final commit into a bounded retry, never lost data.
+Snapshot expiry (destructive to time travel) is NOT part of `optimize` by
+default — the orchestrator reports expired-snapshot candidates and only
+expires when the caller passes retention arguments.
 
 ```sql
--- Analysis (read-only): score the current layout, propose a better one
-SELECT * FROM lakehouse.analyze_layout('public.store_sales');
--- per column: cardinality, null_ratio, skew (z-score of value histogram),
--- entropy, and "layout correlation" — how well the column's value range
--- aligns with current file boundaries (i.e. how prunable it already is);
--- plus observed predicate frequencies when pg_stat_statements is loaded.
--- suggestions column proposes: partition spec (identity for
--- low-cardinality columns, temporal transforms by value spread, bucket[N]
--- for high-cardinality join keys, truncate[L] for strings), sort order
--- (zorder over the top-k correlated columns), target file size, and the
--- estimated pruning ratio under the observed predicate mix.
-
--- One-shot application (user-directed; dry_run reports the plan only)
+-- Three modes, one entry point (mode => 'analyze' | 'plan' | 'exec'):
+--
+-- 'analyze' — read-only statistics pass: per-column cardinality, null
+--   ratio, skew (z-score of histogram), entropy, layout correlation
+--   (how well value ranges align with current file boundaries), file
+--   size/delete-ratio profile. No recommendations attached.
+--
+-- 'plan' — the dry run: runs the analysis pass, then recommends the
+--   full maintenance plan, chosen from measured data — not fixed
+--   heuristics:
+SELECT * FROM lakehouse.optimize('public.store_sales', mode => 'plan');
+--   tier            minor|major            (from small-file ratio, delete
+--                                           ratio, layout score)
+--   actions         [apply_deletes, binpack, repartition, zorder]
+--   partition_by    suggested transforms per column (identity for
+--                   low-cardinality, temporal by value spread, bucket[N]
+--                   for high-cardinality join keys, truncate[L] for strings)
+--   sort_by         zorder over top-k columns ranked by
+--                   predicate-frequency × pruning selectivity ×
+--                   cardinality-below-explosion-limit, with skew/entropy
+--                   flags
+--   estimated_gain  files examined→tasks ratio, bytes-after (encoding
+--                   win), est. duration; partition count capped by
+--                   lakehouse.optimize_max_partitions (default 10k)
+--
+-- 'exec' — apply: runs the same plan for real (or the explicitly given
+--   parameters), reporting bytes-before/after and files examined→tasks
+--   so every claim the plan made is observable afterward.
+SELECT lakehouse.optimize('public.store_sales', mode => 'exec');
+-- Explicit control stays available; strategy => 'auto' defers to the
+-- planner; mode => 'plan' output can be fed back verbatim as arguments.
 SELECT lakehouse.optimize('public.store_sales',
-         partition_by => ARRAY['day(ss_sold_date_sk)'],   -- transform syntax
+         mode => 'exec',
+         tier => 'major',
+         partition_by => ARRAY['day(ss_sold_date_sk)'],
          sort_by      => ARRAY['zorder(ss_store_sk, ss_item_sk)'],
-         strategy     => 'auto',      -- | 'binpack' | 'sort' | 'zorder'
-         dry_run      => true);
+         strategy     => 'auto');
+-- 'analyze' is also exposed standalone for dashboards:
+SELECT * FROM lakehouse.analyze_layout('public.store_sales');
 ```
 
 Design rules:
 
 - **Everything rides on Iceberg-native machinery**: the chosen partition
   spec and sort order are table metadata (`partition-specs` /
-  `sort-orders`), and the re-layout is a COW rewrite committed as a new
+  `sort-orders`), and every tier is a COW rewrite committed as a new
   snapshot (M2 write path + maintenance worker). No core changes.
 - **Encoding efficiency is a side effect of clustering, not a separate
   pass**: sorting/z-ordering concentrates similar values, so parquet
   RLE/dictionary/delta encodings compress tighter AND row-group-level
   min/max stats become discriminating (row-group pruning on top of
-  file pruning). `optimize` reports bytes-before/after so the win is
-  observable.
-- **Statistical scoring, not heuristics alone**: `analyze_layout` ranks
-  candidate columns by (observed predicate frequency) × (pruning
-  selectivity at file granularity) × (cardinality below the
-  partition-explosion limit), with skew/entropy flags for sort candidates.
-  Partition count per action is capped (`lakehouse.optimize_max_partitions`,
-  default 10,000) to avoid small-file explosion.
+  file pruning). Minor optimize gets this within rewritten files; major
+  optimize gets it table-wide.
 - **Automatic mode is a policy, not magic**: `lakehouse.optimize_auto =
-  off` by default. When on, the maintenance worker (§1 triggers) runs
-  `analyze_layout` after compaction and applies suggestions whose
-  estimated pruning ratio exceeds `lakehouse.optimize_auto_min_gain`
-  (default 10× files examined → tasks), during low-traffic windows only.
+  off` by default. When on, the maintenance worker (§1 triggers) runs the
+  dry-run plan after compaction and applies minor tier automatically;
+  major tier applies only when the estimated pruning ratio exceeds
+  `lakehouse.optimize_auto_min_gain` (default 10× files examined →
+  tasks), during low-traffic windows only.
 
 ## 3. Safety rules
 
