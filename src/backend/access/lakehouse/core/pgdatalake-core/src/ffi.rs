@@ -100,6 +100,7 @@ pub unsafe extern "C" fn pg_datalake_scan_new(
     s3_access_key: *const c_char,
     s3_secret_key: *const c_char,
     predicate_json: *const c_char,
+    snapshot_id: i64,
     err_buf: *mut c_char,
     err_len: usize,
 ) -> *mut ScanSession {
@@ -128,8 +129,14 @@ pub unsafe extern "C" fn pg_datalake_scan_new(
         let client =
             CatalogClient::new(&endpoint, &warehouse, &token, &s3).map_err(|e| e.to_string())?;
         let ns_levels: Vec<&str> = namespace.split('.').collect();
+        // snapshot_id 0 = current snapshot (time travel: slice 18)
+        let snapshot_id = if snapshot_id > 0 {
+            Some(snapshot_id)
+        } else {
+            None
+        };
         client
-            .scan_table(&ns_levels, &table, predicate.as_ref())
+            .scan_table(&ns_levels, &table, predicate.as_ref(), snapshot_id)
             .map(|(p, s3)| ScanSession::from_plan(p, s3))
             .map_err(|e| e.to_string())
     });
@@ -655,6 +662,7 @@ mod tests {
                 std::ptr::null(),
                 std::ptr::null(),
                 std::ptr::null(),
+                0,
                 err.as_mut_ptr(),
                 err.len(),
             )
@@ -687,6 +695,7 @@ mod tests {
                 std::ptr::null(),
                 std::ptr::null(),
                 pred.as_ptr(),
+                0,
                 err.as_mut_ptr(),
                 err.len(),
             )
@@ -713,6 +722,7 @@ mod tests {
                 std::ptr::null(),
                 std::ptr::null(),
                 std::ptr::null(),
+                0,
                 err.as_mut_ptr(),
                 err.len(),
             )

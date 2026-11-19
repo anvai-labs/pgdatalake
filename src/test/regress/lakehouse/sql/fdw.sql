@@ -53,6 +53,17 @@ JOIN pg_class c ON c.oid = f.ftrelid
 JOIN pg_foreign_server fs ON fs.oid = f.ftserver
 WHERE c.relname = 'lakehouse_ft';
 
+-- slice 18: snapshot_id pin option is accepted at DDL time (live pinning
+-- verified against fixtures; regress keeps it deterministic)
+CREATE FOREIGN TABLE lakehouse_ft_pinned (
+    id bigint
+) SERVER smoke_server
+    OPTIONS (table 'ns.tbl', snapshot_id '8900085420583981988');
+SELECT f.ftoptions FROM pg_foreign_table f
+JOIN pg_class c ON c.oid = f.ftrelid
+WHERE c.relname = 'lakehouse_ft_pinned';
+DROP FOREIGN TABLE lakehouse_ft_pinned;
+
 DROP FOREIGN TABLE lakehouse_ft;
 DROP SERVER smoke_server;
 DROP FOREIGN DATA WRAPPER lakehouse_wrapper;

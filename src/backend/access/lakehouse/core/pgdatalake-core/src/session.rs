@@ -93,6 +93,7 @@ impl CatalogClient {
         namespace: &[&str],
         table: &str,
         predicate: Option<&ScanPredicate>,
+        snapshot_id: Option<i64>,
     ) -> Result<(ScanPlan, S3Options), crate::storage::StorageError> {
         let cfg = self
             .rest
@@ -106,7 +107,7 @@ impl CatalogClient {
         let s3 = self.s3_client.merged(&cfg);
         let (io, key) = crate::scan::open_for(&lt.metadata_location, Some(&s3))?;
         let md = fetch_metadata(&io, &key)?;
-        let plan = crate::scan::plan_scan(&md, None, Some(&s3), predicate)?;
+        let plan = crate::scan::plan_scan(&md, snapshot_id, Some(&s3), predicate)?;
         Ok((plan, s3))
     }
 }
@@ -189,7 +190,7 @@ mod tests {
         )
         .unwrap();
         let (plan, _s3) = client
-            .scan_table(&["analytics"], "events", None)
+            .scan_table(&["analytics"], "events", None, None)
             .expect("scan");
         assert_eq!(plan.snapshot_id, 42);
         assert_eq!(plan.tasks.len(), 0, "fresh table: empty manifest list");
@@ -206,7 +207,7 @@ mod tests {
             &S3ClientOptions::default(),
         )
         .unwrap();
-        let err = client.scan_table(&["ns"], "t", None).unwrap_err();
+        let err = client.scan_table(&["ns"], "t", None, None).unwrap_err();
         assert!(!err.to_string().is_empty());
     }
 }

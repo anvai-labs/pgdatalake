@@ -59,6 +59,7 @@ typedef struct LakehouseOptions
 	char	   *s3_access_key;
 	char	   *s3_secret_key;
 	char	   *predicate_json; /* translated quals (slice 15) */
+	char	   *snapshot_id;	/* time travel pin (slice 18); NULL = current */
 }			LakehouseOptions;
 
 /* shared task-claim counter for parallel scans (slice 17) */
@@ -184,6 +185,8 @@ ExtractOptions(Oid foreigntableid, LakehouseOptions * opts)
 			opts->s3_access_key = defGetString(def);
 		else if (strcmp(def->defname, "s3_secret_key") == 0)
 			opts->s3_secret_key = defGetString(def);
+		else if (strcmp(def->defname, "snapshot_id") == 0)
+			opts->snapshot_id = defGetString(def);
 	}
 	foreach(lc, table->options)
 	{
@@ -197,6 +200,8 @@ ExtractOptions(Oid foreigntableid, LakehouseOptions * opts)
 			opts->s3_access_key = defGetString(def);
 		else if (strcmp(def->defname, "s3_secret_key") == 0)
 			opts->s3_secret_key = defGetString(def);
+		else if (strcmp(def->defname, "snapshot_id") == 0)
+			opts->snapshot_id = defGetString(def);
 	}
 	if (table_opt == NULL)
 		ereport(ERROR,
@@ -235,6 +240,7 @@ OpenSession(LakehouseOptions * opts)
 								   opts->s3_access_key,
 								   opts->s3_secret_key,
 								   opts->predicate_json ? opts->predicate_json : "",
+								   opts->snapshot_id ? pg_strtoint64(opts->snapshot_id) : 0,
 								   errbuf,
 								   sizeof(errbuf));
 	if (session == NULL)
