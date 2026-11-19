@@ -20,18 +20,33 @@
   views `pg_lakehouse`, GUCs `lakehouse.*`, SQLSTATE `LD0`, meson
   `-Ddatalake=auto`, branch/tests/fixtures/make-targets all `lakehouse*`.
   Iceberg is a FORMAT layer, not the product name. Don't relitigate.
-- **M0 done (see 12-roadmap.md M0 + retro/m0.md)**:
-  - meson feature `-Ddatalake`, `src/backend/access/lakehouse/` (Rust core +
-    C glue + `lakehouse` extension with `lakehouse.version()`).
-  - meson-only build (autoconf tree is distcleaned; `make check` = upstream
-    regress suite via `meson test --suite regress`; both builds can't coexist
-    in one source tree).
-  - TDD'd regress test `src/test/regress/lakehouse/` + cargo test; upstream
-    regress suite 243/243 green under meson.
-  - docker fixtures `src/test/lakehouse/docker-compose.yml` (SeaweedFS S3, Lakekeeper,
-    Azurite, fake-gcs; fake creds). `make lakehouse-up/down`.
-  - CI `.github/workflows/datalake-ci.yml` (additive; upstream pg-ci.yml
-    untouched).
+- **M0 done 2026-11-19** — tag `milestone/m0`, GitHub release, cold-room gate
+  ALL GREEN (transcript `retro/m0-smoke-transcript.txt`, retro `retro/m0.md`).
+  Upstream regress 243/243 under `meson test --suite regress` (meson-only
+  tree; autoconf `make check` = legacy escape hatch, see RULES §9 amendment).
+- **M1 in progress** (REST client + read path, all TDD, live-verified vs the
+  Lakekeeper + SeaweedFS fixture stack):
+  - slice 1 `GET /v1/config` (+ `?warehouse=` — Lakekeeper requires it);
+  - slice 2 OAuth2 client-credentials, cached, proactive refresh at 80% TTL;
+  - slice 3 `loadTable` + **v3-first** metadata model (FormatVersion enum
+    rejects v1; v3 types — unknown/timestamp_ns/variant + snapshot
+    sequence-number/first-row-id — are first-class; v2 parses same model).
+    Namespace `%1F` joins, prefix auto-stored from merged config view
+    (Lakekeeper puts prefix in **defaults**), 404 -> `RestError::NotFound`;
+  - slice 4 object-store IO: `Location` (s3:// full bucket keys, file://
+    rooted local), `StorageIo` over object_store (aws+http), gzip decode
+    for `.gz.metadata.json`, blocking over internal tokio current-thread rt.
+  - live example: `cargo run --example fetch_config` walks config ->
+    loadTable -> S3 fetch -> gzip -> parse (fixture: Lakekeeper `smoke`
+    warehouse, table `analytics.events` — both created idempotently by
+    `lakekeeper-setup.sh`, wired into `make lakehouse-up`).
+  - 22 cargo unit tests; deps: serde/serde_json/reqwest(rustls,blocking)/
+    tokio(rt)/object_store(aws,http)/flate2/uuid/urlencoding; tiny_http +
+    tempfile in dev-deps (unit tests use in-process mocks + local store —
+    no network at unit-test time, doc 10 §1).
+  - **Next slices**: manifest-list/manifest Avro parsing (apache-avro dep) ->
+    scan planning (partition + metrics pruning) -> FFI boundary + FDW C glue
+    -> first `CREATE FOREIGN TABLE` SQL surface + regress tests.
 - Core-allowlist patches so far: meson_options.txt,
   src/backend/access/meson.build, root Makefile (each committed with
   `[core-allowlist]` rationale).
