@@ -118,12 +118,41 @@
     scan_new(snapshot_id) -> plan_scan snapshot selection. LIVE:
     table pinned to first pyiceberg snapshot reads 1000 rows while
     current reads 3000 — time-separated reads verified.
-  - **Next slices**: FOR TIMESTAMP/VERSION AS OF grammar (slice 19, the
-    allowlisted gram.y patch — syntax sugar over the now-existing
-    pinning plumbing; parse hook must reach the FDW via a
-    parse/planner channel, see doc 02 §4) -> M1 conformance gate
-    (Trino-written tables, TPC-DS subset, perf vs doc 10 §5) -> smoke
-    ceremony -> M1 retro + tag milestone/m1.
+  - **Slice 19 implementation sketch** (FOR AS OF grammar — do it FIRST
+    next session; all pinning plumbing already exists via the
+    snapshot_id option):
+      1. parsenodes.h: add to RangeVar
+         `Node *lakehouse_snapshot;` (raw parse tree: A_Const text
+         [TIMESTAMP] / A_Const int [VERSION] / A_Const string [TAG];
+         NULL otherwise). One-line field, catversion bump not needed
+         (parsed trees are not on disk).
+      2. gram.y (~15 lines): in table_ref, after `relation_expr
+         opt_alias_clause`, add lakehouse_time_travel opt rules:
+         FOR TIMESTAMP AS OF a_expr / FOR VERSION AS OF a_expr / FOR
+         TAG AS OF Sconst — attach to the RangeVar before returning.
+         Mark the block [core-allowlist] per RULES §3.
+      3. transformFromClauseItem (parse_clause.c / parse_relation.c —
+         GRAY ZONE: keep the touch to one small hook, or alternatively
+         resolve the A_Const in the FDW itself by reading the raw node
+         from rte->... — decide at implementation time; the leaner
+         option is having transformRangeSubselect-style code in
+         parse_relation set rte->... but rte (RangeTblEntry) changes
+         are bigger. Preferred lean path: resolve the raw node during
+         ExtractOptions time is impossible (planner sees only RTE), so
+         the FDW planner hook reads it via root->simple_rte_array —
+         which does NOT carry RangeVar. DECISION NEEDED: cleanest is
+         storing the resolved snapshot on ParseNamespaceItem
+         (pns_...new field) and reading it in GetForeignRelSize via
+         baserel->fdw_private built in GetForeignPaths from
+         root->parse->rtable? — prototype before committing to a path.
+      4. FDW: state->snapshot_id filled from the carried value instead
+         of the (still supported) snapshot_id option.
+      5. Regress: src/test/regress/lakehouse/sql/time_travel.sql with
+         the deterministic error cases (bad snapshot id -> error text),
+         live cases stay in the example + fixture transcript.
+  - **Next slices**: slice 19 grammar (sketch above) -> M1 conformance
+    gate (Trino-written tables, TPC-DS subset, perf vs doc 10 §5) ->
+    smoke ceremony -> M1 retro + tag milestone/m1.
 - Core-allowlist patches so far: meson_options.txt,
   src/backend/access/meson.build, root Makefile (each committed with
   `[core-allowlist]` rationale).
