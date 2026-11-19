@@ -631,6 +631,17 @@ lakehouse_ExplainForeignScan(ForeignScanState *node, ExplainState *es)
 								   state->opts.table)
 						: state->opts.table, es);
 	ExplainPropertyText("Lakehouse endpoint", state->opts.endpoint, es);
+	{
+		uint64		before =
+			pg_datalake_scan_files_before_pruning(state->session);
+		uint64		after = pg_datalake_scan_files_after_pruning(state->session);
+
+		ExplainPropertyInteger("Iceberg files examined", NULL,
+							   (int64) before, es);
+		if (after < before)
+			ExplainPropertyInteger("Iceberg files pruned", NULL,
+								   (int64) (before - after), es);
+	}
 	ExplainPropertyInteger("Iceberg scan tasks", NULL,
 						   (int64) state->task_count, es);
 	ExplainPropertyInteger("Iceberg rows (parquet metadata)", NULL,

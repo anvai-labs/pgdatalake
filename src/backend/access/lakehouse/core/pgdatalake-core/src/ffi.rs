@@ -411,6 +411,30 @@ pub unsafe extern "C" fn pg_datalake_rows_col_text(
     }
 }
 
+/// Non-deleted manifest entries examined before predicate pruning.
+///
+/// # Safety
+/// `session` must be NULL or a live handle from `pg_datalake_scan_new`.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_scan_files_before_pruning(session: *mut ScanSession) -> u64 {
+    match unsafe { session.as_ref() } {
+        Some(s) => s.plan.files_before_pruning as u64,
+        None => 0,
+    }
+}
+
+/// Entries surviving pruning (the tasks that will be read).
+///
+/// # Safety
+/// `session` must be NULL or a live handle from `pg_datalake_scan_new`.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_scan_files_after_pruning(session: *mut ScanSession) -> u64 {
+    match unsafe { session.as_ref() } {
+        Some(s) => s.plan.files_after_pruning as u64,
+        None => 0,
+    }
+}
+
 /// Free a rows handle. NULL is a no-op.
 ///
 /// # Safety
