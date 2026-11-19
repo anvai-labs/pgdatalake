@@ -106,11 +106,18 @@
     'Iceberg files pruned: M' (omitted when nothing pruned). LIVE:
     WHERE id<5 -> examined 3 / pruned 2 / tasks 1.
   - 41 cargo tests + 3 regress groups.
-  - **Next slices**: parallel scans (ForeignScan partial paths + task
-    claiming via parallel state, doc 06 §3) -> time travel (FOR
-    TIMESTAMP/VERSION AS OF, doc 02 §4 — the allowlisted gram.y patch,
-    biggest core touch so far) -> M1 conformance gate (Trino-written
-    tables, TPC-DS subset, perf vs doc 10 §5) -> smoke ceremony.
+  - slice 17 parallel scans: IsForeignScanParallelSafe (required or the
+    planner disables parallel entirely), partial path with
+    parallel_aware=true (without it the worker DSM hook never runs and
+    every process scans all tasks — the 3x-duplicates bug, caught live),
+    DSM hooks + pg_atomic_uint64 claim counter in Iterate. LIVE:
+    Gather/2 workers, count=3000 distinct=3000, WHERE under parallelism
+    exact. M1 limitation: one foreign scan per query for the shared
+    static pointer (documented, revisit when multi-scan queries matter).
+  - **Next slices**: time travel (FOR TIMESTAMP/VERSION AS OF, doc 02
+    §4 — the allowlisted gram.y patch, biggest core touch so far) ->
+    M1 conformance gate (Trino-written tables, TPC-DS subset, perf vs
+    doc 10 §5) -> smoke ceremony -> M1 retro + tag milestone/m1.
 - Core-allowlist patches so far: meson_options.txt,
   src/backend/access/meson.build, root Makefile (each committed with
   `[core-allowlist]` rationale).
