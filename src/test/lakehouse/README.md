@@ -16,7 +16,7 @@ Entry points (from the repo root, via the root `Makefile` forward):
 |---|---|---|
 | S3 (SeaweedFS) | `http://localhost:9000`, bucket `warehouse` | `lakehouse-test` / `lakehouse-test-password` (read-only: `lakehouse-reader` / `lakehouse-reader-password`) |
 | Lakekeeper REST | `http://localhost:8181` (v1 config: `/catalog/v1/config`) | none (bootstrap-user auth configured in M1) |
-| Azurite blob | `http://localhost:10000` | `devstoreaccount1` / `Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq` (Azurite public dev key) |
+| Azurite blob | `http://localhost:10000` | `devstoreaccount1` / `Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==` (Azurite public dev key) |
 | fake-gcs | `http://localhost:4443` | none |
 
 The S3 store is SeaweedFS (`chrislusf/seaweedfs`) — MinIO deleted its Docker

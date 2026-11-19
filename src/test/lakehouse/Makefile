@@ -21,6 +21,7 @@ lakehouse-up:
 	$(COMPOSE) run --rm lakekeeper-migrate
 	$(COMPOSE) up -d --wait lakekeeper
 	curl -sf http://localhost:8181/health > /dev/null
+	fixtures/smoke.sh
 	@echo "lakehouse fixtures up: S3 :9000, Lakekeeper :8181 (/health ok), Azurite :10000, fake-gcs :4443"
 
 lakehouse-down:
