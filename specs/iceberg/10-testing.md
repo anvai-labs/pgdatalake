@@ -73,3 +73,8 @@ make iceberg-conformance # interop suite vs pyiceberg (uv-managed venv)
 make iceberg-down
 ```
 All fixtures in `src/test/iceberg/fixtures/`, no network at unit-test time.
+
+These root targets are forwarded to `src/test/iceberg/` by a small block in the
+root `Makefile` (`[core-allowlist]`, 2026-11-19) — it is only reachable in
+meson-only trees (no `GNUmakefile`), which is the supported build mode; see
+RULES.md §9 for the meson-vs-autoconf note.

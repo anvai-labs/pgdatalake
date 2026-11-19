@@ -4,8 +4,16 @@ Binding rules for all work in this repository.
 
 ## 1. Git layout
 
-- `main` = **exact mirror** of `upstream/master` at last sync. Never commit here.
-  Fast-forward only: `git fetch upstream && git merge --ff-only upstream/master`.
+- `main` = fork base branch: `upstream/master` plus the `specs/` documentation
+  commits. Nothing but spec/doc updates and upstream sync merges is ever
+  committed directly to `main` — all feature and build work happens on
+  `iceberg-dev` or below. Sync: `git fetch upstream && git merge upstream/master`
+  (a merge commit is expected and fine; upstream never touches `specs/`, so
+  conflicts are rare).
+  *(Superseded 2026-11-19: originally `main` was to be an exact ff-only mirror
+  of `upstream/master`, but the fork was created with a default `master` branch
+  that already carried the specs commits. Renamed `master` → `main` instead of
+  maintaining a separate mirror branch; HANDOFF.md delegated this decision.)*
 - `origin` = `anvai-labs/postgres` (private). `upstream` = `postgres/postgres`.
 - `iceberg-dev` = integration branch (our commits only, always based on latest
   `main`).
@@ -112,8 +120,15 @@ every tagged release.
    - `git clone` the repo, check out the release/branch ref
    - `make iceberg-up` (MinIO + Lakekeeper + Azurite + fake-gcs fixtures)
    - `meson setup build -Diceberg=enabled && ninja`
-   - `make check` (upstream suite must stay 100% green — a fork that breaks
-     upstream behavior fails the smoke test even if iceberg tests pass)
+   - upstream regress suite via `meson test --suite setup && meson test
+     --suite regress` (must stay 100% green — a fork that breaks upstream
+     behavior fails the smoke test even if iceberg tests pass).
+     *(Superseded 2026-11-19: originally this step ran autoconf `make check`;
+     the autoconf and meson builds cannot coexist in one source tree — meson
+     setup errors on configure-generated files — and meson is the primary
+     build system. The upstream `parallel_schedule` suite runs unchanged
+     under `meson test --suite regress`; a legacy autoconf tree can still run
+     `make check`.)*
    - `make iceberg-check` + the milestone's conformance subset (`doc 10`)
    - one MANUAL psql transcript per milestone's headline feature (M1: attach +
      query a MinIO table; M2: CREATE USING iceberg + round-trip DML; …) —

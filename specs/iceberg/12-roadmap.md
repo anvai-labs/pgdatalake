@@ -10,8 +10,11 @@ another's gate. Rough sizing assumes 1–2 engineers + this agent.
       crate, `cbindgen` header generation, meson feature `-Diceberg=auto`
 - [ ] CI: build PG with feature on (ubuntu, cargo toolchain pinned), MinIO +
       Lakekeeper docker-compose fixture
-- **Gate**: `meson setup build -Diceberg=enabled && ninja && make check` green on
-  CI; `SELECT iceberg_version()` returns from a stub catalog module.
+- **Gate**: `meson setup build -Diceberg=enabled && ninja && meson test --suite
+  regress` green on CI (meson-only tree: autoconf `make check` cannot coexist
+  with meson in the same checkout, and the upstream `parallel_schedule` suite
+  runs unchanged under `meson test`); `SELECT iceberg.iceberg_version()`
+  returns from a stub catalog module.
 
 ## M1 — Read path, external tables (2–4 weeks)
 - REST catalog client (config/loadTable, OAuth2 + token refresh, SigV4)
