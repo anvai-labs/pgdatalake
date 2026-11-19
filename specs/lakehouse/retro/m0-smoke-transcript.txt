@@ -1,0 +1,44 @@
+# M0 manual smoke transcript — 2026-11-19T16:15:34Z
+# repo: anvai-labs/postgres @ ec8f557cbabf14c95f1a058c6d4e1186385a9d43 (lakehouse-dev)
+# cold-room fresh clone: meson setup build -Ddatalake=enabled && ninja, all suites green
+
+                              version                               
+--------------------------------------------------------------------
+ PostgreSQL 20devel on x86_64-linux, compiled by gcc-14.2.0, 64-bit
+(1 row)
+
+                          List of installed extensions
+  Name   | Version | Default version |   Schema   |         Description          
+---------+---------+-----------------+------------+------------------------------
+ plpgsql | 1.0     | 1.0             | pg_catalog | PL/pgSQL procedural language
+(1 row)
+
+CREATE EXTENSION
+                                      List of installed extensions
+   Name    | Version | Default version | Schema |                      Description                      
+-----------+---------+-----------------+--------+-------------------------------------------------------
+ lakehouse | 1.0     | 1.0             | public | Lakehouse storage engine support (open table formats)
+(1 row)
+
+          version           
+----------------------------
+ pgdatalake-core 0.1.0 (M0)
+(1 row)
+
+ format_ok 
+-----------
+ t
+(1 row)
+
+ stable 
+--------
+ t
+(1 row)
+
+                          List of functions
+  Schema   |  Name   | Result data type | Argument data types | Type 
+-----------+---------+------------------+---------------------+------
+ lakehouse | version | text             |                     | func
+(1 row)
+
+DROP EXTENSION

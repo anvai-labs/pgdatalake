@@ -4,11 +4,11 @@ Entry points (from the repo root, via the root `Makefile` forward):
 
 | Target | What it does |
 |---|---|
-| `make iceberg-up` | `docker compose up --wait`: MinIO, Lakekeeper (REST catalog), Azurite, fake-gcs |
-| `make iceberg-check` | `cargo test` (pgdatalake-core) + `meson test` (upstream regress + iceberg suites) |
-| `make iceberg-conformance` | interop suite vs PyIceberg/Trino — M1+ |
-| `make iceberg-down` | tear down containers + volumes |
-| `make perf-iceberg` | perf gates (doc 10 §5) — M4+ |
+| `make lakehouse-up` | bring up: SeaweedFS S3, Lakekeeper (REST catalog), Azurite, fake-gcs |
+| `make lakehouse-check` | `cargo test` (pgdatalake-core) + `meson test` (upstream regress + lakehouse suites) |
+| `make lakehouse-conformance` | interop suite vs PyIceberg/Trino — M1+ |
+| `make lakehouse-down` | tear down containers + volumes |
+| `make perf-lakehouse` | perf gates (doc 10 §5) — M4+ |
 
 ## Endpoints after `lakehouse-up` (fixture-local fake creds — never use real ones)
 
