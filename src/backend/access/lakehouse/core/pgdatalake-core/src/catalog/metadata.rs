@@ -172,6 +172,30 @@ pub enum IcebergTypeMarker {
     Struct,
 }
 
+/// One partitioned field of a partition spec (spec § partition-specs).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct PartitionField {
+    /// Partition field id (unique across the table's partition evolution).
+    pub field_id: i64,
+    pub name: String,
+    /// Transform name as written in metadata: identity, bucket[16], day, …
+    pub transform: String,
+    /// Source schema field id the transform reads.
+    pub source_id: i64,
+}
+
+/// A partition spec: an ordered list of partition fields. The ORDER of the
+/// fields defines the layout of data_file.partition values in manifests —
+/// pruning resolves positionally against this list (slice 8).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct PartitionSpec {
+    pub spec_id: i32,
+    #[serde(default)]
+    pub fields: Vec<PartitionField>,
+}
+
 /// A table snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -208,6 +232,10 @@ pub struct TableMetadata {
     pub current_snapshot_id: Option<i64>,
     #[serde(default)]
     pub properties: BTreeMap<String, String>,
+    #[serde(default)]
+    pub partition_specs: Vec<PartitionSpec>,
+    #[serde(default)]
+    pub default_partition_spec_id: Option<i32>,
 }
 
 impl TableMetadata {
@@ -229,6 +257,11 @@ impl TableMetadata {
 
     pub fn snapshot(&self, id: i64) -> Option<&Snapshot> {
         self.snapshots.iter().find(|s| s.snapshot_id == id)
+    }
+
+    /// The partition spec with the given id, or None (doc 03 §5: no panics).
+    pub fn partition_spec(&self, id: i32) -> Option<&PartitionSpec> {
+        self.partition_specs.iter().find(|s| s.spec_id == id)
     }
 }
 
@@ -403,6 +436,45 @@ mod tests {
                 value: Box::new(IcebergType::Long),
             }
         );
+    }
+
+    /// TDD anchor (M1 slice 8): partition-specs parse — identity transform
+    /// first (bucket/truncate/temporal transforms land with their pruning
+    /// slices); unknown transforms are preserved but flagged, never dropped.
+    #[test]
+    fn parses_partition_specs() {
+        let json = r#"{
+            "format-version": 2,
+            "table-uuid": "9c12d441-03fe-11ed-8122-d358e75d12eb",
+            "location": "s3://warehouse/t",
+            "schemas": [{"type": "struct", "schema-id": 0, "fields": [
+                {"id": 1, "name": "id", "required": true, "type": "long"}]}],
+            "current-schema-id": 0,
+            "partition-specs": [
+                {"spec-id": 0, "fields": []},
+                {"spec-id": 1, "fields": [
+                    {"name": "region", "transform": "identity", "source-id": 3,
+                     "field-id": 1000},
+                    {"name": "id_bucket", "transform": "bucket[16]",
+                     "source-id": 1, "field-id": 1001},
+                    {"name": "at_day", "transform": "day", "source-id": 4,
+                     "field-id": 1002}
+                ]}
+            ],
+            "default-partition-spec-id": 1
+        }"#;
+        let md: TableMetadata = serde_json::from_str(json).expect("parse partition specs");
+        assert_eq!(md.partition_specs.len(), 2);
+        let spec = md.partition_spec(1).unwrap();
+        assert_eq!(spec.fields.len(), 3);
+        assert_eq!(spec.fields[0].name, "region");
+        assert_eq!(spec.fields[0].transform, "identity");
+        assert_eq!(spec.fields[0].source_id, 3);
+        assert_eq!(spec.fields[0].field_id, 1000);
+        assert_eq!(spec.fields[1].transform, "bucket[16]");
+        assert_eq!(spec.fields[2].transform, "day");
+        assert_eq!(md.default_partition_spec_id, Some(1));
+        assert!(md.partition_spec(9).is_none());
     }
 
     /// Failed lookups return None, not panics.

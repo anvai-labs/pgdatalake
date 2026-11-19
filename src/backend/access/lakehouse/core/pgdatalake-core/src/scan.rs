@@ -33,6 +33,49 @@ pub struct ScanPlan {
     pub data_files: usize,
 }
 
+/// A minimal scan predicate. Slice 8 supports Eq over identity-transform
+/// partitions (conservative: non-identity transforms are never pruned);
+/// range predicates and metrics/bounds pruning land in later slices.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScanPredicate {
+    And(Vec<ScanPredicate>),
+    Eq {
+        field: String,
+        value: serde_json::Value,
+    },
+}
+
+/// Resolve a data/delete file's opaque partition JSON against a spec: the
+/// manifest's injected field NAMES equal the spec field names (Iceberg
+/// writers inject them in spec order), so resolve by name — but only
+/// identity transforms participate in pruning; anything else is kept
+/// (pruning must never drop a matching file).
+fn partition_matches(
+    spec: &crate::catalog::metadata::PartitionSpec,
+    partition: &serde_json::Value,
+    pred: &ScanPredicate,
+) -> bool {
+    let Some(obj) = partition.as_object() else {
+        return true; // unparseable partition: keep the file
+    };
+    match pred {
+        ScanPredicate::Eq { field, value } => {
+            let pf = match spec.fields.iter().find(|f| &f.name == field) {
+                Some(f) => f,
+                None => return true, // unknown field: keep
+            };
+            if pf.transform != "identity" {
+                return true; // transform-aware pruning is a later slice
+            }
+            match obj.get(field) {
+                Some(v) => v == value,
+                None => true, // null partition value: keep
+            }
+        }
+        ScanPredicate::And(preds) => preds.iter().all(|p| partition_matches(spec, partition, p)),
+    }
+}
+
 /// Open a store for an absolute file location and return (io, key). For
 /// file:// FILE locations the local store must be rooted at the parent
 /// directory with the file name as the key; S3 locations carry the full
@@ -74,6 +117,7 @@ pub fn plan_scan(
     md: &TableMetadata,
     snapshot_id: Option<i64>,
     s3: Option<&S3Options>,
+    predicate: Option<&ScanPredicate>,
 ) -> Result<ScanPlan, StorageError> {
     let snapshot = match snapshot_id.or(md.current_snapshot_id) {
         Some(id) => md.snapshot(id).ok_or_else(|| {
@@ -99,12 +143,28 @@ pub fn plan_scan(
     let mut data_files = 0usize;
 
     for mle in &list_entries {
+        let spec = md
+            .partition_spec(mle.partition_spec_id)
+            .or_else(|| md.partition_spec(mle.partition_spec_id))
+            .or_else(|| {
+                // fall back to the table default spec if the manifest names
+                // a spec that no longer exists (evolved-away manifests)
+                md.default_partition_spec_id
+                    .and_then(|id| md.partition_spec(id))
+            });
         let (io, key) = open_for(&mle.manifest_path, s3)?;
         let bytes = io.get_bytes(&key)?;
         for e in parse_manifest(&bytes)? {
             // DELETED entries are history, not data (doc 06 §2)
             if e.status == crate::manifest::ManifestEntryStatus::Deleted {
                 continue;
+            }
+            if let (Some(spec), Some(pred)) = (spec, predicate) {
+                if let Some(partition) = &e.data_file.partition {
+                    if !partition_matches(spec, partition, pred) {
+                        continue;
+                    }
+                }
             }
             if e.data_file.content == crate::manifest::DataContent::Data {
                 total_rows += e.data_file.record_count;
@@ -288,7 +348,7 @@ mod tests {
         let md: TableMetadata = serde_json::from_str(&metadata_json).unwrap();
         assert_eq!(md.format_version, FormatVersion::V2);
 
-        let plan = plan_scan(&md, None, None).expect("plan_scan");
+        let plan = plan_scan(&md, None, None, None).expect("plan_scan");
         assert_eq!(plan.snapshot_id, 42);
         // ADDED (a) + EXISTING (b) survive; DELETED is dropped.
         assert_eq!(plan.tasks.len(), 2, "deleted entries are not planned");
@@ -323,7 +383,7 @@ mod tests {
             "snapshots": []
         }"#;
         let md: TableMetadata = serde_json::from_str(metadata_json).unwrap();
-        let plan = plan_scan(&md, None, None).expect("plan_scan");
+        let plan = plan_scan(&md, None, None, None).expect("plan_scan");
         assert_eq!(plan.tasks.len(), 0);
         assert_eq!(plan.total_rows, 0);
     }
@@ -344,7 +404,150 @@ mod tests {
             "current-snapshot-id": 42
         }"#;
         let md: TableMetadata = serde_json::from_str(metadata_json).unwrap();
-        let err = plan_scan(&md, Some(999), None).unwrap_err();
+        let err = plan_scan(&md, Some(999), None, None).unwrap_err();
         assert!(matches!(err, StorageError::NotFound(_)), "{err}");
+    }
+
+    /// TDD anchor (M1 slice 8): identity-transform partition pruning —
+    /// region='eu' keeps only the eu file; And-combined predicates AND.
+    /// The manifest fixture injects the partition field into the Avro
+    /// schema exactly as real writers do (per-table partition struct).
+    #[test]
+    fn prunes_partitioned_files_by_identity_predicate() {
+        use crate::manifest::MANIFEST_ENTRY_SCHEMA_V2;
+        use crate::scan::ScanPredicate;
+
+        let partition_fields = r#""name": "region", "type": "string""#;
+        let schema_str = MANIFEST_ENTRY_SCHEMA_V2.replace(
+            "\"name\": \"r_part\", \"fields\": []",
+            &format!("\"name\": \"r_part\", \"fields\": [{{{partition_fields}}}]"),
+        );
+        let schema = AvroSchema::parse_str(&schema_str).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("metadata")).unwrap();
+
+        let mut writer = Writer::new(&schema, Vec::new());
+        for (region, path, rows) in [
+            ("eu", "file:///table/data/eu.parquet", 60),
+            ("us", "file:///table/data/us.parquet", 40),
+        ] {
+            let mut entry = Record::new(&schema).unwrap();
+            entry.put("status", Value::Int(1));
+            entry.put("snapshot_id", Value::Long(42));
+            entry.put("sequence_number", Value::Union(1, Box::new(Value::Long(1))));
+            entry.put(
+                "file_sequence_number",
+                Value::Union(1, Box::new(Value::Long(1))),
+            );
+            let data_file = Value::Record(vec![
+                ("content".into(), Value::Int(0)),
+                ("file_path".into(), Value::String(path.into())),
+                ("file_format".into(), Value::String("parquet".into())),
+                (
+                    "partition".into(),
+                    Value::Union(
+                        1,
+                        Box::new(Value::Record(vec![(
+                            "region".into(),
+                            Value::String(region.into()),
+                        )])),
+                    ),
+                ),
+                ("record_count".into(), Value::Long(rows)),
+                ("file_size_in_bytes".into(), Value::Long(4096)),
+                ("column_sizes".into(), Value::Map(HashMap::new())),
+                ("value_counts".into(), Value::Map(HashMap::new())),
+                ("null_value_counts".into(), Value::Map(HashMap::new())),
+                ("nan_value_counts".into(), Value::Map(HashMap::new())),
+                ("lower_bounds".into(), Value::Map(HashMap::new())),
+                ("upper_bounds".into(), Value::Map(HashMap::new())),
+                (
+                    "key_metadata".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "split_offsets".into(),
+                    Value::Union(1, Box::new(Value::Array(vec![Value::Int(4)]))),
+                ),
+                (
+                    "equality_ids".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "sort_order_id".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+            ]);
+            entry.put("data_file", data_file);
+            writer.append(entry).unwrap();
+        }
+        std::fs::write(
+            dir.path().join("metadata").join("mn1.avro"),
+            writer.into_inner().unwrap(),
+        )
+        .unwrap();
+        build_manifest_list(
+            dir.path().join("metadata").as_path(),
+            &[("mn1.avro", 2, 0, 0)],
+        )
+        .unwrap();
+
+        let list_path = dir.path().join("metadata").join("mn-list.avro");
+        let metadata_json = format!(
+            r#"{{
+                "format-version": 2,
+                "table-uuid": "9c12d441-03fe-11ed-8122-d358e75d12eb",
+                "location": "file://{}",
+                "schemas": [{{"type": "struct", "schema-id": 0, "fields": [
+                    {{"id": 1, "name": "id", "required": true, "type": "long"}}]}}],
+                "current-schema-id": 0,
+                "partition-specs": [{{"spec-id": 0, "fields": [
+                    {{"name": "region", "transform": "identity", "source-id": 2,
+                      "field-id": 1000}}]}}],
+                "default-partition-spec-id": 0,
+                "snapshots": [
+                    {{"snapshot-id": 42, "timestamp-ms": 1712345678000,
+                      "manifest-list": "file://{}",
+                      "summary": {{"operation": "append"}}}}
+                ],
+                "current-snapshot-id": 42
+            }}"#,
+            dir.path().display(),
+            list_path.display(),
+        );
+        let md: TableMetadata = serde_json::from_str(&metadata_json).unwrap();
+
+        // no predicate: both files planned
+        let plan = plan_scan(&md, None, None, None).expect("plan all");
+        assert_eq!(plan.tasks.len(), 2);
+        assert_eq!(plan.total_rows, 100);
+
+        // region = 'eu': one file, 60 rows
+        let pred = ScanPredicate::Eq {
+            field: "region".into(),
+            value: serde_json::json!("eu"),
+        };
+        let plan = plan_scan(&md, None, None, Some(&pred)).expect("plan eu");
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.total_rows, 60);
+        assert_eq!(
+            plan.tasks[0].entry.data_file.file_path,
+            "file:///table/data/eu.parquet"
+        );
+
+        // And with a non-matching eq: zero tasks
+        let pred = ScanPredicate::And(vec![
+            ScanPredicate::Eq {
+                field: "region".into(),
+                value: serde_json::json!("eu"),
+            },
+            ScanPredicate::Eq {
+                field: "region".into(),
+                value: serde_json::json!("apac"),
+            },
+        ]);
+        let plan = plan_scan(&md, None, None, Some(&pred)).expect("plan and");
+        assert_eq!(plan.tasks.len(), 0);
     }
 }
