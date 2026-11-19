@@ -171,6 +171,26 @@
     (docker run --network pgdatalake_default with the venv mounted at
     its absolute path; see scripts note in retro). SPEC: 06-execution.md
     §3 amended (slice 20 amendment). 46 cargo tests + 4 regress groups.
+  - slice 21 conformance read-half (M1 gate item): full primitive type
+    matrix decodes to PG-input-compatible TEXT — NEW decodes: decimal128
+    -> canonical unscaled/scale text, uuid (parquet FLBA(16)) ->
+    canonical hyphenated text, date/date64 -> ISO, time32/64 ->
+    HH:MM:SS.ffffff, binary -> \x-prefixed bytea hex (previously raw
+    ints / bare hex that date_in/time_in/bytea_in reject — caught by
+    TDD red tests). Conformance fixtures:
+    scripts/gen_conformance_fixtures.py (PyIceberg writer, MUST run
+    inside the compose network — see lakekeeper per-table
+    s3.endpoint gotcha at slice 20) writes analytics.types_all (full
+    type matrix, 3 rows incl. all-NULL) + analytics.parts_multi
+    (day/month/bucket[8]/truncate[2]/identity spec, 12 files). LIVE:
+    types_all reads with correct SQL values (uuid/decimal/date/time/
+    bytea round-trip, all-NULL row); parts_multi identity pruning
+    EXPLAIN examined 12 / pruned 6 / tasks 6, non-identity predicates
+    correct-conservative. INTEROP QUIRK: pyiceberg 0.12 writes Iceberg
+    fixed[L] as ASCII hex STRINGS (spec wants FLBA(L)) — documented in
+    05-types.md §1; Trino/Spark-written fixed reads fine. PyIceberg
+    table.delete() is COW (slice 20 note). 49 cargo tests + 4 regress
+    groups.
   - **Next slices**: M1 conformance
     gate (Trino-written tables, TPC-DS subset, perf vs doc 10 §5) ->
     smoke ceremony -> M1 retro + tag milestone/m1.

@@ -32,6 +32,18 @@ Integer width policy: PG `smallint` has no Iceberg counterpart — maps to `int`
 (widening, safe on read; on write, value range checked, overflow → error).
 Unsigned types don't exist in PG; Iceberg's are all signed. Good.
 
+*(Slice 21 amendment, 2026-11-19 — read-half conformance status.)* All
+primitive types decode to their PG input-function-compatible TEXT on the
+read path, verified live against PyIceberg-written fixtures
+(`scripts/gen_conformance_fixtures.py`): decimal → canonical unscaled/scale
+text, uuid → canonical lowercase hyphenated text (parquet FLBA(16); other
+sizes render as raw bytes for `fixed[L]`), date → ISO `YYYY-MM-DD`, time →
+`HH:MM:SS.ffffff`, binary → `\x`-prefixed bytea hex. Interop caveat:
+PyIceberg 0.12 writes Iceberg `fixed[L]` values as ASCII hex STRINGS (2L
+bytes) rather than spec-compliant FLBA(L); Trino/Spark write FLBA, so
+spec-written tables read correctly and the pyiceberg-fixed case is a
+known upstream quirk, not a reader bug.
+
 ## 2. Precision rules
 
 - `timestamptz`: PG stores µs since epoch UTC. Iceberg `timestamptz` (v2) is µs;

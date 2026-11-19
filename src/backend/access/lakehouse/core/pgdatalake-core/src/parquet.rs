@@ -392,21 +392,25 @@ fn cell_from_arrow(col: &dyn arrow::array::Array, row: usize) -> CellValue {
             .unwrap_or(CellValue::Null),
         // temporal arrays are their own primitive types (timestamp columns
         // caught live with PyIceberg-written fixtures, slice 12)
+        // date/time -> PostgreSQL-input-compatible TEXT (slice 21)
         DT::Date32 => col
             .as_any()
             .downcast_ref::<Date32Array>()
-            .map(|a| CellValue::Int64(a.value(row) as i64))
+            .map(|a| {
+                let (y, m, d) = civil_from_days(a.value(row) as i64);
+                CellValue::Str(format!("{y:04}-{m:02}-{d:02}"))
+            })
             .unwrap_or(CellValue::Null),
         DT::Time32(unit) => match unit {
             arrow::datatypes::TimeUnit::Second => col
                 .as_any()
                 .downcast_ref::<Time32SecondArray>()
-                .map(|a| CellValue::Int64(a.value(row) as i64))
+                .map(|a| CellValue::Str(format_time(a.value(row) as i64, 6)))
                 .unwrap_or(CellValue::Null),
             arrow::datatypes::TimeUnit::Millisecond => col
                 .as_any()
                 .downcast_ref::<Time32MillisecondArray>()
-                .map(|a| CellValue::Int64(a.value(row) as i64))
+                .map(|a| CellValue::Str(format_time(a.value(row) as i64 * 1_000, 3)))
                 .unwrap_or(CellValue::Null),
             _ => CellValue::Null,
         },
@@ -414,12 +418,12 @@ fn cell_from_arrow(col: &dyn arrow::array::Array, row: usize) -> CellValue {
             arrow::datatypes::TimeUnit::Microsecond => col
                 .as_any()
                 .downcast_ref::<Time64MicrosecondArray>()
-                .map(|a| CellValue::Int64(a.value(row)))
+                .map(|a| CellValue::Str(format_time(a.value(row), 6)))
                 .unwrap_or(CellValue::Null),
             arrow::datatypes::TimeUnit::Nanosecond => col
                 .as_any()
                 .downcast_ref::<Time64NanosecondArray>()
-                .map(|a| CellValue::Int64(a.value(row)))
+                .map(|a| CellValue::Str(format_time(a.value(row) / 1_000, 6)))
                 .unwrap_or(CellValue::Null),
             // Time64 cannot hold second/millisecond precision; kept
             // unreachable for enum exhaustiveness
@@ -463,14 +467,99 @@ fn cell_from_arrow(col: &dyn arrow::array::Array, row: usize) -> CellValue {
             .downcast_ref::<StringArray>()
             .map(|a| CellValue::Str(a.value(row).to_string()))
             .unwrap_or(CellValue::Null),
+        // binary -> bytea hex text ('\x…', bytea_in-compatible; slice 21)
         DT::Binary | DT::LargeBinary => col
             .as_any()
             .downcast_ref::<BinaryArray>()
+            .map(|a| {
+                let b = a.value(row);
+                let mut hex = String::with_capacity(2 + b.len() * 2);
+                hex.push_str("\\x");
+                for x in b {
+                    hex.push_str(&format!("{x:02x}"));
+                }
+                CellValue::Str(hex)
+            })
+            .unwrap_or(CellValue::Null),
+        // decimal -> canonical unscaled/scale TEXT (numeric_in-compatible;
+        // slice 21 conformance gate)
+        DT::Decimal128(_, scale) => col
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .map(|a| CellValue::Str(format_decimal128(a.value(row), *scale)))
+            .unwrap_or(CellValue::Null),
+        // 16-byte fixed binary is the parquet shape of Iceberg `uuid`
+        // (canonical hyphenated text for uuid_in; `fixed(16)` columns are
+        // rare and render the same — noted in HANDOFF). Other sizes are
+        // plain `fixed[N]` bytes.
+        DT::FixedSizeBinary(16) => col
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .map(|a| CellValue::Str(format_uuid16(a.value(row))))
+            .unwrap_or(CellValue::Null),
+        DT::FixedSizeBinary(_) => col
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
             .map(|a| CellValue::Bytes(a.value(row).to_vec()))
             .unwrap_or(CellValue::Null),
         // nested types land with the type-matrix slice (doc 05)
         _ => CellValue::Null,
     }
+}
+
+/// Canonical decimal TEXT from an unscaled i128 and scale (trailing scale
+/// digits always shown: 12345/2 -> "123.45", -500/2 -> "-5.00").
+fn format_decimal128(v: i128, scale: i8) -> String {
+    let neg = v < 0;
+    let mut digits = v.unsigned_abs().to_string();
+    let scale = scale.max(0) as usize;
+    let body = if scale == 0 {
+        digits
+    } else {
+        while digits.len() <= scale {
+            digits.insert(0, '0');
+        }
+        let split = digits.len() - scale;
+        format!("{}.{}", &digits[..split], &digits[split..])
+    };
+    if neg {
+        format!("-{body}")
+    } else {
+        body
+    }
+}
+
+/// `HH:MM:SS.<f-width>` from a time value in microseconds.
+fn format_time(us: i64, fwidth: usize) -> String {
+    let h = us / 3_600_000_000;
+    let mi = (us / 60_000_000) % 60;
+    let s = (us / 1_000_000) % 60;
+    let f = us % 1_000_000;
+    format!("{h:02}:{mi:02}:{s:02}.{:0fwidth$}", f, fwidth = fwidth)
+}
+
+/// Canonical lowercase hyphenated UUID from 16 big-endian bytes.
+fn format_uuid16(b: &[u8]) -> String {
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-\
+         {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0],
+        b[1],
+        b[2],
+        b[3],
+        b[4],
+        b[5],
+        b[6],
+        b[7],
+        b[8],
+        b[9],
+        b[10],
+        b[11],
+        b[12],
+        b[13],
+        b[14],
+        b[15]
+    )
 }
 
 #[cfg(test)]
@@ -686,5 +775,145 @@ mod tests {
             }
         }
         assert_eq!(seen, vec!["a", "b", "d", "e"]);
+    }
+
+    /// TDD anchor (M1 slice 21, conformance gate): decimal128 columns
+    /// decode to their canonical decimal TEXT (numeric_in-compatible) —
+    /// previously Null.
+    #[test]
+    fn decodes_decimal128_to_canonical_text() {
+        use arrow::array::Decimal128Array;
+
+        let dir = tempfile::tempdir().unwrap();
+        let schema = ArrowSchema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(12, 2),
+            true,
+        )]);
+        let arr: Decimal128Array = vec![Some(12345i128), Some(-500i128), None]
+            .into_iter()
+            .collect::<Decimal128Array>()
+            .with_precision_and_scale(12, 2)
+            .unwrap();
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(arr)]).unwrap();
+        let f = std::fs::File::create(dir.path().join("d.parquet")).unwrap();
+        let mut w = parquet::arrow::ArrowWriter::try_new(f, batch.schema(), None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        let io = StorageIo::open(
+            &parse_location(&format!("file://{}", dir.path().display())).unwrap(),
+            None,
+        )
+        .unwrap();
+
+        let mut rows = ParquetRows::open(&io, "d.parquet", &["amount"]).unwrap();
+        assert!(rows.next());
+        assert_eq!(rows.value(0), CellValue::Str("123.45".into()));
+        assert!(rows.next());
+        assert_eq!(rows.value(0), CellValue::Str("-5.00".into()));
+        assert!(rows.next());
+        assert_eq!(rows.value(0), CellValue::Null);
+        assert!(!rows.next());
+    }
+
+    /// TDD anchor (M1 slice 21, conformance gate): uuid columns (parquet
+    /// FLBA(16) with the UUID logical type) decode to the canonical
+    /// hyphenated lowercase form — previously Null.
+    #[test]
+    fn decodes_uuid_to_canonical_text() {
+        use arrow::array::FixedSizeBinaryArray;
+
+        let dir = tempfile::tempdir().unwrap();
+        let schema = ArrowSchema::new(vec![Field::new("uid", DataType::FixedSizeBinary(16), true)]);
+        let b = FixedSizeBinaryArray::from(vec![
+            Some(
+                {
+                    let mut v = vec![0u8; 16];
+                    v[6] = 0x12;
+                    v
+                }
+                .as_slice(),
+            ),
+            None,
+        ]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(b)]).unwrap();
+        let f = std::fs::File::create(dir.path().join("u.parquet")).unwrap();
+        let mut w = parquet::arrow::ArrowWriter::try_new(f, batch.schema(), None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        let io = StorageIo::open(
+            &parse_location(&format!("file://{}", dir.path().display())).unwrap(),
+            None,
+        )
+        .unwrap();
+
+        let mut rows = ParquetRows::open(&io, "u.parquet", &["uid"]).unwrap();
+        assert!(rows.next());
+        // 16 zero bytes with 0x12 at offset 6 -> group3 = 1200
+        assert_eq!(
+            rows.value(0),
+            CellValue::Str("00000000-0000-1200-0000-000000000000".into())
+        );
+        assert!(rows.next());
+        assert_eq!(rows.value(0), CellValue::Null);
+        assert!(!rows.next());
+    }
+
+    /// TDD anchor (M1 slice 21, conformance gate): date, time, and binary
+    /// cells decode to PostgreSQL-input-compatible TEXT — ISO dates,
+    /// `HH:MM:SS.ffffff` times, `\x`-prefixed bytea hex (previously raw
+    /// integers / bare hex that the type input functions reject).
+    #[test]
+    fn decodes_date_time_binary_to_input_compatible_text() {
+        use arrow::array::{Date32Array, Time64MicrosecondArray};
+
+        let dir = tempfile::tempdir().unwrap();
+        let schema = ArrowSchema::new(vec![
+            Field::new("d", DataType::Date32, true),
+            Field::new(
+                "t",
+                DataType::Time64(arrow::datatypes::TimeUnit::Microsecond),
+                true,
+            ),
+            Field::new("b", DataType::Binary, true),
+        ]);
+        // date 0 = 1970-01-01; 19723 days = 2024-01-01
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Date32Array::from(vec![0, 19723])),
+                Arc::new(Time64MicrosecondArray::from(vec![
+                    36_610_000_000i64, // 10:10:10.000000
+                    0,
+                ])),
+                {
+                    let mut b = arrow::array::BinaryBuilder::with_capacity(8, 16);
+                    b.append_value([0xdeu8, 0xad, 0xbe, 0xefu8]);
+                    b.append_null();
+                    Arc::new(b.finish())
+                },
+            ],
+        )
+        .unwrap();
+        let f = std::fs::File::create(dir.path().join("dtb.parquet")).unwrap();
+        let mut w = parquet::arrow::ArrowWriter::try_new(f, batch.schema(), None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        let io = StorageIo::open(
+            &parse_location(&format!("file://{}", dir.path().display())).unwrap(),
+            None,
+        )
+        .unwrap();
+
+        let mut rows = ParquetRows::open(&io, "dtb.parquet", &["d", "t", "b"]).unwrap();
+        assert!(rows.next());
+        assert_eq!(rows.value(0), CellValue::Str("1970-01-01".into()));
+        assert_eq!(rows.value(1), CellValue::Str("10:10:10.000000".into()));
+        assert_eq!(rows.value(2), CellValue::Str("\\xdeadbeef".into()));
+        assert!(rows.next());
+        assert_eq!(rows.value(0), CellValue::Str("2024-01-01".into()));
+        assert_eq!(rows.value(1), CellValue::Str("00:00:00.000000".into()));
+        assert_eq!(rows.value(2), CellValue::Null);
+        assert!(!rows.next());
     }
 }
