@@ -70,11 +70,19 @@
     lakehouse module for M1 (doc 01 said contrib/lakehouse_fdw — split is
     the M5 extraction item; note in retro).
   - 35 cargo tests + 3 regress groups; deps now incl. parquet/arrow 54.
-  - **Next slices**: fixture data files (scripts/gen_fixtures.py per doc 10:
-    PyIceberg/Trino-written table -> live SELECT returning real rows) ->
-    qual/projection pushdown (doc 06 §4) -> EXPLAIN task counts ->
-    parallel scans -> M1 conformance gate (Trino-written tables, TPC-DS
-    subset with pruning evidence).
+  - slice 12 PyIceberg fixture data + interop fixes: scripts/gen_fixtures.py
+    (3 runs x 1000 rows into analytics.events; venv at build/venv, or run
+    in-container per script docs); int->long Avro promotions, nullable
+    union snapshot_id, long split_offsets, arrow temporal primitive
+    arrays, CellValue::TimestampMicros + ISO rendering (civil-from-days,
+    no chrono). LIVE: SELECT count/min/max/WHERE through the FDW over
+    PyIceberg-written data — full read path works end-to-end.
+  - 36 cargo tests + 3 regress groups.
+  - **Next slices**: EXPLAIN task counts (ExplainForeignScan hook) ->
+    projection/qual pushdown (doc 06 §4) -> parallel scans (task-parallel
+    via ForeignScan parallel API) -> M1 conformance gate (Trino-written
+    tables via gen_fixtures, TPC-DS subset with pruning evidence, perf
+    numbers vs doc 10 §5).
 - Core-allowlist patches so far: meson_options.txt,
   src/backend/access/meson.build, root Makefile (each committed with
   `[core-allowlist]` rationale).
