@@ -31,6 +31,9 @@ lakehouse-down:
 lakehouse-check:
 	@echo "cargo test -p pgdatalake-core"
 	cargo test --manifest-path $(CURDIR)/../../backend/access/lakehouse/core/Cargo.toml
+	@echo "meson install (meson test runs the INSTALLED binaries — a stale"
+	@echo "tmp_install silently tests old code; CI learned this the hard way)"
+	meson install --destdir $(CURDIR)/../../../build/tmp_install > /dev/null
 	@echo "meson test (setup + regress + lakehouse suites)"
 	meson test -C $(CURDIR)/../../../build --suite setup
 	meson test -C $(CURDIR)/../../../build --suite regress

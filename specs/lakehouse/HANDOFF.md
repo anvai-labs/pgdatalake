@@ -201,6 +201,11 @@
 - `pg_regress --inputdir <dir>` expects `<dir>/sql/` and `<dir>/expected/`
   subdirs; psql column headers are CENTERED — take expected output from the
   results file after eyeballing correctness.
+- **meson test runs the INSTALLED binaries** (`tmp_install`) — after changing
+  backend C code you MUST `meson install --destdir build/tmp_install` (and
+  rerun `--suite setup` after a catversion bump) or the suite silently tests
+  old code; this cost one CI cycle on slice 19 (stale expected file with a
+  pre-fix error message). `make lakehouse-check` now installs first.
 - Upstream `pg_mod_args`/`backend_mod_code` are defined *after*
   `subdir('access')`; `src/backend/access/lakehouse/meson.build` assembles
   module args from earlier-defined components (see file comment).
