@@ -99,6 +99,7 @@ pub unsafe extern "C" fn pg_datalake_scan_new(
     s3_endpoint: *const c_char,
     s3_access_key: *const c_char,
     s3_secret_key: *const c_char,
+    predicate_json: *const c_char,
     err_buf: *mut c_char,
     err_len: usize,
 ) -> *mut ScanSession {
@@ -116,11 +117,19 @@ pub unsafe extern "C" fn pg_datalake_scan_new(
                 .filter(|s| !s.is_empty()),
             path_style: true,
         };
+        let pred_json = unsafe { borrow_string(predicate_json) };
+        let predicate = if pred_json.is_empty() {
+            None
+        } else {
+            let v: serde_json::Value =
+                serde_json::from_str(&pred_json).map_err(|e| format!("predicate JSON: {e}"))?;
+            Some(crate::scan::predicate_from_json(&v)?)
+        };
         let client =
             CatalogClient::new(&endpoint, &warehouse, &token, &s3).map_err(|e| e.to_string())?;
         let ns_levels: Vec<&str> = namespace.split('.').collect();
         client
-            .scan_table(&ns_levels, &table)
+            .scan_table(&ns_levels, &table, predicate.as_ref())
             .map(|(p, s3)| ScanSession::from_plan(p, s3))
             .map_err(|e| e.to_string())
     });
@@ -416,7 +425,6 @@ pub unsafe extern "C" fn pg_datalake_rows_close(rows: *mut RowsHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     /// The exported version ABI keeps its documented format (M0 anchor).
     #[test]
@@ -456,12 +464,45 @@ mod tests {
             ("partition".into(), Value::Union(0, Box::new(Value::Null))),
             ("record_count".into(), Value::Long(77)),
             ("file_size_in_bytes".into(), Value::Long(4096)),
-            ("column_sizes".into(), Value::Map(HashMap::new())),
-            ("value_counts".into(), Value::Map(HashMap::new())),
-            ("null_value_counts".into(), Value::Map(HashMap::new())),
-            ("nan_value_counts".into(), Value::Map(HashMap::new())),
-            ("lower_bounds".into(), Value::Map(HashMap::new())),
-            ("upper_bounds".into(), Value::Map(HashMap::new())),
+            // real column stats: id (field 1) spans [1, 3] — needed for the
+            // predicate-pruning assertion below (bounds must be present or
+            // pruning conservatively keeps the file)
+            (
+                "column_sizes".into(),
+                Value::Union(1, Box::new(Value::Array(vec![]))),
+            ),
+            (
+                "value_counts".into(),
+                Value::Union(1, Box::new(Value::Array(vec![]))),
+            ),
+            (
+                "null_value_counts".into(),
+                Value::Union(1, Box::new(Value::Array(vec![]))),
+            ),
+            (
+                "nan_value_counts".into(),
+                Value::Union(1, Box::new(Value::Array(vec![]))),
+            ),
+            (
+                "lower_bounds".into(),
+                Value::Union(
+                    1,
+                    Box::new(Value::Array(vec![Value::Record(vec![
+                        ("key".into(), Value::Int(1)),
+                        ("value".into(), Value::Bytes(1i64.to_le_bytes().to_vec())),
+                    ])])),
+                ),
+            ),
+            (
+                "upper_bounds".into(),
+                Value::Union(
+                    1,
+                    Box::new(Value::Array(vec![Value::Record(vec![
+                        ("key".into(), Value::Int(1)),
+                        ("value".into(), Value::Bytes(3i64.to_le_bytes().to_vec())),
+                    ])])),
+                ),
+            ),
             (
                 "key_metadata".into(),
                 Value::Union(0, Box::new(Value::Null)),
@@ -549,14 +590,21 @@ mod tests {
         let addr = server.server_addr().to_string();
         let md_path = dir.path().join("metadata").join("00000-x.metadata.json");
         std::thread::spawn(move || {
-            for body in [
-                r#"{"defaults": {"prefix": "pfx"}, "overrides": {}}"#.to_string(),
-                format!(
-                    r#"{{"metadata-location": "file://{}", "config": {{}}}}"#,
-                    md_path.display()
-                ),
-            ] {
-                let req = server.recv().unwrap();
+            // serve config + loadTable pairs; enough for the session
+            // variants in this test (plain + predicate + failure paths)
+            for _ in 0..6 {
+                let Some(req) = server.recv().ok() else {
+                    break;
+                };
+                let is_config = req.url().contains("/v1/config");
+                let body = if is_config {
+                    r#"{"defaults": {"prefix": "pfx"}, "overrides": {}}"#.to_string()
+                } else {
+                    format!(
+                        r#"{{"metadata-location": "file://{}", "config": {{}}}}"#,
+                        md_path.display()
+                    )
+                };
                 let resp = tiny_http::Response::from_string(body).with_header(
                     tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
                         .unwrap(),
@@ -582,6 +630,7 @@ mod tests {
                 std::ptr::null(),
                 std::ptr::null(),
                 std::ptr::null(),
+                std::ptr::null(),
                 err.as_mut_ptr(),
                 err.len(),
             )
@@ -598,6 +647,32 @@ mod tests {
         assert_eq!(unsafe { pg_datalake_scan_task_rows(session, 99) }, 0);
         unsafe {
             pg_datalake_scan_free(session);
+        }
+
+        // predicate JSON prunes at plan time: id > 100 drops the only file
+        // (bounds 1..3) -> zero tasks, no error
+        let pred = CString::new(r#"{"op":"gt","field":"id","value":100}"#).unwrap();
+        let pruned = unsafe {
+            pg_datalake_scan_new(
+                endpoint.as_ptr(),
+                warehouse.as_ptr(),
+                token.as_ptr(),
+                namespace.as_ptr(),
+                table.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                pred.as_ptr(),
+                err.as_mut_ptr(),
+                err.len(),
+            )
+        };
+        assert!(!pruned.is_null(), "pruned error: {:?}", unsafe {
+            CStr::from_ptr(err.as_ptr()).to_string_lossy()
+        });
+        assert_eq!(unsafe { pg_datalake_scan_task_count(pruned) }, 0);
+        unsafe {
+            pg_datalake_scan_free(pruned);
             pg_datalake_scan_free(std::ptr::null_mut()); // no-op
         }
 
@@ -610,6 +685,7 @@ mod tests {
                 token.as_ptr(),
                 namespace.as_ptr(),
                 table.as_ptr(),
+                std::ptr::null(),
                 std::ptr::null(),
                 std::ptr::null(),
                 std::ptr::null(),

@@ -22,7 +22,9 @@
 #include "commands/defrem.h"
 #include "commands/explain.h"
 #include "commands/explain_format.h"
+#include "access/table.h"
 #include "foreign/fdwapi.h"
+#include "nodes/primnodes.h"
 #include "foreign/foreign.h"
 #include "optimizer/planmain.h"
 #include "optimizer/pathnode.h"
@@ -33,8 +35,10 @@
 #include "tcop/tcopprot.h"
 #include "executor/tuptable.h"
 #include "miscadmin.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/nodes.h"
 #include "optimizer/optimizer.h"
+#include "utils/fmgroids.h"
 #include "utils/builtins.h"
 #include "utils/rel.h"
 
@@ -51,12 +55,14 @@ typedef struct LakehouseOptions
 	char	   *s3_endpoint;
 	char	   *s3_access_key;
 	char	   *s3_secret_key;
+	char	   *predicate_json; /* translated quals (slice 15) */
 }			LakehouseOptions;
 
 /* per-executor-node state */
 typedef struct LakehouseExecState
 {
 	LakehouseOptions opts;
+	char	   *predicate_json; /* translated quals (slice 15) */
 	ScanSession *session;
 	RowsHandle *rows;
 	uint64		current_task;
@@ -190,6 +196,7 @@ OpenSession(LakehouseOptions * opts)
 								   opts->s3_endpoint,
 								   opts->s3_access_key,
 								   opts->s3_secret_key,
+								   opts->predicate_json ? opts->predicate_json : "",
 								   errbuf,
 								   sizeof(errbuf));
 	if (session == NULL)
@@ -239,19 +246,209 @@ lakehouse_GetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
 	add_path(baserel, &path->path);
 }
 
+/*
+ * Translate one Var-op-Const qual clause into the ScanPredicate JSON the
+ * Rust side understands (slice 15). Returns NULL for anything we cannot
+ * translate — those quals stay local (executor-evaluated, correct but
+ * not pruning). Numeric semantics: int/date/timestamp constants pass as
+ * their binary width (micros for timestamps — matches the parquet stats
+ * bounds, doc 05 §4); float passes through; text via the type output fn.
+ */
+static char *
+TranslateQual(Expr *expr, TupleDesc tupdesc)
+{
+	OpExpr	   *op;
+	Var		   *var = NULL;
+	Const	   *con = NULL;
+	Oid			opno;
+	const char *opname;
+	const char *json_op = NULL;
+	char	   *attname;
+	char	   *value_buf = NULL;
+	Node	   *a1;
+	Node	   *a2;
+
+	if (!IsA(expr, OpExpr))
+		return NULL;
+	op = (OpExpr *) expr;
+	if (list_length(op->args) != 2)
+		return NULL;
+
+	opno = op->opno;
+	opname = get_opname(opno);
+	if (opname == NULL)
+		return NULL;
+	if (strcmp(opname, "=") == 0)
+		json_op = "eq";
+	else if (strcmp(opname, "<") == 0)
+		json_op = "lt";
+	else if (strcmp(opname, "<=") == 0)
+		json_op = "le";
+	else if (strcmp(opname, ">") == 0)
+		json_op = "gt";
+	else if (strcmp(opname, ">=") == 0)
+		json_op = "ge";
+	else
+		return NULL;
+
+	a1 = (Node *) linitial(op->args);
+	a2 = (Node *) lsecond(op->args);
+	if (IsA(a1, Var) && IsA(a2, Const))
+	{
+		var = (Var *) a1;
+		con = (Const *) a2;
+	}
+	else if (IsA(a2, Var) && IsA(a1, Const))
+	{
+		/* flipped comparison: invert the operator */
+		var = (Var *) a2;
+		con = (Const *) a1;
+		if (strcmp(opname, "<") == 0)
+			json_op = "gt";
+		else if (strcmp(opname, "<=") == 0)
+			json_op = "ge";
+		else if (strcmp(opname, ">") == 0)
+			json_op = "lt";
+		else if (strcmp(opname, ">=") == 0)
+			json_op = "le";
+	}
+	else
+		return NULL;
+
+	if (con->constisnull)
+		return NULL;			/* NULL comparison: keep local */
+	if (var->varattno <= 0 || var->varattno > tupdesc->natts)
+		return NULL;
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, var->varattno - 1);
+
+		if (attr->attisdropped)
+			return NULL;
+		attname = pstrdup(NameStr(attr->attname));
+	}
+
+	{
+		Oid			typid = exprType((Node *) con);
+
+		switch (typid)
+		{
+			case INT2OID:
+				value_buf = psprintf("%lld",
+									 (long long) DatumGetInt16(con->constvalue));
+				break;
+			case INT4OID:
+			case DATEOID:
+				value_buf = psprintf("%lld",
+									 (long long) DatumGetInt32(con->constvalue));
+				break;
+			case INT8OID:
+			case TIMESTAMPOID:
+			case TIMESTAMPTZOID:
+				value_buf = psprintf("%lld",
+									 (long long) DatumGetInt64(con->constvalue));
+				break;
+			case FLOAT4OID:
+				value_buf = psprintf("%g",
+									 (double) DatumGetFloat4(con->constvalue));
+				break;
+			case FLOAT8OID:
+				value_buf = psprintf("%g", DatumGetFloat8(con->constvalue));
+				break;
+			default:
+				{
+					Oid			outfn;
+					bool		isvarlen;
+					const char *raw;
+					char	   *quoted;
+					char	   *p;
+					const char *q;
+
+					getTypeOutputInfo(typid, &outfn, &isvarlen);
+					raw = OidOutputFunctionCall(outfn, con->constvalue);
+					quoted = palloc(strlen(raw) + 3);
+					p = quoted;
+					*p++ = '"';
+					for (q = raw; *q; q++)
+					{
+						if (*q == '"' || *q == '\\')
+							*p++ = '\\';
+						*p++ = *q;
+					}
+					*p++ = '"';
+					*p = '\0';
+					value_buf = quoted;
+					break;
+				}
+		}
+	}
+
+	return psprintf("{\"op\":\"%s\",\"field\":\"%s\",\"value\":%s}",
+					json_op, attname, value_buf);
+}
+
 static ForeignScan *
 lakehouse_GetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 						 Oid foreigntableid, ForeignPath *best_path,
 						 List *tlist, List *scan_clauses, Plan *outer_plan)
 {
-	/* keep all quals local (no pushdown yet, doc 06 §4) */
+	TupleDesc	tupdesc;
+	ListCell   *lc;
+	StringInfoData pred;
+	List	   *local_quals = NIL;
+	char	   *pred_json = NULL;
+	bool		first_pred = true;
+	Relation	tmpl_rel;
+
 	/*
-	 * local quals go in qpqual so the executor filters returned rows
-	 * (pushdown to parquet predicates is a later slice, doc 06 s4)
+	 * Translate Var-op-Const quals into the ScanPredicate JSON (slice 15):
+	 * translated clauses are dropped from the local list — the Rust side
+	 * prunes whole FILES conservatively (bounds/partitions), while any
+	 * remaining clause is evaluated per-row by the executor. Row-level
+	 * correctness holds because pruning is strictly conservative.
 	 */
+	tmpl_rel = table_open(foreigntableid, AccessShareLock);
+	tupdesc = CreateTupleDescCopy(RelationGetDescr(tmpl_rel));
+	table_close(tmpl_rel, AccessShareLock);
+
+	/* unwrap RestrictInfos first: TranslateQual wants plain Exprs */
 	scan_clauses = extract_actual_clauses(scan_clauses, false);
-	return make_foreignscan(tlist, scan_clauses, baserel->relid,
-							NIL, NIL, NIL, NIL, outer_plan);
+	initStringInfo(&pred);
+	foreach(lc, scan_clauses)
+	{
+		Expr	   *expr = (Expr *) lfirst(lc);
+		char	   *clause = TranslateQual(expr, tupdesc);
+
+		if (clause != NULL)
+		{
+			if (!first_pred)
+				appendStringInfoChar(&pred, ',');
+			appendStringInfoString(&pred, clause);
+			first_pred = false;
+		}
+		else
+			local_quals = lappend(local_quals, expr);
+	}
+	pfree(tupdesc);
+
+	if (!first_pred)
+		pred_json = psprintf("{\"and\":[%s]}", pred.data);
+
+	/*
+	 * ALL actual clauses stay in qpqual for exact per-row evaluation:
+	 * bounds/partition pruning is conservative (file-level), so pushed quals
+	 * must ALSO be enforced locally for exact results (doc 06 s4).
+	 */
+	{
+		char	   *pred_private = pred_json ? pstrdup(pred_json) : pstrdup("");
+
+		/*
+		 * qpqual = ALL clauses: pruning is file-level conservative, the
+		 * executor enforces the exact per-row filter on top (doc 06 s4)
+		 */
+		return make_foreignscan(tlist, scan_clauses, baserel->relid,
+								NIL, list_make1(makeString(pred_private)),
+								NIL, NIL, outer_plan);
+	}
 }
 
 static void
@@ -301,6 +498,24 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 				state->slot_index[i] = proj_col++;
 	}
 	state->projection_csv = proj.data;
+
+	/*
+	 * slice 15: translated-quals JSON rides in fdw_private (plan -> executor)
+	 * as a single makeString element.
+	 */
+	if (node->ss.ps.plan != NIL)
+	{
+		ForeignScan *fscan = (ForeignScan *) node->ss.ps.plan;
+
+		if (fscan->fdw_private != NIL)
+		{
+			char	   *pred_private = strVal(linitial(fscan->fdw_private));
+
+			state->predicate_json = pred_private[0] != '\0'
+				? pstrdup(pred_private)
+				: NULL;
+		}
+	}
 	state->opts = opts;
 	state->opts.endpoint = opts.endpoint ? pstrdup(opts.endpoint) : NULL;
 	state->opts.warehouse = opts.warehouse ? pstrdup(opts.warehouse) : NULL;
@@ -311,6 +526,9 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 	state->opts.s3_access_key = opts.s3_access_key ? pstrdup(opts.s3_access_key) : NULL;
 	state->opts.s3_secret_key = opts.s3_secret_key ? pstrdup(opts.s3_secret_key) : NULL;
 
+	/* predicate_json must be set on opts BEFORE OpenSession (slice 15) */
+	if (state->predicate_json != NULL)
+		state->opts.predicate_json = state->predicate_json;
 	state->session = OpenSession(&state->opts);
 	state->task_count = pg_datalake_scan_task_count(state->session);
 	state->rows = NULL;

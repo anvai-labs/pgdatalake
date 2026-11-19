@@ -177,12 +177,12 @@ pub const MANIFEST_ENTRY_SCHEMA_V2: &str = r#"{
                 {"name": "partition", "type": ["null", {"type": "record", "name": "r_part", "fields": []}], "default": null},
                 {"name": "record_count", "type": "long"},
                 {"name": "file_size_in_bytes", "type": "long"},
-                {"name": "column_sizes", "type": {"type": "map", "values": "long"}, "default": {}},
-                {"name": "value_counts", "type": {"type": "map", "values": "long"}, "default": {}},
-                {"name": "null_value_counts", "type": {"type": "map", "values": "long"}, "default": {}},
-                {"name": "nan_value_counts", "type": {"type": "map", "values": "long"}, "default": {}},
-                {"name": "lower_bounds", "type": {"type": "map", "values": "bytes"}, "default": {}},
-                {"name": "upper_bounds", "type": {"type": "map", "values": "bytes"}, "default": {}},
+                {"name": "column_sizes", "type": ["null", {"type": "array", "items": {"type": "record", "name": "kv_long", "fields": [{"name": "key", "type": "int"}, {"name": "value", "type": "long"}]}}], "default": null},
+                {"name": "value_counts", "type": ["null", {"type": "array", "items": {"type": "record", "name": "kv_long_v2", "fields": [{"name": "key", "type": "int"}, {"name": "value", "type": "long"}]}}], "default": null},
+                {"name": "null_value_counts", "type": ["null", {"type": "array", "items": {"type": "record", "name": "kv_long_v3", "fields": [{"name": "key", "type": "int"}, {"name": "value", "type": "long"}]}}], "default": null},
+                {"name": "nan_value_counts", "type": ["null", {"type": "array", "items": {"type": "record", "name": "kv_long_v4", "fields": [{"name": "key", "type": "int"}, {"name": "value", "type": "long"}]}}], "default": null},
+                {"name": "lower_bounds", "type": ["null", {"type": "array", "items": {"type": "record", "name": "kv_bytes_v1", "fields": [{"name": "key", "type": "int"}, {"name": "value", "type": "bytes"}]}}], "default": null},
+                {"name": "upper_bounds", "type": ["null", {"type": "array", "items": {"type": "record", "name": "kv_bytes_v2", "fields": [{"name": "key", "type": "int"}, {"name": "value", "type": "bytes"}]}}], "default": null},
                 {"name": "key_metadata", "type": ["null", "bytes"], "default": null},
                 {"name": "split_offsets", "type": ["null", {"type": "array", "items": "int"}], "default": null},
                 {"name": "equality_ids", "type": ["null", {"type": "array", "items": "int"}], "default": null},
@@ -368,35 +368,80 @@ fn manifest_entry_from_value(v: &apache_avro::types::Value) -> Result<ManifestEn
     };
     let i64_map = |k: &str| -> Result<std::collections::BTreeMap<i64, i64>, StorageError> {
         let mut m = std::collections::BTreeMap::new();
-        if let Some((_, V::Map(pairs))) = df_find(k) {
-            for (key, val) in pairs {
-                let V::Long(n) = val else {
-                    return Err(StorageError::Decode(format!("{k}[{key}]: {val:?}")));
-                };
-                m.insert(
-                    key.parse::<i64>().map_err(|e| {
-                        StorageError::Decode(format!("{k}[{key}]: field id not an int: {e}"))
-                    })?,
-                    *n,
-                );
+        // metrics live in the array branch of the nullable union (the
+        // spec Avro schema encodes them as arrays of kv records);
+        // plain Avro maps are accepted leniently
+        let unwrapped = match df_find(k) {
+            Some((_, V::Union(_, inner))) => inner.as_ref(),
+            Some((_, other)) => other,
+            None => &V::Null,
+        };
+        match unwrapped {
+            V::Array(items) => {
+                for it in items {
+                    let V::Record(kv) = it else {
+                        return Err(StorageError::Decode(format!("{k} item: {it:?}")));
+                    };
+                    let key = kv.iter().find(|(fk, _)| fk == "key");
+                    let value = kv.iter().find(|(fk, _)| fk == "value");
+                    let (Some((_, V::Int(fid))), Some((_, V::Long(n)))) = (key, value) else {
+                        return Err(StorageError::Decode(format!("{k} kv: {kv:?}")));
+                    };
+                    m.insert(*fid as i64, *n);
+                }
             }
+            V::Map(pairs) => {
+                for (key, val) in pairs {
+                    let V::Long(n) = val else {
+                        return Err(StorageError::Decode(format!("{k}[{key}]: {val:?}")));
+                    };
+                    m.insert(
+                        key.parse::<i64>().map_err(|e| {
+                            StorageError::Decode(format!("{k}[{key}]: field id not an int: {e}"))
+                        })?,
+                        *n,
+                    );
+                }
+            }
+            _ => {}
         }
         Ok(m)
     };
     let bytes_map = |k: &str| -> Result<std::collections::BTreeMap<i64, Vec<u8>>, StorageError> {
         let mut m = std::collections::BTreeMap::new();
-        if let Some((_, V::Map(pairs))) = df_find(k) {
-            for (key, val) in pairs {
-                let V::Bytes(b) = val else {
-                    return Err(StorageError::Decode(format!("{k}[{key}]: {val:?}")));
-                };
-                m.insert(
-                    key.parse::<i64>().map_err(|e| {
-                        StorageError::Decode(format!("{k}[{key}]: field id not an int: {e}"))
-                    })?,
-                    b.clone(),
-                );
+        let unwrapped = match df_find(k) {
+            Some((_, V::Union(_, inner))) => inner.as_ref(),
+            Some((_, other)) => other,
+            None => &V::Null,
+        };
+        match unwrapped {
+            V::Array(items) => {
+                for it in items {
+                    let V::Record(kv) = it else {
+                        return Err(StorageError::Decode(format!("{k} item: {it:?}")));
+                    };
+                    let key = kv.iter().find(|(fk, _)| fk == "key");
+                    let value = kv.iter().find(|(fk, _)| fk == "value");
+                    let (Some((_, V::Int(fid))), Some((_, V::Bytes(b)))) = (key, value) else {
+                        return Err(StorageError::Decode(format!("{k} kv: {kv:?}")));
+                    };
+                    m.insert(*fid as i64, b.clone());
+                }
             }
+            V::Map(pairs) => {
+                for (key, val) in pairs {
+                    let V::Bytes(b) = val else {
+                        return Err(StorageError::Decode(format!("{k}[{key}]: {val:?}")));
+                    };
+                    m.insert(
+                        key.parse::<i64>().map_err(|e| {
+                            StorageError::Decode(format!("{k}[{key}]: field id not an int: {e}"))
+                        })?,
+                        b.clone(),
+                    );
+                }
+            }
+            _ => {}
         }
         Ok(m)
     };
@@ -563,21 +608,30 @@ mod tests {
     fn parses_manifest_avro_entries() {
         use apache_avro::types::{Record, Value};
         use apache_avro::{Schema as AvroSchema, Writer};
-        use std::collections::HashMap;
         let map = |pairs: &[(&str, i64)]| {
-            Value::Map(
+            Value::Array(
                 pairs
                     .iter()
-                    .map(|(k, v)| (k.to_string(), Value::Long(*v)))
-                    .collect::<HashMap<_, _>>(),
+                    .map(|(k, v)| {
+                        Value::Record(vec![
+                            ("key".into(), Value::Int(k.parse::<i32>().unwrap())),
+                            ("value".into(), Value::Long(*v)),
+                        ])
+                    })
+                    .collect(),
             )
         };
         let bmap = |pairs: &[(&str, u8)]| {
-            Value::Map(
+            Value::Array(
                 pairs
                     .iter()
-                    .map(|(k, v)| (k.to_string(), Value::Bytes(vec![*v])))
-                    .collect::<HashMap<_, _>>(),
+                    .map(|(k, v)| {
+                        Value::Record(vec![
+                            ("key".into(), Value::Int(k.parse::<i32>().unwrap())),
+                            ("value".into(), Value::Bytes(vec![*v])),
+                        ])
+                    })
+                    .collect(),
             )
         };
 
@@ -609,12 +663,30 @@ mod tests {
             ),
             ("record_count".into(), Value::Long(100)),
             ("file_size_in_bytes".into(), Value::Long(5242880)),
-            ("column_sizes".into(), map(&[("1", 1024), ("2", 2048)])),
-            ("value_counts".into(), map(&[("1", 100), ("2", 97)])),
-            ("null_value_counts".into(), map(&[("2", 3)])),
-            ("nan_value_counts".into(), map(&[])),
-            ("lower_bounds".into(), bmap(&[("1", 1)])),
-            ("upper_bounds".into(), bmap(&[("1", 64)])),
+            (
+                "column_sizes".into(),
+                Value::Union(1, Box::new(map(&[("1", 1024), ("2", 2048)]))),
+            ),
+            (
+                "value_counts".into(),
+                Value::Union(1, Box::new(map(&[("1", 100), ("2", 97)]))),
+            ),
+            (
+                "null_value_counts".into(),
+                Value::Union(1, Box::new(map(&[("2", 3)]))),
+            ),
+            (
+                "nan_value_counts".into(),
+                Value::Union(1, Box::new(map(&[]))),
+            ),
+            (
+                "lower_bounds".into(),
+                Value::Union(1, Box::new(bmap(&[("1", 1)]))),
+            ),
+            (
+                "upper_bounds".into(),
+                Value::Union(1, Box::new(bmap(&[("1", 64)]))),
+            ),
             (
                 "key_metadata".into(),
                 Value::Union(0, Box::new(Value::Null)),
@@ -689,5 +761,110 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].added_files_count, Some(1));
         assert_eq!(entries[0].added_rows_count, Some(100));
+    }
+    #[test]
+    fn debug_union_decode() {
+        use apache_avro::types::{Record, Value};
+        use apache_avro::{Schema as AvroSchema, Writer};
+        let schema = AvroSchema::parse_str(MANIFEST_ENTRY_SCHEMA_V2).unwrap();
+        let mut writer = Writer::new(&schema, Vec::new());
+        let mut entry = Record::new(&schema).unwrap();
+        entry.put("status", Value::Int(1));
+        entry.put("snapshot_id", Value::Long(42));
+        entry.put(
+            "sequence_number",
+            Value::Union(1, Box::new(Value::Long(34))),
+        );
+        entry.put(
+            "file_sequence_number",
+            Value::Union(1, Box::new(Value::Long(2))),
+        );
+        let data_file = Value::Record(vec![
+            ("content".into(), Value::Int(0)),
+            ("file_path".into(), Value::String("p".into())),
+            ("file_format".into(), Value::String("parquet".into())),
+            (
+                "partition".into(),
+                Value::Union(1, Box::new(Value::Record(vec![]))),
+            ),
+            ("record_count".into(), Value::Long(100)),
+            ("file_size_in_bytes".into(), Value::Long(1)),
+            (
+                "column_sizes".into(),
+                Value::Union(
+                    1,
+                    Box::new(Value::Array(vec![Value::Record(vec![
+                        ("key".into(), Value::Int(1)),
+                        ("value".into(), Value::Long(1024)),
+                    ])])),
+                ),
+            ),
+            (
+                "value_counts".into(),
+                Value::Union(
+                    1,
+                    Box::new(Value::Array(vec![Value::Record(vec![
+                        ("key".into(), Value::Int(1)),
+                        ("value".into(), Value::Long(100)),
+                    ])])),
+                ),
+            ),
+            (
+                "null_value_counts".into(),
+                Value::Union(
+                    1,
+                    Box::new(Value::Array(vec![Value::Record(vec![
+                        ("key".into(), Value::Int(1)),
+                        ("value".into(), Value::Long(0)),
+                    ])])),
+                ),
+            ),
+            (
+                "nan_value_counts".into(),
+                Value::Union(1, Box::new(Value::Array(vec![]))),
+            ),
+            (
+                "lower_bounds".into(),
+                Value::Union(
+                    1,
+                    Box::new(Value::Array(vec![Value::Record(vec![
+                        ("key".into(), Value::Int(1)),
+                        ("value".into(), Value::Bytes(vec![1])),
+                    ])])),
+                ),
+            ),
+            (
+                "upper_bounds".into(),
+                Value::Union(
+                    1,
+                    Box::new(Value::Array(vec![Value::Record(vec![
+                        ("key".into(), Value::Int(1)),
+                        ("value".into(), Value::Bytes(vec![2])),
+                    ])])),
+                ),
+            ),
+            (
+                "key_metadata".into(),
+                Value::Union(0, Box::new(Value::Null)),
+            ),
+            (
+                "split_offsets".into(),
+                Value::Union(1, Box::new(Value::Array(vec![Value::Int(4)]))),
+            ),
+            (
+                "equality_ids".into(),
+                Value::Union(0, Box::new(Value::Null)),
+            ),
+            (
+                "sort_order_id".into(),
+                Value::Union(0, Box::new(Value::Null)),
+            ),
+        ]);
+        entry.put("data_file", data_file);
+        writer.append(entry).unwrap();
+        let bytes = writer.into_inner().unwrap();
+        let entries = parse_manifest(&bytes).unwrap();
+        println!("DEBUG entry: {:?}", entries[0].data_file.column_sizes);
+        assert_eq!(entries[0].data_file.column_sizes.get(&1), Some(&1024));
     }
 }

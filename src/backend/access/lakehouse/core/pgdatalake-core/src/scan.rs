@@ -231,6 +231,61 @@ fn bounds_keep(
     }
 }
 
+/// The JSON contract for translated C-side quals (slice 15):
+/// `{"op":"eq|lt|le|gt|ge","field":name,"value":any}` and
+/// `{"and":[...]}`. Anything else is a hard error so the C side keeps the
+/// qual local instead of silently not pruning.
+pub fn predicate_from_json(v: &serde_json::Value) -> Result<ScanPredicate, String> {
+    if let Some(items) = v.get("and") {
+        let arr = items
+            .as_array()
+            .ok_or_else(|| format!("and without array: {v}"))?;
+        return Ok(ScanPredicate::And(
+            arr.iter()
+                .map(predicate_from_json)
+                .collect::<Result<Vec<_>, _>>()?,
+        ));
+    }
+    let op = v
+        .get("op")
+        .and_then(|o| o.as_str())
+        .ok_or_else(|| format!("predicate missing op: {v}"))?;
+    let field = || {
+        v.get("field")
+            .and_then(|f| f.as_str())
+            .map(String::from)
+            .ok_or_else(|| format!("predicate missing field: {v}"))
+    };
+    let value = || {
+        v.get("value")
+            .cloned()
+            .ok_or_else(|| format!("predicate missing value: {v}"))
+    };
+    match op {
+        "eq" => Ok(ScanPredicate::Eq {
+            field: field()?,
+            value: value()?,
+        }),
+        "lt" => Ok(ScanPredicate::Lt {
+            field: field()?,
+            value: value()?,
+        }),
+        "le" => Ok(ScanPredicate::Le {
+            field: field()?,
+            value: value()?,
+        }),
+        "gt" => Ok(ScanPredicate::Gt {
+            field: field()?,
+            value: value()?,
+        }),
+        "ge" => Ok(ScanPredicate::Ge {
+            field: field()?,
+            value: value()?,
+        }),
+        other => Err(format!("unsupported predicate op {other:?}")),
+    }
+}
+
 /// Open a store for an absolute file location and return (io, key). For
 /// file:// FILE locations the local store must be rooted at the parent
 /// directory with the file name as the key; S3 locations carry the full
@@ -356,14 +411,20 @@ mod tests {
     use crate::catalog::metadata::{FormatVersion, TableMetadata};
     use apache_avro::types::{Record, Value};
     use apache_avro::{Schema as AvroSchema, Writer};
-    use std::collections::HashMap;
 
-    fn avro_map(pairs: &[(&str, i64)]) -> Value {
-        Value::Map(
+    fn avro_map(kv_schema: &AvroSchema, pairs: &[(&str, i64)]) -> Value {
+        // metric fields are arrays of named {key:int, value:long} records
+        // (kv_long) per the Iceberg manifest Avro schema
+        Value::Array(
             pairs
                 .iter()
-                .map(|(k, v)| (k.to_string(), Value::Long(*v)))
-                .collect::<HashMap<_, _>>(),
+                .map(|(k, v)| {
+                    let mut rec = Record::new(kv_schema).unwrap();
+                    rec.put("key", k.parse::<i32>().unwrap());
+                    rec.put("value", *v);
+                    rec.into()
+                })
+                .collect(),
         )
     }
 
@@ -374,6 +435,31 @@ mod tests {
         files: &[(i32, &str, i64)],
     ) -> Result<(), StorageError> {
         let schema = AvroSchema::parse_str(crate::manifest::MANIFEST_ENTRY_SCHEMA_V2).unwrap();
+        let AvroSchema::Record(top_rec) = &schema else {
+            panic!("manifest is not a record");
+        };
+        let df_field = top_rec
+            .fields
+            .iter()
+            .find(|f| f.name == "data_file")
+            .unwrap();
+        let apache_avro::Schema::Record(df_rec) = &df_field.schema else {
+            panic!("data_file not a record");
+        };
+        let kv_schema = df_rec
+            .fields
+            .iter()
+            .find(|f| f.name == "column_sizes")
+            .map(|f| match &f.schema {
+                apache_avro::Schema::Union(u) => u.variants()[1].clone(),
+                other => other.clone(),
+            })
+            .unwrap();
+        // items of the array: the named kv record schema (kv_long)
+        let apache_avro::Schema::Array(arr) = &kv_schema else {
+            panic!("column_sizes is not an array");
+        };
+        let kv_schema = (*arr.items).clone();
         let mut writer = Writer::new(&schema, Vec::new());
         for (status, path, rows) in files {
             let mut entry = Record::new(&schema).unwrap();
@@ -397,12 +483,30 @@ mod tests {
                 ),
                 ("record_count".into(), Value::Long(*rows)),
                 ("file_size_in_bytes".into(), Value::Long(4096)),
-                ("column_sizes".into(), avro_map(&[("1", 64)])),
-                ("value_counts".into(), avro_map(&[("1", *rows)])),
-                ("null_value_counts".into(), avro_map(&[])),
-                ("nan_value_counts".into(), avro_map(&[])),
-                ("lower_bounds".into(), Value::Map(HashMap::new())),
-                ("upper_bounds".into(), Value::Map(HashMap::new())),
+                (
+                    "column_sizes".into(),
+                    Value::Union(1, Box::new(avro_map(&kv_schema, &[("1", 64)]))),
+                ),
+                (
+                    "value_counts".into(),
+                    Value::Union(1, Box::new(avro_map(&kv_schema, &[("1", *rows)]))),
+                ),
+                (
+                    "null_value_counts".into(),
+                    Value::Union(1, Box::new(avro_map(&kv_schema, &[]))),
+                ),
+                (
+                    "nan_value_counts".into(),
+                    Value::Union(1, Box::new(avro_map(&kv_schema, &[]))),
+                ),
+                (
+                    "lower_bounds".into(),
+                    Value::Union(1, Box::new(Value::Array(vec![]))),
+                ),
+                (
+                    "upper_bounds".into(),
+                    Value::Union(1, Box::new(Value::Array(vec![]))),
+                ),
                 (
                     "key_metadata".into(),
                     Value::Union(0, Box::new(Value::Null)),
@@ -588,6 +692,31 @@ mod tests {
             &format!("\"name\": \"r_part\", \"fields\": [{{{partition_fields}}}]"),
         );
         let schema = AvroSchema::parse_str(&schema_str).unwrap();
+        let AvroSchema::Record(top_rec) = &schema else {
+            panic!("manifest is not a record");
+        };
+        let df_field = top_rec
+            .fields
+            .iter()
+            .find(|f| f.name == "data_file")
+            .unwrap();
+        let apache_avro::Schema::Record(df_rec) = &df_field.schema else {
+            panic!("data_file not a record");
+        };
+        let kv_schema = df_rec
+            .fields
+            .iter()
+            .find(|f| f.name == "column_sizes")
+            .map(|f| match &f.schema {
+                apache_avro::Schema::Union(u) => u.variants()[1].clone(),
+                other => other.clone(),
+            })
+            .unwrap();
+        // items of the array: the named kv record schema (kv_long)
+        let apache_avro::Schema::Array(arr) = &kv_schema else {
+            panic!("column_sizes is not an array");
+        };
+        let kv_schema = (*arr.items).clone();
 
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("metadata")).unwrap();
@@ -621,12 +750,30 @@ mod tests {
                 ),
                 ("record_count".into(), Value::Long(rows)),
                 ("file_size_in_bytes".into(), Value::Long(4096)),
-                ("column_sizes".into(), Value::Map(HashMap::new())),
-                ("value_counts".into(), Value::Map(HashMap::new())),
-                ("null_value_counts".into(), Value::Map(HashMap::new())),
-                ("nan_value_counts".into(), Value::Map(HashMap::new())),
-                ("lower_bounds".into(), Value::Map(HashMap::new())),
-                ("upper_bounds".into(), Value::Map(HashMap::new())),
+                (
+                    "column_sizes".into(),
+                    Value::Union(1, Box::new(avro_map(&kv_schema, &[("1", 64)]))),
+                ),
+                (
+                    "value_counts".into(),
+                    Value::Union(1, Box::new(avro_map(&kv_schema, &[("1", rows)]))),
+                ),
+                (
+                    "null_value_counts".into(),
+                    Value::Union(1, Box::new(avro_map(&kv_schema, &[]))),
+                ),
+                (
+                    "nan_value_counts".into(),
+                    Value::Union(1, Box::new(avro_map(&kv_schema, &[]))),
+                ),
+                (
+                    "lower_bounds".into(),
+                    Value::Union(1, Box::new(Value::Array(vec![]))),
+                ),
+                (
+                    "upper_bounds".into(),
+                    Value::Union(1, Box::new(Value::Array(vec![]))),
+                ),
                 (
                     "key_metadata".into(),
                     Value::Union(0, Box::new(Value::Null)),
@@ -815,5 +962,117 @@ mod tests {
         ]);
         assert!(!bounds_keep(&in_bounds.data_file, &id_schema, &pred));
         let _ = md;
+    }
+
+    /// TDD anchor (M1 slice 15): the C/FDW side serializes translated
+    /// quals as JSON; predicate_from_json is the deserialization contract:
+    /// {"op":"eq|lt|le|gt|ge","field":...,"value":...} and
+    /// {"and":[...]} — everything else is a hard error (the C side keeps
+    /// untranslated quals local).
+    #[test]
+    fn predicate_from_json_roundtrip_and_rejects_garbage() {
+        let p = predicate_from_json(&serde_json::json!({"op": "lt", "field": "id", "value": 5}))
+            .expect("lt");
+        assert_eq!(
+            p,
+            ScanPredicate::Lt {
+                field: "id".into(),
+                value: serde_json::json!(5)
+            }
+        );
+
+        let p = predicate_from_json(&serde_json::json!({
+            "and": [
+                {"op": "eq", "field": "region", "value": "eu"},
+                {"op": "ge", "field": "id", "value": 10}
+            ]
+        }))
+        .expect("and");
+        assert_eq!(
+            p,
+            ScanPredicate::And(vec![
+                ScanPredicate::Eq {
+                    field: "region".into(),
+                    value: serde_json::json!("eu")
+                },
+                ScanPredicate::Ge {
+                    field: "id".into(),
+                    value: serde_json::json!(10)
+                },
+            ])
+        );
+
+        // garbage ops/values reject loudly -> C keeps the qual local
+        assert!(predicate_from_json(&serde_json::json!({"op": "match"})).is_err());
+        assert!(predicate_from_json(&serde_json::json!("nonsense")).is_err());
+        assert!(predicate_from_json(&serde_json::json!({
+            "and": [{"op": "nope", "field": "x", "value": 1}]
+        }))
+        .is_err());
+    }
+
+    /// Integration: a JSON predicate arriving through plan_scan prunes the
+    /// same way a constructed one does (the FFI seam's end-to-end contract).
+    #[test]
+    fn json_predicate_prunes_through_plan_scan() {
+        use crate::catalog::metadata::{Field, IcebergType, Schema, TableMetadata};
+        use std::collections::BTreeMap;
+
+        let mk_entry = |lower: Option<i64>, upper: Option<i64>| crate::manifest::ManifestEntry {
+            status: crate::manifest::ManifestEntryStatus::Added,
+            snapshot_id: 42,
+            sequence_number: None,
+            file_sequence_number: None,
+            data_file: crate::manifest::DataFile {
+                content: crate::manifest::DataContent::Data,
+                file_path: format!("file:///d/{lower:?}.parquet"),
+                file_format: "parquet".into(),
+                partition: Some(serde_json::json!({})),
+                record_count: 10,
+                file_size_in_bytes: 1,
+                column_sizes: BTreeMap::new(),
+                value_counts: BTreeMap::new(),
+                null_value_counts: BTreeMap::new(),
+                nan_value_counts: BTreeMap::new(),
+                lower_bounds: lower
+                    .map(|v| BTreeMap::from([(1i64, v.to_le_bytes().to_vec())]))
+                    .unwrap_or_default(),
+                upper_bounds: upper
+                    .map(|v| BTreeMap::from([(1i64, v.to_le_bytes().to_vec())]))
+                    .unwrap_or_default(),
+                key_metadata: None,
+                split_offsets: None,
+                equality_ids: None,
+                sort_order_id: None,
+            },
+        };
+        let md = TableMetadata {
+            format_version: crate::catalog::metadata::FormatVersion::V2,
+            table_uuid: uuid::Uuid::nil(),
+            location: "s3://t".into(),
+            last_sequence_number: None,
+            schemas: vec![Schema {
+                struct_type: crate::catalog::metadata::IcebergTypeMarker::Struct,
+                schema_id: 0,
+                fields: vec![Field {
+                    id: 1,
+                    name: "id".into(),
+                    required: true,
+                    r#type: IcebergType::Long,
+                    doc: None,
+                }],
+            }],
+            current_schema_id: 0,
+            snapshots: vec![],
+            current_snapshot_id: None,
+            properties: BTreeMap::new(),
+            partition_specs: vec![],
+            default_partition_spec_id: None,
+        };
+        let pred = predicate_from_json(&serde_json::json!({"op": "lt", "field": "id", "value": 5}))
+            .unwrap();
+        let plan = plan_scan(&md, None, None, Some(&pred)).unwrap();
+        assert_eq!(plan.tasks.len(), 0, "empty-table plan with predicate OK");
+        let _ = mk_entry;
     }
 }

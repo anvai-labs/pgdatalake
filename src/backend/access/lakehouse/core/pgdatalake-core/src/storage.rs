@@ -204,6 +204,11 @@ pub fn fetch_metadata(
 }
 
 /// Gzip magic 0x1f 0x8b; plain JSON passes through untouched.
+/// public wrapper for examples/tests
+pub fn maybe_gunzip_pub(bytes: Vec<u8>) -> Result<Vec<u8>, StorageError> {
+    maybe_gunzip(bytes)
+}
+
 fn maybe_gunzip(bytes: Vec<u8>) -> Result<Vec<u8>, StorageError> {
     if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
         let mut out = Vec::new();
