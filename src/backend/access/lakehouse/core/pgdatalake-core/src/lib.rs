@@ -14,4 +14,5 @@
 
 pub mod catalog;
 pub mod ffi;
+pub mod manifest;
 pub mod storage;

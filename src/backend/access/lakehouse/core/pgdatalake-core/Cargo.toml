@@ -17,6 +17,7 @@ urlencoding = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 object_store = { version = "0.11", default-features = false, features = ["aws", "http"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+apache-avro = { version = "0.17", default-features = false }
 tokio = { version = "1", default-features = false, features = ["rt"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 
