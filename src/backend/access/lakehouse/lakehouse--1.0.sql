@@ -24,3 +24,10 @@ CREATE FUNCTION lakehouse.scan_files(
 RETURNS TABLE(file_path text, record_count bigint)
 AS 'MODULE_PATHNAME', 'pg_lakehouse_scan_files'
 LANGUAGE C VOLATILE STRICT;
+
+-- M1 slice 11: the foreign-data wrapper handler (doc 01 D1: external
+-- tables attach via the FDW and appear as ordinary pg_class rows).
+CREATE FUNCTION lakehouse.lakehouse_fdw_handler()
+RETURNS fdw_handler
+AS 'MODULE_PATHNAME', 'lakehouse_fdw_handler'
+LANGUAGE C;
