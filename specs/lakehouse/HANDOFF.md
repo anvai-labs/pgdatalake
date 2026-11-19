@@ -52,10 +52,29 @@
     -> ScanTask list (DELETED dropped, sequence numbers resolved, row/file
     aggregates); fully offline-tested via file:// fixtures;
   - 27 cargo tests; apache-avro dep added.
-  - **Next slices**: partition-spec-aware pruning (resolve opaque partition
-    JSON + bounds predicates, doc 06 §2) -> FFI boundary (pg_datalake_* C
-    structs, panic-free, RULES §4) + FDW C glue -> first `CREATE FOREIGN
-    TABLE` SQL surface + regress tests -> EXPLAIN.
+  - slice 8 partition-spec model + identity-transform pruning
+    (conservative: non-identity transforms always keep the file);
+  - slice 9 FFI boundary (pg_datalake_scan_*, panic-free catch_unwind,
+    caller-owned error buffers, # Safety docs) + CatalogClient
+    orchestrator + lakehouse.scan_files() SQL SRF (8 text args; storage
+    credentials are caller-side — object_store IMDS fallback caught live);
+  - slice 10 Parquet row reads (parquet/arrow 54) + rows FFI
+    (pg_datalake_rows_open/next/col_*/close; values rendered to text at
+    advance time, nulls via parallel flags; CellValue normalization
+    Int32->Int64, Float32->Float64);
+  - slice 11 FDW handler (fdw.c): GetForeignRelSize/Paths/Plan +
+    Begin/Iterate/ReScan/End; table option 'analytics.events' with
+    namespace = last-dot prefix (doc 03 §3); quals evaluated locally
+    (no pushdown yet); regress fdw.sql proves pg_class relkind 'f' +
+    information_schema + 08000 fail-fast. NOTE: FDW ships in the single
+    lakehouse module for M1 (doc 01 said contrib/lakehouse_fdw — split is
+    the M5 extraction item; note in retro).
+  - 35 cargo tests + 3 regress groups; deps now incl. parquet/arrow 54.
+  - **Next slices**: fixture data files (scripts/gen_fixtures.py per doc 10:
+    PyIceberg/Trino-written table -> live SELECT returning real rows) ->
+    qual/projection pushdown (doc 06 §4) -> EXPLAIN task counts ->
+    parallel scans -> M1 conformance gate (Trino-written tables, TPC-DS
+    subset with pruning evidence).
 - Core-allowlist patches so far: meson_options.txt,
   src/backend/access/meson.build, root Makefile (each committed with
   `[core-allowlist]` rationale).
