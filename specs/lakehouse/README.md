@@ -1,7 +1,7 @@
 # PostgreSQL Lakehouse (`pgdatalake`) — Fork Design Specs
 
 This directory contains the design specifications for making this PostgreSQL fork
-(`anvai-labs/postgres`, tracking `postgres/postgres` master) a **native lakehouse**:
+(`anvai-labs/pgdatalake`, tracking `postgres/postgres` master) a **native lakehouse**:
 query and manage open table-format tables (external tables that already live in a
 catalog, and internal managed tables whose on-disk format *is* the table format).
 **Apache Iceberg is the first and initially only FORMAT**, implemented on the
@@ -59,7 +59,7 @@ later formats inherit them.
 
 ## Status
 
-- 2026-11-19: fork created (private repo `anvai-labs/postgres`), specs drafted at
+- 2026-11-19: fork created (private repo `anvai-labs/pgdatalake`), specs drafted at
   PostgreSQL master `61f6021b110` (PG 20 dev, `CATALOG_VERSION_NO 202611121`).
 - 2026-11-19: **naming generalized** — core `pgdatalake-core`, SQL surface
   `lakehouse` (`USING lakehouse FORMAT iceberg`); specs renamed from

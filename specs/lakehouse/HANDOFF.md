@@ -5,14 +5,14 @@
 ## What exists
 
 - Repo: `/home/vsingh/code/postgres`, clone of `postgres/postgres` master
-  (`61f6021b110`, PG 20 dev). `origin` = `anvai-labs/postgres` (private),
+  (`61f6021b110`, PG 20 dev). `origin` = `anvai-labs/pgdatalake` (private),
   `upstream` = `postgres/postgres`.
 - **Branch layout**: `main` = fork base (upstream master + specs commits, merge
   sync per RULES §1 as amended); `lakehouse-dev` = integration branch (renamed
   from `iceberg-dev` 2026-11-19). NOTE: GitHub's default branch is still
   `master` on the remote — flipping it to `main` via `gh repo edit` was denied
   by the harness and `origin/master` still exists; do that manually
-  (`gh repo edit anvai-labs/postgres --default-branch main`, then
+  (`gh repo edit anvai-labs/pgdatalake --default-branch main`, then
   `git push origin --delete master`).
 - **Naming (decided 2026-11-19, user)**: format-generic lakehouse. Rust core
   `pgdatalake-core` (C ABI `pg_datalake_*`, `libpgdatalake_core.a`), SQL

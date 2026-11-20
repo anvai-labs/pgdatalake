@@ -14,7 +14,7 @@ Binding rules for all work in this repository.
   of `upstream/master`, but the fork was created with a default `master` branch
   that already carried the specs commits. Renamed `master` → `main` instead of
   maintaining a separate mirror branch; HANDOFF.md delegated this decision.)*
-- `origin` = `anvai-labs/postgres` (private). `upstream` = `postgres/postgres`.
+- `origin` = `anvai-labs/pgdatalake` (private). `upstream` = `postgres/postgres`.
 - `lakehouse-dev` = integration branch (our commits only, always based on latest
   `main`).
 - Feature work: `feature/<milestone>-<topic>` off `lakehouse-dev`
