@@ -36,6 +36,8 @@
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_am.h"
+#include "foreign/foreign.h"
+#include "commands/defrem.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/storage_xlog.h"
 #include "catalog/storage.h"
@@ -43,6 +45,7 @@
 #include "executor/tuptable.h"
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "utils/acl.h"
 #include "storage/smgr.h"
 #include "utils/lsyscache.h"
 #include "access/reloptions.h"
@@ -96,18 +99,15 @@ get_managed_tables_relid(void)
 static bool
 ExtractManagedIdentity(Oid relid, LakehouseOptions *opts)
 {
+	/* merge mode: caller's opts (possibly from WITH-options) keeps its
+	 * identity fields; only NULL fields get filled from the attach row */
 	Relation	mt;
 	TableScanDesc scan;
 	TupleTableSlot *slot;
 	bool		found = false;
 	char	   *identity = NULL;
-	char	   *opts_token = NULL;
-	char	   *opts_ak = NULL;
-	char	   *opts_sk = NULL;
-	char	   *opts_endpoint = NULL;
+	Oid			serverid = InvalidOid;
 
-	/* merge mode: caller's opts (possibly from WITH-options) keeps its
-	 * identity fields; only NULL fields get filled from the attach row */
 	mt = table_open(get_managed_tables_relid(), AccessShareLock);
 	scan = table_beginscan(mt, GetActiveSnapshot(), 0, NULL, 0);
 	/* the slot type must be the scanned table's AM's own (heap scans
@@ -124,11 +124,8 @@ ExtractManagedIdentity(Oid relid, LakehouseOptions *opts)
 		{
 			int			i;
 
-			for (i = 2; i <= 9; i++)
+			for (i = 2; i <= 4; i++)
 			{
-				char	  **field = NULL;
-				char	  **local_slot = NULL;
-
 				v = slot_getattr(slot, i, &isnull);
 				if (isnull)
 					continue;
@@ -138,42 +135,13 @@ ExtractManagedIdentity(Oid relid, LakehouseOptions *opts)
 						identity = text_to_cstring(DatumGetTextPP(v));
 						break;
 					case 3:
-						field = &opts->endpoint;
+						serverid = DatumGetObjectId(v);
 						break;
 					case 4:
-						field = &opts->warehouse;
-						break;
-					case 5:
-						field = &opts->token;
-						break;
-					case 6:
-						field = &opts->s3_endpoint;
-						break;
-					case 7:
-						field = &opts->s3_access_key;
-						break;
-					case 8:
-						field = &opts->s3_secret_key;
-						break;
-					case 9:
-						field = &opts->snapshot_id;
+						opts->snapshot_id =
+							text_to_cstring(DatumGetTextPP(v));
 						break;
 				}
-				if (i == 3)
-					local_slot = &opts_endpoint;
-				else if (i == 5)
-					local_slot = &opts_token;
-				else if (i == 7)
-					local_slot = &opts_ak;
-				else if (i == 8)
-					local_slot = &opts_sk;
-				if (field != NULL && (field == &opts->token ||
-									  field == &opts->s3_access_key ||
-									  field == &opts->s3_secret_key ||
-									  *field == NULL))
-					*field = text_to_cstring(DatumGetTextPP(v));
-				if (local_slot != NULL)
-					*local_slot = *field;
 			}
 			found = true;
 			break;
@@ -184,37 +152,76 @@ ExtractManagedIdentity(Oid relid, LakehouseOptions *opts)
 	table_endscan(scan);
 	table_close(mt, AccessShareLock);
 
-	if (found)
+	if (found && serverid != InvalidOid)
+	{
+		/*
+		 * Authority model (doc 09, 13-review blocker #6): endpoint and
+		 * storage scope come from the SERVER; credentials come from the
+		 * USER MAPPING of the effective user — never from table options
+		 * or this table (both are dumpable).
+		 */
+		ForeignServer *server = GetForeignServer(serverid);
+		ListCell   *lc;
+
+		if (opts->endpoint == NULL || opts->warehouse == NULL ||
+			opts->s3_endpoint == NULL)
+		{
+			foreach(lc, server->options)
+			{
+				DefElem    *def = (DefElem *) lfirst(lc);
+
+				if (strcmp(def->defname, "endpoint") == 0 &&
+					opts->endpoint == NULL)
+					opts->endpoint = defGetString(def);
+				else if (strcmp(def->defname, "warehouse") == 0 &&
+						 opts->warehouse == NULL)
+					opts->warehouse = defGetString(def);
+				else if (strcmp(def->defname, "s3_endpoint") == 0 &&
+						 opts->s3_endpoint == NULL)
+					opts->s3_endpoint = defGetString(def);
+			}
+		}
+		{
+			UserMapping *um = GetUserMapping(GetUserId(), serverid);
+
+			foreach(lc, um->options)
+			{
+				DefElem    *def = (DefElem *) lfirst(lc);
+
+				if (strcmp(def->defname, "token") == 0 &&
+					opts->token == NULL)
+					opts->token = defGetString(def);
+				else if (strcmp(def->defname, "s3_access_key") == 0 &&
+						 opts->s3_access_key == NULL)
+					opts->s3_access_key = defGetString(def);
+				else if (strcmp(def->defname, "s3_secret_key") == 0 &&
+						 opts->s3_secret_key == NULL)
+					opts->s3_secret_key = defGetString(def);
+			}
+		}
+	}
+
+	if (found && identity != NULL)
 	{
 		if (opts->table != NULL && identity != NULL)
 		{
-			/* caller already has an identity (WITH-options): take only
-			 * credential fields (token, s3 keys) from the attach row */
-			if (opts->token == NULL)
-				opts->token = opts_token;
-			if (opts->s3_access_key == NULL)
-				opts->s3_access_key = opts_ak;
-			if (opts->s3_secret_key == NULL)
-				opts->s3_secret_key = opts_sk;
-			if (opts->endpoint == NULL)
-				opts->endpoint = opts_endpoint;
-			return true;
+			/* caller already has an identity (WITH-options): merge done */
+			return opts->endpoint != NULL;
 		}
-	}
-	if (found && identity != NULL)
-	{
-		/* namespace = before the last '.', table = after (doc 03 §3) */
-		const char *last_dot = strrchr(identity, '.');
+		{
+			/* namespace = before the last '.', table = after (doc 03 §3) */
+			const char *last_dot = strrchr(identity, '.');
 
-		if (last_dot != NULL)
-		{
-			opts->namespace = pnstrdup(identity, last_dot - identity);
-			opts->table = pstrdup(last_dot + 1);
-		}
-		else
-		{
-			opts->namespace = pstrdup("");
-			opts->table = pstrdup(identity);
+			if (last_dot != NULL)
+			{
+				opts->namespace = pnstrdup(identity, last_dot - identity);
+				opts->table = pstrdup(last_dot + 1);
+			}
+			else
+			{
+				opts->namespace = pstrdup("");
+				opts->table = pstrdup(identity);
+			}
 		}
 	}
 	return found;
@@ -1539,6 +1546,11 @@ lakehouse_create_remote(PG_FUNCTION_ARGS)
 	char	   *loc;
 	char		errbuf[1024];
 
+	if (!object_ownercheck(RelationRelationId, relid, GetUserId()))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be owner of %s to create its remote table",
+						get_rel_name(relid) ? get_rel_name(relid) : "?")));
 	rel = table_open(relid, AccessShareLock);
 	if (rel->rd_rel->relkind != RELKIND_RELATION ||
 		rel->rd_rel->relam != lakehouse_am_oid())

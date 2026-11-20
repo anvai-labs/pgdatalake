@@ -6,6 +6,16 @@
 -- pg_am.dat [core-allowlist] edit turned out unnecessary).
 CREATE EXTENSION lakehouse;
 
+-- canonical server + user mapping (credential authority, doc 09):
+-- endpoints on the SERVER, secrets in USER MAPPINGS, never in table
+-- options or the attach row (both are dumpable)
+CREATE FOREIGN DATA WRAPPER lakehouse_w HANDLER lakehouse.lakehouse_fdw_handler;
+CREATE SERVER lakehouse_srv FOREIGN DATA WRAPPER lakehouse_w
+    OPTIONS (endpoint 'http://127.0.0.1:9', warehouse 'wh',
+             s3_endpoint 'http://s3:9000');
+CREATE USER MAPPING FOR CURRENT_USER SERVER lakehouse_srv
+    OPTIONS (s3_access_key 'key', s3_secret_key 'secret');
+
 -- the access method exists, type 't' (table), handler in the lakehouse schema
 SELECT amname, amtype, p.oid::regprocedure AS handler
 FROM pg_am a JOIN pg_proc p ON p.oid = a.amhandler
@@ -47,11 +57,7 @@ END $$;
 -- against an unreachable REST endpoint the scan fails fast with
 -- connection_exception (08000), exactly like the foreign-table path.
 SELECT lakehouse.attach_table('lakehouse_mt'::regclass,
-                              'analytics.events',
-                              endpoint => 'http://127.0.0.1:9',
-                              s3_endpoint => 'http://s3:9000',
-                              s3_access_key => 'key',
-                              s3_secret_key => 'secret');
+                              'analytics.events', 'lakehouse_srv');
 DO $$
 DECLARE
     msg text;
@@ -96,8 +102,7 @@ END $$;
 
 -- attach is idempotent per table (re-attach replaces the identity row)
 SELECT lakehouse.attach_table('lakehouse_mt'::regclass,
-                              'analytics.events_v2',
-                              endpoint => 'http://127.0.0.1:9');
+                              'analytics.events_v2', 'lakehouse_srv');
 SELECT identity FROM lakehouse.managed_tables
 WHERE relid = 'lakehouse_mt'::regclass;
 

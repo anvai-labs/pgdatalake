@@ -39,52 +39,48 @@ RETURNS table_am_handler
 AS 'MODULE_PATHNAME', 'lakehouse_tableam_handler'
 LANGUAGE C;
 
--- Managed-table identity rows (doc 07 §2's pg_lakehouse_table; the M2
--- plan's CREATE-time wiring lands in slice 27 — attach explicitly until
--- then). One row per managed relation: relid is the ordinary pg_class oid,
--- so one catalog, one visibility (00-goals #3).
+-- Managed-table identity rows (doc 07 §2's pg_lakehouse_table). One row
+-- per managed relation: relid is the ordinary pg_class oid, so one
+-- catalog, one visibility (00-goals #3).
+-- SECURITY (doc 09, 13-review blocker #6): NO credential values here or
+-- in WITH-options — pg_class.reloptions and this table are dumpable.
+-- Endpoint/warehouse/s3-endpoint live on a lakehouse FOREIGN SERVER;
+-- credentials (token, s3 keys) live in USER MAPPINGS for that server
+-- (the postgres_fdw authority model: per-user, ACL-controlled, one
+-- place to rotate).
 CREATE TABLE lakehouse.managed_tables (
     relid        oid PRIMARY KEY,
     identity     text NOT NULL,          -- iceberg 'namespace.table'
-    endpoint     text NOT NULL,
-    warehouse    text,
-    token        text,
-    s3_endpoint  text,
-    s3_access_key text,
-    s3_secret_key text,
+    serverid     oid NOT NULL,           -- FDW server: endpoint + mappings
     snapshot_id  text                    -- time-travel pin (slice 18)
 );
 
 CREATE FUNCTION lakehouse.attach_table(target regclass,
                                        identity text,
-                                       endpoint text,
-                                       warehouse text DEFAULT NULL,
-                                       token text DEFAULT NULL,
-                                       s3_endpoint text DEFAULT NULL,
-                                       s3_access_key text DEFAULT NULL,
-                                       s3_secret_key text DEFAULT NULL,
-                                       snapshot_id text DEFAULT NULL)
-RETURNS void LANGUAGE sql AS $$
+                                       server text)
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+    srv oid;
+BEGIN
+    SELECT s.oid INTO srv FROM pg_foreign_server s
+    WHERE s.srvname = server::name;
+    IF srv IS NULL THEN
+        RAISE EXCEPTION 'server "%" does not exist', server
+            USING ERRCODE = '42704';
+    END IF;
     INSERT INTO lakehouse.managed_tables AS mt
-        (relid, identity, endpoint, warehouse, token,
-         s3_endpoint, s3_access_key, s3_secret_key, snapshot_id)
-    VALUES (target, identity, endpoint, warehouse, token,
-            s3_endpoint, s3_access_key, s3_secret_key, snapshot_id)
+        (relid, identity, serverid, snapshot_id)
+    VALUES (target, identity, srv, NULL)
     ON CONFLICT (relid) DO UPDATE
     SET identity = EXCLUDED.identity,
-        endpoint = EXCLUDED.endpoint,
-        warehouse = EXCLUDED.warehouse,
-        token = EXCLUDED.token,
-        s3_endpoint = EXCLUDED.s3_endpoint,
-        s3_access_key = EXCLUDED.s3_access_key,
-        s3_secret_key = EXCLUDED.s3_secret_key,
+        serverid = EXCLUDED.serverid,
         snapshot_id = EXCLUDED.snapshot_id;
-$$;
+END $$;
 
 -- Managed-table hygiene: DROP TABLE removes the identity row (table AMs
 -- get no drop hook, so a sql_drop event trigger does the GC).
 CREATE FUNCTION lakehouse.managed_tables_drop_gc() RETURNS event_trigger
-LANGUAGE plpgsql AS $$
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lakehouse AS $$
 BEGIN
     DELETE FROM lakehouse.managed_tables
     WHERE relid IN (

@@ -483,3 +483,20 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     partition matching by field ID, unknown-partition-spec fallback,
     missing-schema continue, JSON-injection of identifiers (typed
     representation refactor).
+  - 13-implementation-review Blocker #6 — PARTIALLY FIXED 2026-11-20
+    (managed side; suites green + live smoke): credential authority now
+    follows the postgres_fdw model — lakehouse.attach_table takes
+    (regclass, identity, SERVER NAME); endpoint/warehouse/s3_endpoint
+    live on the FOREIGN SERVER options; token/s3 keys live in USER
+    MAPPINGS (per-user, ACL-controlled, single rotation point); the
+    attach row stores only (relid, identity, serverid, snapshot_id) —
+    NO credential columns; WITH-options credential keys already
+    rejected. ExtractManagedIdentity resolves server + GetUserMapping
+    per user. create_remote gained an ownership check
+    (ERRCODE_INSUFFICIENT_PRIVILEGE). drop-gc trigger is SECURITY
+    DEFINER with pinned search_path (ordinary owners can clean their
+    rows). Live-verified: server+mapping -> attach -> create_remote ->
+    INSERT -> count. REMAINING #6 (FDW side + hardening): fdw wrapper
+    validator + ExtractOptions literal-credential removal for FOREIGN
+    tables, scan_files ACL, transport policy (scheme/origin/redirect,
+    redaction), OAuth refresh, sentinel-string dump verification.
