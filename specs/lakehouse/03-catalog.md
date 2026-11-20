@@ -31,7 +31,14 @@ Implement the Iceberg REST openapi spec exactly:
   `renameTable`, `dropTable` (with purge semantics flag), `reportMetrics`.
 - **Commit**: `commitTable` with `requirements` (AssertRefSnapshotId,
   AssertTableUUID, AssertSchemaUUID…) — every requirement type implemented, since
-  this is our optimistic-concurrency instrument (doc 07).
+  this is our optimistic-concurrency instrument (doc 07). Wire contract
+  (verified against pyiceberg 0.12, the interop oracle): requirements
+  discriminate on `"type"` (`assert-table-uuid`, `assert-ref-snapshot-id` with
+  `snapshot-id` ALWAYS present — null means "ref must not exist"), updates
+  discriminate on `"action"` (`add-snapshot`, `set-snapshot-ref` with
+  `ref-name`/`type`/`snapshot-id`). 409 responses classify as the ONLY
+  retryable error class; the retry re-plans from a fresh loadTable (doc 07 §2),
+  bounded by `lakehouse.commit_retries`.
 - **Multi-table atomic commit**: `POST /v1/{ns}/transactions` (`CommitTransactionRequest`)
   implemented for catalogs advertising support; on non-supporting catalogs, our
   cross-table commit strategy degrades per doc 07 §4 (staged sequential commits with

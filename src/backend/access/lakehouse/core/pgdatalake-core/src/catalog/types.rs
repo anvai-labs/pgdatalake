@@ -64,7 +64,7 @@ mod tests {
 /// `metadata` is the deprecated in-band metadata field; when a server
 /// includes it we parse it eagerly (v3-first model) — otherwise the caller
 /// fetches `metadata_location` over file IO.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
 pub struct LoadTableResult {
     #[serde(rename = "metadata-location")]
     pub metadata_location: String,

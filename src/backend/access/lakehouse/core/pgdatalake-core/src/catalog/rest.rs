@@ -26,12 +26,12 @@ impl TokenProvider for StaticToken {
 
 /// HTTP client for one REST catalog endpoint.
 pub struct RestCatalog {
-    endpoint: String,
-    tokens: Box<dyn TokenProvider>,
-    inner: reqwest::blocking::Client,
+    pub(crate) endpoint: String,
+    pub(crate) tokens: Box<dyn TokenProvider>,
+    pub(crate) inner: reqwest::blocking::Client,
     /// Table-route prefix from the config response (`overrides.prefix` in
     /// the Iceberg REST spec); set via with_prefix() or fetch_config().
-    prefix: std::sync::Mutex<Option<String>>,
+    pub(crate) prefix: std::sync::Mutex<Option<String>>,
 }
 
 /// Wire type for the config response; alias to the domain type.
@@ -49,6 +49,11 @@ pub enum RestError {
     /// 404 from loadTable/dropTable etc. — distinct because the caller can
     /// react (doc 03 §5: remote table deleted under us → rel invalid).
     NotFound(String),
+    /// commitTable returned 409 CommitFailedException — a requirement we
+    /// sent failed server-side (concurrent commit won). The ONLY retryable
+    /// error class (doc 03 §5): commit_with_retry re-plans from a fresh
+    /// loadTable; everything else aborts the transaction.
+    Conflict(String),
     Decode(String),
 }
 
@@ -57,6 +62,9 @@ impl std::fmt::Display for RestError {
         match self {
             RestError::Http(m) => write!(f, "REST catalog HTTP error: {m}"),
             RestError::NotFound(m) => write!(f, "REST catalog object not found: {m}"),
+            RestError::Conflict(m) => {
+                write!(f, "REST catalog commit conflict (stale base): {m}")
+            }
             RestError::Decode(m) => write!(f, "REST catalog decode error: {m}"),
         }
     }

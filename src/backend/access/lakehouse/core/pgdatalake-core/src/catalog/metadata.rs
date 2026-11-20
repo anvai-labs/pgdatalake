@@ -38,6 +38,15 @@ impl<'de> Deserialize<'de> for FormatVersion {
     }
 }
 
+impl serde::Serialize for FormatVersion {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u16(match self {
+            FormatVersion::V2 => 2,
+            FormatVersion::V3 => 3,
+        })
+    }
+}
+
 /// Iceberg primitive + nested types. v3-only types (`Unknown`,
 /// nanosecond timestamps, `Variant`) are first-class: the model is v3-shaped,
 /// and per-version capability decisions live in the read/write paths.
@@ -80,6 +89,42 @@ impl<'de> Deserialize<'de> for IcebergType {
         let v = serde_json::Value::deserialize(deserializer)?;
         parse_type(&v)
             .ok_or_else(|| serde::de::Error::custom(format!("unrecognized iceberg type: {v}")))
+    }
+}
+
+/// The canonical type name each variant parses back from (mirror of
+/// parse_parameterized) — used by Serialize so commits write the exact
+/// wire form other engines read.
+fn type_to_value(t: &IcebergType) -> serde_json::Value {
+    use IcebergType::*;
+    match t {
+        Boolean => "boolean".into(),
+        Int => "int".into(),
+        Long => "long".into(),
+        Float => "float".into(),
+        Double => "double".into(),
+        Date => "date".into(),
+        Time => "time".into(),
+        Timestamp => "timestamp".into(),
+        Timestamptz => "timestamptz".into(),
+        TimestampNanos => "timestamp_ns".into(),
+        TimestamptzNanos => "timestamptz_ns".into(),
+        String => "string".into(),
+        Uuid => "uuid".into(),
+        Binary => "binary".into(),
+        Unknown => "unknown".into(),
+        Variant => "variant".into(),
+        Fixed(n) => format!("fixed[{n}]").into(),
+        Decimal { precision, scale } => format!("decimal({precision},{scale})").into(),
+        Struct(fields) => serde_json::json!({ "type": "struct", "fields": fields }),
+        List(inner) => serde_json::json!({ "type": "list", "element": inner }),
+        Map { key, value } => serde_json::json!({ "type": "map", "keys": key, "values": value }),
+    }
+}
+
+impl serde::Serialize for IcebergType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        type_to_value(self).serialize(serializer)
     }
 }
 
@@ -143,7 +188,7 @@ fn parse_type(v: &serde_json::Value) -> Option<IcebergType> {
 }
 
 /// A schema field (v2/v3 shape: id, name, required, type, optional doc).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Field {
     pub id: i64,
@@ -155,7 +200,7 @@ pub struct Field {
 }
 
 /// A schema (ordered field list with an id).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Schema {
     #[serde(rename = "type")]
@@ -166,14 +211,14 @@ pub struct Schema {
 }
 
 /// Marker for the schema's `"type": "struct"`; parsing fails otherwise.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize)]
 pub enum IcebergTypeMarker {
     #[serde(rename = "struct")]
     Struct,
 }
 
 /// One partitioned field of a partition spec (spec § partition-specs).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct PartitionField {
     /// Partition field id (unique across the table's partition evolution).
@@ -188,7 +233,7 @@ pub struct PartitionField {
 /// A partition spec: an ordered list of partition fields. The ORDER of the
 /// fields defines the layout of data_file.partition values in manifests —
 /// pruning resolves positionally against this list (slice 8).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct PartitionSpec {
     pub spec_id: i32,
@@ -196,8 +241,10 @@ pub struct PartitionSpec {
     pub fields: Vec<PartitionField>,
 }
 
-/// A table snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// A table snapshot. Serializes for the commitTable `add-snapshot` update
+/// (M2 slice 25): fields are kebab-case per the table spec, and
+/// `schema-id` is tolerated-absent on read (v2 tables often omit it).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Snapshot {
     pub snapshot_id: i64,
@@ -211,12 +258,14 @@ pub struct Snapshot {
     pub manifest_list: String,
     #[serde(default)]
     pub summary: BTreeMap<String, String>,
+    #[serde(default)]
+    pub schema_id: Option<i64>,
 }
 
 /// An entry of the metadata `refs` map (named snapshot pointers: tags and
 /// branches). Branch-only fields (`min-snapshots-to-keep`,
 /// `max-snapshot-age-ms`) are read-tolerated but unused by reads.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct SnapshotRef {
     pub snapshot_id: i64,
@@ -251,7 +300,7 @@ pub enum SnapshotSelector {
 /// Parsed Iceberg table metadata (metadata.json). Unknown keys are ignored
 /// for forward tolerance; v3-first means v3 additions are typed here, and
 /// v2 documents parse into the same model.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct TableMetadata {
     pub format_version: FormatVersion,

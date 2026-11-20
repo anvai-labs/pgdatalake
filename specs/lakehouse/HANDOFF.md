@@ -246,16 +246,17 @@
     smoke ceremony -> M1 retro + tag milestone/m1.
 - **M2 slice plan (written 2026-11-19, before M1 close; per doc 07 §2
   commit protocol + doc 01 §2 module layout)**:
-  - slice 24 — Rust Parquet writer: columnar batch accumulator ->
-    arrow RecordBatch -> parquet bytes (deps already have
-    parquet/arrow 54 + ArrowWriter) -> StorageIo put; target-file-size
-    splitting; unit tests on file:// stores. Sets up `optimize`'s
-    rewrite machinery for M4.
-  - slice 25 — REST commit protocol: commitTable PUT with requirements
-    [AssertTableUUID, AssertRefSnapshotId(main, base), AssertRefSeq...
-    per Iceberg REST spec], conflict classification + bounded retry
-    (lakehouse.commit_retries), 409 -> re-plan delta; unit-tested
-    against the tiny_http mock catalog (409 path included).
+  - slice 24 — DONE 2026-11-19 (writer.rs, CI green): Rust Parquet
+    writer: columnar batch accumulator -> arrow RecordBatch -> parquet
+    bytes -> StorageIo put; deterministic <rows>-<seq>.parquet naming.
+  - slice 25 — DONE 2026-11-19 (catalog/commit.rs, CI green): REST
+    commit protocol: commitTable with requirements [AssertTableUUID,
+    AssertRefSnapshotId(main, base), + all spec requirement types],
+    conflict classification (409 -> RestError::Conflict, the only
+    retryable class) + bounded re-plan retry; wire shapes pinned against
+    installed pyiceberg 0.12 (requirements tag "type", updates tag
+    "action", explicit-null snapshot-id). 59 cargo tests incl. scripted
+    mock-catalog 409->re-plan->success and budget-exhaustion paths.
   - slice 26 — `USING lakehouse` TableAM skeleton: pg_am.dat
     [core-allowlist] row + catversion bump; tableam handler struct with
     scan callbacks DELEGATING to the existing FDW scan pipeline;
