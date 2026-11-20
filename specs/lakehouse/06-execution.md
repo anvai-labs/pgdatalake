@@ -171,7 +171,24 @@ snapshot summary → manifest entries. Bloom-filter acceleration (table property
 
 - `Parallel Safe` AM scans: leader plans, workers claim tasks from a shared queue
   in the parallel DSM segment (task = data file + delete set; unit granularity
-  `scan_tasks_per_worker` merges small files).
+
+
+*(13-review #7 amendment, 2026-11-20 — per-node queues + pinned-snapshot
+workers.)* Parallel coordination is per-executor-node — never a process
+global (two scans in one query claimed from or cleared one another's
+queue). The stable-task-mapping contract: the LEADER's Begin resolves the
+concrete snapshot (per-execution — the plancache-fresh boundary; named
+refs and "current" resolve once, here) and InitializeDSM records it;
+each worker, whose own Begin may have resolved a different current
+snapshot under a concurrent commit, RE-PINS its session to the leader's
+id when they differ. Every process plans the same immutable snapshot, so
+task index N means the same file everywhere. The partial path is created
+only when `consider_parallel` holds (path invariant). Live acceptance:
+serial == parallel(2 workers) == leader-participation-off multisets
+(self-join, two distinct foreign scans, serial×parallel mix, correlated
+rescan), each row exactly once; the pre-fix leader-off run duplicated
+rows 4× (workers never received the shared queue — Begin runs before the
+DSM hooks in workers too), caught and fixed by this matrix.  `scan_tasks_per_worker` merges small files).
 - Skew handling: repartition pass re-enqueues tasks when a worker finishes 80% of
   its claimed set (v2).
 - EXPLAIN (ANALYZE on scans):

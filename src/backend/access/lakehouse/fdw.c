@@ -67,14 +67,14 @@
 typedef struct LakehouseShared
 {
 	pg_atomic_uint64 next_task;
+	/*
+	 * The LEADER's pinned snapshot id, written before workers launch
+	 * (13-review #7 stable-task-mapping contract): workers plan THIS
+	 * snapshot, so a concurrent commit can never make task index N mean
+	 * different files in different processes. 0 = not pinned (serial).
+	 */
+	uint64		snapshot_id;
 }			LakehouseShared;
-
-/*
- * process-local pointer to the parallel shared state (set by the DSM
- * hooks; NULL in serial plans). One foreign scan per query is an M1
- * limitation, documented in the retro.
- */
-static LakehouseShared * lakehouse_shared_state = NULL;
 
 /*
  * Option homes (13-review #6, doc 09 authority model): each option has
@@ -163,6 +163,12 @@ typedef struct LakehouseExecState
 	uint64		current_task;
 	uint64		task_count;
 	char	   *projection_csv; /* visible attribute names, comma-joined */
+	/*
+	 * THIS node's parallel coordination (13-review #7): per-executor-node,
+	 * never a process global — two scans in one query (self-join) must
+	 * not claim from or clear each other's queues.
+	 */
+	LakehouseShared *shared;
 	int			natts;
 	FmgrInfo   *in_funcs;		/* per visible attribute */
 	Oid		   *typioparams;
@@ -509,9 +515,15 @@ lakehouse_GetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
 
 	/*
 	 * Partial path for parallel scans (slice 17, doc 06 §3): tasks are
-	 * claimed atomically from shared state, so workers divide the task list
-	 * dynamically. Two workers M1 default; tune via GUC later.
+	 * claimed atomically from THIS node's shared queue, and every worker
+	 * plans the leader's PINNED snapshot (13-review #7), so the task
+	 * mapping is stable. Gated on consider_parallel per the path
+	 * invariant (PostgreSQL asserts partial paths only on parallel-safe
+	 * rels — 13-review #7).
 	 */
+	if (!baserel->consider_parallel)
+		return;
+	{
 	ForeignPath *partial;
 
 	partial = create_foreignscan_path(root, baserel, NULL,
@@ -524,6 +536,7 @@ lakehouse_GetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
 	/* parallel_aware: workers get the DSM hook and claim tasks atomically */
 	partial->path.parallel_aware = true;
 	add_partial_path(baserel, &partial->path);
+	}
 }
 
 /*
@@ -1007,11 +1020,11 @@ lakehouse_IterateForeignScan(ForeignScanState *node)
 			char		errbuf[1024];
 			const char *file;
 
-			if (lakehouse_shared_state != NULL)
+			if (state->shared != NULL)
 			{
 				/* parallel: atomically claim the next task (slice 17) */
 				uint64		claimed =
-					pg_atomic_fetch_add_u64(&lakehouse_shared_state->next_task,
+					pg_atomic_fetch_add_u64(&state->shared->next_task,
 											1);
 
 				if (claimed >= state->task_count)
@@ -1160,6 +1173,35 @@ lakehouse_EstimateDSMForeignScan(ForeignScanState *node, ParallelContext *pcxt)
 	return sizeof(LakehouseShared);
 }
 
+/*
+ * Re-open THIS node's session pinned to the leader's concrete snapshot
+ * (13-review #7): every process must plan the SAME immutable snapshot,
+ * or task index N can mean different files under a concurrent commit.
+ * Cheap when ids already match (no commit raced us).
+ */
+static void
+lakehouse_repin_session(LakehouseExecState *state, uint64 snapshot_id)
+{
+	char		sel[64];
+
+	Assert(state != NULL);
+	if (state->session != NULL &&
+		(uint64) pg_datalake_scan_snapshot_id(state->session) == snapshot_id)
+		return;
+	snprintf(sel, sizeof(sel), "{\"kind\":\"id\",\"value\":%llu}",
+			 (unsigned long long) snapshot_id);
+	if (state->session != NULL)
+	{
+		pg_datalake_scan_free(state->session);
+		state->session = NULL;
+	}
+	state->rte_selector = pstrdup(sel);
+	state->session = lakehouse_OpenSession(&state->opts, state->rte_selector);
+	state->task_count = pg_datalake_scan_task_count(state->session);
+	state->rows = NULL;
+	state->current_task = 0;
+}
+
 static void
 lakehouse_InitializeDSMForeignScan(ForeignScanState *node,
 								   ParallelContext *pcxt, void *coordinate)
@@ -1167,7 +1209,25 @@ lakehouse_InitializeDSMForeignScan(ForeignScanState *node,
 	LakehouseShared *shared = (LakehouseShared *) coordinate;
 
 	pg_atomic_init_u64(&shared->next_task, 0);
-	lakehouse_shared_state = shared;
+	/*
+	 * Begin (per-execution pin — the plancache-fresh boundary) ran before
+	 * this hook everywhere: children initialize before the Gather parent.
+	 * The leader's session therefore holds the just-resolved snapshot;
+	 * record it for the workers, who re-pin in their own Initialize hook
+	 * (13-review #7).
+	 */
+	{
+		LakehouseExecState *state = (LakehouseExecState *) node->fdw_state;
+
+		shared->snapshot_id = (state != NULL && state->session != NULL)
+			? (uint64) pg_datalake_scan_snapshot_id(state->session)
+			: 0;
+		if (state != NULL)
+		{
+			state->shared = shared;
+			/* ids already match by construction on the leader */
+		}
+	}
 }
 
 static void
@@ -1175,16 +1235,32 @@ lakehouse_InitializeWorkerForeignScan(ForeignScanState *node, shm_toc *toc,
 									  void *coordinate)
 {
 	LakehouseShared *shared = (LakehouseShared *) coordinate;
+	LakehouseExecState *state = (LakehouseExecState *) node->fdw_state;
 
-	/* runs BEFORE Begin in workers; Iterate picks this up lazily */
-	lakehouse_shared_state = shared;
+	/*
+	 * Begin already ran here (children init before the Gather parent in
+	 * workers too), so fdw_state carries this node's real state: attach
+	 * the node's queue and re-pin the session to the leader's snapshot.
+	 * (An early state is only a defensive fallback.)
+	 */
+	if (state == NULL)
+	{
+		state = (LakehouseExecState *) palloc0(sizeof(LakehouseExecState));
+		node->fdw_state = state;
+	}
+	state->shared = shared;
+	if (shared->snapshot_id != 0)
+		lakehouse_repin_session(state, shared->snapshot_id);
 }
 
 static void
 lakehouse_ShutdownForeignScan(ForeignScanState *node)
 {
-	/* process-local pointer; each worker's copy dies with the process */
-	lakehouse_shared_state = NULL;
+	/* clear THIS node's coordination only (13-review #7) */
+	LakehouseExecState *state = (LakehouseExecState *) node->fdw_state;
+
+	if (state != NULL)
+		state->shared = NULL;
 }
 
 static void

@@ -217,6 +217,21 @@ pub unsafe extern "C" fn pg_datalake_scan_task_file(
     }
 }
 
+/// The scan's pinned Iceberg snapshot id — the basis of the parallel
+/// stable-task-mapping contract (13-review #7): workers plan THIS id,
+/// so concurrent commits can never make task index N mean different
+/// files on different processes.
+///
+/// # Safety
+/// `session` must be NULL or a live handle from `pg_datalake_scan_new`.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_scan_snapshot_id(session: *mut ScanSession) -> i64 {
+    match (unsafe { session.as_ref() }) {
+        Some(s) => s.plan.snapshot_id,
+        None => 0,
+    }
+}
+
 /// record_count of task `idx`; 0 when out of range or session NULL.
 ///
 /// # Safety
