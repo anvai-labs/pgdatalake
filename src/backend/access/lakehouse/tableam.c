@@ -63,6 +63,8 @@
 #include "utils/typcache.h"
 #include "varatt.h"
 
+#include "batch_fill.h"
+
 /* ---------------- identity catalog lookup ---------------- */
 
 /*
@@ -1349,9 +1351,16 @@ typedef struct LakehouseTableScanDescData
 	uint64		staged_pos;
 	/* COW tids (slice 28): 0-based row index within the current task, and
 	 * the task's file path (session-owned CString pointer, stable) for
-	 * tombstone filtering */
+	 * tombstone filtering. M3-R1: the identity is the file-absolute row
+	 * index r from the batch live list (equal to the live-row ordinal for
+	 * managed tables, which carry no delete files). */
 	uint64		row_in_task;
 	const char *cur_task_path;
+	/* M3-R1 typed batch cursor (no per-row renderer on this path) */
+	PgDatalakeRowBatch batch;
+	bool		batch_valid;
+	uint64		batch_cursor;
+	LakehouseBatchMap *maps;	/* per visible attribute */
 }			LakehouseTableScanDescData;
 typedef LakehouseTableScanDescData *LakehouseTableScanDesc;
 
@@ -1368,6 +1377,8 @@ lakehouse_scan_common_setup(LakehouseTableScanDesc scan, Relation rel,
 	scan->in_funcs = (FmgrInfo *) palloc0(tupdesc->natts * sizeof(FmgrInfo));
 	scan->typioparams = (Oid *) palloc0(tupdesc->natts * sizeof(Oid));
 	scan->slot_index = (int *) palloc0(tupdesc->natts * sizeof(int));
+	scan->maps = (LakehouseBatchMap *) palloc0(tupdesc->natts * sizeof(LakehouseBatchMap));
+	scan->batch_valid = false;
 
 	/* projection: visible attribute names, in attribute order — a counted
 	 * JSON ARRAY, not comma-separated: column names may contain commas
@@ -1585,77 +1596,137 @@ lakehouse_scan_getnextslot(TableScanDesc bscan, ScanDirection direction,
 								file, errbuf)));
 			scan->row_in_task = 0;
 			scan->cur_task_path = file;
+			scan->batch_valid = false;
 		}
 
-		/* 13-review #8: explicit ROW/EOF/ERROR — a caught panic used to
-		 * look like EOF (silent truncation); errors abort the scan. */
+		/*
+		 * M3-R1: batch cursor — one pg_datalake_rows_batch_next call per
+		 * arrow batch; Datums are built directly (batch_fill.c). The
+		 * explicit ROW/EOF/ERROR tri-state carries over: EOF advances the
+		 * task, ERROR aborts the scan (13-review #8 — a caught panic is
+		 * never mistaken for EOF).
+		 */
 		{
 			char		next_err[1024];
 			int			nst;
 
-			next_err[0] = '\0';
-			nst = pg_datalake_rows_next(scan->rows, next_err, sizeof(next_err));
-			if (nst == 2)
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_EXCEPTION),
-						 errmsg("lakehouse: row read failed in task %llu: %s",
-								(unsigned long long) scan->current_task,
-								next_err[0] != '\0' ? next_err : "unknown error")));
-			if (nst == 1)
+			if (!scan->batch_valid || scan->batch_cursor >= scan->batch.live_count)
 			{
-				pg_datalake_rows_close(scan->rows);
-				scan->rows = NULL;
-				scan->current_task++;
-				continue;
-			}
-		}
-		{
-			/* COW read-your-deletes: rows tombstoned earlier in THIS
-			 * transaction are filtered here, exactly like the rewrite
-			 * pass filters them at PRE-COMMIT */
-			if (scan->entry != NULL && scan->entry->n_tomb_files > 0 &&
-				scan->cur_task_path != NULL)
-			{
-				LakehouseTombFile *tf = tomb_file_get(scan->entry,
-													  scan->cur_task_path,
-													  false);
-
-				if (tf != NULL &&
-					tomb_file_has_row(tf, scan->row_in_task))
+				next_err[0] = '\0';
+				nst = pg_datalake_rows_batch_next(scan->rows, &scan->batch,
+												  next_err, sizeof(next_err));
+				if (nst == 2)
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_EXCEPTION),
+							 errmsg("lakehouse: row read failed in task %llu: %s",
+									(unsigned long long) scan->current_task,
+									next_err[0] != '\0' ? next_err : "unknown error")));
+				if (nst == 1)
 				{
-					scan->row_in_task++;
+					pg_datalake_rows_close(scan->rows);
+					scan->rows = NULL;
+					scan->batch_valid = false;
+					scan->current_task++;
 					continue;
 				}
-			}
-			ExecClearTuple(slot);
-			/* COW tid (slice 28): (task, rowidx) — the identity
-			 * tuple_delete/tuple_update decode back into the base
-			 * snapshot's file + row position */
-			ItemPointerSetBlockNumber(&slot->tts_tid,
-									  (BlockNumber) (scan->current_task *
-										LAKEHOUSE_TID_FANOUT +
-										(scan->row_in_task >> 11)));
-			ItemPointerSetOffsetNumber(&slot->tts_tid,
-									   (OffsetNumber) ((scan->row_in_task & 0x7FF) + 1));
-			for (i = 0; i < tupdesc->natts; i++)
-			{
-				int			pcol = scan->slot_index[i];
-
-				if (pcol < 0 || pg_datalake_rows_col_null(scan->rows, pcol))
+				scan->batch_valid = true;
+				scan->batch_cursor = 0;
+				for (i = 0; i < tupdesc->natts; i++)
 				{
-					slot->tts_values[i] = PointerGetDatum(NULL);
-					slot->tts_isnull[i] = true;
-					continue;
+					int			pcol = scan->slot_index[i];
+
+					if (pcol < 0)
+						continue;
+					lakehouse_batch_map_column(TupleDescAttr(tupdesc, i),
+											   &scan->batch.cols[pcol],
+											   scan->batch.rows,
+											   &scan->in_funcs[i],
+											   scan->typioparams[i],
+											   &scan->maps[i]);
 				}
-				slot->tts_values[i] = InputFunctionCall(&scan->in_funcs[i],
-							pg_datalake_rows_col_text(scan->rows, pcol),
-							scan->typioparams[i],
-							TupleDescAttr(tupdesc, i)->atttypmod);
-				slot->tts_isnull[i] = false;
 			}
-			ExecStoreVirtualTuple(slot);
-			scan->row_in_task++;
-			return true;
+
+			{
+				/* lr: batch-LOCAL index into the typed buffers; r:
+				 * file-ABSOLUTE row index — the tombstone/TID identity
+				 * (slice 28). Conflating the two silently retargeted
+				 * tombstones at the wrong rows in every batch after the
+				 * first (caught by the M3-R1 live DML verification). */
+				uint32		lr = scan->batch.live_idx[scan->batch_cursor];
+				uint64		r = scan->batch.start_abs + lr;
+
+				/* COW read-your-deletes: rows tombstoned earlier in THIS
+				 * transaction are filtered here, exactly like the rewrite
+				 * pass filters them at PRE-COMMIT. r is the file-absolute
+				 * row index (the tombstone/TID identity, slice 28). */
+				if (scan->entry != NULL && scan->entry->n_tomb_files > 0 &&
+					scan->cur_task_path != NULL)
+				{
+					LakehouseTombFile *tf = tomb_file_get(scan->entry,
+														  scan->cur_task_path,
+														  false);
+
+					if (tf != NULL && tomb_file_has_row(tf, r))
+					{
+						scan->batch_cursor++;
+						continue;
+					}
+				}
+				ExecClearTuple(slot);
+				/* COW tid (slice 28): (task, rowidx) — the identity
+				 * tuple_delete/tuple_update decode back into the base
+				 * snapshot's file + row position */
+				ItemPointerSetBlockNumber(&slot->tts_tid,
+										  (BlockNumber) (scan->current_task *
+												LAKEHOUSE_TID_FANOUT +
+												(r >> 11)));
+				ItemPointerSetOffsetNumber(&slot->tts_tid,
+										   (OffsetNumber) ((r & 0x7FF) + 1));
+				for (i = 0; i < tupdesc->natts; i++)
+				{
+					int			pcol = scan->slot_index[i];
+
+					if (pcol < 0 || scan->batch.cols[pcol].nulls[lr])
+					{
+						slot->tts_values[i] = PointerGetDatum(NULL);
+						slot->tts_isnull[i] = true;
+						continue;
+					}
+					if (scan->maps[i].target != LAKE_FAST_NONE)
+					{
+						slot->tts_values[i] =
+							lakehouse_batch_col_datum(&scan->maps[i],
+													  &scan->batch.cols[pcol], lr,
+													  TupleDescAttr(tupdesc, i)->attname.data);
+					}
+					else
+					{
+						char		cell_err[1024];
+						const char *text;
+
+						cell_err[0] = '\0';
+						text = pg_datalake_rows_batch_cell_text(scan->rows,
+																pcol, lr,
+																cell_err,
+																sizeof(cell_err));
+						if (text == NULL)
+							ereport(ERROR,
+									(errcode(ERRCODE_DATA_EXCEPTION),
+									 errmsg("lakehouse: row read failed in task %llu: %s",
+											(unsigned long long) scan->current_task,
+											cell_err[0] != '\0' ? cell_err : "unknown error")));
+						slot->tts_values[i] =
+							InputFunctionCall(&scan->in_funcs[i], text,
+											  scan->typioparams[i],
+											  TupleDescAttr(tupdesc, i)->atttypmod);
+					}
+					slot->tts_isnull[i] = false;
+				}
+				ExecStoreVirtualTuple(slot);
+				scan->batch_cursor++;
+				scan->row_in_task = r;
+				return true;
+			}
 		}
 	}
 }

@@ -164,6 +164,39 @@ DV write format: Puffin blob with `deletion-vector-v1` spec (v3), referenced fro
 snapshot summary → manifest entries. Bloom-filter acceleration (table property
 `write.dv.filter.bloom`), default on for tables > 1GB.
 
+## 3a. Typed batch read ABI (M3-R1, DONE 2026-11-20)
+
+*(13-review perf #3 landed: the per-cell hot path — one CString per cell
+in Rust, one `InputFunctionCall` per value in C — is gone from both scan
+consumers.)*
+
+- `pg_datalake_rows_batch_next` advances one Arrow batch and returns
+  typed per-column views (`Bool` u8, `Int64`/`TimestampUs`/`Date32` i64,
+  `Float64` f64, zero-copy `Text`/`Bytes` spans, `Rendered` spans for
+  date/time/decimal/uuid) plus a live-row list and a byte-per-row null
+  map. Deletes (position/equality/DV) stay applied in Rust via the live
+  list; the C side never sees dead rows.
+- `batch_fill.c` maps each `(kind, atttypid, typmod)` to an exact fast
+  Datum constructor; anything not provably identical to the old
+  render+parse path (bpchar padding, name truncation, timestamp
+  precision < 6 rounding, numeric widths, float4 double-rounding edge)
+  falls back to `pg_datalake_rows_batch_cell_text` + `InputFunctionCall`
+  — byte-identical text to the old renderer. Never a misread.
+- **Row identity law:** `live_idx` is batch-LOCAL (a buffer index); the
+  tombstone/TID identity is `start_abs + live_idx[k]` (position deletes
+  are file-scoped, doc 07). Conflating the two silently retargeted
+  tombstones at wrong rows in every batch after the first — caught by
+  live multi-batch DML verification in this slice (see the incident
+  note in 13-review §Perf-3); the ABI now carries `start_abs` and the
+  consumers split local/absolute by construction.
+- Lifetimes: batch pointers are valid until the next batch call or
+  close; varlena results are palloc'd per row (same lifetime model as
+  the input functions they replaced).
+- Measured (500K×4-col managed table, same hardware): aggregate scan
+  465 → 145 ms (~3.2×); full row materialization 0.69 → 0.31 s; FDW
+  aggregate process-wall 0.51 → 0.18 s (~2.9×). Remaining hot-path cost
+  is heap_form_tuple + executor work, not transport.
+
 ## 4. Slot & memory model
 
 - Scan fills **virtual TupleTableSlots** from Arrow RecordBatches: per-column

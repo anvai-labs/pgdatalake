@@ -257,6 +257,42 @@ pub struct RowsHandle {
     current_null: Vec<bool>,
     /// Diagnostic of the last ERROR status (13-review #8 ROW/EOF/ERROR).
     last_err: Option<String>,
+    /// M3-R1 batch view: the materialized batch (keeps arrow buffers
+    /// alive for the spans) plus the flat C-facing column array.
+    current_batch: Option<crate::parquet::BatchView>,
+    batch_cols: Vec<PgDatalakeBatchColumn>,
+    /// backing store for pg_datalake_rows_batch_cell_text
+    fallback_cell: CString,
+}
+
+/// C view of one materialized batch column (M3-R1). `kind` selects the
+/// buffer: Bool → `values` as *const u8 (0/1 per row); Int64/TimestampUs/
+/// Date32 → `values` as *const i64; Float64 → `values` as *const f64;
+/// Text/Bytes/Rendered → `spans`. `nulls` is a byte per batch row (1 =
+/// NULL). All pointers are valid until the next batch call or close.
+#[repr(C)]
+pub struct PgDatalakeBatchColumn {
+    pub kind: i32,
+    pub values: *const std::ffi::c_void,
+    pub nulls: *const u8,
+    pub spans: *const crate::parquet::BatchSpan,
+}
+
+/// C view of one materialized arrow batch (M3-R1): total rows, the
+/// ascending live-row list (deletes applied in Rust), and one column
+/// entry per projected column.
+#[repr(C)]
+pub struct PgDatalakeRowBatch {
+    pub rows: u64,
+    pub live_count: u64,
+    /// batch-LOCAL positions of surviving rows (buffer indexes)
+    pub live_idx: *const u32,
+    /// file-absolute position of batch row 0 (tombstone/TID identity:
+    /// absolute = start_abs + live_idx[k]; position deletes are
+    /// file-scoped, doc 07)
+    pub start_abs: u64,
+    pub n_cols: u64,
+    pub cols: *const PgDatalakeBatchColumn,
 }
 
 /// Render the current row into C strings; nulls become empty strings with
@@ -391,6 +427,9 @@ pub unsafe extern "C" fn pg_datalake_rows_open(
             current_row: Vec::new(),
             current_null: Vec::new(),
             last_err: None,
+            current_batch: None,
+            batch_cols: Vec::new(),
+            fallback_cell: CString::new("").unwrap_or_default(),
         })
     });
     let handle = result.unwrap_or_else(|panic| {
@@ -463,6 +502,161 @@ pub unsafe extern "C" fn pg_datalake_rows_next(
             ERROR
         }
     }
+}
+
+/// Advance the batch cursor (M3-R1, 13-review perf #3): materialize the
+/// next arrow batch with surviving rows and fill `out` with typed
+/// per-column views plus the live-row index list. Status: 0 = batch
+/// delivered, 1 = EOF, 2 = ERROR (message in err_buf). Pointers inside
+/// `out` are valid until the next batch call or rows_close — the C
+/// consumer must copy any varlena it keeps. Deletes (position/equality/
+/// DV) are already applied via live_idx; the C side never sees dead rows.
+///
+/// # Safety
+/// `rows` must be a live handle from pg_datalake_rows_open; `out` must
+/// point to writable memory owned by the caller.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_rows_batch_next(
+    rows: *mut RowsHandle,
+    out: *mut PgDatalakeRowBatch,
+    err_buf: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    pub const BATCH: i32 = 0;
+    pub const EOF: i32 = 1;
+    pub const ERROR: i32 = 2;
+    let Some(h) = rows.as_mut() else {
+        unsafe { set_err(err_buf, err_len, "NULL rows handle") };
+        return ERROR;
+    };
+    if out.is_null() {
+        unsafe { set_err(err_buf, err_len, "NULL batch out pointer") };
+        return ERROR;
+    }
+    let outcome =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match h.rows.next_batch() {
+            Ok(Some(view)) => {
+                h.batch_cols.clear();
+                h.batch_cols.reserve(view.cols.len());
+                for c in &view.cols {
+                    let (values, spans) = match c.kind {
+                        crate::parquet::BatchKind::Bool => (
+                            c.bools.as_ptr() as *const std::ffi::c_void,
+                            std::ptr::null(),
+                        ),
+                        crate::parquet::BatchKind::Int64
+                        | crate::parquet::BatchKind::TimestampUs
+                        | crate::parquet::BatchKind::Date32 => {
+                            (c.i64s.as_ptr() as *const std::ffi::c_void, std::ptr::null())
+                        }
+                        crate::parquet::BatchKind::Float64 => {
+                            (c.f64s.as_ptr() as *const std::ffi::c_void, std::ptr::null())
+                        }
+                        _ => (std::ptr::null(), c.spans.as_ptr()),
+                    };
+                    h.batch_cols.push(PgDatalakeBatchColumn {
+                        kind: c.kind as i32,
+                        values,
+                        nulls: c.nulls.as_ptr(),
+                        spans,
+                    });
+                }
+                *out = PgDatalakeRowBatch {
+                    rows: view.rows as u64,
+                    live_count: view.live_idx.len() as u64,
+                    live_idx: view.live_idx.as_ptr(),
+                    start_abs: view.start_abs,
+                    n_cols: view.cols.len() as u64,
+                    cols: h.batch_cols.as_ptr(),
+                };
+                h.current_batch = Some(view);
+                BATCH
+            }
+            Ok(None) => EOF,
+            Err(e) => {
+                h.last_err = Some(e.to_string());
+                unsafe { set_err(err_buf, err_len, &e.to_string()) };
+                ERROR
+            }
+        }));
+    match outcome {
+        Ok(status) => status,
+        Err(panic) => {
+            let m = panic_message(&panic);
+            h.last_err = Some(m.clone());
+            unsafe { set_err(err_buf, err_len, &m) };
+            ERROR
+        }
+    }
+}
+
+/// Text form of one cell of the CURRENT batch (M3-R1 fallback path): the
+/// C consumers use this for (kind, type) combinations without an exact
+/// fast mapping, feeding InputFunctionCall exactly as the old per-row
+/// path did. The bytes are identical to the per-row renderer. The
+/// returned pointer is valid until the next call on this handle.
+///
+/// # Safety
+/// Same pointer rules as pg_datalake_rows_batch_next.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_rows_batch_cell_text(
+    rows: *mut RowsHandle,
+    col: u64,
+    batch_row: u64,
+    err_buf: *mut c_char,
+    err_len: usize,
+) -> *const c_char {
+    let Some(h) = rows.as_mut() else {
+        unsafe { set_err(err_buf, err_len, "NULL rows handle") };
+        return std::ptr::null();
+    };
+    let rendered = {
+        let Some(view) = h.current_batch.as_ref() else {
+            unsafe { set_err(err_buf, err_len, "no current batch") };
+            return std::ptr::null();
+        };
+        let Some(cview) = view.cols.get(col as usize) else {
+            unsafe { set_err(err_buf, err_len, "column out of range") };
+            return std::ptr::null();
+        };
+        if batch_row as usize >= view.rows {
+            unsafe { set_err(err_buf, err_len, "batch row out of range") };
+            return std::ptr::null();
+        }
+        let r = batch_row as usize;
+        use crate::parquet::BatchKind;
+        match cview.kind {
+            BatchKind::Bool => {
+                if cview.bools[r] != 0 {
+                    "t".into()
+                } else {
+                    "f".into()
+                }
+            }
+            BatchKind::Int64 => cview.i64s[r].to_string(),
+            BatchKind::TimestampUs => crate::parquet::format_timestamp_micros(cview.i64s[r]),
+            BatchKind::Date32 => crate::parquet::format_date32(cview.i64s[r] as i32),
+            BatchKind::Float64 => crate::parquet::format_f64(cview.f64s[r]),
+            BatchKind::Text | BatchKind::Rendered => {
+                let sp = &cview.spans[r];
+                std::str::from_utf8(unsafe { std::slice::from_raw_parts(sp.ptr, sp.len as usize) })
+                    .unwrap_or("")
+                    .to_string()
+            }
+            BatchKind::Bytes => {
+                let sp = &cview.spans[r];
+                let b = unsafe { std::slice::from_raw_parts(sp.ptr, sp.len as usize) };
+                let mut hex = String::with_capacity(2 + b.len() * 2);
+                hex.push_str("\\x");
+                for x in b {
+                    hex.push_str(&format!("{x:02x}"));
+                }
+                hex
+            }
+        }
+    };
+    h.fallback_cell = CString::new(rendered).unwrap_or_default();
+    h.fallback_cell.as_ptr()
 }
 
 /// Column count of the projection.
@@ -1027,6 +1221,9 @@ pub unsafe extern "C" fn pg_datalake_rows_open_path(
                 current_row: Vec::new(),
                 current_null: Vec::new(),
                 last_err: None,
+                current_batch: None,
+                batch_cols: Vec::new(),
+                fallback_cell: CString::new("").unwrap_or_default(),
             })
         },
     ));
@@ -2035,6 +2232,9 @@ mod tests {
             current_row: Vec::new(),
             current_null: Vec::new(),
             last_err: None,
+            current_batch: None,
+            batch_cols: Vec::new(),
+            fallback_cell: CString::new("").unwrap_or_default(),
         }));
         let mut err = [0i8; 1024];
         let st = unsafe { pg_datalake_rows_next(h, err.as_mut_ptr() as *mut _, 1024) };
@@ -2088,6 +2288,9 @@ mod tests {
             current_row: Vec::new(),
             current_null: Vec::new(),
             last_err: None,
+            current_batch: None,
+            batch_cols: Vec::new(),
+            fallback_cell: CString::new("").unwrap_or_default(),
         }));
         let mut err = [0i8; 1024];
         assert_eq!(
@@ -2330,5 +2533,626 @@ mod tests {
         assert_eq!(snap["summary"]["deleted-records"], "2", "{body}");
 
         unsafe { pg_datalake_write_free(ws) };
+    }
+
+    // ===== M3-R1: typed batch read ABI (13-review perf #3) =====
+    // pg_datalake_rows_batch_next: one call per arrow batch returns typed
+    // per-column views + a live-row index list (deletes applied in Rust),
+    // so the C consumers build Datums directly — no per-row CString, no
+    // InputFunctionCall on the hot path.
+
+    /// Build a local multi-type table + mock catalog; returns (session,
+    /// endpoint). Caller frees the session. Modelled on
+    /// ffi_scan_roundtrip_with_mock_catalog (slice 20 harness).
+    fn batch_fixture(
+        dir: &tempfile::TempDir,
+        fields_json: &str,
+        batches: &[arrow::record_batch::RecordBatch],
+        delete_positions: &[i64],
+    ) -> (*mut ScanSession, CString) {
+        use apache_avro::types::{Record, Value};
+        use apache_avro::{Schema as AvroSchema, Writer};
+
+        crate::storage::test_allow_local_stores();
+        std::fs::create_dir_all(dir.path().join("table").join("data")).unwrap();
+        std::fs::create_dir_all(dir.path().join("table").join("metadata")).unwrap();
+        std::fs::create_dir_all(dir.path().join("metadata")).unwrap();
+
+        let total_rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
+        let data_path = format!("file://{}/table/data/m.parquet", dir.path().display());
+        let f =
+            std::fs::File::create(dir.path().join("table").join("data").join("m.parquet")).unwrap();
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_size(batches[0].num_rows())
+            .build();
+        let mut w =
+            parquet::arrow::ArrowWriter::try_new(f, batches[0].schema(), Some(props)).unwrap();
+        for b in batches {
+            w.write(b).unwrap();
+        }
+        w.close().unwrap();
+
+        if !delete_positions.is_empty() {
+            let del_schema = arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("file_path", arrow::datatypes::DataType::Utf8, false),
+                arrow::datatypes::Field::new("pos", arrow::datatypes::DataType::Int64, false),
+            ]);
+            let n = delete_positions.len();
+            let del_batch = arrow::record_batch::RecordBatch::try_new(
+                std::sync::Arc::new(del_schema),
+                vec![
+                    std::sync::Arc::new(arrow::array::StringArray::from(vec![
+                        data_path.as_str();
+                        n
+                    ])),
+                    std::sync::Arc::new(arrow::array::Int64Array::from(delete_positions.to_vec())),
+                ],
+            )
+            .unwrap();
+            let df = std::fs::File::create(
+                dir.path()
+                    .join("table")
+                    .join("data")
+                    .join("del-pos.parquet"),
+            )
+            .unwrap();
+            let mut dw =
+                parquet::arrow::ArrowWriter::try_new(df, del_batch.schema(), None).unwrap();
+            dw.write(&del_batch).unwrap();
+            dw.close().unwrap();
+        }
+
+        // manifest with one ADDED data entry (+ the delete entry when present)
+        let schema = AvroSchema::parse_str(crate::manifest::MANIFEST_ENTRY_SCHEMA_V2).unwrap();
+        let mut writer = Writer::new(&schema, Vec::new());
+        let mut entry = Record::new(&schema).unwrap();
+        entry.put("status", Value::Int(1));
+        entry.put("snapshot_id", Value::Long(42));
+        entry.put("sequence_number", Value::Union(1, Box::new(Value::Long(1))));
+        entry.put(
+            "file_sequence_number",
+            Value::Union(1, Box::new(Value::Long(1))),
+        );
+        let data_file = Value::Record(vec![
+            ("content".into(), Value::Int(0)),
+            ("file_path".into(), Value::String(data_path.clone())),
+            ("file_format".into(), Value::String("parquet".into())),
+            ("partition".into(), Value::Union(0, Box::new(Value::Null))),
+            ("record_count".into(), Value::Long(total_rows)),
+            ("file_size_in_bytes".into(), Value::Long(4096)),
+            (
+                "column_sizes".into(),
+                Value::Union(1, Box::new(Value::Array(vec![]))),
+            ),
+            (
+                "value_counts".into(),
+                Value::Union(1, Box::new(Value::Array(vec![]))),
+            ),
+            (
+                "null_value_counts".into(),
+                Value::Union(1, Box::new(Value::Array(vec![]))),
+            ),
+            (
+                "nan_value_counts".into(),
+                Value::Union(1, Box::new(Value::Array(vec![]))),
+            ),
+            (
+                "lower_bounds".into(),
+                Value::Union(0, Box::new(Value::Null)),
+            ),
+            (
+                "upper_bounds".into(),
+                Value::Union(0, Box::new(Value::Null)),
+            ),
+            (
+                "key_metadata".into(),
+                Value::Union(0, Box::new(Value::Null)),
+            ),
+            (
+                "split_offsets".into(),
+                Value::Union(0, Box::new(Value::Null)),
+            ),
+            (
+                "equality_ids".into(),
+                Value::Union(0, Box::new(Value::Null)),
+            ),
+            (
+                "sort_order_id".into(),
+                Value::Union(0, Box::new(Value::Null)),
+            ),
+        ]);
+        entry.put("data_file", data_file);
+        writer.append(entry).unwrap();
+        std::fs::write(
+            dir.path().join("table").join("metadata").join("mn1.avro"),
+            writer.into_inner().unwrap(),
+        )
+        .unwrap();
+
+        let mn2 = !delete_positions.is_empty();
+        if mn2 {
+            let mut del_writer = Writer::new(&schema, Vec::new());
+            let mut del_entry = Record::new(&schema).unwrap();
+            del_entry.put("status", Value::Int(1));
+            del_entry.put("snapshot_id", Value::Long(42));
+            del_entry.put("sequence_number", Value::Union(1, Box::new(Value::Long(2))));
+            del_entry.put(
+                "file_sequence_number",
+                Value::Union(1, Box::new(Value::Long(2))),
+            );
+            let del_data_file = Value::Record(vec![
+                ("content".into(), Value::Int(1)),
+                (
+                    "file_path".into(),
+                    Value::String(format!(
+                        "file://{}/table/data/del-pos.parquet",
+                        dir.path().display()
+                    )),
+                ),
+                ("file_format".into(), Value::String("parquet".into())),
+                ("partition".into(), Value::Union(0, Box::new(Value::Null))),
+                (
+                    "record_count".into(),
+                    Value::Long(delete_positions.len() as i64),
+                ),
+                ("file_size_in_bytes".into(), Value::Long(4096)),
+                (
+                    "column_sizes".into(),
+                    Value::Union(1, Box::new(Value::Array(vec![]))),
+                ),
+                (
+                    "value_counts".into(),
+                    Value::Union(1, Box::new(Value::Array(vec![]))),
+                ),
+                (
+                    "null_value_counts".into(),
+                    Value::Union(1, Box::new(Value::Array(vec![]))),
+                ),
+                (
+                    "nan_value_counts".into(),
+                    Value::Union(1, Box::new(Value::Array(vec![]))),
+                ),
+                (
+                    "lower_bounds".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "upper_bounds".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "key_metadata".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "split_offsets".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "equality_ids".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "sort_order_id".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+            ]);
+            del_entry.put("data_file", del_data_file);
+            del_writer.append(del_entry).unwrap();
+            std::fs::write(
+                dir.path().join("table").join("metadata").join("mn2.avro"),
+                del_writer.into_inner().unwrap(),
+            )
+            .unwrap();
+        }
+
+        // manifest list: mn1 (+ mn2)
+        let lschema = AvroSchema::parse_str(crate::manifest::MANIFEST_LIST_SCHEMA_V2).unwrap();
+        let mut lwriter = Writer::new(&lschema, Vec::new());
+        let mut mrec = Record::new(&lschema).unwrap();
+        mrec.put(
+            "manifest_path",
+            format!("file://{}/table/metadata/mn1.avro", dir.path().display()),
+        );
+        mrec.put("manifest_length", 100i64);
+        mrec.put("partition_spec_id", 0i32);
+        mrec.put("added_snapshot_id", 42i64);
+        mrec.put("added_files_count", Some(1i64));
+        mrec.put("existing_files_count", Some(0i64));
+        mrec.put("deleted_files_count", Some(0i64));
+        mrec.put("added_rows_count", Some(total_rows));
+        mrec.put("existing_rows_count", Some(0i64));
+        mrec.put("deleted_rows_count", Some(0i64));
+        mrec.put("partitions", None::<Value>);
+        mrec.put("key_metadata", None::<Value>);
+        mrec.put("sequence_number", Some(1i64));
+        mrec.put("min_sequence_number", Some(1i64));
+        lwriter.append(mrec).unwrap();
+        if mn2 {
+            let mut mrec2 = Record::new(&lschema).unwrap();
+            mrec2.put(
+                "manifest_path",
+                format!("file://{}/table/metadata/mn2.avro", dir.path().display()),
+            );
+            mrec2.put("manifest_length", 100i64);
+            mrec2.put("partition_spec_id", 0i32);
+            mrec2.put("added_snapshot_id", 42i64);
+            mrec2.put("added_files_count", Some(1i64));
+            mrec2.put("existing_files_count", Some(0i64));
+            mrec2.put("deleted_files_count", Some(0i64));
+            mrec2.put("added_rows_count", Some(delete_positions.len() as i64));
+            mrec2.put("existing_rows_count", Some(0i64));
+            mrec2.put("deleted_rows_count", Some(0i64));
+            mrec2.put("partitions", None::<Value>);
+            mrec2.put("key_metadata", None::<Value>);
+            mrec2.put("sequence_number", Some(2i64));
+            mrec2.put("min_sequence_number", Some(2i64));
+            lwriter.append(mrec2).unwrap();
+        }
+        std::fs::write(
+            dir.path()
+                .join("table")
+                .join("metadata")
+                .join("mn-list.avro"),
+            lwriter.into_inner().unwrap(),
+        )
+        .unwrap();
+
+        let metadata_json = format!(
+            r#"{{"format-version": 2,
+                "table-uuid": "9c12d441-03fe-11ed-8122-d358e75d12eb",
+                "location": "file://{}/table",
+                "schemas": [{{"type": "struct", "schema-id": 0, "fields": [{}]}}],
+                "current-schema-id": 0,
+                "snapshots": [{{"snapshot-id": 42, "timestamp-ms": 1712345678000,
+                                "manifest-list": "file://{}/table/metadata/mn-list.avro",
+                                "summary": {{"operation": "append"}}}}],
+                "current-snapshot-id": 42}}"#,
+            dir.path().display(),
+            fields_json,
+            dir.path().display(),
+        );
+        std::fs::write(
+            dir.path().join("metadata").join("00000-x.metadata.json"),
+            metadata_json,
+        )
+        .unwrap();
+
+        // mock catalog serving config + loadTable
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let md_path = dir.path().join("metadata").join("00000-x.metadata.json");
+        std::thread::spawn(move || {
+            for _ in 0..4 {
+                let Some(req) = server.recv().ok() else {
+                    break;
+                };
+                let is_config = req.url().contains("/v1/config");
+                let body = if is_config {
+                    r#"{"defaults": {"prefix": "pfx"}, "overrides": {}}"#.to_string()
+                } else {
+                    format!(
+                        r#"{{"metadata-location": "file://{}", "config": {{}}}}"#,
+                        md_path.display()
+                    )
+                };
+                let resp = tiny_http::Response::from_string(body).with_header(
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                        .unwrap(),
+                );
+                let _ = req.respond(resp);
+            }
+        });
+
+        let endpoint = CString::new(format!("http://{addr}")).unwrap();
+        let warehouse = CString::new("smoke").unwrap();
+        let token = CString::new("").unwrap();
+        let namespace = CString::new("analytics").unwrap();
+        let table = CString::new("events").unwrap();
+        let mut err = [0 as c_char; 1024];
+        let session = unsafe {
+            pg_datalake_scan_new(
+                endpoint.as_ptr(),
+                warehouse.as_ptr(),
+                token.as_ptr(),
+                namespace.as_ptr(),
+                table.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                err.as_mut_ptr(),
+                err.len(),
+            )
+        };
+        assert!(!session.is_null(), "scan_new: {:?}", unsafe {
+            CStr::from_ptr(err.as_ptr()).to_string_lossy()
+        });
+        (session, endpoint)
+    }
+
+    /// The batch ABI acceptance anchor: one arrow batch, nine column types,
+    /// a null in text and bool columns, an empty (non-null) binary, a
+    /// position delete removing absolute position 1. Kinds, live indices,
+    /// null bytes, values and rendered spans must all match the per-row
+    /// path's semantics.
+    #[test]
+    fn batch_ffi_multitype_with_nulls_and_position_delete() {
+        use arrow::array::{
+            BinaryArray, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array,
+            StringArray, Time64MicrosecondArray, TimestampMicrosecondArray,
+        };
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let fields = r#"
+            {"id": 1, "name": "b", "required": false, "type": "boolean"},
+            {"id": 2, "name": "i4", "required": false, "type": "int"},
+            {"id": 3, "name": "i8", "required": false, "type": "long"},
+            {"id": 4, "name": "f8", "required": false, "type": "double"},
+            {"id": 5, "name": "s", "required": false, "type": "string"},
+            {"id": 6, "name": "ts", "required": false, "type": "timestamp"},
+            {"id": 7, "name": "bin", "required": false, "type": "binary"},
+            {"id": 8, "name": "d32", "required": false, "type": "date"},
+            {"id": 9, "name": "t64", "required": false, "type": "time"}"#;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("b", DataType::Boolean, true),
+            Field::new("i4", DataType::Int32, true),
+            Field::new("i8", DataType::Int64, true),
+            Field::new("f8", DataType::Float64, true),
+            Field::new("s", DataType::Utf8, true),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            Field::new("bin", DataType::Binary, true),
+            Field::new("d32", DataType::Date32, true),
+            Field::new("t64", DataType::Time64(TimeUnit::Microsecond), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(BooleanArray::from(vec![Some(true), Some(false), None])),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(Float64Array::from(vec![1.5, 2.5, 3.5])),
+                Arc::new(StringArray::from(vec![Some("alpha"), None, Some("gamma")])),
+                Arc::new(TimestampMicrosecondArray::from(
+                    vec![1_600_000_000_000_000i64; 3],
+                )),
+                Arc::new(BinaryArray::from(vec![
+                    vec![0x01u8, 0xff].as_slice(),
+                    [].as_slice(),
+                    [0x00u8, 0x7f].as_slice(),
+                ])),
+                Arc::new(Date32Array::from(vec![19000, 19001, 19002])),
+                Arc::new(Time64MicrosecondArray::from(vec![
+                    3_600_000_000i64,
+                    0,
+                    86_399_000_000,
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let (session, _endpoint) = batch_fixture(&dir, fields, &[batch], &[1]);
+
+        let proj = CString::new(r#"["b","i4","i8","f8","s","ts","bin","d32","t64"]"#).unwrap();
+        let mut err = [0 as c_char; 1024];
+        let rows = unsafe {
+            pg_datalake_rows_open(session, 0, proj.as_ptr(), err.as_mut_ptr(), err.len())
+        };
+        assert!(!rows.is_null(), "rows_open: {:?}", unsafe {
+            CStr::from_ptr(err.as_ptr()).to_string_lossy()
+        });
+
+        let mut rb: PgDatalakeRowBatch = unsafe { std::mem::zeroed() };
+        let st = unsafe { pg_datalake_rows_batch_next(rows, &mut rb, err.as_mut_ptr(), err.len()) };
+        assert_eq!(st, 0, "first batch: {:?}", unsafe {
+            CStr::from_ptr(err.as_ptr()).to_string_lossy()
+        });
+        assert_eq!(rb.rows, 3);
+        assert_eq!(rb.live_count, 2, "position delete removed local row 1");
+        let live = unsafe { std::slice::from_raw_parts(rb.live_idx, rb.live_count as usize) };
+        assert_eq!(live, &[0, 2]);
+        let cols = unsafe { std::slice::from_raw_parts(rb.cols, rb.n_cols as usize) };
+
+        // kinds: bool, widened i32, i64, f64, text, ts_us, bytes, date32, rendered(time)
+        let expect_kinds = [1i32, 2, 2, 3, 5, 4, 6, 7, 8];
+        for (i, k) in expect_kinds.iter().enumerate() {
+            assert_eq!(cols[i].kind, *k, "column {i} kind");
+        }
+
+        // nulls: bool[2] and text[1]
+        let b_nulls = unsafe { std::slice::from_raw_parts(cols[0].nulls, 3) };
+        assert_eq!(b_nulls, &[0, 0, 1]);
+        let s_nulls = unsafe { std::slice::from_raw_parts(cols[4].nulls, 3) };
+        assert_eq!(s_nulls, &[0, 1, 0]);
+
+        // widened int32 buffer
+        let i4 = unsafe { std::slice::from_raw_parts(cols[1].values as *const i64, 3) };
+        assert_eq!(i4, &[10, 20, 30]);
+        let i8 = unsafe { std::slice::from_raw_parts(cols[2].values as *const i64, 3) };
+        assert_eq!(i8, &[1, 2, 3]);
+        let f8 = unsafe { std::slice::from_raw_parts(cols[3].values as *const f64, 3) };
+        assert_eq!(f8, &[1.5, 2.5, 3.5]);
+        let ts = unsafe { std::slice::from_raw_parts(cols[5].values as *const i64, 3) };
+        assert_eq!(ts, &[1_600_000_000_000_000i64; 3]);
+        let d32 = unsafe { std::slice::from_raw_parts(cols[7].values as *const i64, 3) };
+        assert_eq!(d32, &[19000, 19001, 19002]);
+
+        // text spans (zero-copy) + binary spans incl. EMPTY NON-NULL and
+        // an interior-NUL byte (allowed in binary — the loud check is for
+        // TEXT columns only)
+        let spans = unsafe { std::slice::from_raw_parts(cols[4].spans, 3) };
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(spans[0].ptr, 5) },
+            b"alpha"
+        );
+        assert_eq!(spans[1].len, 0, "null text has a span but len 0");
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(spans[2].ptr, 5) },
+            b"gamma"
+        );
+        let bspans = unsafe { std::slice::from_raw_parts(cols[6].spans, 3) };
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(bspans[0].ptr, 2) },
+            &[0x01u8, 0xff]
+        );
+        assert_eq!(bspans[1].len, 0, "empty binary is NOT null");
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(bspans[2].ptr, 2) },
+            &[0x00u8, 0x7f]
+        );
+
+        // rendered time spans match the per-row path exactly
+        let tspans = unsafe { std::slice::from_raw_parts(cols[8].spans, 3) };
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(tspans[0].ptr, 15) },
+            b"01:00:00.000000"
+        );
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(tspans[2].ptr, 15) },
+            b"23:59:59.000000"
+        );
+
+        // second call: EOF
+        let st = unsafe { pg_datalake_rows_batch_next(rows, &mut rb, err.as_mut_ptr(), err.len()) };
+        assert_eq!(st, 1, "EOF after the single batch");
+        unsafe { pg_datalake_rows_close(rows) };
+        unsafe { pg_datalake_scan_free(session) };
+    }
+
+    /// Batches advance across the reader's RecordBatch boundaries
+    /// (arrow-rs yields up to 1024 rows per batch, merging row groups);
+    /// a position delete must die in whichever batch holds its absolute
+    /// position, and live indices are batch-local (never misread).
+    #[test]
+    fn batch_ffi_advances_across_batches() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let fields = r#"{"id": 1, "name": "id", "required": false, "type": "long"}"#;
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            true,
+        )]));
+        let b1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(
+                (1..=1025i64).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        let b2 = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(
+                (1026..=2050i64).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        // absolute position 1024 (id=1025) dies: it sits in the SECOND
+        // reader batch (batch_size 1024), local index 0
+        let (session, _endpoint) = batch_fixture(&dir, fields, &[b1, b2], &[1024]);
+
+        let proj = CString::new(r#"["id"]"#).unwrap();
+        let mut err = [0 as c_char; 1024];
+        let rows = unsafe {
+            pg_datalake_rows_open(session, 0, proj.as_ptr(), err.as_mut_ptr(), err.len())
+        };
+        assert!(!rows.is_null(), "rows_open: {:?}", unsafe {
+            CStr::from_ptr(err.as_ptr()).to_string_lossy()
+        });
+
+        let mut rb: PgDatalakeRowBatch = unsafe { std::mem::zeroed() };
+        let st = unsafe { pg_datalake_rows_batch_next(rows, &mut rb, err.as_mut_ptr(), err.len()) };
+        assert_eq!(st, 0);
+        assert_eq!(rb.rows, 1024, "first reader batch");
+        assert_eq!(rb.live_count, 1024);
+        let live = unsafe { std::slice::from_raw_parts(rb.live_idx, 2) };
+        assert_eq!(&live[..2], &[0, 1]);
+        let cols = unsafe { std::slice::from_raw_parts(rb.cols, 1) };
+        let ids = unsafe { std::slice::from_raw_parts(cols[0].values as *const i64, 2) };
+        assert_eq!(ids, &[1, 2]);
+
+        let st = unsafe { pg_datalake_rows_batch_next(rows, &mut rb, err.as_mut_ptr(), err.len()) };
+        assert_eq!(st, 0);
+        assert_eq!(rb.rows, 1024, "second reader batch");
+        assert_eq!(
+            rb.start_abs, 1024,
+            "second batch starts at absolute row 1024"
+        );
+        assert_eq!(rb.live_count, 1023, "abs position 1024 died in this batch");
+        let live = unsafe { std::slice::from_raw_parts(rb.live_idx, rb.live_count as usize) };
+        assert_eq!(
+            live[0], 1,
+            "local index 0 (id=1024) is dead; 1 (id=1025) survives"
+        );
+        assert_eq!(*live.last().unwrap(), 1023);
+        let cols = unsafe { std::slice::from_raw_parts(rb.cols, 1) };
+        let ids = unsafe { std::slice::from_raw_parts(cols[0].values as *const i64, 2) };
+        assert_eq!(ids[0], 1025, "dead row's raw buffer slot still holds 1025");
+        assert_eq!(ids[1], 1026);
+
+        let st = unsafe { pg_datalake_rows_batch_next(rows, &mut rb, err.as_mut_ptr(), err.len()) };
+        assert_eq!(st, 0, "third batch (46 remaining rows)");
+        assert_eq!(rb.rows, 2, "2050 - 2*1024 = 2");
+        assert_eq!(rb.live_count, 2);
+
+        let st = unsafe { pg_datalake_rows_batch_next(rows, &mut rb, err.as_mut_ptr(), err.len()) };
+        assert_eq!(st, 1, "EOF");
+        unsafe { pg_datalake_rows_close(rows) };
+        unsafe { pg_datalake_scan_free(session) };
+    }
+
+    /// The render_row law carries over: interior NUL in a TEXT column is a
+    /// loud batch error, never a truncated string (a silent truncation
+    /// would fabricate a value).
+    #[test]
+    fn batch_interior_nul_text_is_loud() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let fields = r#"{"id": 1, "name": "s", "required": false, "type": "string"}"#;
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "s",
+            DataType::Utf8,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![
+                "ok".to_string(),
+                "a\u{0}b".to_string(),
+            ]))],
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let (session, _endpoint) = batch_fixture(&dir, fields, &[batch], &[]);
+
+        let proj = CString::new(r#"["s"]"#).unwrap();
+        let mut err = [0 as c_char; 1024];
+        let rows = unsafe {
+            pg_datalake_rows_open(session, 0, proj.as_ptr(), err.as_mut_ptr(), err.len())
+        };
+        assert!(!rows.is_null(), "rows_open: {:?}", unsafe {
+            CStr::from_ptr(err.as_ptr()).to_string_lossy()
+        });
+
+        let mut rb: PgDatalakeRowBatch = unsafe { std::mem::zeroed() };
+        let st = unsafe { pg_datalake_rows_batch_next(rows, &mut rb, err.as_mut_ptr(), err.len()) };
+        assert_eq!(st, 2, "loud ERROR, not a batch");
+        let msg = unsafe { CStr::from_ptr(err.as_ptr()) }.to_string_lossy();
+        assert!(msg.contains("interior NUL"), "error names the cause: {msg}");
+        unsafe { pg_datalake_rows_close(rows) };
+        unsafe { pg_datalake_scan_free(session) };
     }
 }

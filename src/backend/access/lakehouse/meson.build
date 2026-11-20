@@ -39,6 +39,7 @@ lakehouse_sources = files(
   'lakehouse_core.c',
   'tableam.c',
   'fdw.c',
+  'batch_fill.c',
 )
 
 if host_system == 'windows'

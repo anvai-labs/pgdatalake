@@ -41,6 +41,19 @@ pub fn format_timestamp_micros(micros: i64) -> String {
     )
 }
 
+/// Format days-since-1970 as `YYYY-MM-DD` (identical bytes to
+/// cell_from_arrow's Date32 branch — the batch fallback renders through
+/// this and the input function, exactly as the per-row path did).
+pub fn format_date32(days: i32) -> String {
+    let (y, m, d) = civil_from_days(days as i64);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Format an f64 exactly as the per-row renderer does (shortest repr).
+pub fn format_f64(v: f64) -> String {
+    v.to_string()
+}
+
 /// Howard Hinnant's civil_from_days algorithm (days since 1970-01-01).
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
@@ -140,6 +153,75 @@ impl LoadedDeletes {
     }
 }
 
+/// Typed batch view kinds (M3-R1, 13-review perf #3). The discriminants
+/// are the FFI ABI values (cbindgen exports the enum); adding a variant
+/// is a breaking change for the C consumers.
+#[repr(i32)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BatchKind {
+    /// u8 per row, 0/1
+    Bool = 1,
+    /// i64 per row (Int64/Date64 raw, Int32 widened)
+    Int64 = 2,
+    /// f64 per row (Float64, Float32 widened)
+    Float64 = 3,
+    /// i64 micros-since-epoch per row (any timestamp unit, doc 05 §4 rules)
+    TimestampUs = 4,
+    /// zero-copy UTF-8 spans (`spans`)
+    Text = 5,
+    /// zero-copy raw spans (`spans`); interior NUL allowed
+    Bytes = 6,
+    /// i64 days-since-1970 per row
+    Date32 = 7,
+    /// input-function-compatible text spans, rendered once per batch
+    /// (date/time/decimal/uuid) — identical bytes to the per-row path
+    Rendered = 8,
+}
+
+/// A length-delimited byte range pointing INTO the current arrow batch.
+/// Valid only until the next batch call or close — the C consumer must
+/// copy anything it keeps.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct BatchSpan {
+    pub ptr: *const u8,
+    pub len: u64,
+}
+
+/// One column of a materialized batch. Exactly one of the buffers is
+/// populated per `kind` (checked by `next_batch`'s construction).
+#[derive(Debug)]
+pub struct BatchColumnView {
+    pub kind: BatchKind,
+    pub bools: Vec<u8>,
+    pub i64s: Vec<i64>,
+    pub f64s: Vec<f64>,
+    pub spans: Vec<BatchSpan>,
+    /// backing store for Rendered spans
+    pub rendered: Vec<String>,
+    /// byte per row, 1 = NULL
+    pub nulls: Vec<u8>,
+}
+
+/// One materialized arrow batch: typed column views plus the live-row
+/// index list (deletion vectors and position/equality deletes applied —
+/// slice 20 + doc 14 V1). C iterates `live_idx` only; positions of dead
+/// rows in the buffers are unspecified.
+#[derive(Debug)]
+pub struct BatchView {
+    /// total rows in the arrow batch (live + dead)
+    pub rows: usize,
+    /// ascending positions of surviving rows WITHIN THE BATCH (buffer
+    /// indexes — the file-absolute position of live_idx[k] is
+    /// `start_abs + live_idx[k]`)
+    pub live_idx: Vec<u32>,
+    /// file-absolute position of batch row 0 (position deletes are
+    /// file-scoped, doc 07)
+    pub start_abs: u64,
+    /// one view per PROJECTED column (eq-delete internals excluded)
+    pub cols: Vec<BatchColumnView>,
+}
+
 /// Projected row iterator over one parquet object.
 #[derive(Debug)]
 pub struct ParquetRows {
@@ -148,6 +230,9 @@ pub struct ParquetRows {
     row: usize,
     column_names: Vec<String>,
     column_indices: Vec<usize>,
+    /// width of the caller's projection (column_indices may exceed it —
+    /// eq-delete internal columns ride beyond this mark)
+    projection_len: usize,
     num_rows_in_current: usize,
     /// Absolute position of the current row within the FILE (position
     /// deletes are file-scoped, doc 07).
@@ -202,6 +287,7 @@ impl ParquetRows {
         }
 
         let mut column_indices = Vec::with_capacity(read_names.len());
+        let projection_len = projection.len();
         for name in &read_names {
             let idx = arrow_schema
                 .fields()
@@ -269,6 +355,7 @@ impl ParquetRows {
             row: 0,
             column_names,
             column_indices,
+            projection_len,
             batch_start_abs: 0,
             deletes,
             eq_col_indices,
@@ -299,6 +386,7 @@ impl ParquetRows {
             current: None,
             row: 0,
             column_names: names,
+            projection_len: indices.len(),
             column_indices: indices,
             batch_start_abs: 0,
             deletes: RowDeletes::default(),
@@ -350,7 +438,13 @@ impl ParquetRows {
     /// Position deletes match the file-absolute position; equality deletes
     /// match when every listed column equals the delete tuple.
     fn current_row_deleted(&self) -> bool {
-        let abs = self.batch_start_abs + self.row as u64;
+        self.row_deleted_at(self.row)
+    }
+
+    /// Same check, for an arbitrary row of `current` (the batch path
+    /// computes the whole live list up front — M3-R1).
+    fn row_deleted_at(&self, row: usize) -> bool {
+        let abs = self.batch_start_abs + row as u64;
         if self.deletes.positions.contains(&abs) {
             return true;
         }
@@ -361,10 +455,10 @@ impl ParquetRows {
                 let arr_idx = self.eq_col_indices[eq_idx][c_i];
                 let col = batch.column(arr_idx);
                 use arrow::array::Array as _;
-                let got = if col.is_null(self.row) {
+                let got = if col.is_null(row) {
                     CellValue::Null
                 } else {
-                    cell_from_arrow(col, self.row)
+                    cell_from_arrow(col, row)
                 };
                 if got != *want {
                     all = false;
@@ -376,6 +470,257 @@ impl ParquetRows {
             }
         }
         false
+    }
+
+    /// Materialize the next arrow batch with live rows as a typed view
+    /// (M3-R1, 13-review perf #3): one pass per column instead of one
+    /// CString per cell. Skips batches whose every row is dead. The views
+    /// borrow `current`'s buffers — valid until the following
+    /// `next_batch`/`next` call or drop. Deletes/DVs are already applied
+    /// via `live_idx`; the C consumer never sees dead rows.
+    pub fn next_batch(&mut self) -> Result<Option<BatchView>, StorageError> {
+        use arrow::array::Array as _;
+        use arrow::datatypes::DataType as DT;
+        loop {
+            let Some(batch) = self.batches.next() else {
+                // keep the shared `current` cursor semantics: after the
+                // last batch, both cursors are exhausted
+                return Ok(None);
+            };
+            self.batch_start_abs += self.num_rows_in_current as u64;
+            self.num_rows_in_current = batch.num_rows();
+            self.row = 0;
+            self.current = Some(batch);
+            if self.num_rows_in_current == 0 {
+                continue;
+            }
+            // live list: deletes + DVs applied here, once per batch
+            let mut live_idx = Vec::with_capacity(self.num_rows_in_current);
+            for r in 0..self.num_rows_in_current {
+                if !self.row_deleted_at(r) {
+                    live_idx.push(r as u32);
+                }
+            }
+            if live_idx.is_empty() {
+                continue;
+            }
+            let batch = self.current.as_ref().expect("just set");
+            let mut cols = Vec::with_capacity(self.projection_len);
+            for c in 0..self.projection_len {
+                let arr_idx = self.column_indices[c];
+                let col = batch.column(arr_idx);
+                let mut nulls = Vec::with_capacity(self.num_rows_in_current);
+                for r in 0..self.num_rows_in_current {
+                    nulls.push(col.is_null(r) as u8);
+                }
+                let mut view = BatchColumnView {
+                    kind: BatchKind::Rendered,
+                    bools: Vec::new(),
+                    i64s: Vec::new(),
+                    f64s: Vec::new(),
+                    spans: Vec::new(),
+                    rendered: Vec::new(),
+                    nulls,
+                };
+                match col.data_type() {
+                    DT::Boolean => {
+                        view.kind = BatchKind::Bool;
+                        let a = col
+                            .as_any()
+                            .downcast_ref::<arrow::array::BooleanArray>()
+                            .expect("boolean array");
+                        for r in 0..self.num_rows_in_current {
+                            view.bools.push(a.value(r) as u8);
+                        }
+                    }
+                    DT::Int32 | DT::Int64 | DT::Date64 => {
+                        view.kind = BatchKind::Int64;
+                        for r in 0..self.num_rows_in_current {
+                            let v = match col.data_type() {
+                                DT::Int32 => col
+                                    .as_any()
+                                    .downcast_ref::<arrow::array::Int32Array>()
+                                    .expect("int32 array")
+                                    .value(r) as i64,
+                                _ => col
+                                    .as_any()
+                                    .downcast_ref::<arrow::array::Int64Array>()
+                                    .expect("int64 array")
+                                    .value(r),
+                            };
+                            view.i64s.push(v);
+                        }
+                    }
+                    DT::Float32 | DT::Float64 => {
+                        view.kind = BatchKind::Float64;
+                        for r in 0..self.num_rows_in_current {
+                            let v = match col.data_type() {
+                                DT::Float32 => col
+                                    .as_any()
+                                    .downcast_ref::<arrow::array::Float32Array>()
+                                    .expect("float32 array")
+                                    .value(r) as f64,
+                                _ => col
+                                    .as_any()
+                                    .downcast_ref::<arrow::array::Float64Array>()
+                                    .expect("float64 array")
+                                    .value(r),
+                            };
+                            view.f64s.push(v);
+                        }
+                    }
+                    DT::Timestamp(unit, _) => {
+                        view.kind = BatchKind::TimestampUs;
+                        // exactly cell_from_arrow's per-unit rules (doc 05 §4);
+                        // temporal arrays are their own primitive types
+                        use arrow::array::{
+                            TimestampMicrosecondArray, TimestampMillisecondArray,
+                            TimestampNanosecondArray, TimestampSecondArray,
+                        };
+                        {
+                            let scaled: Vec<i64> = match unit {
+                                arrow::datatypes::TimeUnit::Second => {
+                                    let a = col
+                                        .as_any()
+                                        .downcast_ref::<TimestampSecondArray>()
+                                        .expect("timestamp array");
+                                    (0..a.len()).map(|r| a.value(r) * 1_000_000).collect()
+                                }
+                                arrow::datatypes::TimeUnit::Millisecond => {
+                                    let a = col
+                                        .as_any()
+                                        .downcast_ref::<TimestampMillisecondArray>()
+                                        .expect("timestamp array");
+                                    (0..a.len()).map(|r| a.value(r) * 1_000).collect()
+                                }
+                                arrow::datatypes::TimeUnit::Microsecond => {
+                                    let a = col
+                                        .as_any()
+                                        .downcast_ref::<TimestampMicrosecondArray>()
+                                        .expect("timestamp array");
+                                    (0..a.len()).map(|r| a.value(r)).collect()
+                                }
+                                arrow::datatypes::TimeUnit::Nanosecond => {
+                                    let a = col
+                                        .as_any()
+                                        .downcast_ref::<TimestampNanosecondArray>()
+                                        .expect("timestamp array");
+                                    (0..a.len()).map(|r| a.value(r) / 1_000).collect()
+                                }
+                            };
+                            view.i64s = scaled;
+                        }
+                    }
+                    DT::Date32 => {
+                        view.kind = BatchKind::Date32;
+                        let a = col
+                            .as_any()
+                            .downcast_ref::<arrow::array::Date32Array>()
+                            .expect("date32 array");
+                        for r in 0..self.num_rows_in_current {
+                            view.i64s.push(a.value(r) as i64);
+                        }
+                    }
+                    DT::Utf8 | DT::LargeUtf8 => {
+                        view.kind = BatchKind::Text;
+                        for r in 0..self.num_rows_in_current {
+                            let s = if col.is_null(r) {
+                                ""
+                            } else {
+                                match col.data_type() {
+                                    DT::LargeUtf8 => col
+                                        .as_any()
+                                        .downcast_ref::<arrow::array::LargeStringArray>()
+                                        .expect("large utf8")
+                                        .value(r),
+                                    _ => col
+                                        .as_any()
+                                        .downcast_ref::<arrow::array::StringArray>()
+                                        .expect("utf8")
+                                        .value(r),
+                                }
+                            };
+                            if s.contains('\0') {
+                                return Err(StorageError::Decode(format!(
+                                    "column {:?} value contains an interior NUL byte and \
+                                     cannot be returned as text",
+                                    self.column_names.get(c).cloned().unwrap_or_default()
+                                )));
+                            }
+                            view.rendered.push(s.to_string());
+                        }
+                        view.spans = view
+                            .rendered
+                            .iter()
+                            .map(|s| BatchSpan {
+                                ptr: s.as_ptr(),
+                                len: s.len() as u64,
+                            })
+                            .collect();
+                    }
+                    DT::Binary | DT::LargeBinary => {
+                        view.kind = BatchKind::Bytes;
+                        for r in 0..self.num_rows_in_current {
+                            let b: &[u8] = if col.is_null(r) {
+                                &[]
+                            } else {
+                                match col.data_type() {
+                                    DT::LargeBinary => col
+                                        .as_any()
+                                        .downcast_ref::<arrow::array::LargeBinaryArray>()
+                                        .expect("large binary")
+                                        .value(r),
+                                    _ => col
+                                        .as_any()
+                                        .downcast_ref::<arrow::array::BinaryArray>()
+                                        .expect("binary")
+                                        .value(r),
+                                }
+                            };
+                            view.spans.push(BatchSpan {
+                                ptr: b.as_ptr(),
+                                len: b.len() as u64,
+                            });
+                        }
+                    }
+                    // date/time/decimal/uuid/fixed-binary: the same
+                    // cell_from_arrow rendering as the per-row path, once
+                    // per batch instead of once per row
+                    _ => {
+                        view.kind = BatchKind::Rendered;
+                        for r in 0..self.num_rows_in_current {
+                            let s = match cell_from_arrow(col, r) {
+                                CellValue::Str(s) => s,
+                                CellValue::Null => String::new(),
+                                other => {
+                                    return Err(StorageError::Decode(format!(
+                                        "batch render: unexpected cell {:?} for column {:?}",
+                                        other,
+                                        self.column_names.get(c).cloned().unwrap_or_default()
+                                    )))
+                                }
+                            };
+                            view.rendered.push(s);
+                        }
+                        view.spans = view
+                            .rendered
+                            .iter()
+                            .map(|s| BatchSpan {
+                                ptr: s.as_ptr(),
+                                len: s.len() as u64,
+                            })
+                            .collect();
+                    }
+                }
+                cols.push(view);
+            }
+            return Ok(Some(BatchView {
+                rows: self.num_rows_in_current,
+                live_idx,
+                start_abs: self.batch_start_abs,
+                cols,
+            }));
+        }
     }
 
     /// Cell `col_idx` of the current row. Out-of-range column or a call

@@ -60,6 +60,7 @@
 #include "pg_datalake_core.h"
 
 #include "lakehouse.h"
+#include "batch_fill.h"
 
 /* LakehouseOptions moved to lakehouse.h (M2 slice 26): the table access
  * method shares the option block and the session pipeline. */
@@ -174,6 +175,15 @@ typedef struct LakehouseExecState
 	FmgrInfo   *in_funcs;		/* per visible attribute */
 	Oid		   *typioparams;
 	int		   *slot_index;		/* attribute slot per projection column */
+	/* M3-R1 typed batch cursor: one arrow batch at a time, Datums built
+	 * directly (batch_fill.c); the per-row renderer is gone from this
+	 * path. rows_next is no longer called here. */
+	PgDatalakeRowBatch batch;
+	bool		batch_valid;
+	uint64		batch_cursor;
+	LakehouseBatchMap *maps;	/* per visible attribute */
+	Datum	   *row_values;		/* reused per row */
+	bool	   *row_nulls;
 }			LakehouseExecState;
 
 static void lakehouse_GetForeignRelSize(PlannerInfo *root,
@@ -929,6 +939,10 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 	state->in_funcs = (FmgrInfo *) palloc0(tupdesc->natts * sizeof(FmgrInfo));
 	state->typioparams = (Oid *) palloc0(tupdesc->natts * sizeof(Oid));
 	state->slot_index = (int *) palloc0(tupdesc->natts * sizeof(int));
+	state->maps = (LakehouseBatchMap *) palloc0(tupdesc->natts * sizeof(LakehouseBatchMap));
+	state->row_values = (Datum *) palloc(tupdesc->natts * sizeof(Datum));
+	state->row_nulls = (bool *) palloc(tupdesc->natts * sizeof(bool));
+	state->batch_valid = false;
 
 	/* projection: visible attribute names, in attribute order — a counted
 	 * JSON ARRAY, not comma-separated: column names may contain commas
@@ -1057,65 +1071,114 @@ lakehouse_IterateForeignScan(ForeignScanState *node)
 		}
 
 		/*
-		 * 13-review #8: explicit ROW/EOF/ERROR status — a caught panic
-		 * used to return false, INDISTINGUISHABLE FROM EOF (silent
-		 * result-set truncation). Errors abort the statement after the
-		 * rows already returned.
+		 * M3-R1: batch cursor — one pg_datalake_rows_batch_next call per
+		 * arrow batch; rows are served from the materialized typed views
+		 * with Datums built directly (batch_fill.c). The explicit
+		 * ROW/EOF/ERROR tri-state carries over: EOF advances the task,
+		 * ERROR aborts the statement (13-review #8 — a caught panic is
+		 * never mistaken for EOF).
 		 */
 		{
 			char		next_err[1024];
 			int			nst;
 
-			next_err[0] = '\0';
-			nst = pg_datalake_rows_next(state->rows, next_err, sizeof(next_err));
-			if (nst == 2)
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_EXCEPTION),
-						 errmsg("lakehouse: row read failed in task %llu after %llu rows: %s",
-								(unsigned long long) state->current_task,
-								(unsigned long long) state->current_task,
-								next_err[0] != '\0' ? next_err : "unknown error")));
-			if (nst == 1)
+			if (!state->batch_valid || state->batch_cursor >= state->batch.live_count)
 			{
-				/* task exhausted: advance to the next one */
-				pg_datalake_rows_close(state->rows);
-				state->rows = NULL;
-				state->current_task++;
-				continue;
-			}
-		}
-		{
-			Datum	   *values = (Datum *) palloc(tupdesc->natts * sizeof(Datum));
-			bool	   *nulls = (bool *) palloc(tupdesc->natts * sizeof(bool));
-			HeapTuple	tuple;
-
-			for (int i = 0; i < tupdesc->natts; i++)
-			{
-				int			pcol = state->slot_index[i];
-
-				if (pcol < 0)
+				next_err[0] = '\0';
+				nst = pg_datalake_rows_batch_next(state->rows, &state->batch,
+												  next_err, sizeof(next_err));
+				if (nst == 2)
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_EXCEPTION),
+							 errmsg("lakehouse: row read failed in task %llu: %s",
+									(unsigned long long) state->current_task,
+									next_err[0] != '\0' ? next_err : "unknown error")));
+				if (nst == 1)
 				{
-					values[i] = PointerGetDatum(NULL);
-					nulls[i] = true;
+					/* task exhausted: advance to the next one */
+					pg_datalake_rows_close(state->rows);
+					state->rows = NULL;
+					state->batch_valid = false;
+					state->current_task++;
 					continue;
 				}
-				if (pg_datalake_rows_col_null(state->rows, pcol))
+				state->batch_valid = true;
+				state->batch_cursor = 0;
+				/* per-batch fast/fallback decision for every attribute */
+				for (int i = 0; i < tupdesc->natts; i++)
 				{
-					values[i] = PointerGetDatum(NULL);
-					nulls[i] = true;
-					continue;
+					int			pcol = state->slot_index[i];
+
+					if (pcol < 0)
+						continue;
+					lakehouse_batch_map_column(TupleDescAttr(tupdesc, i),
+											   &state->batch.cols[pcol],
+											   state->batch.rows,
+											   &state->in_funcs[i],
+											   state->typioparams[i],
+											   &state->maps[i]);
 				}
-				values[i] = InputFunctionCall(&state->in_funcs[i],
-											  pg_datalake_rows_col_text(state->rows,
-																		pcol),
-											  state->typioparams[i],
-											  TupleDescAttr(tupdesc, i)->atttypmod);
-				nulls[i] = false;
 			}
-			tuple = heap_form_tuple(tupdesc, values, nulls);
-			pfree(values);
-			pfree(nulls);
-			return ExecStoreHeapTuple(tuple, slot, false);
+
+			{
+				uint32		r = state->batch.live_idx[state->batch_cursor];
+				HeapTuple	tuple;
+
+				for (int i = 0; i < tupdesc->natts; i++)
+				{
+					int			pcol = state->slot_index[i];
+
+					if (pcol < 0)
+					{
+						state->row_values[i] = PointerGetDatum(NULL);
+						state->row_nulls[i] = true;
+						continue;
+					}
+					{
+						const PgDatalakeBatchColumn *col =
+							&state->batch.cols[pcol];
+
+						if (col->nulls[r])
+						{
+							state->row_values[i] = PointerGetDatum(NULL);
+							state->row_nulls[i] = true;
+							continue;
+						}
+						if (state->maps[i].target != LAKE_FAST_NONE)
+						{
+							state->row_values[i] =
+								lakehouse_batch_col_datum(&state->maps[i], col, r,
+														  TupleDescAttr(tupdesc, i)->attname.data);
+							state->row_nulls[i] = false;
+						}
+						else
+						{
+							char		cell_err[1024];
+							const char *text;
+
+							cell_err[0] = '\0';
+							text = pg_datalake_rows_batch_cell_text(state->rows,
+																	pcol, r,
+																	cell_err,
+																	sizeof(cell_err));
+							if (text == NULL)
+								ereport(ERROR,
+										(errcode(ERRCODE_DATA_EXCEPTION),
+										 errmsg("lakehouse: row read failed in task %llu: %s",
+												(unsigned long long) state->current_task,
+												cell_err[0] != '\0' ? cell_err : "unknown error")));
+							state->row_values[i] =
+								InputFunctionCall(&state->in_funcs[i], text,
+												  state->typioparams[i],
+												  TupleDescAttr(tupdesc, i)->atttypmod);
+							state->row_nulls[i] = false;
+						}
+					}
+				}
+				state->batch_cursor++;
+				tuple = heap_form_tuple(tupdesc, state->row_values, state->row_nulls);
+				return ExecStoreHeapTuple(tuple, slot, false);
+			}
 		}
 
 	}
@@ -1181,6 +1244,7 @@ lakehouse_ReScanForeignScan(ForeignScanState *node)
 		pg_datalake_rows_close(state->rows);
 		state->rows = NULL;
 	}
+	state->batch_valid = false;
 	if (state->session == NULL)
 	{
 		state->session = lakehouse_OpenSession(&state->opts, state->rte_selector);

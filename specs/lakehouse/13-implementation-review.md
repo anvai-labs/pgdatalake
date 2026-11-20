@@ -111,6 +111,18 @@ Define explicit ROW/EOF/ERROR status with owned, bounded diagnostics. Use field 
 
 3. **Remove per-cell conversions on the hot path.** Rust allocates a CString per cell, the FDW calls a PostgreSQL input function per value, then forms a heap tuple with temporary arrays. Start with typed primitives and a batch ABI with explicit ownership and null bitmaps, preserving typmods and exact SQL values. Fill a slot of the kind promised to the executor and document the lifetime of by-reference values. Keep a checked fallback for uncommon types. Apply byte/row flush thresholds to the managed writer and a spillable own-write overlay. Today it buffers both Rust column builders and copied PG Datums, grows PG arrays in increments of 64 and flushes at commit on the SQL path. Use the primary-key index for attachment lookup instead of scanning the heap per open. **Measure** CPU per million rows, peak backend RSS during COPY/INSERT, bytes uploaded, and rescan work. Avoid interpreting faster runtimes with missing rows as an improvement. [FDW iterator](../../src/backend/access/lakehouse/fdw.c) · [Renderer](../../src/backend/access/lakehouse/core/pgdatalake-core/src/ffi.rs) · [TableAM staging](../../src/backend/access/lakehouse/tableam.c)
 
+   *(STATUS 2026-11-20, M3-R1: LANDED for the scan readers — see
+   specs/lakehouse/06-execution.md §3a for the ABI and the measured
+   numbers. **INCIDENT:** the slice-28 COW row identity conflated
+   batch-local row indexes with file-absolute positions, silently
+   retargeting UPDATE/DELETE tombstones at wrong rows in every reader
+   batch after the first — staged updates vanished and unintended rows
+   were dropped (silent data loss, the worst violation of the
+   never-misread law). Tables written between slice 28 (e986095cc7c) and
+   this fix must be regenerated. The writer-side half of item 3 (flush
+   thresholds, spillable overlay, PK-index attachment lookup) remains
+   open.)*
+
 4. **Establish a reproducible comparison.** The recorded SF10 q3 run was terminated after over 60 minutes. The ten completed queries used smaller samples, and q6 also reduced a dimension. These are distinct workloads. Store dataset seed, scale, snapshots, row counts, query text, client/server settings, worker count, layout, reference result digests and object-cache conditions. Compare a multi-file narrow scan, wide scan, selective filter, equality-delete scan, rescan join and repeated append. Collect five runs per case and publish median/range plus peak RSS and bytes. Agree on target hardware and budgets before introducing latency pass/fail thresholds. [Recorded TPC-DS evidence](../../src/test/lakehouse/fixtures/gate-evidence-m1-tpcds.md)
 
 ## Delivery order and spec amendments

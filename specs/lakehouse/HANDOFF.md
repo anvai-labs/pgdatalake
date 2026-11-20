@@ -871,3 +871,34 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     Fixture gen: docker trino CLI (CREATE TABLE WITH format_version=3,
     INSERT, DELETE). V3 (DV write mode) remains future; M3 slice 24
     columnar reads is the next major slice.
+  - M3-R1 slice — DONE 2026-11-20 (typed batch read ABI, TDD + live):
+    13-review perf #3 scan-reader half LANDED. pg_datalake_rows_batch_next
+    (Rust) materializes one arrow batch at a time: typed views (Bool u8 /
+    Int64 / Float64 / TimestampUs / Date32 buffers; zero-copy Text/Bytes
+    spans; Rendered spans via cell_from_arrow for date/time/decimal/uuid),
+    live-row list with deletes+DVs still applied in Rust, byte-per-row
+    null map. batch_fill.c maps (kind, atttypid, typmod) -> exact fast
+    Datum constructors; unprovable combinations (bpchar/name/timestamp
+    precision<6/numeric/float4) fall back via
+    pg_datalake_rows_batch_cell_text + InputFunctionCall — byte-identical
+    to the old renderer. fdw.c Iterate + tableam.c scan_getnextslot
+    rewired; per-row CString render + InputFunctionCall GONE from both
+    hot paths. MEASURED (500Kx4 managed table): aggregate 465 -> 145 ms
+    (~3.2x), full materialize 0.69 -> 0.31 s, FDW wall 0.51 -> 0.18 s.
+    TDD: 3 new ffi tests (multitype+nulls+position-delete, multi-batch
+    advance, interior-NUL loud) + start_abs anchor; 104 cargo green; 6/6
+    regress. LIVE: COW UPDATE/DELETE multi-batch round-trips verified
+    against pyiceberg (per-row values + row presence).
+    **INCIDENT (never-misread violated by slice 28):** first cut exposed
+    that slice-28's TID/tombstone identity used the LIVE-ROW ORDINAL
+    while the batch live list is batch-LOCAL — rows past the first
+    arrow batch (1024 rows) tombstoned the WRONG ROWS silently: victim
+    updates vanished, unintended rows dropped at commit (caught live:
+    UPDATE id=2500 recorded tombstone row 451; a 500K-row table lost a
+    staged update). Fix: PgDatalakeRowBatch.start_abs; consumers split
+    local (buffer index) vs absolute (identity) by construction; ABI
+    test asserts start_abs. Tables written between e986095cc7c (slice
+    28) and this fix must be REGENERATED (dev fixtures only: t28, t28b,
+    t29, bench_rows, vg_bench show lost/misapplied DML). Next: writer
+    min/max bounds, or spec 15 (staged-write WAL + background
+    compaction + caching, spec-only per user direction).
