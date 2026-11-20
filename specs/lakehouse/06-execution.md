@@ -19,8 +19,39 @@ SQL query
 ```
 
 **Never trust, always re-check**: any predicate handed to the core (metrics/
-row-group pruning) is re-evaluated on returned rows. Pushdown bugs degrade
-performance, never correctness.
+row-group pruning) is re-evaluated on returned rows.
+
+*(13-review #4 correction, 2026-11-20.)* The earlier claim — "pushdown bugs
+degrade performance, never correctness" — is **wrong** and was demonstrated
+live: a pushed predicate that mis-prunes eliminates FILES before any local
+recheck can run, and re-checks only see surviving rows. Pushdown bugs can
+silently lose rows. The pushdown path therefore admits only operators,
+types, and collations whose semantics the byte-order pruner can model:
+
+- **Operator identity, not spelling**: only pg_catalog operators push
+  (`OPEROID` → `oprnamespace`); a user operator that shares the name
+  `=`/`<` has different semantics and stays local.
+- **Type allowlist**: int2/int4/int8 (exact binary), date (+10957 days),
+  timestamp/timestamptz (+946684800000000 µs epoch), float4/float8
+  (shortest round-trip out; NaN/Inf stay local), text/varchar/name.
+  Everything else stays local — pushdown eligibility must not call
+  arbitrary user-defined output functions. bpchar is excluded (its
+  trailing-blank-insensitive equality is not byte equality).
+- **Collation rules**: ordering (`< <= > >=`) pushes only under
+  byte-ordered collations (C); equality (`=`) pushes only under
+  deterministic collations. Otherwise the qual stays local — locale
+  ordering (ICU en-US) and non-deterministic equality (case-folded)
+  match rows byte comparisons reject.
+- **Safe encoding**: values and field names are JSON-encoded with a
+  growable buffer (quote, backslash, `\b\f\n\r\t`, other control bytes
+  as `\u00XX`) — control characters in a constant previously produced
+  JSON the Rust decode rejected outright.
+- **Live acceptance** (Lakekeeper + S3 fixtures, ground truth via
+  identical heap tables, two disjoint-range files with real bounds):
+  inverted same-named operator, ICU ordering, non-deterministic eq and
+  control-char eq — each previously returned wrong results or failed
+  the scan; all now equal ground truth, while deterministic-eq and
+  C-ordered pushdowns still prune correctly.
 
 ## 2. What pushes down (v1)
 

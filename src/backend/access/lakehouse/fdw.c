@@ -38,6 +38,12 @@
 #include "access/parallel.h"
 #include "port/atomics.h"
 #include "utils/injection_point.h"
+#include "utils/rel.h"
+#include "catalog/pg_collation.h"
+#include "catalog/pg_operator.h"
+#include "utils/syscache.h"
+#include "catalog/pg_namespace.h"
+#include "lib/stringinfo.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/nodes.h"
 #include "optimizer/optimizer.h"
@@ -361,12 +367,126 @@ lakehouse_GetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
 }
 
 /*
+ * 13-review #4: pushdown eligibility is decided by OPERATOR IDENTITY,
+ * not spelling. get_opname() alone accepts a user operator that merely
+ * shares the name "=" / "<" but has different semantics — the pushed
+ * byte-order pruning then eliminates files whose rows the operator
+ * WOULD have matched, and local rechecks cannot recover them. Require
+ * the operator to live in pg_catalog.
+ */
+static bool
+operator_is_builtin(Oid opno)
+{
+	HeapTuple	tp;
+	Form_pg_operator opform;
+	bool		ok;
+
+	tp = SearchSysCache1(OPEROID, ObjectIdGetDatum(opno));
+	if (!HeapTupleIsValid(tp))
+		return false;
+	opform = (Form_pg_operator) GETSTRUCT(tp);
+	ok = opform->oprnamespace == PG_CATALOG_NAMESPACE;
+	ReleaseSysCache(tp);
+	return ok;
+}
+
+/*
+ * Non-deterministic collations (case/accent-insensitive) make PG's text
+ * equality broader than byte equality — pushing `name = 'APPLE'` as a
+ * byte-eq prunes files that DO contain matches under the collation
+ * (live-verified: ground truth 1 row, returned 0). Deterministic
+ * collations define equality as byte equality, so eq pushdown is safe.
+ */
+static bool
+collation_is_deterministic(Oid collid)
+{
+	HeapTuple	tp;
+	Form_pg_collation collform;
+	bool		det;
+
+	if (collid == InvalidOid || collid == DEFAULT_COLLATION_OID)
+		return true;			/* implicit / deterministic database default */
+	tp = SearchSysCache1(COLLOID, ObjectIdGetDatum(collid));
+	if (!HeapTupleIsValid(tp))
+		return false;
+	collform = (Form_pg_collation) GETSTRUCT(tp);
+	det = collform->collisdeterministic;
+	ReleaseSysCache(tp);
+	return det;
+}
+
+/*
+ * Ordering (lt/le/gt/ge) pushdown compares byte order on the Rust side
+ * (spec-wise deterministic for Iceberg strings). Only the collations
+ * DEFINED as byte order (C) may push — a locale-ordered column
+ * (en-US-x-icu) has rows where 'apple' < 'B' holds locally while every
+ * byte comparison says otherwise (live-verified: ground truth 2 rows,
+ * returned 0).
+ */
+static bool
+collation_is_byte_ordered(Oid collid)
+{
+	return collid == C_COLLATION_OID || collid == InvalidOid;
+}
+
+/*
+ * JSON string encoding with a growable buffer (13-review #4): escape
+ * quotes, backslashes AND the control characters a JSON parser rejects
+ * (raw 0x00-0x1F in a value string previously failed the Rust
+ * serde decode outright). Used for field names and text values alike.
+ */
+static void
+append_json_string(StringInfo buf, const char *s)
+{
+	const unsigned char *p;
+
+	appendStringInfoCharMacro(buf, '"');
+	for (p = (const unsigned char *) s; *p; p++)
+	{
+		switch (*p)
+		{
+			case '"':
+				appendStringInfoString(buf, "\\\"");
+				break;
+			case '\\':
+				appendStringInfoString(buf, "\\\\");
+				break;
+			case '\b':
+				appendStringInfoString(buf, "\\b");
+				break;
+			case '\f':
+				appendStringInfoString(buf, "\\f");
+				break;
+			case '\n':
+				appendStringInfoString(buf, "\\n");
+				break;
+			case '\r':
+				appendStringInfoString(buf, "\\r");
+				break;
+			case '\t':
+				appendStringInfoString(buf, "\\t");
+				break;
+			default:
+				if (*p < 0x20)
+					appendStringInfo(buf, "\\u%04x", *p);
+				else
+					appendStringInfoCharMacro(buf, *p);
+		}
+	}
+	appendStringInfoCharMacro(buf, '"');
+}
+
+/*
  * Translate one Var-op-Const qual clause into the ScanPredicate JSON the
  * Rust side understands (slice 15). Returns NULL for anything we cannot
  * translate — those quals stay local (executor-evaluated, correct but
  * not pruning). Numeric semantics: int/date/timestamp constants pass as
  * their binary width (micros for timestamps — matches the parquet stats
- * bounds, doc 05 §4); float passes through; text via the type output fn.
+ * bounds, doc 05 §4); float passes through. 13-review #4: text types
+ * push only under the collation rules above; ALL other types (whose
+ * output functions are arbitrary user code and whose semantics the
+ * byte-order pruner cannot model) stay local — pushdown eligibility
+ * must not call user-defined output functions.
  */
 static char *
 TranslateQual(Expr *expr, TupleDesc tupdesc)
@@ -391,6 +511,10 @@ TranslateQual(Expr *expr, TupleDesc tupdesc)
 	opno = op->opno;
 	opname = get_opname(opno);
 	if (opname == NULL)
+		return NULL;
+	/* spelling alone is not semantics (13-review #4): same-named user
+	 * operators must stay local */
+	if (!operator_is_builtin(opno))
 		return NULL;
 	if (strcmp(opname, "=") == 0)
 		json_op = "eq";
@@ -490,39 +614,52 @@ TranslateQual(Expr *expr, TupleDesc tupdesc)
 					value_buf = out;
 					break;
 				}
-			default:
+			case TEXTOID:
+			case VARCHAROID:
+			case NAMEOID:
+				/* bpchar is deliberately absent: PG's bpchar equality
+				 * ignores trailing blanks, byte equality does not. */
 				{
 					Oid			outfn;
 					bool		isvarlen;
 					const char *raw;
-					char	   *quoted;
-					char	   *p;
-					const char *q;
+					bool		ordering;
+					bool		coll_ok;
+					StringInfoData buf;
+
+					ordering = strcmp(json_op, "eq") != 0;
+					if (ordering)
+						coll_ok = collation_is_byte_ordered(var->varcollid);
+					else
+						coll_ok = collation_is_deterministic(var->varcollid);
+					if (!coll_ok)
+						return NULL;	/* stay local: collation semantics
+										 * are not byte semantics */
 
 					getTypeOutputInfo(typid, &outfn, &isvarlen);
 					raw = OidOutputFunctionCall(outfn, con->constvalue);
-					/* escaping can double every byte (\\ runs); the old
-					 * strlen+3 buffer overflowed on backslash-heavy
-					 * values */
-					quoted = palloc(2 * strlen(raw) + 3);
-					p = quoted;
-					*p++ = '"';
-					for (q = raw; *q; q++)
-					{
-						if (*q == '"' || *q == '\\')
-							*p++ = '\\';
-						*p++ = *q;
-					}
-					*p++ = '"';
-					*p = '\0';
-					value_buf = quoted;
+					initStringInfo(&buf);
+					append_json_string(&buf, raw);
+					value_buf = buf.data;
 					break;
 				}
+			default:
+				/* 13-review #4: unknown / user-defined types stay local —
+				 * their output functions are arbitrary code, and the
+				 * byte-order pruner cannot model their comparison
+				 * semantics */
+				return NULL;
 		}
 	}
 
-	return psprintf("{\"op\":\"%s\",\"field\":\"%s\",\"value\":%s}",
-					json_op, attname, value_buf);
+	{
+		StringInfoData buf;
+
+		initStringInfo(&buf);
+		append_json_string(&buf, attname);
+		return psprintf("{\"op\":\"%s\",\"field\":%s,\"value\":%s}",
+						json_op, buf.data, value_buf);
+	}
 }
 
 static ForeignScan *
