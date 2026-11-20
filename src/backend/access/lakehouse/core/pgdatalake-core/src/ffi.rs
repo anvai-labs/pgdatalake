@@ -867,21 +867,43 @@ pub unsafe extern "C" fn pg_datalake_write_commit(
     err_buf: *mut c_char,
     err_len: usize,
 ) -> *mut c_char {
-    let Some(ws) = (unsafe { ws.as_mut() }) else {
+    let Some(mut ws) = (unsafe { ws.as_mut() }) else {
         unsafe { set_err(err_buf, err_len, "write commit: NULL session") };
         return std::ptr::null_mut();
     };
+    commit_internal(&mut ws, &[], retries, err_buf, err_len)
+}
+
+/// Shared commit tail (append or overwrite): flush remainder, commit via
+/// session.rs, hand back the metadata-location. `deleted` non-empty makes
+/// the snapshot an overwrite (M2 slice 28 COW UPDATE/DELETE).
+///
+/// # Safety
+/// `ws` must be a live handle; err_buf rules as usual.
+unsafe fn commit_internal(
+    ws: &mut WriteSession,
+    deleted: &[crate::snapshot_write::DeletedDataFile],
+    retries: u32,
+    err_buf: *mut c_char,
+    err_len: usize,
+) -> *mut c_char {
     if !unsafe { pg_datalake_write_flush(ws, err_buf, err_len) } {
         return std::ptr::null_mut();
     }
-    if ws.flushed.is_empty() {
+    if ws.flushed.is_empty() && deleted.is_empty() {
         unsafe { set_err(err_buf, err_len, "write commit: no rows staged") };
         return std::ptr::null_mut();
     }
     let ns_refs: Vec<&str> = ws.namespace.iter().map(|s| s.as_str()).collect();
     let commit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        ws.client
-            .commit_append(&ws.state, &ns_refs, &ws.table, &ws.flushed, &[], retries)
+        ws.client.commit_append(
+            &ws.state,
+            &ns_refs,
+            &ws.table,
+            &ws.flushed,
+            deleted,
+            retries,
+        )
     }));
     match commit {
         Ok(Ok(loc)) => {
@@ -901,6 +923,139 @@ pub unsafe extern "C" fn pg_datalake_write_commit(
             std::ptr::null_mut()
         }
     }
+}
+
+/// Commit an OVERWRITE snapshot (M2 slice 28 COW UPDATE/DELETE):
+/// flushed rows become ADDED files, `deleted_json` rows become DELETED
+/// manifest entries. `deleted_json` is `[["path", record_count, size],
+/// ...]` — identity of files REMOVED by this statement, as read from the
+/// base snapshot's task list. Returns/ownership like pg_datalake_write_commit.
+///
+/// # Safety
+/// Same rules as pg_datalake_write_commit.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_write_commit_overwrite(
+    ws: *mut WriteSession,
+    deleted_json: *const c_char,
+    retries: u32,
+    err_buf: *mut c_char,
+    err_len: usize,
+) -> *mut c_char {
+    let Some(mut ws) = (unsafe { ws.as_mut() }) else {
+        unsafe { set_err(err_buf, err_len, "overwrite commit: NULL session") };
+        return std::ptr::null_mut();
+    };
+    let raw = borrow_string(deleted_json);
+    let deleted: Vec<crate::snapshot_write::DeletedDataFile> =
+        match serde_json::from_str::<Vec<(String, i64, i64)>>(&raw) {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|(file_path, record_count, file_size_in_bytes)| {
+                    crate::snapshot_write::DeletedDataFile {
+                        file_path,
+                        record_count,
+                        file_size_in_bytes,
+                    }
+                })
+                .collect(),
+            Err(e) => {
+                unsafe {
+                    set_err(
+                        err_buf,
+                        err_len,
+                        &format!("overwrite commit: deleted list must be [[path,count,size],...]: {e}"),
+                    )
+                };
+                return std::ptr::null_mut();
+            }
+        };
+    unsafe { commit_internal(&mut ws, &deleted, retries, err_buf, err_len) }
+}
+
+/// Open one data file BY PATH for a COW rewrite pass (slice 28): rows are
+/// re-read from the BASE snapshot's files (never the catalog's current
+/// snapshot — a concurrent writer may have moved it) using the write
+/// session's storage credentials. The path is scope-gated to the
+/// session's table root. Projection is a counted JSON array of column
+/// names, as in pg_datalake_rows_open.
+///
+/// # Safety
+/// `ws` must be a live handle; the returned handle is freed exactly once
+/// with pg_datalake_rows_close.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_rows_open_path(
+    ws: *mut WriteSession,
+    path: *const c_char,
+    projection: *const c_char,
+    err_buf: *mut c_char,
+    err_len: usize,
+) -> *mut RowsHandle {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<RowsHandle, String> {
+        let Some(w) = ws.as_ref() else {
+            return Err("NULL write session".into());
+        };
+        let file_path = borrow_string(path);
+        if file_path.is_empty() {
+            return Err("empty file path".into());
+        }
+        // transport policy: every hop stays inside the table root
+        crate::scan::ensure_within_table_root(&file_path, &w.state.location)
+            .map_err(|e| e.to_string())?;
+        let projection = borrow_string(projection);
+        let projection_owned: Vec<String> = if projection.is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_str(&projection)
+                .map_err(|e| format!("projection is not a JSON array: {e}"))?
+        };
+        let projection: Vec<&str> = projection_owned.iter().map(|s| s.as_str()).collect();
+        let (io, key) = crate::scan::open_for(&file_path, Some(&w.state.s3))
+            .map_err(|e| e.to_string())?;
+        let rows = crate::parquet::ParquetRows::open(&io, &key, &projection)
+            .map_err(|e| e.to_string())?;
+        let column_names = rows
+            .column_names()
+            .iter()
+            .map(|n| CString::new(n.as_str()).unwrap_or_default())
+            .collect();
+        Ok(RowsHandle {
+            rows,
+            column_names,
+            current_row: Vec::new(),
+            current_null: Vec::new(),
+            last_err: None,
+        })
+    }));
+    let handle = result.unwrap_or_else(|panic| {
+        Err(panic_message(&panic))
+    });
+    match handle {
+        Ok(h) => Box::into_raw(Box::new(h)),
+        Err(e) => {
+            unsafe { set_err(err_buf, err_len, &e) };
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Size in bytes of one task's data file (deleted manifest entries carry
+/// the ORIGINAL file's size; 0 when NULL session or out of range).
+///
+/// # Safety
+/// `session` must be NULL or a live handle from pg_datalake_scan_new.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_scan_task_size(
+    session: *mut ScanSession,
+    idx: u64,
+) -> i64 {
+    let Some(s) = (unsafe { session.as_ref() }) else {
+        return 0;
+    };
+    s.plan
+        .tasks
+        .get(idx as usize)
+        .map(|t| t.entry.data_file.file_size_in_bytes)
+        .unwrap_or(0)
 }
 
 /// Create the remote Iceberg table from a column list (managed CREATE,
@@ -1948,5 +2103,231 @@ mod tests {
             "LargeUtf8 value must decode, not NULL"
         );
         unsafe { drop(Box::from_raw(h)) };
+    }
+
+    /// COW rewrite plumbing (M2 slice 28): rows_open_path re-reads a BASE
+    /// snapshot file through the write session's credentials, scope-gated
+    /// to the table root; commit_overwrite emits the overwrite snapshot
+    /// with the deleted file's identity.
+    #[test]
+    fn ffi_rows_open_path_and_overwrite_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
+        let location = format!("file://{}", dir.path().join("table").display());
+        std::fs::create_dir_all(dir.path().join("table").join("data")).unwrap();
+        std::fs::create_dir_all(dir.path().join("table").join("metadata")).unwrap();
+        std::fs::create_dir_all(dir.path().join("metadata")).unwrap();
+
+        // base data file: rows 1 and 2 (the file an UPDATE/DELETE rewrites)
+        let mut w = crate::writer::BatchWriter::new(vec![crate::writer::WriteColumn {
+            name: "id".into(),
+            ty: crate::catalog::metadata::IcebergType::Long,
+            field_id: Some(1),
+        }])
+        .unwrap();
+        w.push(&[crate::parquet::CellValue::Int64(1)]).unwrap();
+        w.push(&[crate::parquet::CellValue::Int64(2)]).unwrap();
+        let wf = w.write_file(
+            &crate::storage::StorageIo::open(
+                &crate::storage::parse_location(&location).unwrap(),
+                None,
+            )
+            .unwrap(),
+            "data",
+            0,
+        )
+        .unwrap();
+        let data_path = format!("{location}/{}", wf.key);
+        let data_size = wf.file_size_in_bytes;
+
+        // base snapshot 42: the data file is LIVE (the liveness check
+        // re-verifies deleted paths against this base before committing)
+        let manifest_bytes = crate::snapshot_write::build_manifest_bytes(
+            &[crate::snapshot_write::NewDataFile {
+                file_path: data_path.clone(),
+                record_count: 2,
+                file_size_in_bytes: data_size,
+                ..Default::default()
+            }],
+            &[],
+            42,
+            3,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("table").join("metadata")).unwrap();
+        std::fs::write(dir.path().join("table").join("metadata").join("m0.avro"), &manifest_bytes)
+            .unwrap();
+        let list_bytes = crate::snapshot_write::build_manifest_list_bytes(&[
+            crate::manifest::ManifestListEntry {
+                manifest_path: format!("{location}/metadata/m0.avro"),
+                manifest_length: manifest_bytes.len() as i64,
+                partition_spec_id: 0,
+                content: Some(0),
+                added_snapshot_id: 42,
+                added_files_count: Some(1),
+                existing_files_count: None,
+                deleted_files_count: None,
+                added_rows_count: Some(2),
+                existing_rows_count: None,
+                deleted_rows_count: None,
+                sequence_number: Some(3),
+                min_sequence_number: Some(3),
+            },
+        ])
+        .unwrap();
+        std::fs::write(dir.path().join("table").join("metadata").join("snap.avro"), list_bytes)
+            .unwrap();
+
+        let metadata_json = format!(
+            r#"{{"format-version": 2,
+                "table-uuid": "1ca92afa-70b9-4d02-9ba6-7ee1a3ac0f5e",
+                "location": "{location}",
+                "last-sequence-number": 3,
+                "schemas": [{{"type": "struct", "schema-id": 0, "fields": [
+                    {{"id": 1, "name": "id", "required": false, "type": "long"}}]}}],
+                "current-schema-id": 0,
+                "snapshots": [{{"snapshot-id": 42, "timestamp-ms": 1712345678000,
+                                "manifest-list": "{location}/metadata/snap.avro",
+                                "summary": {{"operation": "append", "added-records": "2"}}}}],
+                "current-snapshot-id": 42}}"#,
+        );
+        let md_path = dir.path().join("metadata").join("00000-x.metadata.json");
+        std::fs::write(&md_path, &metadata_json).unwrap();
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let md_capture = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let md_capture_t = std::sync::Arc::clone(&md_capture);
+        let md_path_srv = md_path.clone();
+        std::thread::spawn(move || {
+            for _ in 0..4 {
+                let Some(mut req) = server.recv().ok() else {
+                    break;
+                };
+                let url = req.url().to_string();
+                let body = if url.contains("/v1/config") {
+                    r#"{"defaults": {"prefix": "pfx"}, "overrides": {}}"#.to_string()
+                } else if url.contains("namespaces") && req.method().as_str() == "POST" {
+                    let mut body_s = String::new();
+                    {
+                        let _ = req.as_reader().read_to_string(&mut body_s);
+                    }
+                    *md_capture_t.lock().unwrap() = body_s;
+                    r#"{"metadata-location": "file:///committed/00005.metadata.json", "config": {}}"#.to_string()
+                } else {
+                    format!(
+                        r#"{{"metadata-location": "file://{}", "config": {{}}}}"#,
+                        md_path_srv.display()
+                    )
+                };
+                let resp = tiny_http::Response::from_string(body).with_header(
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                        .unwrap(),
+                );
+                let _ = req.respond(resp);
+            }
+        });
+
+        let endpoint = CString::new(format!("http://{addr}")).unwrap();
+        let warehouse = CString::new("smoke").unwrap();
+        let namespace = CString::new("analytics").unwrap();
+        let table = CString::new("events").unwrap();
+        let schema_json = CString::new(r#"[{"name": "id", "type": "long"}]"#).unwrap();
+        let mut err = [0 as c_char; 1024];
+        fn errmsg(err: &[c_char]) -> String {
+            unsafe { CStr::from_ptr(err.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        }
+
+        let ws = unsafe {
+            pg_datalake_write_new(
+                endpoint.as_ptr(),
+                warehouse.as_ptr(),
+                std::ptr::null(),
+                namespace.as_ptr(),
+                table.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                schema_json.as_ptr(),
+                err.as_mut_ptr(),
+                err.len(),
+            )
+        };
+        assert!(!ws.is_null(), "write_new: {}", errmsg(&err));
+
+        // rows_open_path: read the base file back (the C rewrite pass's
+        // "survivors" source), through the session's storage credentials
+        {
+            let path = CString::new(data_path.as_str()).unwrap();
+            let proj = CString::new(r#"["id"]"#).unwrap();
+            let rows = unsafe {
+                pg_datalake_rows_open_path(
+                    ws,
+                    path.as_ptr(),
+                    proj.as_ptr(),
+                    err.as_mut_ptr(),
+                    err.len(),
+                )
+            };
+            assert!(!rows.is_null(), "rows_open_path: {}", errmsg(&err));
+            let mut got = |h: *mut RowsHandle| -> i64 {
+                let st = unsafe {
+                    pg_datalake_rows_next(h, err.as_mut_ptr() as *mut _, err.len())
+                };
+                assert_eq!(st, 0, "row expected, status {st}: {}", errmsg(&err));
+                unsafe { CStr::from_ptr(pg_datalake_rows_col_text(h, 0)) }
+                    .to_string_lossy()
+                    .parse::<i64>()
+                    .unwrap()
+            };
+            assert_eq!(got(rows), 1);
+            assert_eq!(got(rows), 2);
+            let st = unsafe { pg_datalake_rows_next(rows, err.as_mut_ptr() as *mut _, err.len()) };
+            assert_eq!(st, 1, "EOF");
+            unsafe { pg_datalake_rows_close(rows) };
+
+            // transport policy: OUT-OF-ROOT paths are rejected
+            let evil = CString::new("file:///etc/passwd").unwrap();
+            let blocked = unsafe {
+                pg_datalake_rows_open_path(
+                    ws,
+                    evil.as_ptr(),
+                    proj.as_ptr(),
+                    err.as_mut_ptr(),
+                    err.len(),
+                )
+            };
+            assert!(blocked.is_null(), "out-of-root path must be rejected");
+            assert!(errmsg(&err).contains("outside") || errmsg(&err).contains("root"));
+        }
+
+        // commit_overwrite: deleted identity travels to the snapshot
+        let deleted_json =
+            CString::new(format!(r#"[["{}", 2, {}]]"#, data_path, data_size)).unwrap();
+        let loc = unsafe {
+            pg_datalake_write_commit_overwrite(
+                ws,
+                deleted_json.as_ptr(),
+                0,
+                err.as_mut_ptr(),
+                err.len(),
+            )
+        };
+        assert!(!loc.is_null(), "overwrite commit: {}", errmsg(&err));
+        unsafe { pg_datalake_write_commit_result_free(loc) };
+
+        let body = md_capture.lock().unwrap().clone();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let snap = &v["updates"][0]["snapshot"];
+        assert_eq!(
+            snap["summary"]["operation"], "overwrite",
+            "{body}"
+        );
+        assert_eq!(snap["summary"]["deleted-data-files"], "1", "{body}");
+        assert_eq!(snap["summary"]["deleted-records"], "2", "{body}");
+
+        unsafe { pg_datalake_write_free(ws) };
     }
 }
