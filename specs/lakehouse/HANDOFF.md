@@ -231,8 +231,16 @@
     gate run; worth promoting to scripts/ if the fixture is reused).
     Cross-engine: proximadb session (proximadb-e4) benchmarking the
     same fixture (native/DataFusion/DuckDB) against these numbers;
-    results land in 10-testing.md when delivered. M1 gate is GREEN
-    pending the cold-room ceremony (scripts/coldroom-smoke-m1.sh).
+    results land in 10-testing.md when delivered.
+  - M1 CLOSED 2026-11-19: cold-room ceremony COLDROOM M1 ALL GREEN
+    (scripts/coldroom-smoke-m1.sh — fresh clone + fresh fixture stack:
+    build, setup/upstream/lakehouse suites incl. time_travel, cargo,
+    PyIceberg fixture generation in-network, live read-path/
+    time-travel-mechanics/type-matrix verification). Retro at
+    specs/lakehouse/retro/m1.md (8 findings incl. row-transport
+    bottleneck, rescan re-plan bug, LALR(1) FOR-clause lesson, 2
+    operational gotchas). Tag milestone/m1. NEXT: M2 per the slice
+    plan above (slice 24 first: Rust Parquet writer).
   - **Next slices**: M1 conformance
     gate (Trino-written tables, TPC-DS subset, perf vs doc 10 §5) ->
     smoke ceremony -> M1 retro + tag milestone/m1.
