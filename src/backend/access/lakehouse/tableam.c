@@ -30,6 +30,7 @@
 #include "access/xact.h"
 #include "access/heaptoast.h"
 #include "utils/memutils.h"
+#include "utils/array.h"
 #include "utils/datum.h"
 #include "nodes/miscnodes.h"
 #include "catalog/index.h"
@@ -441,6 +442,164 @@ append_cell_json(StringInfoData *buf, Form_pg_attribute attr, Datum v,
 	}
 }
 
+/* ---------------- WITH-options (managed CREATE, slice 28) ---------------- */
+
+/*
+ * The lakehouse WITH-options payload: NUL-separated values in FIXED order
+ * (option i ends where the i-th NUL is). Written by
+ * lakehouse_relation_reloptions at CREATE, decoded via
+ * decode_lakehouse_reloptions at access time.
+ */
+static const char *lakehouse_relopt_keys[] = {
+	"endpoint", "warehouse", "token", "table",
+	"s3_endpoint", "s3_access_key", "s3_secret_key", "snapshot_id",
+};
+#define LAKEHOUSE_NUM_RELOPTS 8
+
+/*
+ * [core-allowlist consumer] parse the raw WITH (...) list into our bytea.
+ * Unknown keys error loudly (a typo'd endpoint should never silently
+ * fall back to the attach path).
+ */
+static bytea *
+lakehouse_relation_reloptions(Datum reloptions, bool validate)
+{
+	/* no WITH (...) at all — plain heap-default relation options */
+	if (DatumGetPointer(reloptions) == NULL)
+		return NULL;
+	ArrayType  *array = DatumGetArrayTypeP(reloptions);
+	Datum	   *elems;
+	int			nelems;
+	char	   *values[LAKEHOUSE_NUM_RELOPTS] = {0};
+	StringInfoData buf;
+	bytea	   *out;
+	int			i;
+
+	deconstruct_array(array, TEXTOID, -1, false, TYPALIGN_INT,
+					 &elems, NULL, &nelems);
+
+	for (i = 0; i < nelems; i++)
+	{
+		char	   *raw = TextDatumGetCString(elems[i]);
+		char	   *eq = strchr(raw, '=');
+		char	   *key;
+		char	   *val;
+		bool		known = false;
+
+		key = raw;
+		val = eq ? eq + 1 : "";
+		if (eq != NULL)
+			*eq = '\0';
+		for (int k = 0; k < LAKEHOUSE_NUM_RELOPTS; k++)
+		{
+			if (strcmp(key, lakehouse_relopt_keys[k]) == 0)
+			{
+				values[k] = val;
+				known = true;
+				break;
+			}
+		}
+		if (!known)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("lakehouse: unrecognized option \"%s\"", key),
+					 errhint("Known options: endpoint, warehouse, token, table, "
+							 "s3_endpoint, s3_access_key, s3_secret_key, snapshot_id.")));
+	}
+
+	/* an identity without a table option is meaningless */
+	if (values[3] == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("lakehouse: the \"table\" option is required"),
+				 errhint("WITH (table 'namespace.table_name', endpoint '...')")));
+
+	initStringInfo(&buf);
+	for (i = 0; i < LAKEHOUSE_NUM_RELOPTS; i++)
+	{
+		if (values[i] != NULL)
+			appendStringInfoString(&buf, values[i]);
+		appendStringInfoChar(&buf, '\0');
+	}
+	out = (bytea *) palloc(buf.len + VARHDRSZ);
+	SET_VARSIZE(out, buf.len + VARHDRSZ);
+	memcpy(VARDATA(out), buf.data, buf.len);
+	return out;
+}
+
+/*
+ * Decode the bytea back into a LakehouseOptions (palloc'd strings).
+ * Returns false when the relation carries no WITH-options.
+ */
+static bool
+decode_lakehouse_reloptions(Relation rel, LakehouseOptions *opts)
+{
+	bytea	   *raw = rel->rd_options;
+	char	   *p;
+	int			i;
+
+	if (raw == NULL)
+		return false;
+
+	memset(opts, 0, sizeof(*opts));
+	p = VARDATA(raw);
+	for (i = 0; i < LAKEHOUSE_NUM_RELOPTS; i++)
+	{
+		char	  **field = NULL;
+		char	   *start = p;
+
+		while (*p != '\0')
+			p++;
+		switch (i)
+		{
+			case 0:
+				field = &opts->endpoint;
+				break;
+			case 1:
+				field = &opts->warehouse;
+				break;
+			case 2:
+				field = &opts->token;
+				break;
+			case 3:
+				field = &opts->table;
+				break;
+			case 4:
+				field = &opts->s3_endpoint;
+				break;
+			case 5:
+				field = &opts->s3_access_key;
+				break;
+			case 6:
+				field = &opts->s3_secret_key;
+				break;
+			case 7:
+				field = &opts->snapshot_id;
+				break;
+		}
+		if (p > start)
+			*field = pnstrdup(start, p - start);
+		p++;					/* skip the NUL */
+	}
+
+	/* split identity into namespace.table (doc 03 §3) */
+	if (opts->table != NULL)
+	{
+		const char *last_dot = strrchr(opts->table, '.');
+
+		if (last_dot != NULL)
+		{
+			char	   *full = opts->table;
+
+			opts->namespace = pnstrdup(full, last_dot - full);
+			opts->table = pstrdup(last_dot + 1);
+		}
+		else
+			opts->namespace = pstrdup("");
+	}
+	return opts->table != NULL;
+}
+
 static LakehouseWriteEntry *
 get_write_entry(Relation rel)
 {
@@ -471,8 +630,11 @@ get_write_entry(Relation rel)
 		entry->natts = 0;
 		entry->tupdesc = NULL;
 		memset(&entry->opts, 0, sizeof(entry->opts));
-		entry->have_identity =
-			ExtractManagedIdentity(relid, &entry->opts);
+		/* WITH-options identity (managed CREATE) wins over the attach row */
+		entry->have_identity = decode_lakehouse_reloptions(rel, &entry->opts);
+		if (!entry->have_identity)
+			entry->have_identity =
+				ExtractManagedIdentity(relid, &entry->opts);
 		if (!entry->have_identity)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -601,7 +763,8 @@ lakehouse_scan_begin(Relation rel, Snapshot snapshot,
 	else
 		scan->rs_base.rs_instrument = NULL;
 
-	if (!ExtractManagedIdentity(RelationGetRelid(rel), &scan->opts))
+	if (!decode_lakehouse_reloptions(rel, &scan->opts) &&
+		!ExtractManagedIdentity(RelationGetRelid(rel), &scan->opts))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("managed table %s has no lakehouse identity",
@@ -1225,6 +1388,8 @@ static const TableAmRoutine lakehouse_tableam_methods = {
 
 	.scan_set_tidrange = lakehouse_scan_set_tidrange,
 	.scan_getnextslot_tidrange = lakehouse_scan_getnextslot_tidrange,
+
+	.relation_reloptions = lakehouse_relation_reloptions,
 };
 
 void

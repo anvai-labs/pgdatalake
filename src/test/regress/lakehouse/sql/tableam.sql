@@ -133,3 +133,59 @@ EXCEPTION WHEN OTHERS THEN
         RAISE EXCEPTION 'unexpected SQLSTATE %', st;
     END IF;
 END $$;
+
+-- managed CREATE via WITH-options (slice 28): the WITH block IS the
+-- identity — no attach_table needed. Offline anchors use an unreachable
+-- endpoint; the live pure-SQL cycle ran against the fixture stack.
+CREATE TABLE lakehouse_wt (id bigint, name text) USING lakehouse
+    WITH (endpoint = 'http://127.0.0.1:9',
+          warehouse = 'wh',
+          table = 'analytics.events',
+          s3_endpoint = 'http://s3:9000');
+SELECT c.relkind, a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
+WHERE c.relname = 'lakehouse_wt';
+-- scan fails fast (08000) straight off the WITH-options identity
+DO $$
+DECLARE
+    st text;
+BEGIN
+    PERFORM * FROM lakehouse_wt;
+    RAISE EXCEPTION 'WITH-options scan did not error';
+EXCEPTION WHEN OTHERS THEN
+    GET STACKED DIAGNOSTICS st = RETURNED_SQLSTATE;
+    IF st <> '08000' THEN
+        RAISE EXCEPTION 'unexpected SQLSTATE %', st;
+    END IF;
+END $$;
+
+-- unknown WITH keys are rejected loudly at CREATE
+DO $$
+DECLARE
+    st text;
+BEGIN
+    CREATE TABLE lakehouse_bad (id bigint) USING lakehouse
+        WITH (endpiont = 'http://typo');
+    RAISE EXCEPTION 'typo option did not error';
+EXCEPTION WHEN OTHERS THEN
+    GET STACKED DIAGNOSTICS st = RETURNED_SQLSTATE;
+    IF st <> '22023' THEN
+        RAISE EXCEPTION 'unexpected SQLSTATE %', st;
+    END IF;
+END $$;
+
+-- missing table option rejected
+DO $$
+DECLARE
+    st text;
+BEGIN
+    CREATE TABLE lakehouse_bad2 (id bigint) USING lakehouse
+        WITH (endpoint = 'http://127.0.0.1:9');
+    RAISE EXCEPTION 'missing table option did not error';
+EXCEPTION WHEN OTHERS THEN
+    GET STACKED DIAGNOSTICS st = RETURNED_SQLSTATE;
+    IF st <> '22023' THEN
+        RAISE EXCEPTION 'unexpected SQLSTATE %', st;
+    END IF;
+END $$;
+
+DROP TABLE lakehouse_wt;

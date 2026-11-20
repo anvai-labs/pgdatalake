@@ -252,6 +252,8 @@ extern struct StdRdOptions *merge_toast_reloptions(const struct StdRdOptions *to
 extern bytea *heap_reloptions(char relkind, Datum reloptions, bool validate);
 extern bytea *view_reloptions(Datum reloptions, bool validate);
 extern bytea *partitioned_table_reloptions(Datum reloptions, bool validate);
+extern bytea *table_am_reloptions(char relkind, Datum reloptions,
+								  bool validate, Oid relam);
 extern bytea *index_reloptions(amoptions_function amoptions, Datum reloptions,
 							   bool validate);
 extern bytea *attribute_reloptions(Datum reloptions, bool validate);
