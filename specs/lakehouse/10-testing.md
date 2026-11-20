@@ -21,6 +21,70 @@ endpoint override. Production support for real MinIO deployments is unchanged
 fixture* swapped. Revisit if Iceberg workloads hit SeaweedFS-specific gaps
 (listing semantics, checksum headers).)*
 
+### 1a. CI/CD strategy — pipelines, gates, coverage (amended 2026-11-20)
+
+**Pipeline map** (what runs, where, on what trigger):
+
+```mermaid
+flowchart LR
+    push[push / PR any branch] --> filt{path filter:
+lakehouse code?}
+    filt -- no --> skip[skip - docs-only]
+    filt -- yes --> fast[CI-fast
+jobs run in parallel]
+    fast --> q[quality: fmt + clippy -D warnings
++ cargo test]
+    fast --> b[build -Ddatalake=enabled
++ ninja]
+    fast --> up[upstream regress suite
+100% green]
+    fast --> lh[lakehouse regress suite
++ conformance fixtures]
+    q & b & up & lh --> gate{branch?}
+    gate -- feature branch --> ready[mergeable into lakehouse-dev
+RULES 1a B3/B5]
+    gate -- lakehouse-dev --> integ[integration gate:
+branch protection requires green]
+    nightly[nightly schedule] --> mx[CI-matrix:
+Azurite + fake-gcs + auth profiles]
+    weekly[weekly / pre-release] --> cl[CI-cloud:
+real S3 / ADLS / GCS via OIDC]
+```
+
+**Gate tiers** (what blocks what):
+
+| Tier | Trigger | Contents | Blocking? |
+|---|---|---|---|
+| **quality** | every push (any branch, path-filtered) | `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` | **yes** — a style/lint red blocks merge before any build minute is spent |
+| **CI-fast** | every push (any branch, path-filtered) | build + upstream regress + lakehouse regress | **yes** |
+| **CI-matrix** | nightly on `lakehouse-dev` | full store/auth matrix (§1) | no (alert + fix-next-day contract) |
+| **CI-cloud** | weekly + pre-release | real cloud stores (§1) | yes for releases |
+| **coverage** | nightly on `lakehouse-dev` | Rust `llvm-cov` on pgdatalake-core, C `gcov` on lakehouse dirs, scoped to the lakehouse suites | **no** — trend artifact, threshold alarms only (see below) |
+| **sanitizers** | nightly on `lakehouse-dev` | ASAN/UBSAN build of the lakehouse suites; valgrind one-shard sampling | no, but any sanitizer finding is a **P1 defect** (this class of bug = silent corruption, see 13-review incident) |
+
+**Design rules** (why it looks like this):
+
+- Fail fast and cheap first: the quality job runs in parallel but before the
+  docker fixtures come up; a fmt/lint failure costs seconds, not a 10-minute
+  build.
+- Path filtering keeps docs-only pushes at zero build cost, but NEVER gate
+  feature-branch CI on branch name — every branch that can merge is a branch
+  that must be tested (RULES §1a).
+- Upstream's regress suite stays in CI-fast: a fork that breaks upstream
+  behavior fails even when lakehouse tests pass (RULES §9).
+- Coverage: scoped to lakehouse code only (fork delta — upstream code coverage
+  is upstream's own CI problem). Threshold model: **ratchet, not cliff** — the
+  nightly job records line/branch coverage per crate/directory and alarms when
+  it drops below the last accepted value; no hard CI-fail until the trend is
+  stable, then the ratchet becomes the gate. New slices must include their
+  tests in the same commit (RULES §8), which is what keeps the ratchet moving
+  up.
+- Sanitizer nightlies exist because the M3-R1 incident (silent tombstone
+  corruption) was caught by live verification, not by tooling — the class of
+  defect that must never rely on luck again.
+- The validity rule (RULES §1a): only `gh run list --workflow datalake-ci`
+  output counts as green; upstream "CI for PostgreSQL" runs are no-ops here.
+
 ## 2. Conformance suite (the acceptance bar)
 
 - **Iceberg spec conformance**: port the official `iceberg-python`/`iceberg-go`

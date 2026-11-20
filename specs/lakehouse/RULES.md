@@ -23,6 +23,47 @@ Binding rules for all work in this repository.
 - Tags of upstream releases: keep `REL_19_RC2` etc. as fetched from upstream —
   never re-tag.
 
+### 1a. Branch & promotion discipline (amended 2026-11-20 — the binding graph)
+
+*(Born from an incident: work on feature branch `cf5631-port` was pushed for
+days while only upstream's no-op CI ran, because `datalake-ci` triggered on
+`lakehouse-dev`/`main` only — and edits were nearly cross-pasted between
+branches. The graph below is now binding.)*
+
+```mermaid
+gitGraph
+    commit id: "upstream/master"
+    branch main
+    commit id: "fork base + specs/"
+    branch lakehouse-dev
+    commit id: "integration"
+    branch feature/x order: 2
+    commit id: "slice work"
+    commit id: "slice work"
+    checkout lakehouse-dev
+    merge feature/x tag: "--no-ff + datalake-ci GREEN"
+    checkout main
+    merge lakehouse-dev tag: "milestone boundary"
+    checkout main
+    merge upstream/master tag: "weekly sync"
+```
+
+| Rule | Statement |
+|---|---|
+| B1 | `upstream/master` merges ONLY into `main`. Never into feature branches. |
+| B2 | `main` merges into `lakehouse-dev` at milestone boundaries (and for urgent upstream fixes). |
+| B3 | Feature branches (`cf5631-port`, `feature/*`) merge ONLY INTO `lakehouse-dev` (`--no-ff`). **Never cherry-pick or paste between feature branches** — if two branches need a shared fix, it merges to `lakehouse-dev` first and both rebase. |
+| B4 | A feature branch lives until its slice lands in `lakehouse-dev`, then it is deleted. Long-lived parallel work streams are forbidden — they are how the CI gap (below) and merge rot happen. |
+| B5 | Promotion = merge, never rebase, across branch tiers. Rebase is only for a feature branch onto `lakehouse-dev` before ITS OWN merge. |
+| B6 | Upstream sync (`git fetch upstream && git merge upstream/master` into `main`) is blocked while `datalake-ci` is red on `lakehouse-dev`. |
+
+**CI validity rule (closes the incident):** the ONLY signal that counts is the
+`datalake-ci` workflow, verified as
+`gh run list --workflow datalake-ci`. Upstream's `CI for PostgreSQL` runs are
+no-ops on this fork (6–19 s "success" jobs) and must NEVER be cited as green.
+`datalake-ci` now triggers on **every branch** (path-filtered), so a feature
+branch push is itself gated before it can merge (B3/B5).
+
 ## 2. Upstream sync cadence
 
 - Sync `main` from `upstream/master` **at least weekly** and before starting any
@@ -84,7 +125,8 @@ outside the table, stop and redesign — or raise it in a spec revision first.
 - Every commit that changes behavior includes or updates the relevant spec
   section in `specs/lakehouse/` — specs are living docs, not artifacts; a code
   change that contradicts a spec must update the spec in the same commit.
-- CI must be green before push to `lakehouse-dev` (fast tier, doc 10 §1).
+- CI must be green before merge into `lakehouse-dev` (fast tier, doc 10 §1) —
+  verified via `gh run list --workflow datalake-ci` (§1a CI validity rule).
 - Never force-push `main` or `lakehouse-dev` after they're shared.
 
 ## 6. Secrets & data

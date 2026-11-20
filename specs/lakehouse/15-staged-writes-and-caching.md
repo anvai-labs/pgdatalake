@@ -63,6 +63,28 @@ reads →  │ D. Read path: buffer cache → local block cache →   │  ← i
 A is the foundation; B depends on A; C is doc 08's already-designed
 optimizer running continuously instead of on-demand; D is additive.
 
+**Commit → visibility timeline (staged INSERT mode):**
+
+```mermaid
+sequenceDiagram
+    participant T as PG backend (txn)
+    participant W as WAL
+    participant D as delta store
+    participant R as reader (same instance)
+    participant P as publisher bgworker
+    participant I as Iceberg catalog
+    T->>W: DML rows (rmgr record, in-txn)
+    T->>D: delta append (in-txn staging)
+    T->>W: COMMIT (delta record durable BEFORE ack)
+    W-->>T: ack (cloud never in the loop)
+    R->>D: scan = published snapshot + delta + own txn
+    P->>D: coalesce segments -> parquet PUTs
+    P->>I: commitTable (retry + liveness)
+    I-->>P: new snapshot id
+    P->>D: ledger write (segment -> snapshot) -> segment deletable
+    Note over I: other engines (Trino/Spark)<br/>see rows ONLY here
+```
+
 ## 3. A — the staged-delta layer
 
 ### 3.1 Representation
@@ -132,6 +154,18 @@ Retention: a segment dies only when the publisher has durably recorded
 its Iceberg commit result (the published-snapshot-id ledger, §4.3).
 Publish is idempotent and at-least-once at this layer; §4.4 makes
 duplicate publish harmless.
+
+**Segment lifecycle:**
+
+```mermaid
+stateDiagram-v2
+    [*] --> in_txn: DML staging (memory)
+    in_txn --> committed: COMMIT (WAL-fsynced)
+    committed --> published: publisher commitTable + ledger write
+    published --> deleted: safe to remove (ledger proof)
+    in_txn --> [*]: txn abort (pruned, nothing durable)
+    committed --> committed: crash -> WAL replay reconstructs
+```
 
 ### 3.4 Read-your-writes through the delta
 

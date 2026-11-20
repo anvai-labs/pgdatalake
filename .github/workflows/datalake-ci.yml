@@ -1,6 +1,9 @@
 # Lakehouse CI (specs/lakehouse/10-testing.md §1, CI-fast tier).
-# Runs on every push/PR touching lakehouse-dev. Upstream CI (pg-ci.yml) is
-# untouched; this workflow is additive.
+# Runs on EVERY branch's pushes that touch lakehouse code (path-filtered, so
+# docs-only pushes skip) — feature branches get the real gate, not just
+# lakehouse-dev/main. Upstream CI (pg-ci.yml) is untouched; this workflow is
+# additive and is the ONLY validity signal for fork code (upstream's
+# "CI for PostgreSQL" no-op runs must never be cited as green).
 #
 # M0 gate (specs/lakehouse/12-roadmap.md): build with -Ddatalake=enabled,
 # upstream regress suite green, lakehouse regress green, cargo test green,
@@ -10,7 +13,7 @@ name: datalake-ci
 
 on:
   push:
-    branches: [lakehouse-dev, main]
+    branches: ['**']
     paths:
       - 'src/backend/access/lakehouse/**'
       - 'src/test/lakehouse/**'
@@ -21,7 +24,7 @@ on:
       - 'Makefile'
       - '.github/workflows/datalake-ci.yml'
   pull_request:
-    branches: [lakehouse-dev]
+    branches: [lakehouse-dev, main]
   workflow_dispatch:
 
 env:
