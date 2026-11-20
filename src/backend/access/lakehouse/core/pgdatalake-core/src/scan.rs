@@ -458,6 +458,16 @@ pub fn plan_scan(
     let mut files_before_pruning = 0usize;
     let mut files_after_pruning = 0usize;
 
+    // M2 slice 28 (COW overwrite): a file ADDED in one manifest and
+    // DELETED in a later manifest of the SAME snapshot must not be
+    // planned. DELETED entries are therefore collected across ALL
+    // manifests first (pass 1) and their paths excluded from the live
+    // set in pass 2 — an inline per-entry skip alone would resurrect
+    // overwritten files from their carrying manifest. (Iceberg file
+    // paths are unique per table, so path-keyed exclusion is exact.)
+    let mut deleted_paths = std::collections::HashSet::new();
+    let mut live: Vec<(&crate::manifest::ManifestListEntry, crate::manifest::ManifestEntry)> =
+        Vec::new();
     for mle in &list_entries {
         // 13-review #4: a manifest-list entry naming a partition spec the
         // table no longer lists is corrupt metadata — a loud error, never a
@@ -467,62 +477,75 @@ pub fn plan_scan(
         // partition specs at all is unpartitioned — its manifests' spec-0
         // references resolve to the implicit empty spec (provably cannot
         // mis-prune; older writers omit partition-specs entirely).
-        let spec = match md.partition_spec(mle.partition_spec_id) {
-            Some(s) => s,
-            None if md.partition_specs.is_empty() => &crate::catalog::metadata::PartitionSpec {
-                spec_id: mle.partition_spec_id,
-                fields: Vec::new(),
-            },
-            None => {
-                return Err(StorageError::Decode(format!(
-                    "manifest {} references partition spec {} missing from table metadata",
-                    mle.manifest_path, mle.partition_spec_id
-                )));
-            }
-        };
+        if md.partition_spec(mle.partition_spec_id).is_none()
+            && !md.partition_specs.is_empty()
+        {
+            return Err(StorageError::Decode(format!(
+                "manifest {} references partition spec {} missing from table metadata",
+                mle.manifest_path, mle.partition_spec_id
+            )));
+        }
         ensure_within_table_root(&mle.manifest_path, &md.location)?;
         let (io, key) = open_for(&mle.manifest_path, s3)?;
         let bytes = io.get_bytes(&key)?;
         for e in parse_manifest(&bytes)? {
             // DELETED entries are history, not data (doc 06 §2)
             if e.status == crate::manifest::ManifestEntryStatus::Deleted {
+                deleted_paths.insert(e.data_file.file_path.clone());
                 continue;
             }
             // 13-review #6: data/delete file paths stay inside the root too
             ensure_within_table_root(&e.data_file.file_path, &md.location)?;
-            files_before_pruning += 1;
-            // slice 20: delete files are never data tasks — the row readers
-            // load and apply them separately. Routing happens BEFORE the
-            // predicate block (13-review #5): the data-file bounds rule
-            // must never eliminate a delete task (a delete file's bounds
-            // are over its keys, not the surviving rows). Deletes are
-            // pruned only by the proven delete-specific rule, partition
-            // applicability.
-            let is_delete = e.data_file.content != crate::manifest::DataContent::Data;
-            if let Some(pred) = predicate {
-                if let Some(partition) = &e.data_file.partition {
-                    if !partition_matches(spec, schema.unwrap(), partition, pred) {
-                        continue;
-                    }
-                }
-                // bounds are a data-file rule only (13-review #5)
-                if !is_delete && !bounds_keep(&e.data_file, schema.unwrap(), pred) {
+            live.push((mle, e));
+        }
+    }
+
+    // pass 2: pruning + task routing over the surviving live entries
+    // (the loud missing-spec check already ran in pass 1; unwrap_or is
+    // only reachable for the implicit empty spec of unpartitioned tables)
+    let implicit_spec = crate::catalog::metadata::PartitionSpec {
+        spec_id: 0,
+        fields: Vec::new(),
+    };
+    for (mle, e) in live {
+        let spec = md
+            .partition_spec(mle.partition_spec_id)
+            .unwrap_or(&implicit_spec);
+        if deleted_paths.contains(&e.data_file.file_path) {
+            continue;
+        }
+        files_before_pruning += 1;
+        // slice 20: delete files are never data tasks — the row readers
+        // load and apply them separately. Routing happens BEFORE the
+        // predicate block (13-review #5): the data-file bounds rule
+        // must never eliminate a delete task (a delete file's bounds
+        // are over its keys, not the surviving rows). Deletes are
+        // pruned only by the proven delete-specific rule, partition
+        // applicability.
+        let is_delete = e.data_file.content != crate::manifest::DataContent::Data;
+        if let Some(pred) = predicate {
+            if let Some(partition) = &e.data_file.partition {
+                if !partition_matches(spec, schema.unwrap(), partition, pred) {
                     continue;
                 }
             }
-            files_after_pruning += 1;
-            let task = ScanTask {
-                sequence_number: e.sequence_number.or(mle.sequence_number).unwrap_or(0),
-                entry: e,
-            };
-            if is_delete {
-                delete_tasks.push(task);
+            // bounds are a data-file rule only (13-review #5)
+            if !is_delete && !bounds_keep(&e.data_file, schema.unwrap(), pred) {
                 continue;
             }
-            total_rows += task.entry.data_file.record_count;
-            data_files += 1;
-            tasks.push(task);
         }
+        files_after_pruning += 1;
+        let task = ScanTask {
+            sequence_number: e.sequence_number.or(mle.sequence_number).unwrap_or(0),
+            entry: e,
+        };
+        if is_delete {
+            delete_tasks.push(task);
+            continue;
+        }
+        total_rows += task.entry.data_file.record_count;
+        data_files += 1;
+        tasks.push(task);
     }
 
     Ok(ScanPlan {
@@ -1052,6 +1075,70 @@ mod tests {
         );
         assert_eq!(plan.total_rows, 130);
         assert_eq!(plan.data_files, 2);
+    }
+
+    /// COW overwrite semantics (M2 slice 28): a data file ADDED in one
+    /// manifest and DELETED in a LATER manifest of the same snapshot must
+    /// not be planned. The inline per-entry skip only handles a DELETED
+    /// entry in its own manifest; overwrite commits emit the DELETED entry
+    /// in a NEW manifest while the original file's manifest is carried —
+    /// without a cross-manifest exclusion the deleted row set would come
+    /// back from the dead (the pre-fix behavior this test pins).
+    #[test]
+    fn file_deleted_in_later_manifest_is_excluded() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("metadata")).unwrap();
+
+        // mn1: carried manifest with the original ADDED file (3 rows);
+        // mn2: overwrite manifest with the same path as DELETED.
+        build_manifest(
+            dir.path().join("metadata").as_path(),
+            "mn1.avro",
+            &[(1, "file:///table/data/a.parquet", 3)],
+        )
+        .unwrap();
+        build_manifest(
+            dir.path().join("metadata").as_path(),
+            "mn2.avro",
+            &[(2, "file:///table/data/a.parquet", 3)],
+        )
+        .unwrap();
+        build_manifest_list_named(
+            dir.path().join("metadata").as_path(),
+            "mn-list.avro",
+            &[("mn1.avro", 1, 0, 0), ("mn2.avro", 0, 0, 1)],
+        )
+        .unwrap();
+
+        let list_path = dir.path().join("metadata").join("mn-list.avro");
+        let metadata_json = format!(
+            r#"{{
+                "format-version": 2,
+                "table-uuid": "9c12d441-03fe-11ed-8122-d358e75d12eb",
+                "location": "file://{}",
+                "schemas": [{{"type": "struct", "schema-id": 0, "fields": [
+                    {{"id": 1, "name": "id", "required": true, "type": "long"}}]}}],
+                "current-schema-id": 0,
+                "snapshots": [
+                    {{"snapshot-id": 42, "timestamp-ms": 1712345678000,
+                      "manifest-list": "file://{}",
+                      "summary": {{"operation": "overwrite"}}}}
+                ],
+                "current-snapshot-id": 42
+            }}"#,
+            dir.path().display(),
+            list_path.display(),
+        );
+        let md: TableMetadata = serde_json::from_str(&metadata_json).unwrap();
+
+        let plan = plan_scan(&md, None, None, None).expect("plan_scan");
+        assert_eq!(
+            plan.tasks.len(),
+            0,
+            "the only file was deleted in a later manifest"
+        );
+        assert_eq!(plan.total_rows, 0);
+        assert_eq!(plan.data_files, 0);
     }
 
     /// A table with no snapshots (freshly created) plans to zero tasks with
