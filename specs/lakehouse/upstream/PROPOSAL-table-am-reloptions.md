@@ -160,3 +160,26 @@ TDD coverage now spans (all in-patch, upstream regress green locally):
 - CREATE acceptance + relkind wiring
 SGML documents both the callback contract and the preset helper.
 Branch anvai-labs:table-am-reloptions = the 2-patch series.
+
+## CF #5631 acquisition (2026-11-20)
+
+The live submission is ANDREW DUNSTAN's series (not Korotkov's):
+"Add amoptions callback to table access methods", thread
+20250302085641.hmjom5ru3w554t2n@poseidon.home.virt, now v14 (3 parts),
+Needs review in the November PG20 CF. Saved locally:
+cf5631/v14-0001-lock.patch (AccessExclusiveLock for unrecognized
+options — GPT-6 finding #4's exact topic) and cf5631/v14-0002-
+Add-amoptions-callback.patch (the main callback, v13 1/2; remaining
+parts of the 3-part v14 series still to fetch from the thread tail).
+
+REMARKABLE CONVERGENCE — Dunstan's series history independently
+arrived at our identical fixes: v2 = "unrecognized parameter after SET
+ACCESS METHOD heap" (our finding #3), v5 = has_std_options_prefix
+after TOAST/fillfactor failures (our finding #2 StdRdOptions prefix),
+v7 = unconditional revalidation on SET ACCESS METHOD + partition
+fallback. Ajit Awekar's open 2026-09-30 feedback mirrors GPT-6's #3
+(SET-before-RESET ordering) and #2 (unguarded TOAST macro). Our
+consumer evaluation of v14 will therefore test: our WITH-options
+lifecycle on Dunstan's contract, the ordering bug, the TOAST guard,
+matview dispatch (our #5 — unknown if the series covers it), and the
+lock analysis (#4, partially covered by v14 1/3).
