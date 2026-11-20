@@ -1,0 +1,86 @@
+# Upstream proposal: table AMs may own their relation options
+
+*Prepared 2026-11-20. Status: patch ready (0001-table-am-reloptions.patch
+in this directory); delivery = pgsql-hackers email + commitfest entry
+(the postgres/postgres mirror accepts no issues or PRs).*
+
+## The ask
+
+Add an optional `TableAmRoutine.relation_reloptions` callback:
+
+```c
+bytea *(*relation_reloptions) (Datum reloptions, bool validate);
+```
+
+Route both the relcache extract path (`extractRelOptions`) and the
+CREATE/ALTER validation path (`tablecmds.c`; AM resolved from
+`stmt->accessMethod` / `default_table_access_method`, matching
+`DefineRelation`) through it when the AM supplies one. NULL = heap
+defaults. 62 lines, 4 files, no catalog changes.
+
+## Email (ready to send)
+
+To: pgsql-hackers@lists.postgresql.org
+Subject: table AMs may own their relation options (TableAmRoutine.relation_reloptions)
+
+Attachment: 0001-table-am-reloptions.patch (git am / format-patch)
+
+Body: the "WHY REINVOKING THIS, AND WHY THIS SHAPE" section of the
+patch commit message (below), plus the motivating-consumer paragraph.
+
+## Why reinvoking this, and why this shape (thread-grounded)
+
+1. Jeff Davis, pgsql-hackers 2020-09, "Reloptions for table access
+   methods" (message-id
+   429fb58fa3218221bb17c7bf9e70e1aa6cfc6b5d.camel@j-davis.com):
+   proposed relaxing fillRelOptions' leftover-option check for heaps.
+   Rejected because Simon Riggs objected that heap's option set must
+   not silently apply to every extension AM ("options should work the
+   same for indexes and tables") and Michael Paquier agreed "bypassing
+   a sanity check does not feel like a good solution in the long
+   term". Our patch relaxes NO check: AMs without the callback are
+   behavior-identical; AMs with it own validation AND parsing — the
+   index-AM symmetry Simon asked for.
+
+2. Paquier (2020-12-16, same thread) explicitly named this design:
+   "an options callback in TableAmRoutine to do the loading work",
+   with AMs defining their own option sets (dummy_index_am-style)
+   instead of extending the static relOpts registry. Alvaro Herrera's
+   silent-ignored-option concern is covered by the validate path: an
+   AM-specific key on a plain heap still errors "unrecognized
+   parameter" at CREATE because dispatch follows the effective AM.
+
+3. Korotkov, "Table AM Interface Enhancements" (CF #4866; returned
+   with feedback 2024-09, no reviewers; latest patch 2024-04): carried
+   this capability inside a large series (ANALYZE generalization,
+   index-insert hooks), making the reloptions piece hard to review
+   alone. Ours is ONLY that piece.
+
+4. Alternatives discussed in the 2020 thread and why they don't fit:
+   - fillRelOptions validate=false (Jeff's one-liner): bypasses a
+     check; rejected above.
+   - Extensible StdRdOptions + allocateReloptStruct hook: keeps the
+     registry in core, needs per-feature TOAST/autovacuum handling
+     spread across two mechanisms; Jeff himself called it
+     over-engineering.
+   - rd_amcache leftover stash: splits validation in two places with
+     AM-visible results only at relcache-build time.
+   - Per-AM custom relopt kind via default_reloptions(kind): requires
+     the registry anyway and special-cases the plain-heap error;
+     Paquier's callback suggestion superseded it.
+
+5. Motivating consumer: anvai-labs/postgres (public fork),
+   lakehouse-dev — a public Iceberg table AM where the table's remote
+   identity and storage endpoints ride in
+   CREATE TABLE ... USING lakehouse WITH (table = 'ns.tbl',
+   endpoint = '...', ...). One-statement managed DDL that pg_dump/
+   restore round-trips; no companion catalog table, no post-create
+   attach step. With the callback absent, everything above is
+   behavior-neutral for heap and in-core AMs.
+
+## Evidence
+
+- Upstream regress suite green on the patch (local run).
+- Consumer AM regression suite exercises CREATE/ALTER/relcache paths:
+  with-options identity, unknown-key rejection at CREATE, ALTER
+  SET/RESET round-trip via relcache.

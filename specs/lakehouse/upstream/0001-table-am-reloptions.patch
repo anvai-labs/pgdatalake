@@ -1,0 +1,218 @@
+From 8dd5ac9575779f7fee8cedf922b3fab795624f76 Mon Sep 17 00:00:00 2001
+From: VIJAY SINGH <singhvjd@gmail.com>
+Date: Thu, 19 Nov 2026 23:21:00 -0600
+Subject: [PATCH 1/1] table AMs may own their relation options
+ (TableAmRoutine.relation_reloptions)
+
+Table access methods cannot currently carry custom relation options:
+extractRelOptions and CREATE/ALTER validation dispatch every plain
+relation to heap_reloptions by relkind, and heap's option set is
+hard-coded. Index AMs solve the same problem with pg_am.amoptions.
+
+Add an optional TableAmRoutine.relation_reloptions callback:
+
+  bytea *(*relation_reloptions) (Datum reloptions, bool validate);
+
+and route both the relcache extract path (extractRelOptions) and the
+CREATE/ALTER validation path (tablecmds.c, with the AM resolved from
+stmt->accessMethod or default_table_access_method, matching how
+DefineRelation resolves it) through it when the AM supplies one.
+NULL = heap defaults, so heap and existing AMs are unchanged; no
+catalog changes.
+
+WHY REINVOKING THIS, AND WHY THIS SHAPE
+
+This is the custom-reloptions slice of two prior efforts, reshaped
+around the thread's own consensus:
+
+1. "Reloptions for table access methods" (Jeff Davis, pgsql-hackers
+   2020-09; thread:
+   https://www.postgresql.org/message-id/flat/429fb58fa3218221bb17c7bf9e70e1aa6cfc6b5d.camel@j-davis.com)
+   proposed relaxing fillRelOptions' leftover-option check for heaps.
+   It was rejected: Simon Riggs objected that heap's option set
+   (dozens of options) should not silently apply to every extension
+   AM, and that "options should work the same for indexes and
+   tables"; Michael Paquier agreed that "bypassing a sanity check
+   does not feel like a good solution in the long term". This patch
+   does NOT relax any check: an AM without the callback behaves
+   exactly as today (unknown options still error at CREATE/ALTER),
+   and an AM WITH the callback owns both validation and parsing --
+   the same full ownership index AMs have via amoptions, which is
+   precisely the symmetry Simon asked for.
+
+2. Michael Paquier (2020-12-16, same thread) named the design this
+   patch implements: "an options callback in TableAmRoutine to do
+   the loading work", with AMs defining their own option sets
+   (dummy_index_am-style) instead of extending the static relOpts
+   registry. Alvaro Herrera's silent-ignored-option concern from the
+   same thread is also addressed by the validate path: a lakehouse
+   key on a PLAIN heap table still errors "unrecognized parameter"
+   at CREATE, because dispatch follows the effective AM.
+
+3. "Table AM Interface Enhancements" (CF #4866, returned with
+   feedback 2024-09; https://commitfest.postgresql.org/48/4866/)
+   carried this capability as one part of a large series (ANALYZE
+   generalization, index-insert hooks, etc.), which made the
+   reloptions piece hard to review on its own. This submission is
+   ONLY the reloptions callback -- 62 lines over 4 files -- so the
+   design question can be settled independently.
+
+   Jeff's alternatives (extensible StdRdOptions with an allocation
+   hook; stashing leftovers in rd_amcache; a per-AM custom relopt
+   kind via default_reloptions) were each discussed and set aside in
+   the 2020 thread as over-engineering or incomplete: they keep the
+   parsing registry in core, whereas the callback moves ownership
+   wholly to the AM, matching the index-AM precedent and Paquier's
+   suggested end state.
+
+MOTIVATING CONSUMER
+
+A public Iceberg table AM for Postgres (anvai-labs/postgres,
+branch lakehouse-dev): the table's remote identity and storage
+endpoints ride in CREATE TABLE ... USING lakehouse WITH (table =
+'ns.tbl', endpoint = '...', ...), so managed DDL is one statement
+that pg_dump/restore round-trips -- no companion catalog table, no
+post-create attach step. With the callback absent, all of the above
+is behavior-neutral for heap and in-core AMs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/backend/access/common/reloptions.c | 33 +++++++++++++++++++++++++-
+ src/backend/commands/tablecmds.c       | 22 +++++++++++++++--
+ src/include/access/reloptions.h        |  2 ++
+ src/include/access/tableam.h           |  8 +++++++
+ 4 files changed, 62 insertions(+), 3 deletions(-)
+
+diff --git a/src/backend/access/common/reloptions.c b/src/backend/access/common/reloptions.c
+index ea9a0417909..a7429376694 100644
+--- a/src/backend/access/common/reloptions.c
++++ b/src/backend/access/common/reloptions.c
+@@ -23,6 +23,10 @@
+ #include "access/htup_details.h"
+ #include "access/nbtree.h"
+ #include "access/reloptions.h"
++#include "access/tableam.h"
++#include "catalog/pg_am.h"
++#include "catalog/pg_am_d.h"
++#include "utils/syscache.h"
+ #include "access/spgist_private.h"
+ #include "catalog/pg_type.h"
+ #include "commands/defrem.h"
+@@ -1587,6 +1591,32 @@ untransformRelOptions(Datum options)
+  * AM's options parser function in the case of a tuple corresponding to an
+  * index, or NULL otherwise.
+  */
++/*
++ * Parse a table's reloptions through its table AM when the AM provides a
++ * relation_reloptions callback, else heap_reloptions. relam may be
++ * InvalidOid when unknown (callers that know it pass it in).
++ */
++bytea *
++table_am_reloptions(char relkind, Datum reloptions, bool validate, Oid relam)
++{
++	if (relkind == RELKIND_RELATION && OidIsValid(relam) &&
++		relam != HEAP_TABLE_AM_OID)
++	{
++		HeapTuple	amtup = SearchSysCache1(AMOID, ObjectIdGetDatum(relam));
++
++		if (HeapTupleIsValid(amtup))
++		{
++			const TableAmRoutine *routine =
++				GetTableAmRoutine(((Form_pg_am) GETSTRUCT(amtup))->amhandler);
++
++			ReleaseSysCache(amtup);
++			if (routine->relation_reloptions != NULL)
++				return routine->relation_reloptions(reloptions, validate);
++		}
++	}
++	return heap_reloptions(relkind, reloptions, validate);
++}
++
+ bytea *
+ extractRelOptions(HeapTuple tuple, TupleDesc tupdesc,
+ 				  amoptions_function amoptions)
+@@ -1611,7 +1641,8 @@ extractRelOptions(HeapTuple tuple, TupleDesc tupdesc,
+ 		case RELKIND_RELATION:
+ 		case RELKIND_TOASTVALUE:
+ 		case RELKIND_MATVIEW:
+-			options = heap_reloptions(classForm->relkind, datum, false);
++			options = table_am_reloptions(classForm->relkind, datum, false,
++										  classForm->relam);
+ 			break;
+ 		case RELKIND_PARTITIONED_TABLE:
+ 			options = partitioned_table_reloptions(datum, false);
+diff --git a/src/backend/commands/tablecmds.c b/src/backend/commands/tablecmds.c
+index b6700929459..1ba69610a93 100644
+--- a/src/backend/commands/tablecmds.c
++++ b/src/backend/commands/tablecmds.c
+@@ -973,7 +973,24 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
+ 			(void) partitioned_table_reloptions(reloptions, true);
+ 			break;
+ 		default:
+-			(void) heap_reloptions(relkind, reloptions, true);
++			/*
++			 * Resolve the table AM the same way DefineRelation does below
++			 * (explicit USING, else default_table_access_method), so the
++			 * AM can validate its own options at CREATE time.
++			 */
++			{
++				Oid			amoid = InvalidOid;
++
++				if (RELKIND_HAS_TABLE_AM(relkind))
++				{
++					if (stmt->accessMethod != NULL)
++						amoid = get_table_am_oid(stmt->accessMethod, false);
++					else
++						amoid = get_table_am_oid(default_table_access_method,
++												 false);
++				}
++				(void) table_am_reloptions(relkind, reloptions, true, amoid);
++			}
+ 	}
+ 
+ 	if (stmt->ofTypename)
+@@ -18053,7 +18070,8 @@ ATExecSetRelOptions(Relation rel, List *defList, AlterTableType operation,
+ 	{
+ 		case RELKIND_RELATION:
+ 		case RELKIND_MATVIEW:
+-			(void) heap_reloptions(rel->rd_rel->relkind, newOptions, true);
++			(void) table_am_reloptions(rel->rd_rel->relkind, newOptions, true,
++									   rel->rd_rel->relam);
+ 			break;
+ 		case RELKIND_PARTITIONED_TABLE:
+ 			(void) partitioned_table_reloptions(newOptions, true);
+diff --git a/src/include/access/reloptions.h b/src/include/access/reloptions.h
+index ccff4717b62..23531a7ec9d 100644
+--- a/src/include/access/reloptions.h
++++ b/src/include/access/reloptions.h
+@@ -252,6 +252,8 @@ extern struct StdRdOptions *merge_toast_reloptions(const struct StdRdOptions *to
+ extern bytea *heap_reloptions(char relkind, Datum reloptions, bool validate);
+ extern bytea *view_reloptions(Datum reloptions, bool validate);
+ extern bytea *partitioned_table_reloptions(Datum reloptions, bool validate);
++extern bytea *table_am_reloptions(char relkind, Datum reloptions,
++								  bool validate, Oid relam);
+ extern bytea *index_reloptions(amoptions_function amoptions, Datum reloptions,
+ 							   bool validate);
+ extern bytea *attribute_reloptions(Datum reloptions, bool validate);
+diff --git a/src/include/access/tableam.h b/src/include/access/tableam.h
+index 9d2fc7f9acb..dfb762588c3 100644
+--- a/src/include/access/tableam.h
++++ b/src/include/access/tableam.h
+@@ -878,6 +878,14 @@ typedef struct TableAmRoutine
+ 										   SampleScanState *scanstate,
+ 										   TupleTableSlot *slot);
+ 
++
++	/*
++	 * Parse this AM's relation options (CREATE TABLE ... USING am WITH
++	 * (...)). Called with the raw reloptions text[] datum; NULL means the
++	 * heap defaults apply (AMs without custom options). Mirrors how index
++	 * AMs own their reloptions via amoptions.
++	 */
++	bytea	   *(*relation_reloptions) (Datum reloptions, bool validate);
+ } TableAmRoutine;
+ 
+ 
+-- 
+2.43.0
+
