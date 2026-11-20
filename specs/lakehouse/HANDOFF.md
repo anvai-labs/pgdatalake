@@ -633,3 +633,32 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     OAuth refresh), #7 parallel per-scan queues, #8 type-boundary
     statuses, #1 tail (create-only PUTs, two-writer concurrency,
     independent-reader verification).
+  - 13-implementation-review Blocker #6 (FDW side) — FIXED 2026-11-20
+    371573da8b3 (regress fdw_auth green; live-verified on the
+    /tmp/live-fdw fixture instance): (a) OPTION AUTHORITY: one legal
+    home per option — SERVER endpoint/warehouse/s3_endpoint, USER
+    MAPPING token/s3 keys, FOREIGN TABLE table/snapshot_id — enforced
+    at DDL by the new lakehouse_fdw_validator (canonical lakehouse_fdw
+    wrapper ships wired to it) and AGAIN on use by ExtractOptions, so
+    legacy pre-validator tables with table-level credentials error
+    instead of silently using them (live: re-added s3_access_key ->
+    "option ... belongs on user mappings"). The table-level
+    s3_endpoint override (credential/destination repurposing) is
+    rejected both ways. Foreign tables now resolve credentials from
+    the mapping of the INVOKING user; missing mapping = loud plan-time
+    error. (b) FUNCTION HARDENING: scan_files (caller-chosen endpoint
+    + creds = arbitrary egress) and create_remote (external DDL,
+    C-side ownership check kept) revoked from PUBLIC. (c) REGRESS
+    fdw_auth: validator rejections (unknown/misplaced x server/table/
+    mapping), sentinel-token catalog-output check, on-use legacy
+    rejection, PUBLIC revocation, unrelated-DROP non-interference by
+    an ordinary owner. ALL prior pushdown acceptance queries re-run
+    green on mapping-only creds. Fixture expectations regenerated
+    (fdw.sql, time_travel.sql moved to mapping creds). Spec:
+    09-security.md FDW option authority section; managed interim-state
+    marked resolved. REMAINING #6 (Rust transport): shared scheme/
+    origin/bucket/path policy per hop (catalog redirects + delegated
+    locations), redaction of URL userinfo/query + remote bodies,
+    explicit OAuth config resolution + refresh-token invalidation,
+    type-conflict responses instead of "409" string search, ambient
+    cloud credentials opt-in. Then #7, #8, #1 tail.
