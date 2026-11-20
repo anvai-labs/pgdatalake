@@ -1592,6 +1592,62 @@ untransformRelOptions(Datum options)
  * index, or NULL otherwise.
  */
 /*
+ * Compose the heap-standard option set with keys owned by a table AM:
+ * the AM's keys are stripped from the raw list and the remainder is
+ * parsed by heap_reloptions, so an access method gets the standard
+ * options (fillfactor, autovacuum, ...) plus clean ownership of its
+ * own without duplicating heap's option registry. AMs wanting a
+ * richer layout use build_reloptions with their own parse table
+ * instead (the index-AM pattern).
+ */
+bytea *
+heap_reloptions_for_am(Datum reloptions, bool validate,
+					   const char *const *am_keys, int namkeys)
+{
+	ArrayType  *array;
+	Datum	   *elems;
+	int			nelems;
+	Datum	   *keep;
+	int			nkeep = 0;
+	int			i;
+
+	if (DatumGetPointer(reloptions) == NULL)
+		return heap_reloptions(RELKIND_RELATION, reloptions, validate);
+
+	deconstruct_array_builtin(DatumGetArrayTypeP(reloptions), TEXTOID,
+							  &elems, NULL, &nelems);
+
+	keep = (Datum *) palloc(nelems * sizeof(Datum));
+	for (i = 0; i < nelems; i++)
+	{
+		char	   *raw = TextDatumGetCString(elems[i]);
+		char	   *eq = strchr(raw, '=');
+		bool		owned = false;
+		int			k;
+
+		if (eq != NULL)
+			*eq = '\0';
+		for (k = 0; k < namkeys; k++)
+		{
+			if (strcmp(raw, am_keys[k]) == 0)
+			{
+				owned = true;
+				break;
+			}
+		}
+		if (owned)
+			continue;
+		if (eq != NULL)
+			*eq = '=';
+		keep[nkeep++] = elems[i];
+	}
+
+	array = construct_array_builtin(keep, nkeep, TEXTOID);
+	return heap_reloptions(RELKIND_RELATION, PointerGetDatum(array),
+						   validate);
+}
+
+/*
  * Parse a table's reloptions through its table AM when the AM provides a
  * reloptions callback, else heap_reloptions. relam may be
  * InvalidOid when unknown (callers that know it pass it in).

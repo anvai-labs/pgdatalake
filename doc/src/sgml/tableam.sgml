@@ -180,7 +180,12 @@ my_tableam_handler(PG_FUNCTION_ARGS)
   </para>
 
   <para>
-   See <filename>src/test/modules/tableam_reloptions</filename> for a
+   Access methods that want the heap-standard options (fillfactor,
+   autovacuum, ...) composed with their own keys can call
+   <function>heap_reloptions_for_am</function> with the list of keys
+   they own; the standard keys are parsed by the heap parser and the
+   AM's keys are reserved for its own processing. See
+   <filename>src/test/modules/tableam_reloptions</filename> for a
    working example that delegates all other callbacks to the heap.
   </para>
  </sect1>

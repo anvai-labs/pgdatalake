@@ -30,47 +30,18 @@ PG_MODULE_MAGIC;
 /* the one AM-specific option this AM accepts */
 #define TEST_OPTION_KEY "test_option"
 
+static const char *const test_am_keys[] = {TEST_OPTION_KEY};
+
 static bytea *
 tableam_reloptions_test_reloptions(Datum reloptions, bool validate)
 {
-	ArrayType  *array;
-	Datum	   *elems;
-	int			nelems;
-	Datum	   *keep;
-	int			nkeep = 0;
-	int			i;
-
-	/* no WITH (...) at all: defer to heap defaults */
-	if (DatumGetPointer(reloptions) == NULL)
-		return heap_reloptions(RELKIND_RELATION, reloptions, validate);
-
-	array = DatumGetArrayTypeP(reloptions);
-	deconstruct_array(array, TEXTOID, -1, false, TYPALIGN_INT,
-					 &elems, NULL, &nelems);
-
 	/*
-	 * Strip the keys this AM owns, then let heap validate the remainder.
-	 * A production AM would instead build its own options struct here
-	 * (the build_reloptions pattern index AMs use).
+	 * One line: heap-standard options composed with this AM's own key.
+	 * Unknown keys (neither heap's nor ours) still error at
+	 * validate time, inside heap_reloptions.
 	 */
-	keep = (Datum *) palloc(nelems * sizeof(Datum));
-	for (i = 0; i < nelems; i++)
-	{
-		char	   *raw = TextDatumGetCString(elems[i]);
-		char	   *eq = strchr(raw, '=');
-
-		if (eq != NULL)
-			*eq = '\0';
-		if (strcmp(raw, TEST_OPTION_KEY) == 0)
-			continue;			/* owned by this AM */
-		if (eq != NULL)
-			*eq = '=';
-		keep[nkeep++] = elems[i];
-	}
-
-	array = construct_array_builtin(keep, nkeep, TEXTOID);
-	return heap_reloptions(RELKIND_RELATION, PointerGetDatum(array),
-						   validate);
+	return heap_reloptions_for_am(reloptions, validate,
+								  test_am_keys, 1);
 }
 
 PG_FUNCTION_INFO_V1(tableam_reloptions_handler);
