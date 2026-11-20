@@ -72,11 +72,16 @@ pub enum ScanPredicate {
 
 /// Resolve a data/delete file's opaque partition JSON against a spec: the
 /// manifest's injected field NAMES equal the spec field names (Iceberg
-/// writers inject them in spec order), so resolve by name — but only
-/// identity transforms participate in pruning; anything else is kept
-/// (pruning must never drop a matching file).
+/// writers inject them in spec order). Matching REQUIRES the spec field's
+/// source-id to equal the predicate column's schema field ID (13-review
+/// #4): a display name reused across schema evolution (drop + re-add with
+/// a new ID) must not compare the new column's values against the old
+/// column's partition member. Only identity transforms participate in
+/// pruning; anything inconclusive is kept (pruning must never drop a
+/// matching file).
 fn partition_matches(
     spec: &crate::catalog::metadata::PartitionSpec,
+    schema: &crate::catalog::metadata::Schema,
     partition: &serde_json::Value,
     pred: &ScanPredicate,
 ) -> bool {
@@ -85,19 +90,26 @@ fn partition_matches(
     };
     match pred {
         ScanPredicate::Eq { field, value } => {
-            let pf = match spec.fields.iter().find(|f| &f.name == field) {
-                Some(f) => f,
-                None => return true, // unknown field: keep
+            // prove the partition member belongs to THIS column: resolve
+            // the predicate field to its Iceberg ID, then require a spec
+            // field whose source-id is that ID
+            let Some(sf) = schema.fields.iter().find(|f| &f.name == field) else {
+                return true; // predicate column not in the schema: keep
+            };
+            let Some(pf) = spec.fields.iter().find(|f| f.source_id == sf.id) else {
+                return true; // this column does not feed this spec: keep
             };
             if pf.transform != "identity" {
                 return true; // transform-aware pruning is a later slice
             }
-            match obj.get(field) {
+            match obj.get(&pf.name) {
                 Some(v) => v == value,
                 None => true, // null partition value: keep
             }
         }
-        ScanPredicate::And(preds) => preds.iter().all(|p| partition_matches(spec, partition, p)),
+        ScanPredicate::And(preds) => preds
+            .iter()
+            .all(|p| partition_matches(spec, schema, partition, p)),
         // range predicates (Lt/Le/Gt/Ge) are bounds-pruned, not
         // partition-pruned (slice 8 covers identity-Eq only)
         _ => true,
@@ -399,6 +411,14 @@ pub fn plan_scan(
     let list_entries = parse_manifest_list(&list_bytes)?;
 
     let schema = md.current_schema();
+    // 13-review #4: with a predicate and no current schema (corrupt
+    // metadata), planning errors loudly — a per-file `continue` here would
+    // silently discard EVERY file and produce a plausible empty result.
+    if predicate.is_some() && schema.is_none() {
+        return Err(StorageError::Decode(
+            "table metadata has no current schema; cannot apply scan predicates".into(),
+        ));
+    }
     let mut tasks = Vec::new();
     let mut delete_tasks = Vec::new();
     let mut total_rows = 0i64;
@@ -407,15 +427,27 @@ pub fn plan_scan(
     let mut files_after_pruning = 0usize;
 
     for mle in &list_entries {
-        let spec = md
-            .partition_spec(mle.partition_spec_id)
-            .or_else(|| md.partition_spec(mle.partition_spec_id))
-            .or_else(|| {
-                // fall back to the table default spec if the manifest names
-                // a spec that no longer exists (evolved-away manifests)
-                md.default_partition_spec_id
-                    .and_then(|id| md.partition_spec(id))
-            });
+        // 13-review #4: a manifest-list entry naming a partition spec the
+        // table no longer lists is corrupt metadata — a loud error, never a
+        // silent fallback to the default spec (pruning against the wrong
+        // spec can eliminate live files, and local rechecks cannot recover
+        // what the planner already dropped). Tolerance: a table with NO
+        // partition specs at all is unpartitioned — its manifests' spec-0
+        // references resolve to the implicit empty spec (provably cannot
+        // mis-prune; older writers omit partition-specs entirely).
+        let spec = match md.partition_spec(mle.partition_spec_id) {
+            Some(s) => s,
+            None if md.partition_specs.is_empty() => &crate::catalog::metadata::PartitionSpec {
+                spec_id: mle.partition_spec_id,
+                fields: Vec::new(),
+            },
+            None => {
+                return Err(StorageError::Decode(format!(
+                    "manifest {} references partition spec {} missing from table metadata",
+                    mle.manifest_path, mle.partition_spec_id
+                )));
+            }
+        };
         let (io, key) = open_for(&mle.manifest_path, s3)?;
         let bytes = io.get_bytes(&key)?;
         for e in parse_manifest(&bytes)? {
@@ -433,18 +465,14 @@ pub fn plan_scan(
             // applicability.
             let is_delete = e.data_file.content != crate::manifest::DataContent::Data;
             if let Some(pred) = predicate {
-                if let (Some(spec), Some(partition)) = (spec, &e.data_file.partition) {
-                    if !partition_matches(spec, partition, pred) {
+                if let Some(partition) = &e.data_file.partition {
+                    if !partition_matches(spec, schema.unwrap(), partition, pred) {
                         continue;
                     }
                 }
-                if !is_delete {
-                    let Some(schema) = schema else {
-                        continue;
-                    };
-                    if !bounds_keep(&e.data_file, schema, pred) {
-                        continue;
-                    }
+                // bounds are a data-file rule only (13-review #5)
+                if !is_delete && !bounds_keep(&e.data_file, schema.unwrap(), pred) {
+                    continue;
                 }
             }
             files_after_pruning += 1;
@@ -1316,7 +1344,8 @@ mod tests {
                 "table-uuid": "9c12d441-03fe-11ed-8122-d358e75d12eb",
                 "location": "file://{}",
                 "schemas": [{{"type": "struct", "schema-id": 0, "fields": [
-                    {{"id": 1, "name": "id", "required": true, "type": "long"}}]}}],
+                    {{"id": 1, "name": "id", "required": true, "type": "long"}},
+                    {{"id": 2, "name": "region", "required": false, "type": "string"}}]}}],
                 "current-schema-id": 0,
                 "partition-specs": [{{"spec-id": 0, "fields": [
                     {{"name": "region", "transform": "identity", "source-id": 2,
@@ -1365,6 +1394,309 @@ mod tests {
         ]);
         let plan = plan_scan(&md, None, None, Some(&pred)).expect("plan and");
         assert_eq!(plan.tasks.len(), 0);
+    }
+
+    /// 13-review #4: a manifest-list entry referencing a partition spec
+    /// the table no longer lists is corrupt metadata — a loud error, never
+    /// a silent fallback to the default spec (pruning against the wrong
+    /// spec can eliminate live files, and local rechecks cannot recover
+    /// what the planner already dropped).
+    #[test]
+    fn unknown_partition_spec_is_a_loud_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = dir.path().join("metadata");
+        std::fs::create_dir_all(&meta).unwrap();
+        build_manifest(
+            &meta,
+            "mn1.avro",
+            &[(1, "file:///table/data/a.parquet", 10)],
+        )
+        .unwrap();
+
+        // manifest list whose entry names partition spec 5 — the table
+        // metadata below lists only spec 0
+        let schema = AvroSchema::parse_str(crate::manifest::MANIFEST_LIST_SCHEMA_V2).unwrap();
+        let mut writer = Writer::new(&schema, Vec::new());
+        let mut rec = Record::new(&schema).unwrap();
+        rec.put(
+            "manifest_path",
+            format!("file://{}", meta.join("mn1.avro").display()),
+        );
+        rec.put("manifest_length", 100i64);
+        rec.put("partition_spec_id", 5i32);
+        rec.put("added_snapshot_id", 42i64);
+        rec.put("added_files_count", Some(1i64));
+        rec.put("existing_files_count", Some(0i64));
+        rec.put("deleted_files_count", Some(0i64));
+        rec.put("added_rows_count", Some(0i64));
+        rec.put("existing_rows_count", Some(0i64));
+        rec.put("deleted_rows_count", Some(0i64));
+        rec.put("partitions", None::<Value>);
+        rec.put("key_metadata", None::<Value>);
+        rec.put("sequence_number", Some(1i64));
+        rec.put("min_sequence_number", Some(1i64));
+        writer.append(rec).unwrap();
+        let list_path = meta.join("mn-list.avro");
+        std::fs::write(&list_path, writer.into_inner().unwrap()).unwrap();
+
+        let metadata_json = format!(
+            r#"{{
+                "format-version": 2,
+                "table-uuid": "9c12d441-03fe-11ed-8122-d358e75d12eb",
+                "location": "file://{}",
+                "schemas": [{{"type": "struct", "schema-id": 0, "fields": [
+                    {{"id": 1, "name": "id", "required": true, "type": "long"}}]}}],
+                "current-schema-id": 0,
+                "partition-specs": [{{"spec-id": 0, "fields": []}}],
+                "default-spec-id": 0,
+                "snapshots": [
+                    {{"snapshot-id": 42, "timestamp-ms": 1712345678000,
+                      "manifest-list": "file://{}",
+                      "summary": {{"operation": "append"}}}}
+                ],
+                "current-snapshot-id": 42
+            }}"#,
+            dir.path().display(),
+            list_path.display(),
+        );
+        let md: TableMetadata = serde_json::from_str(&metadata_json).unwrap();
+
+        let err = plan_scan(&md, None, None, None).unwrap_err();
+        assert!(
+            matches!(err, StorageError::Decode(ref m) if m.contains("partition spec 5")),
+            "unknown partition spec must be a loud decode error: {err}"
+        );
+    }
+
+    /// 13-review #4: with a predicate and no current schema (corrupt
+    /// metadata), planning must error — the old `continue` silently
+    /// discarded EVERY file, producing a plausible empty result.
+    #[test]
+    fn missing_schema_with_predicate_is_a_loud_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = dir.path().join("metadata");
+        std::fs::create_dir_all(&meta).unwrap();
+        build_manifest(
+            &meta,
+            "mn1.avro",
+            &[(1, "file:///table/data/a.parquet", 10)],
+        )
+        .unwrap();
+        build_manifest_list(&meta, &[("mn1.avro", 1, 0, 0)]).unwrap();
+
+        let metadata_json = format!(
+            r#"{{
+                "format-version": 2,
+                "table-uuid": "9c12d441-03fe-11ed-8122-d358e75d12eb",
+                "location": "file://{}",
+                "schemas": [],
+                "current-schema-id": 0,
+                "snapshots": [
+                    {{"snapshot-id": 42, "timestamp-ms": 1712345678000,
+                      "manifest-list": "file://{}",
+                      "summary": {{"operation": "append"}}}}
+                ],
+                "current-snapshot-id": 42
+            }}"#,
+            dir.path().display(),
+            meta.join("mn-list.avro").display(),
+        );
+        let md: TableMetadata = serde_json::from_str(&metadata_json).unwrap();
+
+        // without a predicate: plans fine
+        assert_eq!(plan_scan(&md, None, None, None).unwrap().tasks.len(), 1);
+
+        let pred = ScanPredicate::Lt {
+            field: "id".into(),
+            value: serde_json::json!(15),
+        };
+        let err = plan_scan(&md, None, None, Some(&pred)).unwrap_err();
+        assert!(
+            matches!(err, StorageError::Decode(ref m) if m.contains("current schema")),
+            "missing schema with predicate must be a loud decode error: {err}"
+        );
+    }
+
+    /// 13-review #4: identity-partition matching must prove the spec
+    /// field's source-id IS the predicate column's Iceberg ID. Name reuse
+    /// across schema evolution (drop "region" id 1, re-add "region" id 2)
+    /// must not compare the new column's values against the OLD column's
+    /// partition member — a name-only match prunes live files.
+    #[test]
+    fn partition_matching_requires_source_field_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = dir.path().join("metadata");
+        std::fs::create_dir_all(&meta).unwrap();
+
+        // partition records {"region": "eu"|"us"} were written under the
+        // OLD schema, where "region" was field id 1. The CURRENT schema's
+        // "region" is a re-added column with id 2.
+        build_manifest(
+            &meta,
+            "mn1.avro",
+            &[
+                (1, "file:///table/data/eu.parquet", 60),
+                (1, "file:///table/data/us.parquet", 40),
+            ],
+        )
+        .unwrap();
+        // the generic builder writes empty partition records; build with
+        // region members explicitly (patch the per-table partition struct
+        // exactly as real writers inject it)
+        {
+            let schema_str = crate::manifest::MANIFEST_ENTRY_SCHEMA_V2.replace(
+                "\"name\": \"r_part\", \"fields\": []",
+                "\"name\": \"r_part\", \"fields\": [{\"name\": \"region\", \"type\": \"string\"}]",
+            );
+            let schema = AvroSchema::parse_str(&schema_str).unwrap();
+            let AvroSchema::Record(top_rec) = &schema else {
+                panic!("not a record")
+            };
+            let df_field = top_rec
+                .fields
+                .iter()
+                .find(|f| f.name == "data_file")
+                .unwrap();
+            let apache_avro::Schema::Record(df_rec) = &df_field.schema else {
+                panic!("data_file not a record");
+            };
+            let kv_schema = df_rec
+                .fields
+                .iter()
+                .find(|f| f.name == "column_sizes")
+                .map(|f| match &f.schema {
+                    apache_avro::Schema::Union(u) => u.variants()[1].clone(),
+                    other => other.clone(),
+                })
+                .unwrap();
+            let apache_avro::Schema::Array(arr) = &kv_schema else {
+                panic!("column_sizes is not an array");
+            };
+            let kv_schema = (*arr.items).clone();
+
+            let mut writer = Writer::new(&schema, Vec::new());
+            for (region, path, rows) in [
+                ("eu", "file:///table/data/eu.parquet", 60),
+                ("us", "file:///table/data/us.parquet", 40),
+            ] {
+                let mut entry = Record::new(&schema).unwrap();
+                entry.put("status", Value::Int(1));
+                entry.put("snapshot_id", Value::Long(42));
+                entry.put("sequence_number", Value::Union(1, Box::new(Value::Long(1))));
+                entry.put(
+                    "file_sequence_number",
+                    Value::Union(1, Box::new(Value::Long(1))),
+                );
+                let data_file = Value::Record(vec![
+                    ("content".into(), Value::Int(0)),
+                    ("file_path".into(), Value::String(path.into())),
+                    ("file_format".into(), Value::String("parquet".into())),
+                    (
+                        "partition".into(),
+                        Value::Union(
+                            1,
+                            Box::new(Value::Record(vec![(
+                                "region".into(),
+                                Value::String(region.into()),
+                            )])),
+                        ),
+                    ),
+                    ("record_count".into(), Value::Long(rows)),
+                    ("file_size_in_bytes".into(), Value::Long(4096)),
+                    (
+                        "column_sizes".into(),
+                        Value::Union(1, Box::new(avro_map(&kv_schema, &[]))),
+                    ),
+                    (
+                        "value_counts".into(),
+                        Value::Union(1, Box::new(avro_map(&kv_schema, &[]))),
+                    ),
+                    (
+                        "null_value_counts".into(),
+                        Value::Union(1, Box::new(avro_map(&kv_schema, &[]))),
+                    ),
+                    (
+                        "nan_value_counts".into(),
+                        Value::Union(1, Box::new(avro_map(&kv_schema, &[]))),
+                    ),
+                    (
+                        "lower_bounds".into(),
+                        Value::Union(1, Box::new(Value::Array(vec![]))),
+                    ),
+                    (
+                        "upper_bounds".into(),
+                        Value::Union(1, Box::new(Value::Array(vec![]))),
+                    ),
+                    (
+                        "key_metadata".into(),
+                        Value::Union(0, Box::new(Value::Null)),
+                    ),
+                    (
+                        "split_offsets".into(),
+                        Value::Union(1, Box::new(Value::Array(vec![Value::Int(4)]))),
+                    ),
+                    (
+                        "equality_ids".into(),
+                        Value::Union(0, Box::new(Value::Null)),
+                    ),
+                    (
+                        "sort_order_id".into(),
+                        Value::Union(0, Box::new(Value::Null)),
+                    ),
+                ]);
+                entry.put("data_file", data_file);
+                writer.append(entry).unwrap();
+            }
+            std::fs::write(meta.join("mn-region.avro"), writer.into_inner().unwrap()).unwrap();
+        }
+        build_manifest_list(&meta, &[("mn-region.avro", 2, 0, 0)]).unwrap();
+
+        let metadata_json = format!(
+            r#"{{
+                "format-version": 2,
+                "table-uuid": "9c12d441-03fe-11ed-8122-d358e75d12eb",
+                "location": "file://{}",
+                "schemas": [{{"type": "struct", "schema-id": 0, "fields": [
+                    {{"id": 2, "name": "region", "required": false, "type": "string"}}]}}],
+                "current-schema-id": 0,
+                "partition-specs": [{{"spec-id": 0, "fields": [
+                    {{"name": "region", "transform": "identity", "source-id": 1,
+                      "field-id": 1000}}]}}],
+                "default-spec-id": 0,
+                "snapshots": [
+                    {{"snapshot-id": 42, "timestamp-ms": 1712345678000,
+                      "manifest-list": "file://{}",
+                      "summary": {{"operation": "append"}}}}
+                ],
+                "current-snapshot-id": 42
+            }}"#,
+            dir.path().display(),
+            meta.join("mn-list.avro").display(),
+        );
+        let md: TableMetadata = serde_json::from_str(&metadata_json).unwrap();
+
+        // current schema's "region" (id 2) is NOT the partition member's
+        // source (id 1): no proof -> keep both files, never prune by name
+        let pred = ScanPredicate::Eq {
+            field: "region".into(),
+            value: serde_json::json!("eu"),
+        };
+        let plan = plan_scan(&md, None, None, Some(&pred)).expect("plan reuse");
+        assert_eq!(
+            plan.tasks.len(),
+            2,
+            "name-reused column must not prune by the old column's partition values"
+        );
+
+        // positive control: matching source-id prunes properly
+        let metadata_json_ok = metadata_json.replace(r#""source-id": 1"#, r#""source-id": 2"#);
+        let md_ok: TableMetadata = serde_json::from_str(&metadata_json_ok).unwrap();
+        let plan_ok = plan_scan(&md_ok, None, None, Some(&pred)).expect("plan proven");
+        assert_eq!(plan_ok.tasks.len(), 1);
+        assert_eq!(
+            plan_ok.tasks[0].entry.data_file.file_path,
+            "file:///table/data/eu.parquet"
+        );
     }
 
     /// TDD anchor (M1 slice 14): bounds pruning — predicates compared to

@@ -82,6 +82,25 @@ manifest inheritance.)* Predicate pruning is content-aware:
   applicability is that rule (a delete file touches only data files in
   its own partition).
 
+*(13-review #4 planner amendment, 2026-11-20 — loud metadata errors and
+field-ID partition matching.)*
+
+- A manifest-list entry naming a partition spec the table no longer lists
+  is a **loud decode error**. The old silent fallback to the default spec
+  could prune against the wrong spec (evolved partitions), and local
+  rechecks cannot recover what the planner already eliminated. Tolerance:
+  a table with NO partition specs at all is unpartitioned — its spec-0
+  references resolve to the implicit empty spec (provably cannot
+  mis-prune).
+- With a predicate and no current schema, planning **errors loudly**. The
+  old per-file `continue` silently discarded every file, producing a
+  plausible empty result.
+- Identity-partition matching **proves the spec field's `source-id` equals
+  the predicate column's schema field ID** before comparing values. A
+  display name reused across schema evolution (drop + re-add with a new
+  ID) must not compare the new column's values against the old column's
+  partition member. Inconclusive cases keep the file.
+
 Manifest-entry decode inherits a **null `snapshot_id`** from the
 enclosing manifest's `added-snapshot-id` Avro container metadata
 (older writers omit the entry-level ID). A null with no container
