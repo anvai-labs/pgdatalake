@@ -23,6 +23,10 @@
 #include "access/htup_details.h"
 #include "access/nbtree.h"
 #include "access/reloptions.h"
+#include "access/tableam.h"
+#include "catalog/pg_am.h"
+#include "catalog/pg_am_d.h"
+#include "utils/syscache.h"
 #include "access/spgist_private.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
@@ -1587,6 +1591,32 @@ untransformRelOptions(Datum options)
  * AM's options parser function in the case of a tuple corresponding to an
  * index, or NULL otherwise.
  */
+/*
+ * Parse a table's reloptions through its table AM when the AM provides a
+ * relation_reloptions callback, else heap_reloptions. relam may be
+ * InvalidOid when unknown (callers that know it pass it in).
+ */
+bytea *
+table_am_reloptions(char relkind, Datum reloptions, bool validate, Oid relam)
+{
+	if (relkind == RELKIND_RELATION && OidIsValid(relam) &&
+		relam != HEAP_TABLE_AM_OID)
+	{
+		HeapTuple	amtup = SearchSysCache1(AMOID, ObjectIdGetDatum(relam));
+
+		if (HeapTupleIsValid(amtup))
+		{
+			const TableAmRoutine *routine =
+				GetTableAmRoutine(((Form_pg_am) GETSTRUCT(amtup))->amhandler);
+
+			ReleaseSysCache(amtup);
+			if (routine->relation_reloptions != NULL)
+				return routine->relation_reloptions(reloptions, validate);
+		}
+	}
+	return heap_reloptions(relkind, reloptions, validate);
+}
+
 bytea *
 extractRelOptions(HeapTuple tuple, TupleDesc tupdesc,
 				  amoptions_function amoptions)
@@ -1611,7 +1641,8 @@ extractRelOptions(HeapTuple tuple, TupleDesc tupdesc,
 		case RELKIND_RELATION:
 		case RELKIND_TOASTVALUE:
 		case RELKIND_MATVIEW:
-			options = heap_reloptions(classForm->relkind, datum, false);
+			options = table_am_reloptions(classForm->relkind, datum, false,
+										  classForm->relam);
 			break;
 		case RELKIND_PARTITIONED_TABLE:
 			options = partitioned_table_reloptions(datum, false);

@@ -878,6 +878,14 @@ typedef struct TableAmRoutine
 										   SampleScanState *scanstate,
 										   TupleTableSlot *slot);
 
+
+	/*
+	 * Parse this AM's relation options (CREATE TABLE ... USING am WITH
+	 * (...)). Called with the raw reloptions text[] datum; NULL means the
+	 * heap defaults apply (AMs without custom options). Mirrors how index
+	 * AMs own their reloptions via amoptions.
+	 */
+	bytea	   *(*relation_reloptions) (Datum reloptions, bool validate);
 } TableAmRoutine;
 
 

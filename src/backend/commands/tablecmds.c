@@ -973,7 +973,24 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 			(void) partitioned_table_reloptions(reloptions, true);
 			break;
 		default:
-			(void) heap_reloptions(relkind, reloptions, true);
+			/*
+			 * Resolve the table AM the same way DefineRelation does below
+			 * (explicit USING, else default_table_access_method), so the
+			 * AM can validate its own options at CREATE time.
+			 */
+			{
+				Oid			amoid = InvalidOid;
+
+				if (RELKIND_HAS_TABLE_AM(relkind))
+				{
+					if (stmt->accessMethod != NULL)
+						amoid = get_table_am_oid(stmt->accessMethod, false);
+					else
+						amoid = get_table_am_oid(default_table_access_method,
+												 false);
+				}
+				(void) table_am_reloptions(relkind, reloptions, true, amoid);
+			}
 	}
 
 	if (stmt->ofTypename)
@@ -18053,7 +18070,8 @@ ATExecSetRelOptions(Relation rel, List *defList, AlterTableType operation,
 	{
 		case RELKIND_RELATION:
 		case RELKIND_MATVIEW:
-			(void) heap_reloptions(rel->rd_rel->relkind, newOptions, true);
+			(void) table_am_reloptions(rel->rd_rel->relkind, newOptions, true,
+									   rel->rd_rel->relam);
 			break;
 		case RELKIND_PARTITIONED_TABLE:
 			(void) partitioned_table_reloptions(newOptions, true);
