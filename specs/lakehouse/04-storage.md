@@ -107,3 +107,34 @@ a cap, 100 backends × 4 prefetch = 400 concurrent connections per store — mos
 SDKs pool per handle, so the handle is per-backend with the semaphore shared via
 the DSM/IPC layer only for bgworker coordination (backends self-limit via
 `max_concurrency` division).
+
+## 7. Transport policy (2026-11-20, 13-review blocker #6)
+
+Catalogs and manifests supply absolute paths, so every hop is scoped to
+the table's own location root and the store surface is constrained:
+
+- **Table-root scope gate** (`ensure_within_table_root`): the manifest
+  list, every manifest, and every data/delete file path must share the
+  table location's scheme/bucket and live under its key prefix
+  (segment-aware — `s3://b/a` does not admit `s3://b/ab`). A violation
+  is a loud decode error, never a best-effort read from an unscoped
+  location. The catalog-supplied `metadata_location` itself is checked
+  only after the metadata is parsed (its location IS the scope anchor's
+  source).
+- **Local object stores are default-deny.** `file://` paths from
+  catalogs/manifests are refused unless the embedding process opted
+  in — and the opt-in API is test-only (`cfg(test)`), so the shipped
+  binary structurally cannot open local paths. Explicit local-store
+  deployments arrive with the M3 storage-profile work as a real
+  operator-facing option.
+- **Static S3 credentials are REQUIRED.** The ambient provider chain
+  (env vars, IMDS probes) is removed: missing keys are a loud config
+  error pointing at the user mapping — never a silent instance-role
+  trust. This is stricter than the review's "require explicit trust
+  for ambient credentials": there is no ambient path at all until a
+  profile slice adds an operator-facing opt-in.
+- **Plain HTTP only for explicit `http://` endpoints** (fixture
+  stores); unconfigured endpoints mean AWS — TLS-only.
+- **Redaction and redirect policy** (REST hops, URL userinfo/query
+  redaction, response-body truncation) land with the REST-client
+  slice (follow-up, same blocker).

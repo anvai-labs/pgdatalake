@@ -103,6 +103,50 @@ impl S3Options {
     }
 }
 
+/// Explicit opt-in for file:// object stores (13-review #6): catalogs and
+/// manifests supply absolute paths, so a compromised catalog must not be
+/// able to direct reads at arbitrary local paths. The flag is process-
+/// global, monotonic (false -> true, never reset) and test-only — the
+/// shipped binary has NO API to enable local stores (explicit local
+/// deployments arrive with the M3 profile work).
+static ALLOW_LOCAL_STORES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn local_stores_allowed() -> bool {
+    ALLOW_LOCAL_STORES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Construct the local object store with an explicit opt-in decision —
+/// the only place file:// stores are ever created.
+fn open_local_store(root: &str, allowed: bool) -> Result<Box<dyn ObjectStore>, StorageError> {
+    if !allowed {
+        return Err(StorageError::Config(format!(
+            "file:// object store refused: local paths from catalogs/manifests \
+             require explicit opt-in (path: {root})"
+        )));
+    }
+    Ok(Box::new(
+        object_store::local::LocalFileSystem::new_with_prefix(root)
+            .map_err(|e| StorageError::Config(e.to_string()))?,
+    ))
+}
+
+/// Fixture opt-in (13-review #6): test code ONLY — cfg(test), monotonic
+/// (once opted in the process stays opted in; parallel tests never
+/// un-opt-in). The production binary structurally cannot open file://
+/// stores.
+#[cfg(test)]
+pub fn test_allow_local_stores() {
+    ALLOW_LOCAL_STORES.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Plain HTTP for the S3 client is allowed ONLY for explicitly configured
+/// http:// endpoints (fixture stores). TLS-only otherwise — no endpoint
+/// configured means AWS, never plaintext.
+fn s3_allow_http(endpoint: Option<&str>) -> bool {
+    endpoint.map(|e| e.starts_with("http://")).unwrap_or(false)
+}
+
 fn runtime() -> &'static tokio::runtime::Runtime {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RT.get_or_init(|| {
@@ -121,17 +165,29 @@ pub struct StorageIo {
 impl StorageIo {
     pub fn open(loc: &Location, s3: Option<&S3Options>) -> Result<Self, StorageError> {
         let store: Box<dyn ObjectStore> = match loc {
-            Location::Local { root } => Box::new(
-                object_store::local::LocalFileSystem::new_with_prefix(root)
-                    .map_err(|e| StorageError::Config(e.to_string()))?,
-            ),
+            Location::Local { root } => open_local_store(root, local_stores_allowed())?,
             Location::S3 { bucket, .. } => {
                 let opts = s3.ok_or_else(|| {
                     StorageError::Config("s3 location requires S3Options".to_string())
                 })?;
+                // 13-review #6: ambient cloud credential fallback is
+                // removed — no static keys means a loud config error
+                // (pointing at the user mapping), never an IMDS probe.
+                let (ak, sk) = match (&opts.access_key_id, &opts.secret_access_key) {
+                    (Some(k), Some(sec)) => (k, sec),
+                    _ => {
+                        return Err(StorageError::Config(
+                            "static S3 credentials missing: set s3_access_key/s3_secret_key \
+                             on the user mapping (ambient cloud-credential fallback is disabled)"
+                                .into(),
+                        ));
+                    }
+                };
                 let mut b = object_store::aws::AmazonS3Builder::new()
                     .with_bucket_name(bucket)
-                    .with_allow_http(true);
+                    .with_allow_http(s3_allow_http(opts.endpoint.as_deref()))
+                    .with_access_key_id(ak)
+                    .with_secret_access_key(sk);
                 if let Some(ep) = &opts.endpoint {
                     b = b.with_endpoint(ep);
                 }
@@ -223,6 +279,65 @@ fn maybe_gunzip(bytes: Vec<u8>) -> Result<Vec<u8>, StorageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 13-review #6: file:// object stores are refused unless explicitly
+    /// opted in — and the opt-in API is cfg(test) only, so the shipped
+    /// binary structurally cannot open catalog/manifest-supplied local
+    /// paths. (The gate is tested directly on open_local_store so the
+    /// process-global monotonic flag never races parallel tests.)
+    #[test]
+    fn file_store_requires_explicit_opt_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let err = match open_local_store(&root, false) {
+            Err(e) => e,
+            Ok(_) => panic!("local store must be refused without opt-in"),
+        };
+        assert!(
+            matches!(err, StorageError::Config(ref m) if m.contains("explicit opt-in")),
+            "local store must be refused by default: {err}"
+        );
+        // explicit opt-in admits it (fixtures, doc 10 §1)
+        open_local_store(&root, true).expect("opted-in local store opens");
+    }
+
+    /// 13-review #6: ambient cloud credential fallback is removed —
+    /// static keys are REQUIRED for S3; absent keys are a loud config
+    /// error pointing at the user mapping, never an IMDS probe.
+    #[test]
+    fn s3_static_keys_required() {
+        let loc = Location::S3 {
+            bucket: "warehouse".into(),
+            key: "t/metadata/x.json".into(),
+        };
+        let err = match StorageIo::open(&loc, Some(&S3Options::default())) {
+            Err(e) => e,
+            Ok(_) => panic!("missing static keys must fail"),
+        };
+        assert!(
+            matches!(err, StorageError::Config(ref m) if m.contains("static S3 credentials")),
+            "missing static keys must be a loud config error: {err}"
+        );
+        let with_keys = S3Options {
+            endpoint: Some("https://s3.example.com".into()),
+            region: Some("us-east-1".into()),
+            access_key_id: Some("k".into()),
+            secret_access_key: Some("s".into()),
+            path_style: true,
+        };
+        StorageIo::open(&loc, Some(&with_keys)).expect("static keys open");
+    }
+
+    /// 13-review #6: plain HTTP is allowed ONLY for explicitly configured
+    /// http:// endpoints (fixture stores); https and AWS defaults stay
+    /// TLS-only.
+    #[test]
+    fn s3_allow_http_tracks_endpoint_scheme() {
+        assert!(!s3_allow_http(None));
+        assert!(!s3_allow_http(Some("https://s3.example.com")));
+        assert!(!s3_allow_http(Some("s3.amazonaws.com")));
+        assert!(s3_allow_http(Some("http://localhost:9000")));
+    }
 
     /// TDD anchor (M1 slice 4): an s3:// location parses into
     /// (bucket, key) — the metadata_location from slice 3's loadTable.

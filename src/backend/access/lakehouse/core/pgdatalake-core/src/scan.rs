@@ -372,6 +372,36 @@ pub fn open_for(
     }
 }
 
+/// 13-review #6: catalog- and manifest-supplied paths must stay inside
+/// the table's own location root. Segment-aware: the last component of
+/// the root is never treated as a bare prefix (`s3://b/a` does NOT
+/// admit `s3://b/ab`). A violation is a loud decode error — never a
+/// best-effort read from an unscoped location.
+pub(crate) fn ensure_within_table_root(
+    path_uri: &str,
+    table_location: &str,
+) -> Result<(), StorageError> {
+    let scoped = |p: &str| -> Result<(String, String, String), StorageError> {
+        match parse_location(p)? {
+            crate::storage::Location::S3 { bucket, key } => Ok(("s3".into(), bucket, key)),
+            crate::storage::Location::Local { root } => {
+                Ok(("file".into(), String::new(), root.clone()))
+            }
+            crate::storage::Location::Http { url } => Ok(("http".into(), String::new(), url)),
+        }
+    };
+    let (ps, pb, pk) = scoped(path_uri)?;
+    let (rs, rb, rk) = scoped(table_location)?;
+    let in_root =
+        ps == rs && pb == rb && (pk == rk || pk.strip_prefix(&format!("{rk}/")).is_some());
+    if !in_root {
+        return Err(StorageError::Decode(format!(
+            "path {path_uri} is outside the table location {table_location}"
+        )));
+    }
+    Ok(())
+}
+
 /// Plan a scan of the given table metadata. `selector = None` selects the
 /// current snapshot; a selector that resolves to nothing is a NotFound
 /// (doc 02 §2 pin semantics — `FOR … AS OF`, slice 19). `s3` carries
@@ -406,6 +436,8 @@ pub fn plan_scan(
         },
     };
 
+    // 13-review #6: scope every hop to the table's own location root
+    ensure_within_table_root(&snapshot.manifest_list, &md.location)?;
     let (list_io, list_key) = open_for(&snapshot.manifest_list, s3)?;
     let list_bytes = list_io.get_bytes(&list_key)?;
     let list_entries = parse_manifest_list(&list_bytes)?;
@@ -448,6 +480,7 @@ pub fn plan_scan(
                 )));
             }
         };
+        ensure_within_table_root(&mle.manifest_path, &md.location)?;
         let (io, key) = open_for(&mle.manifest_path, s3)?;
         let bytes = io.get_bytes(&key)?;
         for e in parse_manifest(&bytes)? {
@@ -455,6 +488,8 @@ pub fn plan_scan(
             if e.status == crate::manifest::ManifestEntryStatus::Deleted {
                 continue;
             }
+            // 13-review #6: data/delete file paths stay inside the root too
+            ensure_within_table_root(&e.data_file.file_path, &md.location)?;
             files_before_pruning += 1;
             // slice 20: delete files are never data tasks — the row readers
             // load and apply them separately. Routing happens BEFORE the
@@ -641,18 +676,30 @@ mod tests {
         )
     }
 
+    /// 13-review #6: fixture data paths must live under the (test) table
+    /// root — remap the historical file:///table/data/ prefix onto the
+    /// tempdir so the table-root scope gate sees in-root paths.
+    fn scope_data_path(dir: &std::path::Path, p: &str) -> String {
+        if let Some(rest) = p.strip_prefix("file:///table/data/") {
+            format!("file://{}/data/{}", dir.display(), rest)
+        } else {
+            p.to_string()
+        }
+    }
+
     /// Build one manifest (avro) with the given (status, path, rows) files.
     fn build_manifest(
         dir: &std::path::Path,
         name: &str,
         files: &[(i32, &str, i64)],
     ) -> Result<(), StorageError> {
+        crate::storage::test_allow_local_stores();
         build_manifest_content(
             dir,
             name,
             &files
                 .iter()
-                .map(|(s, p, r)| (*s, *p, *r, 0i32))
+                .map(|(s, p, r)| (*s, scope_data_path(dir, p), *r, 0i32))
                 .collect::<Vec<_>>(),
         )
     }
@@ -662,8 +709,9 @@ mod tests {
     fn build_manifest_content(
         dir: &std::path::Path,
         name: &str,
-        files: &[(i32, &str, i64, i32)],
+        files: &[(i32, String, i64, i32)],
     ) -> Result<(), StorageError> {
+        crate::storage::test_allow_local_stores();
         let schema = AvroSchema::parse_str(crate::manifest::MANIFEST_ENTRY_SCHEMA_V2).unwrap();
         let AvroSchema::Record(top_rec) = &schema else {
             panic!("manifest is not a record");
@@ -705,7 +753,7 @@ mod tests {
             );
             let data_file = Value::Record(vec![
                 ("content".into(), Value::Int(*content)),
-                ("file_path".into(), Value::String(path.to_string())),
+                ("file_path".into(), Value::String(path.clone())),
                 ("file_format".into(), Value::String("parquet".into())),
                 (
                     "partition".into(),
@@ -772,6 +820,7 @@ mod tests {
         name: &str,
         files: &[BoundsFile<'_>],
     ) -> Result<(), StorageError> {
+        crate::storage::test_allow_local_stores();
         let schema = AvroSchema::parse_str(crate::manifest::MANIFEST_ENTRY_SCHEMA_V2).unwrap();
         let AvroSchema::Record(top_rec) = &schema else {
             panic!("manifest is not a record");
@@ -828,7 +877,10 @@ mod tests {
             );
             let data_file = Value::Record(vec![
                 ("content".into(), Value::Int(*content)),
-                ("file_path".into(), Value::String(path.to_string())),
+                (
+                    "file_path".into(),
+                    Value::String(scope_data_path(dir, path)),
+                ),
                 ("file_format".into(), Value::String("parquet".into())),
                 (
                     "partition".into(),
@@ -893,6 +945,7 @@ mod tests {
         name: &str,
         manifests: &[(&str, i64, i64, i64)],
     ) -> Result<(), StorageError> {
+        crate::storage::test_allow_local_stores();
         let schema = AvroSchema::parse_str(crate::manifest::MANIFEST_LIST_SCHEMA_V2).unwrap();
         let mut writer = Writer::new(&schema, Vec::new());
         for (name, added, existing, deleted) in manifests {
@@ -987,8 +1040,14 @@ mod tests {
         assert_eq!(
             paths,
             [
-                "file:///table/data/a.parquet",
-                "file:///table/data/b.parquet"
+                format!(
+                    "file://{}/data/a.parquet",
+                    dir.path().join("metadata").display()
+                ),
+                format!(
+                    "file://{}/data/b.parquet",
+                    dir.path().join("metadata").display()
+                )
             ]
         );
         assert_eq!(plan.total_rows, 130);
@@ -1159,13 +1218,29 @@ mod tests {
         build_manifest_content(
             dir.path().join("metadata").as_path(),
             "mn-posdel.avro",
-            &[(1, "file:///table/data/deletes-pos.parquet", 2, 1)],
+            &[(
+                1,
+                scope_data_path(
+                    dir.path().join("metadata").as_path(),
+                    "file:///table/data/deletes-pos.parquet",
+                ),
+                2,
+                1,
+            )],
         )
         .unwrap();
         build_manifest_content(
             dir.path().join("metadata").as_path(),
             "mn-eqdel.avro",
-            &[(1, "file:///table/data/deletes-eq.parquet", 1, 2)],
+            &[(
+                1,
+                scope_data_path(
+                    dir.path().join("metadata").as_path(),
+                    "file:///table/data/deletes-eq.parquet",
+                ),
+                1,
+                2,
+            )],
         )
         .unwrap();
         build_manifest_list(
@@ -1205,7 +1280,10 @@ mod tests {
         assert_eq!(plan.total_rows, 100, "delete files add no rows");
         assert_eq!(
             plan.tasks[0].entry.data_file.file_path,
-            "file:///table/data/a.parquet"
+            format!(
+                "file://{}/data/a.parquet",
+                dir.path().join("metadata").display()
+            )
         );
     }
 
@@ -1258,6 +1336,7 @@ mod tests {
             ("eu", "file:///table/data/eu.parquet", 60),
             ("us", "file:///table/data/us.parquet", 40),
         ] {
+            let path = scope_data_path(dir.path(), path);
             let mut entry = Record::new(&schema).unwrap();
             entry.put("status", Value::Int(1));
             entry.put("snapshot_id", Value::Long(42));
@@ -1268,7 +1347,7 @@ mod tests {
             );
             let data_file = Value::Record(vec![
                 ("content".into(), Value::Int(0)),
-                ("file_path".into(), Value::String(path.into())),
+                ("file_path".into(), Value::String(path.clone())),
                 ("file_format".into(), Value::String("parquet".into())),
                 (
                     "partition".into(),
@@ -1378,7 +1457,7 @@ mod tests {
         assert_eq!(plan.total_rows, 60);
         assert_eq!(
             plan.tasks[0].entry.data_file.file_path,
-            "file:///table/data/eu.parquet"
+            format!("file://{}/data/eu.parquet", dir.path().display())
         );
 
         // And with a non-matching eq: zero tasks
@@ -1589,7 +1668,10 @@ mod tests {
                 );
                 let data_file = Value::Record(vec![
                     ("content".into(), Value::Int(0)),
-                    ("file_path".into(), Value::String(path.into())),
+                    (
+                        "file_path".into(),
+                        Value::String(scope_data_path(meta.as_path(), path)),
+                    ),
                     ("file_format".into(), Value::String("parquet".into())),
                     (
                         "partition".into(),
@@ -1695,7 +1777,7 @@ mod tests {
         assert_eq!(plan_ok.tasks.len(), 1);
         assert_eq!(
             plan_ok.tasks[0].entry.data_file.file_path,
-            "file:///table/data/eu.parquet"
+            format!("file://{}/data/eu.parquet", meta.display())
         );
     }
 
@@ -2024,6 +2106,90 @@ mod tests {
             plan.delete_tasks.len(),
             1,
             "delete task must survive: data bounds never prune deletes"
+        );
+    }
+
+    /// 13-review #6: catalog/manifest-supplied paths must stay inside the
+    /// table's own location root — a compromised catalog or manifest must
+    /// not direct reads at arbitrary buckets or local paths. Every hop
+    /// (manifest list, manifests, data/delete files) is checked with a
+    /// segment-aware prefix (no s3://t/ab vs s3://t/a confusion); a
+    /// violation is a loud decode error, never a best-effort read.
+    #[test]
+    fn paths_outside_table_root_are_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = dir.path().join("metadata");
+        std::fs::create_dir_all(&meta).unwrap();
+        build_manifest(
+            &meta,
+            "mn1.avro",
+            &[(1, "file:///table/data/a.parquet", 10)],
+        )
+        .unwrap();
+        build_manifest_list(&meta, &[("mn1.avro", 1, 0, 0)]).unwrap();
+
+        // manifest list lives OUTSIDE the table root (table root is
+        // file://{dir}/table, the fixtures are siblings)
+        let metadata_json = format!(
+            r#"{{
+                "format-version": 2,
+                "table-uuid": "9c12d441-03fe-11ed-8122-d358e75d12eb",
+                "location": "file://{}",
+                "schemas": [{{"type": "struct", "schema-id": 0, "fields": [
+                    {{"id": 1, "name": "id", "required": true, "type": "long"}}]}}],
+                "current-schema-id": 0,
+                "snapshots": [
+                    {{"snapshot-id": 42, "timestamp-ms": 1712345678000,
+                      "manifest-list": "file://{}",
+                      "summary": {{"operation": "append"}}}}
+                ],
+                "current-snapshot-id": 42
+            }}"#,
+            dir.path().join("table").display(),
+            meta.join("mn-list.avro").display(),
+        );
+        let md: TableMetadata = serde_json::from_str(&metadata_json).unwrap();
+        let err = plan_scan(&md, None, None, None).unwrap_err();
+        assert!(
+            matches!(err, StorageError::Decode(ref m) if m.contains("outside the table location")),
+            "manifest list outside the table root must be a loud error: {err}"
+        );
+
+        // control: data file paths outside the root are equally loud
+        let dir2 = tempfile::tempdir().unwrap();
+        let meta2 = dir2.path().join("metadata");
+        std::fs::create_dir_all(&meta2).unwrap();
+        // manifest path INSIDE the root, data file OUTSIDE
+        build_manifest(
+            &meta2,
+            "mn1.avro",
+            &[(1, "file:///elsewhere/data/a.parquet", 10)],
+        )
+        .unwrap();
+        build_manifest_list(&meta2, &[("mn1.avro", 1, 0, 0)]).unwrap();
+        let metadata_json2 = format!(
+            r#"{{
+                "format-version": 2,
+                "table-uuid": "9c12d441-03fe-11ed-8122-d358e75d12eb",
+                "location": "file://{}",
+                "schemas": [{{"type": "struct", "schema-id": 0, "fields": [
+                    {{"id": 1, "name": "id", "required": true, "type": "long"}}]}}],
+                "current-schema-id": 0,
+                "snapshots": [
+                    {{"snapshot-id": 42, "timestamp-ms": 1712345678000,
+                      "manifest-list": "file://{}",
+                      "summary": {{"operation": "append"}}}}
+                ],
+                "current-snapshot-id": 42
+            }}"#,
+            dir2.path().display(),
+            meta2.join("mn-list.avro").display(),
+        );
+        let md2: TableMetadata = serde_json::from_str(&metadata_json2).unwrap();
+        let err2 = plan_scan(&md2, None, None, None).unwrap_err();
+        assert!(
+            matches!(err2, StorageError::Decode(ref m) if m.contains("outside the table location")),
+            "data file outside the table root must be a loud error: {err2}"
         );
     }
 }

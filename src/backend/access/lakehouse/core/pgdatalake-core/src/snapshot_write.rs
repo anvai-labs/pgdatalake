@@ -477,6 +477,7 @@ mod tests {
     #[test]
     fn write_snapshot_end_to_end_readback() {
         let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
         let location = format!("file://{}", dir.path().display());
         let loc = parse_location(&location).unwrap();
         let io = StorageIo::open(&loc, None).unwrap();
@@ -699,6 +700,7 @@ mod carry_tests {
     #[test]
     fn append_a_then_b_preserves_history() {
         let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
         let location = format!("file://{}", dir.path().display());
         let loc = parse_location(&location).unwrap();
         let io = StorageIo::open(&loc, None).unwrap();

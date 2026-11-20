@@ -625,6 +625,7 @@ mod tests {
     #[test]
     fn reads_projected_rows_with_nulls() {
         let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
         write_fixture(dir.path(), "a.parquet");
         let io = StorageIo::open(
             &parse_location(&format!("file://{}", dir.path().display())).unwrap(),
@@ -668,6 +669,7 @@ mod tests {
     #[test]
     fn projection_selects_and_orders_columns() {
         let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
         write_fixture(dir.path(), "a.parquet");
         let io = StorageIo::open(
             &parse_location(&format!("file://{}", dir.path().display())).unwrap(),
@@ -687,6 +689,7 @@ mod tests {
     #[test]
     fn unknown_projection_column_errors() {
         let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
         write_fixture(dir.path(), "a.parquet");
         let io = StorageIo::open(
             &parse_location(&format!("file://{}", dir.path().display())).unwrap(),
@@ -722,6 +725,7 @@ mod tests {
     #[test]
     fn position_deletes_skip_rows() {
         let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
         write_ids(dir.path(), "a.parquet", &[1, 2, 3, 4, 5]);
         let io = StorageIo::open(
             &parse_location(&format!("file://{}", dir.path().display())).unwrap(),
@@ -750,6 +754,7 @@ mod tests {
     #[test]
     fn equality_deletes_drop_matching_rows() {
         let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
         // data: id 1..=5 with a name column
         let schema = ArrowSchema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -803,6 +808,7 @@ mod tests {
         use arrow::array::Decimal128Array;
 
         let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
         let schema = ArrowSchema::new(vec![Field::new(
             "amount",
             DataType::Decimal128(12, 2),
@@ -842,6 +848,7 @@ mod tests {
         use arrow::array::FixedSizeBinaryArray;
 
         let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
         let schema = ArrowSchema::new(vec![Field::new("uid", DataType::FixedSizeBinary(16), true)]);
         let b = FixedSizeBinaryArray::from(vec![
             Some(
@@ -886,6 +893,7 @@ mod tests {
         use arrow::array::{Date32Array, Time64MicrosecondArray};
 
         let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
         let schema = ArrowSchema::new(vec![
             Field::new("d", DataType::Date32, true),
             Field::new(
@@ -982,6 +990,7 @@ mod pos_delete_applicability_tests {
         use std::sync::Arc;
 
         let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
         let aschema = ArrowSchema::new(vec![AF::new("id", DataType::Int64, false)]);
         let batch = RecordBatch::try_new(
             Arc::new(aschema),

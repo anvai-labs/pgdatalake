@@ -982,6 +982,8 @@ mod tests {
         use apache_avro::{Schema as AvroSchema, Writer};
 
         let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
+        std::fs::create_dir_all(dir.path().join("table").join("metadata")).unwrap();
         std::fs::create_dir_all(dir.path().join("metadata")).unwrap();
 
         // slice 20: real data parquet (3 rows) + a position-delete parquet
@@ -1116,7 +1118,7 @@ mod tests {
         entry.put("data_file", data_file);
         writer.append(entry).unwrap();
         std::fs::write(
-            dir.path().join("metadata").join("mn1.avro"),
+            dir.path().join("table").join("metadata").join("mn1.avro"),
             writer.into_inner().unwrap(),
         )
         .unwrap();
@@ -1189,7 +1191,7 @@ mod tests {
         del_entry.put("data_file", del_data_file);
         del_writer.append(del_entry).unwrap();
         std::fs::write(
-            dir.path().join("metadata").join("mn2.avro"),
+            dir.path().join("table").join("metadata").join("mn2.avro"),
             del_writer.into_inner().unwrap(),
         )
         .unwrap();
@@ -1199,7 +1201,10 @@ mod tests {
         let lwriter = Writer::new(&lschema, Vec::new());
         let _ = lwriter; // empty writer serializes a zero-row avro on into_inner
         std::fs::write(
-            dir.path().join("metadata").join("mn-list.avro"),
+            dir.path()
+                .join("table")
+                .join("metadata")
+                .join("mn-list.avro"),
             lwriter.into_inner().unwrap(),
         )
         .unwrap();
@@ -1209,7 +1214,7 @@ mod tests {
         let mut mrec = Record::new(&lschema).unwrap();
         mrec.put(
             "manifest_path",
-            format!("file://{}/metadata/mn1.avro", dir.path().display()),
+            format!("file://{}/table/metadata/mn1.avro", dir.path().display()),
         );
         mrec.put("manifest_length", 100i64);
         mrec.put("partition_spec_id", 0i32);
@@ -1228,7 +1233,7 @@ mod tests {
         let mut mrec2 = Record::new(&lschema).unwrap();
         mrec2.put(
             "manifest_path",
-            format!("file://{}/metadata/mn2.avro", dir.path().display()),
+            format!("file://{}/table/metadata/mn2.avro", dir.path().display()),
         );
         mrec2.put("manifest_length", 100i64);
         mrec2.put("partition_spec_id", 0i32);
@@ -1245,7 +1250,10 @@ mod tests {
         mrec2.put("min_sequence_number", Some(2i64));
         lwriter.append(mrec2).unwrap();
         std::fs::write(
-            dir.path().join("metadata").join("mn-list.avro"),
+            dir.path()
+                .join("table")
+                .join("metadata")
+                .join("mn-list.avro"),
             lwriter.into_inner().unwrap(),
         )
         .unwrap();
@@ -1258,7 +1266,7 @@ mod tests {
                     {{"id": 1, "name": "id", "required": true, "type": "long"}}]}}],
                 "current-schema-id": 0,
                 "snapshots": [{{"snapshot-id": 42, "timestamp-ms": 1712345678000,
-                                "manifest-list": "file://{}/metadata/mn-list.avro",
+                                "manifest-list": "file://{}/table/metadata/mn-list.avro",
                                 "summary": {{"operation": "append"}}}}],
                 "current-snapshot-id": 42}}"#,
             dir.path().display(),
@@ -1467,6 +1475,8 @@ mod tests {
     #[test]
     fn ffi_write_commit_read_back_with_mock_catalog() {
         let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
+        std::fs::create_dir_all(dir.path().join("table").join("metadata")).unwrap();
         std::fs::create_dir_all(dir.path().join("metadata")).unwrap();
 
         // fresh table: no snapshots, no manifest list yet; the table

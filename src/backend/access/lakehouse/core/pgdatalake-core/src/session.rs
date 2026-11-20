@@ -398,6 +398,7 @@ mod tests {
         use apache_avro::{Schema as AvroSchema, Writer};
 
         let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
         std::fs::create_dir_all(dir.path().join("metadata")).unwrap();
 
         // empty manifest list (fresh table) keeps the fixture tiny
@@ -413,7 +414,7 @@ mod tests {
             r#"{{
                 "format-version": 2,
                 "table-uuid": "9c12d441-03fe-11ed-8122-d358e75d12eb",
-                "location": "file://{}/table",
+                "location": "file://{}",
                 "schemas": [{{"type": "struct", "schema-id": 0, "fields": [
                     {{"id": 1, "name": "id", "required": true, "type": "long"}}]}}],
                 "current-schema-id": 0,
