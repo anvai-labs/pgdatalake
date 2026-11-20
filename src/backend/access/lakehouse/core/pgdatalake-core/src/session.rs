@@ -244,9 +244,7 @@ impl CatalogClient {
         if let Err(e) = self.rest.create_namespace(namespace) {
             match e {
                 crate::catalog::rest::RestError::Conflict(_) => {}
-                other => {
-                    return Err(crate::storage::StorageError::Config(other.to_string()))
-                }
+                other => return Err(crate::storage::StorageError::Config(other.to_string())),
             }
         }
         let fields = columns

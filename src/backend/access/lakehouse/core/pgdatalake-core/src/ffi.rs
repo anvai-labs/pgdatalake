@@ -928,7 +928,11 @@ pub unsafe extern "C" fn pg_datalake_create_table(
                 out
             }
             _ => {
-                return fail("write path: schema_json is not an array".into(), err_buf, err_len);
+                return fail(
+                    "write path: schema_json is not an array".into(),
+                    err_buf,
+                    err_len,
+                );
             }
         };
     let ns_levels: Vec<String> = ns
