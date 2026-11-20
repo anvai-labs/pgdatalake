@@ -1593,7 +1593,7 @@ untransformRelOptions(Datum options)
  */
 /*
  * Parse a table's reloptions through its table AM when the AM provides a
- * relation_reloptions callback, else heap_reloptions. relam may be
+ * reloptions callback, else heap_reloptions. relam may be
  * InvalidOid when unknown (callers that know it pass it in).
  */
 bytea *
@@ -1610,8 +1610,8 @@ table_am_reloptions(char relkind, Datum reloptions, bool validate, Oid relam)
 				GetTableAmRoutine(((Form_pg_am) GETSTRUCT(amtup))->amhandler);
 
 			ReleaseSysCache(amtup);
-			if (routine->relation_reloptions != NULL)
-				return routine->relation_reloptions(reloptions, validate);
+			if (routine->reloptions != NULL)
+				return routine->reloptions(reloptions, validate);
 		}
 	}
 	return heap_reloptions(relkind, reloptions, validate);

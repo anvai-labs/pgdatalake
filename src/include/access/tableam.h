@@ -885,7 +885,7 @@ typedef struct TableAmRoutine
 	 * heap defaults apply (AMs without custom options). Mirrors how index
 	 * AMs own their reloptions via amoptions.
 	 */
-	bytea	   *(*relation_reloptions) (Datum reloptions, bool validate);
+	bytea	   *(*reloptions) (Datum reloptions, bool validate);
 } TableAmRoutine;
 
 

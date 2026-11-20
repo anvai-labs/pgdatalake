@@ -1,0 +1,6 @@
+# tableam_reloptions extension
+comment = 'test table AM exercising the reloptions callback'
+default_version = '1.0'
+module_pathname = '$libdir/tableam_reloptions'
+relocatable = false
+superuser = true

@@ -152,4 +152,36 @@ my_tableam_handler(PG_FUNCTION_ARGS)
   its implementation.
  </para>
 
+
+ <sect1 id="tableam-reloptions">
+  <title>Table Access Method Relation Options</title>
+
+  <para>
+   A table access method may own the relation options accepted by
+   <literal>CREATE TABLE ... USING <replaceable>am</replaceable> WITH
+   (...) </literal> and <command>ALTER TABLE ... SET (...) </command> by
+   providing a <structname>TableAmRoutine</structname>.<function>reloptions</function>
+   callback. The callback receives the raw reloptions <type>text[]</type>
+   datum and returns the parsed options as a <type>bytea</type>, which the
+   relcache exposes via <structfield>rd_options</structfield>. When the
+   callback is <literal>NULL</literal>, the heap's default option set
+   applies, so access methods without custom options are unaffected.
+  </para>
+
+  <para>
+   The callback is invoked with <literal>validate = true</literal> at
+   CREATE and ALTER time (with the access method resolved from the
+   statement or <xref linkend="guc-default-table-access-method"/>) and
+   with <literal>validate = false</literal> when the relcache is built.
+   Dispatch follows the effective access method: an option known only to
+   one access method is rejected on tables using another. This mirrors
+   how index access methods own their options via
+   <structfield>amoptions</structfield>.
+  </para>
+
+  <para>
+   See <filename>src/test/modules/tableam_reloptions</filename> for a
+   working example that delegates all other callbacks to the heap.
+  </para>
+ </sect1>
 </chapter>
