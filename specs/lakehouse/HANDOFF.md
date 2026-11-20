@@ -564,3 +564,28 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     eq-delete binding test. REMAINING #5: delete-specific pruning rule,
     map/list nested field IDs, manifest inheritance with null
     snapshot IDs.
+  - 13-implementation-review Blocker #5 depth — FIXED 2026-11-20
+    afba7ef29e7 (78 cargo tests): (a) DELETE-SPECIFIC PRUNING: content
+    routing now happens BEFORE the predicate block — data predicates
+    (partition + column bounds) prune DATA files only; delete files
+    prune by partition applicability only (a delete file's bounds are
+    over its keys, not the surviving rows; position deletes carry no
+    key bounds). Previously a delete file whose min/max fell outside
+    the query bounds was eliminated from delete_tasks and its
+    deletions silently lost. (b) MANIFEST INHERITANCE: a NULL entry
+    snapshot_id inherits the enclosing manifest's added-snapshot-id
+    Avro container metadata (older writers); null with no metadata is
+    a loud Decode error, never a silent 0. (c) NESTED FIELD IDS:
+    ListType/MapType retain element-id/key-id/value-id and
+    element-required/value-required; IDs required on the wire (loud
+    parse failure — columns bind by ID through schema evolution),
+    *-required defaults true per spec. Serialization emits the full
+    spec member set. TDD: delete_tasks_survive_data_bounds_pruning,
+    null_entry_snapshot_id_inherits_manifest_added_snapshot,
+    nested_types_keep_field_ids_and_requiredness (all written
+    failing first). Spec: 06-execution.md 13-review #5 amendment.
+    REMAINING #5: NONE — blocker #5 CLOSED pending independent-reader
+    acceptance (external-reader survivor-ID matrix from the review's
+    acceptance list, lands with M2 #29 ceremony). REMAINING overall:
+    #4 tail (typed representation, operator allowlist), #6 FDW side,
+    #7, #8, blocker #1 tail.
