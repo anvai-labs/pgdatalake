@@ -451,23 +451,45 @@ TranslateQual(Expr *expr, TupleDesc tupdesc)
 									 (long long) DatumGetInt16(con->constvalue));
 				break;
 			case INT4OID:
-			case DATEOID:
 				value_buf = psprintf("%lld",
 									 (long long) DatumGetInt32(con->constvalue));
 				break;
+			case DATEOID:
+				/* PG date = days since 2000-01-01; Iceberg = days since
+				 * 1970-01-01. Pushing the raw datum compared every date
+				 * predicate against bounds 10957 days off. */
+				value_buf = psprintf("%lld",
+									 (long long) (DatumGetInt32(con->constvalue) +
+												  (POSTGRES_EPOCH_JDATE -
+												   UNIX_EPOCH_JDATE)));
+				break;
 			case INT8OID:
-			case TIMESTAMPOID:
-			case TIMESTAMPTZOID:
 				value_buf = psprintf("%lld",
 									 (long long) DatumGetInt64(con->constvalue));
 				break;
+			case TIMESTAMPOID:
+			case TIMESTAMPTZOID:
+				/* PG micros since 2000 -> Iceberg micros since 1970 */
+				value_buf = psprintf("%lld",
+									 (long long) (DatumGetInt64(con->constvalue) +
+												  946684800000000LL));
+				break;
 			case FLOAT4OID:
-				value_buf = psprintf("%g",
-									 (double) DatumGetFloat4(con->constvalue));
-				break;
 			case FLOAT8OID:
-				value_buf = psprintf("%g", DatumGetFloat8(con->constvalue));
-				break;
+				{
+					char	   *out = DatumGetCString(typid == FLOAT4OID
+						? DirectFunctionCall1(float4out, con->constvalue)
+						: DirectFunctionCall1(float8out, con->constvalue));
+
+					/* out funcs give shortest round-trip decimal (%g
+					 * loses digits and mis-pruned near-bound files);
+					 * NaN/Infinity are not JSON numbers -> no pushdown
+					 * (the local filter still applies) */
+					if (strstr(out, "NaN") || strstr(out, "Inf"))
+						return NULL;
+					value_buf = out;
+					break;
+				}
 			default:
 				{
 					Oid			outfn;
@@ -479,7 +501,10 @@ TranslateQual(Expr *expr, TupleDesc tupdesc)
 
 					getTypeOutputInfo(typid, &outfn, &isvarlen);
 					raw = OidOutputFunctionCall(outfn, con->constvalue);
-					quoted = palloc(strlen(raw) + 3);
+					/* escaping can double every byte (\\ runs); the old
+					 * strlen+3 buffer overflowed on backslash-heavy
+					 * values */
+					quoted = palloc(2 * strlen(raw) + 3);
 					p = quoted;
 					*p++ = '"';
 					for (q = raw; *q; q++)

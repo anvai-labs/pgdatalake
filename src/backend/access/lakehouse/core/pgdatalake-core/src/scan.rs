@@ -106,6 +106,10 @@ fn partition_matches(
 
 #[derive(Debug, Clone, PartialEq)]
 enum BoundVal {
+    /// Exact i64 for Int/Long/Timestamp/Timestamptz — f64 collapses
+    /// adjacent integers above 2^53 into equal values, which pruned
+    /// matching files (13-review blocker #4, reproduced wrong result).
+    Int(i64),
     Num(f64),
     Str(String),
 }
@@ -122,8 +126,8 @@ fn decode_bound(bytes: &[u8], ty: &crate::catalog::metadata::IcebergType) -> Opt
             .map(|a: [u8; 4]| i32::from_le_bytes(a) as i64)
     };
     Some(match ty {
-        IT::Int => BoundVal::Num(le_i32(bytes)? as f64),
-        IT::Long | IT::Timestamp | IT::Timestamptz => BoundVal::Num(le_i64(bytes)? as f64),
+        IT::Int => BoundVal::Int(le_i32(bytes)?),
+        IT::Long | IT::Timestamp | IT::Timestamptz => BoundVal::Int(le_i64(bytes)?),
         IT::Float => {
             let b: [u8; 4] = bytes.try_into().ok()?;
             BoundVal::Num(f32::from_le_bytes(b) as f64)
@@ -137,11 +141,26 @@ fn decode_bound(bytes: &[u8], ty: &crate::catalog::metadata::IcebergType) -> Opt
     })
 }
 
-/// Coerce a JSON predicate literal into the bound-comparable form.
-fn coerce_value(v: &serde_json::Value) -> Option<BoundVal> {
-    Some(match v {
-        serde_json::Value::Number(n) => BoundVal::Num(n.as_f64()?),
-        serde_json::Value::String(s) => BoundVal::Str(s.clone()),
+/// Coerce a JSON predicate literal into the bound-comparable form for
+/// the field's type. Integer fields take exact i64 literals (a float
+/// literal on an integer field is incomparable -> conservative keep).
+fn coerce_value(v: &serde_json::Value, ty: &crate::catalog::metadata::IcebergType) -> Option<BoundVal> {
+    use crate::catalog::metadata::IcebergType as IT;
+    Some(match (ty, v) {
+        (_, serde_json::Value::String(s)) => BoundVal::Str(s.clone()),
+        (
+            IT::Int | IT::Long | IT::Timestamp | IT::Timestamptz,
+            serde_json::Value::Number(n),
+        ) => {
+            // exact only when integral and in i64 range; anything else is
+            // incomparable against an i64 bound (conservative keep)
+            let i = n.as_i64()?;
+            if n.as_f64()? != i as f64 {
+                return None;
+            }
+            BoundVal::Int(i)
+        }
+        (_, serde_json::Value::Number(n)) => BoundVal::Num(n.as_f64()?),
         _ => return None,
     })
 }
@@ -150,6 +169,16 @@ fn cmp_bound<'a>(bound: Option<&'a BoundVal>, other: &'a BoundVal) -> Option<std
     match (bound?, other) {
         (BoundVal::Num(a), BoundVal::Num(b)) => a.partial_cmp(b),
         (BoundVal::Str(a), BoundVal::Str(b)) => Some(a.as_bytes().cmp(b.as_bytes())),
+        // integer-vs-float compares exactly only inside f64's integer
+        // continuum (|v| <= 2^53); beyond that -> incomparable, keep
+        (BoundVal::Int(a), BoundVal::Num(b)) | (BoundVal::Num(b), BoundVal::Int(a)) => {
+            if a.abs() <= 9_007_199_254_740_992 {
+                (*a as f64).partial_cmp(b)
+            } else {
+                None
+            }
+        }
+        (BoundVal::Int(a), BoundVal::Int(b)) => Some(a.cmp(b)),
         // numeric/string mismatch: incomparable -> never prune
         _ => None,
     }
@@ -199,7 +228,7 @@ fn bounds_keep(
         | ScanPredicate::Ge { value, .. } => value,
         _ => unreachable!(),
     };
-    let value = match coerce_value(value) {
+    let value = match coerce_value(value, &f.r#type) {
         Some(v) => v,
         None => return true,
     };
@@ -1434,5 +1463,113 @@ mod tests {
         assert_eq!(plan.files_before_pruning, 3);
         assert_eq!(plan.files_after_pruning, 3);
         assert_eq!(plan.data_files, 3);
+    }
+}
+
+#[cfg(test)]
+mod prune_i64_tests {
+    use super::*;
+    use crate::catalog::metadata::{Field, IcebergType, Schema, IcebergTypeMarker};
+
+    fn md() -> crate::catalog::metadata::TableMetadata {
+        use crate::catalog::metadata::{FormatVersion, TableMetadata};
+        TableMetadata {
+            format_version: FormatVersion::V2,
+            table_uuid: uuid::Uuid::nil(),
+            location: "file:///t".into(),
+            last_sequence_number: Some(1),
+            schemas: vec![Schema {
+                struct_type: IcebergTypeMarker::Struct,
+                schema_id: 0,
+                fields: vec![Field {
+                    id: 1,
+                    name: "id".into(),
+                    required: false,
+                    r#type: IcebergType::Long,
+                    doc: None,
+                }],
+            }],
+            current_schema_id: 0,
+            snapshots: vec![],
+            current_snapshot_id: None,
+            properties: Default::default(),
+            partition_specs: vec![],
+            default_partition_spec_id: Some(0),
+            refs: Default::default(),
+        }
+    }
+
+    fn data_file(lower: i64, upper: i64) -> crate::manifest::DataFile {
+        crate::manifest::DataFile {
+            content: crate::manifest::DataContent::Data,
+            file_path: "file:///t/data/1.parquet".into(),
+            file_format: "parquet".into(),
+            partition: None,
+            record_count: 1,
+            file_size_in_bytes: 100,
+            column_sizes: Default::default(),
+            value_counts: Default::default(),
+            null_value_counts: Default::default(),
+            nan_value_counts: Default::default(),
+            lower_bounds: [(1, lower.to_le_bytes().to_vec())].into(),
+            upper_bounds: [(1, upper.to_le_bytes().to_vec())].into(),
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+            sort_order_id: None,
+        }
+    }
+
+    const ABOVE_2POW53: i64 = 9_007_199_254_740_993; // 2^53 + 1
+
+    /// ACCEPTANCE (13-review blocker #4, the reproduced wrong result): a
+    /// file whose bounds are [2^53, 2^53+1] MATCHES `id > 2^53+1`... no —
+    /// matches rows <= 2^53+1; the review's case: bounds [2^53, 2^53+1]
+    /// and predicate id > 2^53. The file's upper bound (2^53+1) SATISFIES
+    /// the predicate, so the file must be KEPT. Under f64 both bounds
+    /// collapse to 2^53 and Gt(2^53) vs upper==2^53 pruned the file.
+    #[test]
+    fn bigint_strict_gt_keeps_file_above_2pow53() {
+        let md = md();
+        let df = data_file(9_007_199_254_740_992, ABOVE_2POW53);
+        let pred = ScanPredicate::Gt {
+            field: "id".into(),
+            value: serde_json::json!(9_007_199_254_740_992i64),
+        };
+        assert!(
+            bounds_keep(&df, md.current_schema().unwrap(), &pred),
+            "f64 collapse must not prune a file whose upper bound satisfies the predicate"
+        );
+        // and the symmetric Eq case: Eq(2^53+1) matches the file too
+        let pred_eq = ScanPredicate::Eq {
+            field: "id".into(),
+            value: serde_json::json!(ABOVE_2POW53),
+        };
+        assert!(bounds_keep(&df, md.current_schema().unwrap(), &pred_eq));
+    }
+
+    /// Pruning still works below 2^53: file with bounds [1,10] must be
+    /// pruned by Gt(10).
+    #[test]
+    fn small_int_pruning_still_prunes() {
+        let md = md();
+        let df = data_file(1, 10);
+        let pred = ScanPredicate::Gt {
+            field: "id".into(),
+            value: serde_json::json!(10),
+        };
+        assert!(!bounds_keep(&df, md.current_schema().unwrap(), &pred));
+    }
+
+    /// Float literal vs integer bound beyond 2^53: incomparable -> keep.
+    #[test]
+    fn float_literal_vs_big_int_bound_keeps() {
+        let md = md();
+        let df = data_file(9_007_199_254_740_992, ABOVE_2POW53);
+        let pred = ScanPredicate::Gt {
+            field: "id".into(),
+            value: serde_json::json!(9.007199254740993e15),
+        };
+        assert!(bounds_keep(&df, md.current_schema().unwrap(), &pred));
     }
 }

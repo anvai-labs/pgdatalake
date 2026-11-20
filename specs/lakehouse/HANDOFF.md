@@ -465,3 +465,21 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     blockers: #3 txn boundary, #4 predicate serialization (2^53
     pruning bug), #5 delete schema binding, #6 credential authority,
     #7 per-scan queues, #8 type statuses.
+  - 13-implementation-review Blocker #4 — PARTIALLY FIXED 2026-11-20
+    (69 cargo tests + C-side, suites green): RUST: bounds/coercion are
+    exact i64 for Int/Long/Timestamp/Timestamptz (BoundVal::Int);
+    integer-vs-float compares exactly only within f64's integer
+    continuum (|v| <= 2^53), beyond it the file is conservatively
+    KEPT; tests: the review's reproduced 2^53 case (Gt/Eq above 2^53
+    no longer pruned), below-2^53 pruning still prunes, float-literal
+    cross-type keeps. C SIDE (fdw.c TranslateQual): DATE pushed
+    days-since-2000 and TIMESTAMP/TZ micros-since-2000 (epoch bug:
+    every temporal predicate mis-pruned by 10957 days / 946684800000000
+    micros) -> converted to Iceberg epoch; float pushdown now uses
+    float4out/float8out shortest round-trip (not %g) with
+    NaN/Inf -> no pushdown; escape buffer 2x (the strlen+3 buffer
+    overflowed on backslash-heavy values). REMAINING #4: operator
+    allowlist (same-named user operators, collation), identity
+    partition matching by field ID, unknown-partition-spec fallback,
+    missing-schema continue, JSON-injection of identifiers (typed
+    representation refactor).
