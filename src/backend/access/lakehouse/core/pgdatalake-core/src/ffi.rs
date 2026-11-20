@@ -486,6 +486,368 @@ pub unsafe extern "C" fn pg_datalake_rows_close(rows: *mut RowsHandle) {
     }
 }
 
+/// An open managed-append write session (M2 slice 27b): accumulates rows
+/// into the slice-24 BatchWriter and flushes/commits via session.rs's
+/// write pipeline. Opaque handle owned by the C side.
+pub struct WriteSession {
+    client: crate::session::CatalogClient,
+    namespace: Vec<String>,
+    table: String,
+    state: crate::session::TableWriteState,
+    columns: Vec<crate::writer::WriteColumn>,
+    writer: crate::writer::BatchWriter,
+    io: crate::storage::StorageIo,
+    flushed: Vec<crate::snapshot_write::NewDataFile>,
+    file_seq: usize,
+    staged_rows: usize,
+    next_snapshot_id: i64,
+}
+
+/// Open a write session. `schema_json` is `[{"name": ..., "type":
+/// "<iceberg type name>"}...]` — names must exist in the table's current
+/// schema (field-ids resolved server-side). Returns NULL + err message on
+/// any failure (no panics across the FFI).
+///
+/// # Safety
+/// All CStrings must be valid NUL-terminated pointers.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_write_new(
+    endpoint: *const c_char,
+    warehouse: *const c_char,
+    token: *const c_char,
+    namespace: *const c_char,
+    table: *const c_char,
+    s3_endpoint: *const c_char,
+    s3_access_key: *const c_char,
+    s3_secret_key: *const c_char,
+    schema_json: *const c_char,
+    err_buf: *mut c_char,
+    err_len: usize,
+) -> *mut WriteSession {
+    use std::ffi::CStr;
+    let cstr = |p: *const c_char| -> String {
+        if p.is_null() {
+            String::new()
+        } else {
+            unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+        }
+    };
+    let fail = |msg: String, err_buf: *mut c_char, err_len: usize| -> *mut WriteSession {
+        unsafe { set_err(err_buf, err_len, &msg) };
+        std::ptr::null_mut()
+    };
+    let (endpoint, warehouse, token, ns, table) = (
+        cstr(endpoint),
+        cstr(warehouse),
+        cstr(token),
+        cstr(namespace),
+        cstr(table),
+    );
+    let (s3_endpoint_c, s3_access_key_c, s3_secret_key_c) =
+        (cstr(s3_endpoint), cstr(s3_access_key), cstr(s3_secret_key));
+    let schema_json = cstr(schema_json);
+    let cols: Vec<(String, crate::catalog::metadata::IcebergType)> =
+        match serde_json::from_str::<serde_json::Value>(&schema_json) {
+            Ok(v) => match v.as_array() {
+                Some(arr) => {
+                    let mut out = Vec::with_capacity(arr.len());
+                    for c in arr {
+                        let (Some(name), Some(t)) = (c.get("name"), c.get("type")) else {
+                            return fail(
+                                "write path: schema entries need name+type".into(),
+                                err_buf,
+                                err_len,
+                            );
+                        };
+                        let (Some(name), Some(t)) = (name.as_str(), t.as_str()) else {
+                            return fail(
+                                "write path: schema entries need name+type strings".into(),
+                                err_buf,
+                                err_len,
+                            );
+                        };
+                        // type names go through the same parser the metadata
+                        // reader uses (canonical text form)
+                        let ty: crate::catalog::metadata::IcebergType =
+                            match serde_json::from_str(&serde_json::json!(t).to_string()) {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    return fail(
+                                        format!("write path: bad type {t:?}: {e}"),
+                                        err_buf,
+                                        err_len,
+                                    )
+                                }
+                            };
+                        out.push((name.to_string(), ty));
+                    }
+                    out
+                }
+                None => {
+                    return fail(
+                        "write path: schema_json is not an array".into(),
+                        err_buf,
+                        err_len,
+                    );
+                }
+            },
+            Err(e) => {
+                return fail(
+                    format!("write path: bad schema_json: {e}"),
+                    err_buf,
+                    err_len,
+                )
+            }
+        };
+
+    let ns_levels: Vec<String> = ns
+        .split('.')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    let ns_refs: Vec<&str> = ns_levels.iter().map(|s| s.as_str()).collect();
+
+    let client = match crate::session::CatalogClient::new(
+        &endpoint,
+        &warehouse,
+        &token,
+        &crate::session::S3ClientOptions {
+            endpoint: (!cstr(s3_endpoint).is_empty()).then(|| s3_endpoint_c.clone()),
+            region: None,
+            access_key_id: (!s3_access_key_c.is_empty()).then(|| s3_access_key_c.clone()),
+            secret_access_key: (!s3_secret_key_c.is_empty()).then(|| s3_secret_key_c.clone()),
+            path_style: true,
+        },
+    ) {
+        Ok(c) => c,
+        Err(e) => return fail(format!("lakehouse write open: {e}"), err_buf, err_len),
+    };
+    let state = match client.write_table_open(&ns_refs, &table, &cols) {
+        Ok(s) => s,
+        Err(e) => return fail(format!("lakehouse write open: {e}"), err_buf, err_len),
+    };
+    let columns: Vec<crate::writer::WriteColumn> = cols
+        .into_iter()
+        .map(|(name, ty)| crate::writer::WriteColumn { name, ty })
+        .collect();
+    let writer = match crate::writer::BatchWriter::new(columns.clone()) {
+        Ok(w) => w,
+        Err(e) => return fail(format!("lakehouse write open: {e}"), err_buf, err_len),
+    };
+    let io = match crate::storage::StorageIo::open(
+        &crate::storage::parse_location(&state.location)
+            .unwrap_or_else(|_| crate::storage::parse_location("file:///nonexistent").unwrap()),
+        Some(&state.s3),
+    ) {
+        Ok(io) => io,
+        Err(e) => return fail(format!("lakehouse write open: {e}"), err_buf, err_len),
+    };
+    // snapshot ids: one past the max seen (server may assign differently,
+    // but REST commits accept client-chosen ids — pyiceberg does the same)
+    let next_snapshot_id = state
+        .last_sequence_number
+        .unwrap_or(0)
+        .checked_mul(1000)
+        .and_then(|v| {
+            v.checked_add(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| (d.as_millis() % 1000) as i64)
+                    .unwrap_or(0),
+            )
+        })
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(1)
+        });
+    let ws = Box::new(WriteSession {
+        client,
+        namespace: ns_levels,
+        table,
+        state,
+        columns,
+        writer,
+        io,
+        flushed: Vec::new(),
+        file_seq: 0,
+        staged_rows: 0,
+        next_snapshot_id,
+    });
+    Box::into_raw(ws)
+}
+
+/// Push one row. Returns false + err message on arity/type mismatch.
+///
+/// # Safety
+/// `ws` must be a live handle; `row_json` a valid NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_write_push(
+    ws: *mut WriteSession,
+    row_json: *const c_char,
+    err_buf: *mut c_char,
+    err_len: usize,
+) -> bool {
+    let Some(ws) = (unsafe { ws.as_mut() }) else {
+        unsafe { set_err(err_buf, err_len, "write push: NULL session") };
+        return false;
+    };
+    let row = unsafe { std::ffi::CStr::from_ptr(row_json) }.to_string_lossy();
+    let parsed: serde_json::Value = match serde_json::from_str(&row) {
+        Ok(v) => v,
+        Err(e) => {
+            unsafe { set_err(err_buf, err_len, &format!("write push: bad row json: {e}")) };
+            return false;
+        }
+    };
+    let cells = match crate::writer::parse_row_json(&ws.columns, &parsed) {
+        Ok(c) => c,
+        Err(e) => {
+            unsafe { set_err(err_buf, err_len, &e.to_string()) };
+            return false;
+        }
+    };
+    match ws.writer.push(&cells) {
+        Ok(()) => {
+            ws.staged_rows += 1;
+            true
+        }
+        Err(e) => {
+            unsafe { set_err(err_buf, err_len, &e.to_string()) };
+            false
+        }
+    }
+}
+
+/// Flush the accumulated batch to a data file (C calls this at batch-size
+/// thresholds; commit flushes any remainder). Returns false + err on IO
+/// failure.
+///
+/// # Safety
+/// `ws` must be a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_write_flush(
+    ws: *mut WriteSession,
+    err_buf: *mut c_char,
+    err_len: usize,
+) -> bool {
+    let Some(ws) = (unsafe { ws.as_mut() }) else {
+        unsafe { set_err(err_buf, err_len, "write flush: NULL session") };
+        return false;
+    };
+    if ws.writer.num_rows() == 0 {
+        return true;
+    }
+    let key = match ws.writer.write_file(&ws.io, "data", ws.file_seq) {
+        Ok(k) => k,
+        Err(e) => {
+            unsafe { set_err(err_buf, err_len, &format!("write flush: {e}")) };
+            return false;
+        }
+    };
+    ws.file_seq += 1;
+    let bytes = ws.io.get_bytes(&key).unwrap_or_default();
+    // metric maps keyed by the TABLE's field ids
+    let ids: Vec<i64> = ws
+        .columns
+        .iter()
+        .filter_map(|c| ws.state.field_ids.get(&c.name).copied())
+        .collect();
+    let mut file = crate::snapshot_write::NewDataFile {
+        file_path: format!("{}/{key}", ws.state.location.trim_end_matches('/')),
+        record_count: 0,
+        file_size_in_bytes: bytes.len() as i64,
+        ..Default::default()
+    };
+    // record count = rows written, from the deterministic key name
+    // (<rows>-<seq>.parquet — slice 24's orphan-GC naming rule)
+    if let Some(stem) = key.rsplit('/').next() {
+        if let Some(rows) = stem.split('-').next() {
+            file.record_count = rows.parse().unwrap_or(0);
+        }
+    }
+    for id in &ids {
+        file.value_counts.insert(*id, file.record_count);
+    }
+    ws.flushed.push(file);
+    ws.staged_rows = 0;
+    true
+}
+
+/// Flush remainder + commit the append snapshot. Returns a heap CString
+/// with the new metadata-location, or NULL + err. THE CALLER FREES the
+/// returned string with pg_datalake_write_commit_result_free.
+///
+/// # Safety
+/// `ws` must be a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_write_commit(
+    ws: *mut WriteSession,
+    retries: u32,
+    err_buf: *mut c_char,
+    err_len: usize,
+) -> *mut c_char {
+    let Some(ws) = (unsafe { ws.as_mut() }) else {
+        unsafe { set_err(err_buf, err_len, "write commit: NULL session") };
+        return std::ptr::null_mut();
+    };
+    if !unsafe { pg_datalake_write_flush(ws, err_buf, err_len) } {
+        return std::ptr::null_mut();
+    }
+    if ws.flushed.is_empty() {
+        unsafe { set_err(err_buf, err_len, "write commit: no rows staged") };
+        return std::ptr::null_mut();
+    }
+    let ns_refs: Vec<&str> = ws.namespace.iter().map(|s| s.as_str()).collect();
+    let snapshot_id = ws.next_snapshot_id;
+    match ws.client.commit_append(
+        &ws.state,
+        &ns_refs,
+        &ws.table,
+        &ws.flushed,
+        snapshot_id,
+        retries,
+    ) {
+        Ok((loc, _snapshot)) => {
+            ws.flushed.clear();
+            ws.next_snapshot_id += 1;
+            match std::ffi::CString::new(loc) {
+                Ok(c) => c.into_raw(),
+                Err(_) => std::ptr::null_mut(),
+            }
+        }
+        Err(e) => {
+            unsafe { set_err(err_buf, err_len, &format!("lakehouse commit: {e}")) };
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Free a commit result string.
+///
+/// # Safety
+/// `ptr` must be NULL or a pointer returned by pg_datalake_write_commit.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_write_commit_result_free(ptr: *mut c_char) {
+    if !ptr.is_null() {
+        drop(unsafe { std::ffi::CString::from_raw(ptr) });
+    }
+}
+
+/// Free a write session WITHOUT committing (abort semantics: staged
+/// unflushed rows are dropped; flushed files are orphans cleaned by
+/// orphan GC per doc 07 §2 ABORT).
+///
+/// # Safety
+/// `ws` must be NULL or a live handle from pg_datalake_write_new.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_write_free(ws: *mut WriteSession) {
+    if !ws.is_null() {
+        drop(unsafe { Box::from_raw(ws) });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -979,5 +1341,231 @@ mod tests {
         assert!(session.is_null());
         let msg = unsafe { CStr::from_ptr(err.as_ptr()).to_string_lossy() };
         assert!(!msg.is_empty(), "error buffer populated");
+    }
+    /// TDD anchor (M2 slice 27b-i): the FFI WRITE path end-to-end against
+    /// the mock catalog — write_new -> push rows -> write_commit (mock
+    /// captures the commitTable body: requirements pin the base, updates
+    /// carry the AddSnapshot + SetSnapshotRef) -> the captured snapshot is
+    /// merged into the on-disk metadata -> pg_datalake_scan_new reads OUR
+    /// OWN written rows back. Write->commit->read, full circle, no
+    /// external engine.
+    #[test]
+    fn ffi_write_commit_read_back_with_mock_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("metadata")).unwrap();
+
+        // fresh table: no snapshots, no manifest list yet; the table
+        // location must exist for the local store root to canonicalize
+        std::fs::create_dir_all(dir.path().join("table").join("data")).unwrap();
+        std::fs::create_dir_all(dir.path().join("table").join("metadata")).unwrap();
+        let metadata_json = format!(
+            r#"{{"format-version": 2,
+                "table-uuid": "1ca92afa-70b9-4d02-9ba6-7ee1a3ac0f5e",
+                "location": "file://{}/table",
+                "last-sequence-number": 3,
+                "schemas": [{{"type": "struct", "schema-id": 0, "fields": [
+                    {{"id": 1, "name": "id", "required": false, "type": "long"}}]}}],
+                "current-schema-id": 0}}"#,
+            dir.path().display(),
+        );
+        let md_path = dir.path().join("metadata").join("00000-x.metadata.json");
+        std::fs::write(&md_path, &metadata_json).unwrap();
+
+        // scripted mock: config, loadTable, POST commitTable (capture),
+        // config, loadTable (read-back pass)
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let md_capture = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let md_capture_t = std::sync::Arc::clone(&md_capture);
+        let md_path_srv = md_path.clone();
+        // detached, like the scan mock above: the request count here is
+        // config+loadTable (open) + loadTable (commit pre-load, slice-25
+        // retry protocol) + POST commitTable + config+loadTable (read-back)
+        std::thread::spawn(move || {
+            for _ in 0..6 {
+                let Some(mut req) = server.recv().ok() else {
+                    break;
+                };
+                let url = req.url().to_string();
+                let body = if url.contains("/v1/config") {
+                    r#"{"defaults": {"prefix": "pfx"}, "overrides": {}}"#.to_string()
+                } else if url.contains("namespaces") && req.method().as_str() == "POST" {
+                    let mut body_s = String::new();
+                    {
+                        let _ = req.as_reader().read_to_string(&mut body_s);
+                    }
+                    *md_capture_t.lock().unwrap() = body_s;
+                    r#"{"metadata-location": "file:///committed/00005.metadata.json", "config": {}}"#.to_string()
+                } else {
+                    format!(
+                        r#"{{"metadata-location": "file://{}", "config": {{}}}}"#,
+                        md_path_srv.display()
+                    )
+                };
+                let resp = tiny_http::Response::from_string(body).with_header(
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                        .unwrap(),
+                );
+                let _ = req.respond(resp);
+            }
+        });
+
+        let endpoint = CString::new(format!("http://{addr}")).unwrap();
+        let warehouse = CString::new("smoke").unwrap();
+        let namespace = CString::new("analytics").unwrap();
+        let table = CString::new("events").unwrap();
+        let schema_json = CString::new(r#"[{"name": "id", "type": "long"}]"#).unwrap();
+        let mut err = [0 as c_char; 1024];
+        fn errmsg(err: &[c_char]) -> String {
+            unsafe { CStr::from_ptr(err.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        }
+
+        let ws = unsafe {
+            pg_datalake_write_new(
+                endpoint.as_ptr(),
+                warehouse.as_ptr(),
+                std::ptr::null(), // token
+                namespace.as_ptr(),
+                table.as_ptr(),
+                std::ptr::null(), // s3 endpoint (file:// store)
+                std::ptr::null(),
+                std::ptr::null(),
+                schema_json.as_ptr(),
+                err.as_mut_ptr(),
+                err.len(),
+            )
+        };
+        assert!(!ws.is_null(), "write_new: {}", errmsg(&err));
+
+        // push rows: bare JSON numbers for a long column
+        for row in ["[1]", "[2]"] {
+            let rj = CString::new(row).unwrap();
+            assert!(
+                unsafe { pg_datalake_write_push(ws, rj.as_ptr(), err.as_mut_ptr(), err.len()) },
+                "push {row}: {}",
+                errmsg(&err)
+            );
+        }
+        // arity mismatch fails cleanly
+        let bad = CString::new("[1, 2]").unwrap();
+        assert!(!unsafe { pg_datalake_write_push(ws, bad.as_ptr(), err.as_mut_ptr(), err.len()) });
+
+        // commit
+        let loc = unsafe { pg_datalake_write_commit(ws, 0, err.as_mut_ptr(), err.len()) };
+        assert!(!loc.is_null(), "commit: {}", errmsg(&err));
+        let loc_s = unsafe { CStr::from_ptr(loc) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { pg_datalake_write_commit_result_free(loc) };
+        assert!(loc_s.ends_with("00005.metadata.json"), "{loc_s}");
+
+        // captured commitTable body: requirements + updates, pinned base
+        let body = md_capture.lock().unwrap().clone();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let reqs = v["requirements"].as_array().unwrap();
+        assert_eq!(reqs.len(), 2, "{body}");
+        assert_eq!(reqs[0]["type"], "assert-table-uuid");
+        assert_eq!(reqs[1]["type"], "assert-ref-snapshot-id");
+        assert!(
+            reqs[1]["snapshot-id"].is_null(),
+            "fresh table: main must not exist: {body}"
+        );
+        let updates = v["updates"].as_array().unwrap();
+        assert_eq!(updates.len(), 2, "{body}");
+        assert_eq!(updates[0]["action"], "add-snapshot");
+        let snap = &updates[0]["snapshot"];
+        assert_eq!(snap["sequence-number"], 4, "base seq 3 + 1: {body}");
+        assert!(snap["manifest-list"]
+            .as_str()
+            .unwrap()
+            .starts_with("file://"));
+        let ml_path = snap["manifest-list"].as_str().unwrap().to_string();
+        assert_eq!(updates[1]["action"], "set-snapshot-ref");
+        assert_eq!(updates[1]["ref-name"], "main");
+        assert_eq!(updates[1]["type"], "branch");
+
+        // data file + avros exist on the local store
+        let snap_id = snap["snapshot-id"].as_i64().unwrap();
+        assert!(dir
+            .path()
+            .join("table")
+            .join("data")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_some());
+        let ml_key = ml_path.trim_start_matches("file://");
+        assert!(std::path::Path::new(ml_key).exists(), "{ml_path}");
+        let manifest_list =
+            crate::manifest::parse_manifest_list(&std::fs::read(ml_key).unwrap()).unwrap();
+        assert_eq!(manifest_list.len(), 1);
+        let manifest_path = manifest_list[0].manifest_path.clone();
+        let entries = crate::manifest::parse_manifest(
+            &std::fs::read(manifest_path.trim_start_matches("file://")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].data_file.record_count, 2, "value_counts rows");
+        assert_eq!(entries[0].data_file.value_counts.get(&1), Some(&2));
+
+        unsafe { pg_datalake_write_free(ws) };
+
+        // read-back: merge the committed snapshot into the on-disk metadata
+        // (what the catalog does remotely), then scan through the FFI
+        let updated = format!(
+            r#"{{"format-version": 2,
+                "table-uuid": "1ca92afa-70b9-4d02-9ba6-7ee1a3ac0f5e",
+                "location": "file://{}/table",
+                "last-sequence-number": 4,
+                "schemas": [{{"type": "struct", "schema-id": 0, "fields": [
+                    {{"id": 1, "name": "id", "required": false, "type": "long"}}]}}],
+                "current-schema-id": 0,
+                "snapshots": [{{"snapshot-id": {}, "timestamp-ms": 1712345678000,
+                                "manifest-list": "{}",
+                                "summary": {{"operation": "append"}}}}],
+                "current-snapshot-id": {}}}"#,
+            dir.path().display(),
+            snap_id,
+            ml_path,
+            snap_id,
+        );
+        std::fs::write(&md_path, updated).unwrap();
+
+        let session = unsafe {
+            pg_datalake_scan_new(
+                endpoint.as_ptr(),
+                warehouse.as_ptr(),
+                std::ptr::null(),
+                namespace.as_ptr(),
+                table.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                err.as_mut_ptr(),
+                err.len(),
+            )
+        };
+        assert!(!session.is_null(), "scan_new: {}", errmsg(&err));
+        assert_eq!(unsafe { pg_datalake_scan_task_count(session) }, 1);
+        assert_eq!(unsafe { pg_datalake_scan_task_rows(session, 0) }, 2);
+        {
+            let proj = CString::new("id").unwrap();
+            let rows = unsafe {
+                pg_datalake_rows_open(session, 0, proj.as_ptr(), err.as_mut_ptr(), err.len())
+            };
+            assert!(!rows.is_null(), "rows_open: {}", errmsg(&err));
+            let mut ids = Vec::new();
+            while unsafe { pg_datalake_rows_next(rows) } {
+                let v = unsafe { pg_datalake_rows_col_text(rows, 0) };
+                ids.push(unsafe { CStr::from_ptr(v) }.to_string_lossy().into_owned());
+            }
+            unsafe { pg_datalake_rows_close(rows) };
+            assert_eq!(ids, vec!["1", "2"], "WROTE 1,2; READ 1,2");
+        }
+        unsafe { pg_datalake_scan_free(session) };
     }
 }

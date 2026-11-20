@@ -282,14 +282,23 @@
       the END-TO-END anchor: BatchWriter -> data file -> write_snapshot
       -> metadata merge -> OUR plan_scan reads rows back; manifest and
       manifest-list round-trip through the existing readers.
-    - 27b (C TableAM): tuple_insert accumulates CellValues into a
+    - 27b-i — DONE 2026-11-20 (ffi.rs write surface + session.rs +
+      writer.rs row-JSON, CI green): pg_datalake_write_new/push/flush/
+      commit/free. write_table_open resolves identity + field-ids from
+      the table's schema; commit_append flushes -> write_snapshot ->
+      commit_with_retry with requirements rebuilt from each fresh
+      loadTable (appends are additive — only the base pin moves).
+      Typed row-JSON cells (bare values + {"d"}/{ "t"}/{"ts"}/{"dec"}/
+      {"u"}/{"b"} wrappers) so the C side sends datum arithmetic, not
+      text formatting. Anchor: mock-catalog write->commit->capture
+      commitTable body->merge snapshot->scan OUR OWN rows back (1,2).
+    - 27b-ii (C TableAM): tuple_insert accumulates CellValues into a
       per-txn BatchWriter (RegisterXactCallback for pre-commit flush
-      per doc 07 §2 steps 1-5: flush -> write_snapshot -> AddSnapshot +
-      SetSnapshotRef via commit_with_retry), own-writes overlay (scan
-      yields staged rows after file rows), abort = discard (nothing
-      flushed pre-commit -> nothing orphaned). CI has a LIVE fixture
-      stack (datalake-ci brings up SeaweedFS+Lakekeeper), so regress
-      INSERT can be end-to-end: INSERT visible-after-commit +
+      per doc 07 §2 steps 1-5), own-writes overlay (scan yields staged
+      rows after file rows), abort = discard (nothing flushed
+      pre-commit -> nothing orphaned). CI has a LIVE fixture stack
+      (datalake-ci brings up SeaweedFS+Lakekeeper), so regress INSERT
+      can be end-to-end: INSERT visible-after-commit +
       rollback-invisible against localhost fixtures.
   - slice 28 — UPDATE/DELETE as COW (rewrite affected files, reuse
     slice-20 delete reading for concurrent reads), TRUNCATE (empty

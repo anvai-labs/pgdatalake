@@ -51,6 +51,20 @@ impl S3ClientOptions {
     }
 }
 
+/// Everything an append commit needs about the target table, resolved at
+/// open time (doc 07 §2: requirements come from THIS base; conflict =>
+/// retry re-pins).
+pub struct TableWriteState {
+    pub table_uuid: uuid::Uuid,
+    pub base_snapshot_id: Option<i64>,
+    pub last_sequence_number: Option<i64>,
+    pub location: String,
+    pub schema_id: Option<i64>,
+    pub partition_spec_id: i32,
+    pub s3: S3Options,
+    pub field_ids: std::collections::BTreeMap<String, i64>,
+}
+
 pub struct CatalogClient {
     rest: RestCatalog,
     warehouse: String,
@@ -84,6 +98,129 @@ impl CatalogClient {
             warehouse: warehouse.to_string(),
             s3_client: s3_client.clone(),
         })
+    }
+
+    /// Open write state for a managed append (M2 slice 27b): config ->
+    /// loadTable -> metadata.json, resolving the table's identity (uuid,
+    /// base snapshot, location, partition spec) and the current schema's
+    /// field-ids by column name (the manifest metric maps are keyed by
+    /// field id, so the write schema must map onto the table's schema).
+    pub fn write_table_open(
+        &self,
+        namespace: &[&str],
+        table: &str,
+        columns: &[(String, crate::catalog::metadata::IcebergType)],
+    ) -> Result<TableWriteState, crate::storage::StorageError> {
+        let cfg = self
+            .rest
+            .fetch_config(Some(&self.warehouse))
+            .map_err(|e| crate::storage::StorageError::Config(e.to_string()))?;
+        let lt = self
+            .rest
+            .load_table(namespace, table)
+            .map_err(|e| crate::storage::StorageError::Config(e.to_string()))?;
+        let s3 = self.s3_client.merged(&cfg);
+        let (io, key) = crate::scan::open_for(&lt.metadata_location, Some(&s3))?;
+        let md = crate::storage::fetch_metadata(&io, &key)?;
+        let schema = md.current_schema().ok_or_else(|| {
+            crate::storage::StorageError::Config(format!(
+                "write path: table {table} has no current schema"
+            ))
+        })?;
+        let mut field_ids = std::collections::BTreeMap::new();
+        for (name, _) in columns {
+            let field = schema
+                .fields
+                .iter()
+                .find(|f| &f.name == name)
+                .ok_or_else(|| {
+                    crate::storage::StorageError::Config(format!(
+                        "write path: column {name} is not in table {table}'s schema"
+                    ))
+                })?;
+            field_ids.insert(name.clone(), field.id);
+        }
+        Ok(TableWriteState {
+            table_uuid: md.table_uuid,
+            base_snapshot_id: md.current_snapshot_id,
+            last_sequence_number: md.last_sequence_number,
+            location: md.location.clone(),
+            schema_id: Some(md.current_schema_id),
+            partition_spec_id: md.default_partition_spec_id.unwrap_or(0),
+            s3,
+            field_ids,
+        })
+    }
+
+    /// Flush + assemble + COMMIT an append snapshot (doc 07 §2 steps 1-3).
+    /// Requirements are rebuilt from a fresh loadTable on every attempt
+    /// (the appends are additive, so only the base pin moves); retries
+    /// bounded by `retries`. Returns the new metadata-location.
+    pub fn commit_append(
+        &self,
+        st: &TableWriteState,
+        namespace: &[&str],
+        table: &str,
+        new_files: &[crate::snapshot_write::NewDataFile],
+        snapshot_id: i64,
+        retries: u32,
+    ) -> Result<(String, crate::catalog::metadata::Snapshot), crate::storage::StorageError> {
+        let loc = crate::storage::parse_location(&st.location)?;
+        let io = crate::storage::StorageIo::open(&loc, Some(&st.s3))?;
+        let written = crate::snapshot_write::write_snapshot(
+            &io,
+            &st.location,
+            new_files,
+            crate::snapshot_write::SnapshotParams {
+                snapshot_id,
+                timestamp_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0),
+                parent_snapshot_id: st.base_snapshot_id,
+                last_sequence_number: st.last_sequence_number,
+                schema_id: st.schema_id,
+                partition_spec_id: st.partition_spec_id,
+            },
+        )?;
+
+        let updates = vec![
+            crate::catalog::commit::TableUpdate::AddSnapshot {
+                snapshot: written.snapshot.clone(),
+            },
+            crate::catalog::commit::TableUpdate::SetSnapshotRef {
+                ref_name: "main".into(),
+                kind: crate::catalog::commit::RefKind::Branch,
+                snapshot_id,
+                min_snapshots_to_keep: None,
+                max_snapshot_age_ms: None,
+            },
+        ];
+        let resp = self
+            .rest
+            .commit_with_retry(
+                namespace,
+                table,
+                |lt| {
+                    let md = lt.metadata.as_ref();
+                    (
+                        vec![
+                            crate::catalog::commit::TableRequirement::AssertTableUUID {
+                                uuid: md.map(|m| m.table_uuid).unwrap_or(st.table_uuid),
+                            },
+                            crate::catalog::commit::TableRequirement::AssertRefSnapshotId {
+                                r#ref: "main".into(),
+                                snapshot_id: md.and_then(|m| m.current_snapshot_id),
+                            },
+                        ],
+                        updates.clone(),
+                    )
+                },
+                retries,
+                std::time::Duration::from_millis(50),
+            )
+            .map_err(|e| crate::storage::StorageError::Config(e.to_string()))?;
+        Ok((resp.metadata_location, written.snapshot))
     }
 
     /// config -> loadTable -> metadata -> plan. Returns the plan plus the
