@@ -424,17 +424,27 @@ pub fn plan_scan(
                 continue;
             }
             files_before_pruning += 1;
+            // slice 20: delete files are never data tasks — the row readers
+            // load and apply them separately. Routing happens BEFORE the
+            // predicate block (13-review #5): the data-file bounds rule
+            // must never eliminate a delete task (a delete file's bounds
+            // are over its keys, not the surviving rows). Deletes are
+            // pruned only by the proven delete-specific rule, partition
+            // applicability.
+            let is_delete = e.data_file.content != crate::manifest::DataContent::Data;
             if let Some(pred) = predicate {
                 if let (Some(spec), Some(partition)) = (spec, &e.data_file.partition) {
                     if !partition_matches(spec, partition, pred) {
                         continue;
                     }
                 }
-                let Some(schema) = schema else {
-                    continue;
-                };
-                if !bounds_keep(&e.data_file, schema, pred) {
-                    continue;
+                if !is_delete {
+                    let Some(schema) = schema else {
+                        continue;
+                    };
+                    if !bounds_keep(&e.data_file, schema, pred) {
+                        continue;
+                    }
                 }
             }
             files_after_pruning += 1;
@@ -442,9 +452,7 @@ pub fn plan_scan(
                 sequence_number: e.sequence_number.or(mle.sequence_number).unwrap_or(0),
                 entry: e,
             };
-            // slice 20: delete files are never data tasks — the row readers
-            // load and apply them separately
-            if task.entry.data_file.content != crate::manifest::DataContent::Data {
+            if is_delete {
                 delete_tasks.push(task);
                 continue;
             }
@@ -701,6 +709,123 @@ mod tests {
                     "upper_bounds".into(),
                     Value::Union(1, Box::new(Value::Array(vec![]))),
                 ),
+                (
+                    "key_metadata".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "split_offsets".into(),
+                    Value::Union(1, Box::new(Value::Array(vec![Value::Int(4)]))),
+                ),
+                (
+                    "equality_ids".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "sort_order_id".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+            ]);
+            entry.put("data_file", data_file);
+            writer.append(entry).unwrap();
+        }
+        std::fs::write(dir.join(name), writer.into_inner().unwrap())
+            .map_err(|e| StorageError::Config(format!("write fixture: {e}")))?;
+        Ok(())
+    }
+
+    /// One fixture file: (status, path, rows, content, field-1 bounds).
+    type BoundsFile<'a> = (i32, &'a str, i64, i32, Option<(i64, i64)>);
+
+    /// Manifest with per-file lower/upper bounds on field 1 (LE i64 Long
+    /// bytes) — 13-review #5 delete-pruning tests.
+    fn build_manifest_bounds(
+        dir: &std::path::Path,
+        name: &str,
+        files: &[BoundsFile<'_>],
+    ) -> Result<(), StorageError> {
+        let schema = AvroSchema::parse_str(crate::manifest::MANIFEST_ENTRY_SCHEMA_V2).unwrap();
+        let AvroSchema::Record(top_rec) = &schema else {
+            panic!("manifest is not a record");
+        };
+        let df_field = top_rec
+            .fields
+            .iter()
+            .find(|f| f.name == "data_file")
+            .unwrap();
+        let apache_avro::Schema::Record(df_rec) = &df_field.schema else {
+            panic!("data_file not a record");
+        };
+        // lower_bounds: array of kv_bytes records {key:int, value:bytes}
+        let kv_bytes_schema = df_rec
+            .fields
+            .iter()
+            .find(|f| f.name == "lower_bounds")
+            .map(|f| match &f.schema {
+                apache_avro::Schema::Union(u) => u.variants()[1].clone(),
+                other => other.clone(),
+            })
+            .unwrap();
+        let apache_avro::Schema::Array(arr) = &kv_bytes_schema else {
+            panic!("lower_bounds is not an array");
+        };
+        let kv_bytes_schema = (*arr.items).clone();
+        let bounds_entries = |b: &Option<(i64, i64)>| {
+            let items = match b {
+                Some((lo, hi)) => {
+                    let mut lo_rec = Record::new(&kv_bytes_schema).unwrap();
+                    lo_rec.put("key", 1i32);
+                    lo_rec.put("value", Value::Bytes(lo.to_le_bytes().to_vec()));
+                    let mut hi_rec = Record::new(&kv_bytes_schema).unwrap();
+                    hi_rec.put("key", 1i32);
+                    hi_rec.put("value", Value::Bytes(hi.to_le_bytes().to_vec()));
+                    vec![lo_rec.into(), hi_rec.into()]
+                }
+                None => vec![],
+            };
+            Value::Union(1, Box::new(Value::Array(items)))
+        };
+        let mut writer = Writer::new(&schema, Vec::new());
+        for (status, path, rows, content, bounds) in files {
+            let mut entry = Record::new(&schema).unwrap();
+            entry.put("status", Value::Int(*status));
+            entry.put("snapshot_id", Value::Long(42));
+            entry.put(
+                "sequence_number",
+                Value::Union(1, Box::new(Value::Long(34))),
+            );
+            entry.put(
+                "file_sequence_number",
+                Value::Union(1, Box::new(Value::Long(1))),
+            );
+            let data_file = Value::Record(vec![
+                ("content".into(), Value::Int(*content)),
+                ("file_path".into(), Value::String(path.to_string())),
+                ("file_format".into(), Value::String("parquet".into())),
+                (
+                    "partition".into(),
+                    Value::Union(1, Box::new(Value::Record(vec![]))),
+                ),
+                ("record_count".into(), Value::Long(*rows)),
+                ("file_size_in_bytes".into(), Value::Long(4096)),
+                (
+                    "column_sizes".into(),
+                    Value::Union(1, Box::new(Value::Array(vec![]))),
+                ),
+                (
+                    "value_counts".into(),
+                    Value::Union(1, Box::new(Value::Array(vec![]))),
+                ),
+                (
+                    "null_value_counts".into(),
+                    Value::Union(1, Box::new(Value::Array(vec![]))),
+                ),
+                (
+                    "nan_value_counts".into(),
+                    Value::Union(1, Box::new(Value::Array(vec![]))),
+                ),
+                ("lower_bounds".into(), bounds_entries(bounds)),
+                ("upper_bounds".into(), bounds_entries(bounds)),
                 (
                     "key_metadata".into(),
                     Value::Union(0, Box::new(Value::Null)),
@@ -1509,6 +1634,65 @@ mod tests {
         assert_eq!(plan.files_before_pruning, 3);
         assert_eq!(plan.files_after_pruning, 3);
         assert_eq!(plan.data_files, 3);
+    }
+
+    /// 13-review #5: the data-file bounds rule must never eliminate a
+    /// delete task. A delete file's bounds are over its DELETE KEYS, not
+    /// the surviving rows — a delete whose keys all fail the predicate
+    /// would only be redundant if every data file it can touch was also
+    /// pruned by the same predicate, which bounds alone don't establish
+    /// (position deletes carry no key bounds at all). The proven
+    /// delete-specific rule is partition applicability only.
+    #[test]
+    fn delete_tasks_survive_data_bounds_pruning() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = dir.path().join("metadata");
+        std::fs::create_dir_all(&meta).unwrap();
+        build_manifest_bounds(
+            meta.as_path(),
+            "mn1.avro",
+            &[
+                // data file: id in [1,10] — kept by `id < 15`
+                (1, "file:///table/data/a.parquet", 10, 0, Some((1, 10))),
+                // equality delete: keys in [100,200] — outside the
+                // predicate's bounds range; must STILL be planned
+                (1, "file:///table/data/del.parquet", 5, 2, Some((100, 200))),
+            ],
+        )
+        .unwrap();
+        build_manifest_list(meta.as_path(), &[("mn1.avro", 2, 0, 0)]).unwrap();
+
+        let metadata_json = format!(
+            r#"{{
+                "format-version": 2,
+                "table-uuid": "9c12d441-03fe-11ed-8122-d358e75d12eb",
+                "location": "file://{}",
+                "schemas": [{{"type": "struct", "schema-id": 0, "fields": [
+                    {{"id": 1, "name": "id", "required": true, "type": "long"}}]}}],
+                "current-schema-id": 0,
+                "snapshots": [
+                    {{"snapshot-id": 42, "timestamp-ms": 1712345678000,
+                      "manifest-list": "file://{}",
+                      "summary": {{"operation": "append"}}}}
+                ],
+                "current-snapshot-id": 42
+            }}"#,
+            dir.path().display(),
+            meta.join("mn-list.avro").display(),
+        );
+        let md: TableMetadata = serde_json::from_str(&metadata_json).unwrap();
+
+        let pred = ScanPredicate::Lt {
+            field: "id".into(),
+            value: serde_json::json!(15),
+        };
+        let plan = plan_scan(&md, None, None, Some(&pred)).unwrap();
+        assert_eq!(plan.data_files, 1, "data file id∈[1,10] kept by id<15");
+        assert_eq!(
+            plan.delete_tasks.len(),
+            1,
+            "delete task must survive: data bounds never prune deletes"
+        );
     }
 }
 

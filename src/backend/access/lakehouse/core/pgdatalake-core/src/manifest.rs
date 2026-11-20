@@ -256,17 +256,41 @@ pub struct DataFile {
     pub sort_order_id: Option<i32>,
 }
 
+/// Decode an Iceberg Avro container metadata value that carries a long
+/// (`added-snapshot-id`). Writers emit UTF-8 decimal digits (Java/pyiceberg
+/// both stringify); a raw 8-byte little-endian long is accepted as a
+/// defensive fallback.
+fn container_meta_i64(raw: &[u8]) -> Option<i64> {
+    if let Ok(s) = std::str::from_utf8(raw) {
+        if let Ok(n) = s.trim().parse::<i64>() {
+            return Some(n);
+        }
+    }
+    if raw.len() == 8 {
+        let arr: [u8; 8] = raw.try_into().ok()?;
+        return Some(i64::from_le_bytes(arr));
+    }
+    None
+}
+
 /// Parse a manifest Avro blob using its EMBEDDED writer schema (required:
 /// the partition struct is per-table). Known fields are mapped by name;
-/// unknown extra fields are ignored (forward tolerance).
+/// unknown extra fields are ignored (forward tolerance). Entries carrying
+/// a null `snapshot_id` (older writers) inherit the enclosing manifest's
+/// `added-snapshot-id` container metadata (13-review #5); a null with no
+/// metadata to inherit from is a loud decode error.
 pub fn parse_manifest(bytes: &[u8]) -> Result<Vec<ManifestEntry>, StorageError> {
     let reader =
         AvroReader::new(bytes).map_err(|e| StorageError::Decode(format!("manifest avro: {e}")))?;
     validate_manifest_schema(reader.writer_schema())?;
+    let added_snapshot = reader
+        .user_metadata()
+        .get("added-snapshot-id")
+        .and_then(|b| container_meta_i64(b));
     let mut out = Vec::new();
     for value in reader {
         let v = value.map_err(|e| StorageError::Decode(format!("manifest entry: {e}")))?;
-        out.push(manifest_entry_from_value(&v)?);
+        out.push(manifest_entry_from_value(&v, added_snapshot)?);
     }
     Ok(out)
 }
@@ -307,7 +331,10 @@ fn validate_manifest_schema(schema: &AvroSchema) -> Result<(), StorageError> {
     Ok(())
 }
 
-fn manifest_entry_from_value(v: &apache_avro::types::Value) -> Result<ManifestEntry, StorageError> {
+fn manifest_entry_from_value(
+    v: &apache_avro::types::Value,
+    added_snapshot_fallback: Option<i64>,
+) -> Result<ManifestEntry, StorageError> {
     use apache_avro::types::Value as V;
     let V::Record(fields) = v else {
         return Err(StorageError::Decode(
@@ -325,15 +352,29 @@ fn manifest_entry_from_value(v: &apache_avro::types::Value) -> Result<ManifestEn
         other => return Err(StorageError::Decode(format!("status: {other:?}"))),
     };
     // pyiceberg writes snapshot_id as a nullable union; accept bare
-    // Int/Long too (same promotion rules as the manifest-list counts)
+    // Int/Long too (same promotion rules as the manifest-list counts).
+    // A null entry ID inherits the manifest's added-snapshot-id container
+    // metadata (13-review #5); no fallback either is a loud error.
     let snapshot_id = match find("snapshot_id") {
         Some((_, V::Union(_, inner))) => match inner.as_ref() {
             V::Long(n) => *n,
             V::Int(n) => *n as i64,
+            V::Null => added_snapshot_fallback.ok_or_else(|| {
+                StorageError::Decode(
+                    "snapshot_id is null and manifest container metadata has no added-snapshot-id to inherit"
+                        .into(),
+                )
+            })?,
             other => return Err(StorageError::Decode(format!("snapshot_id: {other:?}"))),
         },
         Some((_, V::Long(n))) => *n,
         Some((_, V::Int(n))) => *n as i64,
+        Some((_, V::Null)) => added_snapshot_fallback.ok_or_else(|| {
+            StorageError::Decode(
+                "snapshot_id is null and manifest container metadata has no added-snapshot-id to inherit"
+                    .into(),
+            )
+        })?,
         other => return Err(StorageError::Decode(format!("snapshot_id: {other:?}"))),
     };
     let opt_long = |k: &str| -> Result<Option<i64>, StorageError> {
@@ -747,6 +788,182 @@ mod tests {
         assert_eq!(e.data_file.column_sizes.get(&1), Some(&1024));
         assert_eq!(e.data_file.null_value_counts.get(&2), Some(&3));
         assert_eq!(e.data_file.split_offsets, Some(vec![4]));
+    }
+
+    /// 13-review #5: manifest entries written with a NULL snapshot_id are
+    /// valid when the enclosing manifest supplies `added-snapshot-id` in
+    /// its Avro container metadata (older writers omit the entry-level
+    /// ID). The reader must inherit it; a null with NO metadata to
+    /// inherit from is a loud decode error, never a silent 0.
+    #[test]
+    fn null_entry_snapshot_id_inherits_manifest_added_snapshot() {
+        use apache_avro::types::{Record, Value};
+        use apache_avro::{Schema as AvroSchema, Writer};
+
+        // writer schema mirroring older writers: nullable snapshot_id
+        let schema_str = MANIFEST_ENTRY_SCHEMA_V2.replace(
+            r#"{"name": "snapshot_id", "type": "long", "default": -1}"#,
+            r#"{"name": "snapshot_id", "type": ["null", "long"], "default": null}"#,
+        );
+        assert_ne!(
+            schema_str, MANIFEST_ENTRY_SCHEMA_V2,
+            "schema replacement applied"
+        );
+        let schema = AvroSchema::parse_str(&schema_str).unwrap();
+        let mut writer = Writer::new(&schema, Vec::new());
+        writer
+            .add_user_metadata("added-snapshot-id".to_string(), b"77")
+            .unwrap();
+
+        let mut entry = Record::new(&schema).unwrap();
+        entry.put("status", Value::Int(1));
+        entry.put("snapshot_id", Value::Union(0, Box::new(Value::Null)));
+        entry.put("sequence_number", Value::Union(0, Box::new(Value::Null)));
+        entry.put(
+            "file_sequence_number",
+            Value::Union(0, Box::new(Value::Null)),
+        );
+        entry.put(
+            "data_file",
+            Value::Record(vec![
+                ("content".into(), Value::Int(0)),
+                (
+                    "file_path".into(),
+                    Value::String("file:///t/a.parquet".into()),
+                ),
+                ("file_format".into(), Value::String("parquet".into())),
+                (
+                    "partition".into(),
+                    Value::Union(1, Box::new(Value::Record(vec![]))),
+                ),
+                ("record_count".into(), Value::Long(1)),
+                ("file_size_in_bytes".into(), Value::Long(64)),
+                (
+                    "column_sizes".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "value_counts".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "null_value_counts".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "nan_value_counts".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "lower_bounds".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "upper_bounds".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "key_metadata".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "split_offsets".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "equality_ids".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "sort_order_id".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+            ]),
+        );
+        writer.append(entry).unwrap();
+        let avro_bytes = writer.into_inner().unwrap();
+
+        let entries = parse_manifest(&avro_bytes).expect("parse manifest with null snapshot_id");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].snapshot_id, 77,
+            "null entry snapshot_id inherits added-snapshot-id container metadata"
+        );
+
+        // no container metadata + null entry ID: loud error, not a silent 0
+        let schema2 = AvroSchema::parse_str(&schema_str).unwrap();
+        let mut writer2 = Writer::new(&schema2, Vec::new());
+        let mut entry2 = Record::new(&schema2).unwrap();
+        entry2.put("status", Value::Int(1));
+        entry2.put("snapshot_id", Value::Union(0, Box::new(Value::Null)));
+        entry2.put("sequence_number", Value::Union(0, Box::new(Value::Null)));
+        entry2.put(
+            "file_sequence_number",
+            Value::Union(0, Box::new(Value::Null)),
+        );
+        entry2.put(
+            "data_file",
+            Value::Record(vec![
+                ("content".into(), Value::Int(0)),
+                (
+                    "file_path".into(),
+                    Value::String("file:///t/a.parquet".into()),
+                ),
+                ("file_format".into(), Value::String("parquet".into())),
+                (
+                    "partition".into(),
+                    Value::Union(1, Box::new(Value::Record(vec![]))),
+                ),
+                ("record_count".into(), Value::Long(1)),
+                ("file_size_in_bytes".into(), Value::Long(64)),
+                (
+                    "column_sizes".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "value_counts".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "null_value_counts".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "nan_value_counts".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "lower_bounds".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "upper_bounds".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "key_metadata".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "split_offsets".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "equality_ids".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "sort_order_id".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+            ]),
+        );
+        writer2.append(entry2).unwrap();
+        let err = parse_manifest(&writer2.into_inner().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, StorageError::Decode(_)),
+            "null snapshot_id with no added-snapshot-id metadata must be a loud decode error: {err}"
+        );
     }
 
     /// Interop regression (slice 12): PyIceberg 0.12 writes manifest-list

@@ -69,6 +69,28 @@ load at scan planning (eager; small relative to data) into
 - **v3 deletion vectors**: later slice (Puffin DV blobs; read half of the
   gate matrix).
 
+*(13-review #5 amendment, 2026-11-20 — delete-specific pruning and
+manifest inheritance.)* Predicate pruning is content-aware:
+
+- **Data files** prune by partition applicability, then column min/max
+  bounds.
+- **Delete files** prune by **partition applicability only**. A delete
+  file's bounds are over its delete keys, not the surviving rows; applying
+  the data-bounds rule could eliminate a delete task whose deletions are
+  still needed (position deletes carry no key bounds at all). Eliminating
+  a delete task requires a proven delete-specific rule; partition
+  applicability is that rule (a delete file touches only data files in
+  its own partition).
+
+Manifest-entry decode inherits a **null `snapshot_id`** from the
+enclosing manifest's `added-snapshot-id` Avro container metadata
+(older writers omit the entry-level ID). A null with no container
+metadata to inherit from is a loud decode error, never a silent 0.
+Schema list/map models retain **nested field IDs** (`element-id`,
+`key-id`, `value-id`) and requiredness flags — required on the wire;
+their absence fails the parse loudly since columns bind by ID through
+schema evolution.
+
 Interop note: PyIceberg 0.12 `table.delete()` performs COW rewrites (no
 delete files); MoR delete fixtures for live verification come from
 Spark/Trino in the M1 conformance gate, or from our own M2 writer.

@@ -67,18 +67,34 @@ pub enum IcebergType {
     Uuid,
     Fixed(u32),
     Binary,
-    Decimal {
-        precision: u32,
-        scale: u32,
-    },
+    Decimal { precision: u32, scale: u32 },
     Unknown,
     Variant,
     Struct(Vec<Field>),
-    List(Box<IcebergType>),
-    Map {
-        key: Box<IcebergType>,
-        value: Box<IcebergType>,
-    },
+    List(ListType),
+    Map(MapType),
+}
+
+/// A `list` type with its nested field identity (spec § schemas): the
+/// element carries its own field ID (bindable through schema evolution)
+/// and a requiredness flag defaulting to true when a writer omits it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListType {
+    pub element_id: i64,
+    pub element_required: bool,
+    pub element: Box<IcebergType>,
+}
+
+/// A `map` type with its nested field identity (spec § schemas): key and
+/// value carry their own field IDs; the value's requiredness flag defaults
+/// to true when a writer omits it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapType {
+    pub key_id: i64,
+    pub key: Box<IcebergType>,
+    pub value_id: i64,
+    pub value_required: bool,
+    pub value: Box<IcebergType>,
 }
 
 impl<'de> Deserialize<'de> for IcebergType {
@@ -117,8 +133,20 @@ fn type_to_value(t: &IcebergType) -> serde_json::Value {
         Fixed(n) => format!("fixed[{n}]").into(),
         Decimal { precision, scale } => format!("decimal({precision},{scale})").into(),
         Struct(fields) => serde_json::json!({ "type": "struct", "fields": fields }),
-        List(inner) => serde_json::json!({ "type": "list", "element": inner }),
-        Map { key, value } => serde_json::json!({ "type": "map", "key": key, "value": value }),
+        List(lt) => serde_json::json!({
+            "type": "list",
+            "element-id": lt.element_id,
+            "element-required": lt.element_required,
+            "element": lt.element,
+        }),
+        Map(mt) => serde_json::json!({
+            "type": "map",
+            "key-id": mt.key_id,
+            "key": mt.key,
+            "value-id": mt.value_id,
+            "value-required": mt.value_required,
+            "value": mt.value,
+        }),
     }
 }
 
@@ -176,11 +204,28 @@ fn parse_type(v: &serde_json::Value) -> Option<IcebergType> {
                 let fields = o.get("fields")?;
                 Some(Struct(serde_json::from_value(fields.clone()).ok()?))
             }
-            "list" => Some(List(Box::new(parse_type(o.get("element")?)?))),
-            "map" => Some(Map {
+            // nested field IDs are required on the wire (spec § appendix C):
+            // without them the columns cannot bind through schema evolution,
+            // so their absence fails the parse loudly. `*`-required flags
+            // default to true (v1-era writers omit them).
+            "list" => Some(List(ListType {
+                element_id: o.get("element-id")?.as_i64()?,
+                element_required: o
+                    .get("element-required")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
+                element: Box::new(parse_type(o.get("element")?)?),
+            })),
+            "map" => Some(Map(MapType {
+                key_id: o.get("key-id")?.as_i64()?,
                 key: Box::new(parse_type(o.get("key").or_else(|| o.get("keys"))?)?),
+                value_id: o.get("value-id")?.as_i64()?,
+                value_required: o
+                    .get("value-required")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
                 value: Box::new(parse_type(o.get("value").or_else(|| o.get("values"))?)?),
-            }),
+            })),
             _ => None,
         },
         _ => None,
@@ -523,11 +568,13 @@ mod tests {
                     "type": "struct", "fields": [
                         {"id": 2, "name": "uid", "required": true, "type": "long"},
                         {"id": 3, "name": "tags", "required": false, "type": {
-                            "type": "list", "element": "string"}}
+                            "type": "list", "element-id": 30,
+                            "element-required": false, "element": "string"}}
                     ]}
                 },
                 {"id": 4, "name": "counts", "required": false, "type": {
-                    "type": "map", "keys": "string", "values": "long"}}
+                    "type": "map", "key-id": 40, "key": "string",
+                    "value-id": 41, "value-required": false, "value": "long"}}
             ]}],
             "current-schema-id": 0
         }"#;
@@ -538,17 +585,83 @@ mod tests {
                 assert_eq!(fields[1].name, "tags");
                 assert_eq!(
                     fields[1].r#type,
-                    IcebergType::List(Box::new(IcebergType::String))
+                    IcebergType::List(ListType {
+                        element_id: 30,
+                        element_required: false,
+                        element: Box::new(IcebergType::String),
+                    })
                 );
             }
             other => panic!("expected struct, got {other:?}"),
         }
         assert_eq!(
             md.current_schema().unwrap().fields[1].r#type,
-            IcebergType::Map {
+            IcebergType::Map(MapType {
+                key_id: 40,
                 key: Box::new(IcebergType::String),
+                value_id: 41,
+                value_required: false,
                 value: Box::new(IcebergType::Long),
-            }
+            })
+        );
+    }
+
+    /// 13-review #5: list and map models keep their nested field IDs and
+    /// requiredness — projection and delete binding happen by Iceberg ID,
+    /// so discarding `element-id`/`key-id`/`value-id` (and the `*-required`
+    /// flags) makes nested columns unbindable and silently optional. The
+    /// `*`-required flags default to true per spec when a v1-era writer
+    /// omits them; the IDs themselves are required (a nested type without
+    /// IDs cannot participate in schema evolution).
+    #[test]
+    fn nested_types_keep_field_ids_and_requiredness() {
+        let json = r#"{
+            "format-version": 2,
+            "table-uuid": "9c12d441-03fe-11ed-8122-d358e75d12eb",
+            "location": "s3://warehouse/t",
+            "schemas": [{"type": "struct", "schema-id": 0, "fields": [
+                {"id": 1, "name": "tags", "required": false, "type": {
+                    "type": "list", "element-id": 2, "element": "string"}},
+                {"id": 3, "name": "counts", "required": false, "type": {
+                    "type": "map", "key-id": 4, "key": "string",
+                    "value-id": 5, "value": "long"}}
+            ]}],
+            "current-schema-id": 0
+        }"#;
+        let md: TableMetadata = serde_json::from_str(json).expect("parse nested ids");
+        let fields = &md.current_schema().unwrap().fields;
+        assert_eq!(
+            fields[0].r#type,
+            IcebergType::List(ListType {
+                element_id: 2,
+                element_required: true, // spec default when flag omitted
+                element: Box::new(IcebergType::String),
+            })
+        );
+        assert_eq!(
+            fields[1].r#type,
+            IcebergType::Map(MapType {
+                key_id: 4,
+                key: Box::new(IcebergType::String),
+                value_id: 5,
+                value_required: true, // spec default when flag omitted
+                value: Box::new(IcebergType::Long),
+            })
+        );
+
+        // loud failure: a nested type with no field IDs cannot bind by ID
+        let bad = r#"{
+            "format-version": 2,
+            "table-uuid": "9c12d441-03fe-11ed-8122-d358e75d12eb",
+            "location": "s3://warehouse/t",
+            "schemas": [{"type": "struct", "schema-id": 0, "fields": [
+                {"id": 1, "name": "tags", "required": false, "type": {
+                    "type": "list", "element": "string"}}]}],
+            "current-schema-id": 0
+        }"#;
+        assert!(
+            serde_json::from_str::<TableMetadata>(bad).is_err(),
+            "list without element-id must fail loudly"
         );
     }
 
@@ -728,9 +841,9 @@ mod wire_name_tests {
         assert_eq!(md.default_partition_spec_id, Some(1), "spec wire name");
         let schema = md.current_schema().unwrap();
         match &schema.fields[0].r#type {
-            IcebergType::Map { key, value } => {
-                assert_eq!(**key, IcebergType::String);
-                assert_eq!(**value, IcebergType::Long);
+            IcebergType::Map(mt) => {
+                assert_eq!(*mt.key, IcebergType::String);
+                assert_eq!(*mt.value, IcebergType::Long);
             }
             other => panic!("expected map, got {other:?}"),
         }
@@ -742,20 +855,28 @@ mod wire_name_tests {
         );
     }
 
-    /// Round-trip: a map type serializes the SPEC members.
+    /// Round-trip: a map type serializes the SPEC members, including the
+    /// nested field IDs (13-review #5).
     #[test]
     fn map_type_serializes_spec_members() {
-        let t = IcebergType::Map {
+        let t = IcebergType::Map(MapType {
+            key_id: 4,
             key: Box::new(IcebergType::String),
+            value_id: 5,
+            value_required: true,
             value: Box::new(IcebergType::Long),
-        };
+        });
         let json = serde_json::to_string(&t).unwrap();
         assert!(json.contains("\"key\""), "{json}");
         assert!(json.contains("\"value\""), "{json}");
+        assert!(json.contains("\"key-id\":4"), "{json}");
+        assert!(json.contains("\"value-id\":5"), "{json}");
         assert!(!json.contains("\"keys\""), "{json}");
     }
 
-    /// Legacy misspelling still parses (tolerance for old writers).
+    /// Legacy misspelling still parses (tolerance for old writers). The
+    /// member NAMES are tolerated; nested field IDs remain required
+    /// (13-review #5), so this fixture carries them.
     #[test]
     fn legacy_misspellings_tolerated() {
         let json = r#"{
@@ -764,7 +885,8 @@ mod wire_name_tests {
             "location": "s3://warehouse/t",
             "schemas": [{"type": "struct", "schema-id": 0, "fields": [
                 {"id": 1, "name": "m", "required": false,
-                 "type": {"type": "map", "keys": "string", "values": "long"}}
+                 "type": {"type": "map", "keys": "string", "values": "long",
+                          "key-id": 2, "value-id": 3}}
             ]}],
             "current-schema-id": 0,
             "default-partition-spec-id": 2
