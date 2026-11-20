@@ -746,3 +746,27 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     counted projection fields (vs comma CSV), typmod pass-through,
     bytea_output independence, fixed[16]-vs-UUID disambiguation by
     iceberg field type. Then #1 tail; M2 #28/#29.
+  - 13-implementation-review Blocker #8b (write path) — FIXED
+    2026-11-20 bc98a8c3794 (90 cargo tests; regress green; live +
+    independent pyiceberg verification): name via nameout (NameData*
+    is NOT varlena text — textout read garbage); bpchar via
+    bpcharout; bytea hex-encodes DIRECTLY (byteaout followed the
+    bytea_output GUC — escape mode silently corrupted stored bytes);
+    decimal text reconciles to the column's scale (was verbatim
+    unscaled: 123.45 into scale-3 read 12.345; extra fractional
+    digits = loud error, precision checked); push() two-passes
+    (whole-row validation before ANY builder mutation — a mid-row
+    failure used to misalign every later row in the batch); dropped
+    attributes skipped in rows (schema omits them — mismatch broke
+    managed INSERT on altered tables); reader projection = counted
+    JSON array (commas in column names split wrongly); atttypmod
+    passed to input functions (was -1). Live: name/varchar/bytea/
+    numeric(10,3) table under bytea_output=escape — PG + pyiceberg
+    independently confirm exact bytes/decimals/names. NOTE: meson
+    install raced the custom-target regeneration for the live
+    instance — after rebuilds, copy lakehouse.so into tmp_install
+    directly. BLOCKER #8 FULLY CLOSED (fixed[16]-vs-UUID
+    disambiguation remains noted in HANDOFF as an interop nicety;
+    both render canonical text today). REMAINING overall: #1 tail
+    (two-writer concurrency, independent-reader verification);
+    M2 #28 UPDATE/DELETE COW, #29 MERGE + ceremony.
