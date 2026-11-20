@@ -466,8 +466,10 @@ pub fn plan_scan(
     // overwritten files from their carrying manifest. (Iceberg file
     // paths are unique per table, so path-keyed exclusion is exact.)
     let mut deleted_paths = std::collections::HashSet::new();
-    let mut live: Vec<(&crate::manifest::ManifestListEntry, crate::manifest::ManifestEntry)> =
-        Vec::new();
+    let mut live: Vec<(
+        &crate::manifest::ManifestListEntry,
+        crate::manifest::ManifestEntry,
+    )> = Vec::new();
     for mle in &list_entries {
         // 13-review #4: a manifest-list entry naming a partition spec the
         // table no longer lists is corrupt metadata — a loud error, never a
@@ -477,9 +479,7 @@ pub fn plan_scan(
         // partition specs at all is unpartitioned — its manifests' spec-0
         // references resolve to the implicit empty spec (provably cannot
         // mis-prune; older writers omit partition-specs entirely).
-        if md.partition_spec(mle.partition_spec_id).is_none()
-            && !md.partition_specs.is_empty()
-        {
+        if md.partition_spec(mle.partition_spec_id).is_none() && !md.partition_specs.is_empty() {
             return Err(StorageError::Decode(format!(
                 "manifest {} references partition spec {} missing from table metadata",
                 mle.manifest_path, mle.partition_spec_id

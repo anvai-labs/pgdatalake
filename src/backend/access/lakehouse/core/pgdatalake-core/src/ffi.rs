@@ -946,29 +946,31 @@ pub unsafe extern "C" fn pg_datalake_write_commit_overwrite(
         return std::ptr::null_mut();
     };
     let raw = borrow_string(deleted_json);
-    let deleted: Vec<crate::snapshot_write::DeletedDataFile> =
-        match serde_json::from_str::<Vec<(String, i64, i64)>>(&raw) {
-            Ok(rows) => rows
-                .into_iter()
-                .map(|(file_path, record_count, file_size_in_bytes)| {
-                    crate::snapshot_write::DeletedDataFile {
-                        file_path,
-                        record_count,
-                        file_size_in_bytes,
-                    }
-                })
-                .collect(),
-            Err(e) => {
-                unsafe {
-                    set_err(
-                        err_buf,
-                        err_len,
-                        &format!("overwrite commit: deleted list must be [[path,count,size],...]: {e}"),
-                    )
-                };
-                return std::ptr::null_mut();
-            }
-        };
+    let deleted: Vec<crate::snapshot_write::DeletedDataFile> = match serde_json::from_str::<
+        Vec<(String, i64, i64)>,
+    >(&raw)
+    {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|(file_path, record_count, file_size_in_bytes)| {
+                crate::snapshot_write::DeletedDataFile {
+                    file_path,
+                    record_count,
+                    file_size_in_bytes,
+                }
+            })
+            .collect(),
+        Err(e) => {
+            unsafe {
+                set_err(
+                    err_buf,
+                    err_len,
+                    &format!("overwrite commit: deleted list must be [[path,count,size],...]: {e}"),
+                )
+            };
+            return std::ptr::null_mut();
+        }
+    };
     unsafe { commit_internal(&mut ws, &deleted, retries, err_buf, err_len) }
 }
 
@@ -990,45 +992,45 @@ pub unsafe extern "C" fn pg_datalake_rows_open_path(
     err_buf: *mut c_char,
     err_len: usize,
 ) -> *mut RowsHandle {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<RowsHandle, String> {
-        let Some(w) = ws.as_ref() else {
-            return Err("NULL write session".into());
-        };
-        let file_path = borrow_string(path);
-        if file_path.is_empty() {
-            return Err("empty file path".into());
-        }
-        // transport policy: every hop stays inside the table root
-        crate::scan::ensure_within_table_root(&file_path, &w.state.location)
-            .map_err(|e| e.to_string())?;
-        let projection = borrow_string(projection);
-        let projection_owned: Vec<String> = if projection.is_empty() {
-            Vec::new()
-        } else {
-            serde_json::from_str(&projection)
-                .map_err(|e| format!("projection is not a JSON array: {e}"))?
-        };
-        let projection: Vec<&str> = projection_owned.iter().map(|s| s.as_str()).collect();
-        let (io, key) = crate::scan::open_for(&file_path, Some(&w.state.s3))
-            .map_err(|e| e.to_string())?;
-        let rows = crate::parquet::ParquetRows::open(&io, &key, &projection)
-            .map_err(|e| e.to_string())?;
-        let column_names = rows
-            .column_names()
-            .iter()
-            .map(|n| CString::new(n.as_str()).unwrap_or_default())
-            .collect();
-        Ok(RowsHandle {
-            rows,
-            column_names,
-            current_row: Vec::new(),
-            current_null: Vec::new(),
-            last_err: None,
-        })
-    }));
-    let handle = result.unwrap_or_else(|panic| {
-        Err(panic_message(&panic))
-    });
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        || -> Result<RowsHandle, String> {
+            let Some(w) = ws.as_ref() else {
+                return Err("NULL write session".into());
+            };
+            let file_path = borrow_string(path);
+            if file_path.is_empty() {
+                return Err("empty file path".into());
+            }
+            // transport policy: every hop stays inside the table root
+            crate::scan::ensure_within_table_root(&file_path, &w.state.location)
+                .map_err(|e| e.to_string())?;
+            let projection = borrow_string(projection);
+            let projection_owned: Vec<String> = if projection.is_empty() {
+                Vec::new()
+            } else {
+                serde_json::from_str(&projection)
+                    .map_err(|e| format!("projection is not a JSON array: {e}"))?
+            };
+            let projection: Vec<&str> = projection_owned.iter().map(|s| s.as_str()).collect();
+            let (io, key) =
+                crate::scan::open_for(&file_path, Some(&w.state.s3)).map_err(|e| e.to_string())?;
+            let rows = crate::parquet::ParquetRows::open(&io, &key, &projection)
+                .map_err(|e| e.to_string())?;
+            let column_names = rows
+                .column_names()
+                .iter()
+                .map(|n| CString::new(n.as_str()).unwrap_or_default())
+                .collect();
+            Ok(RowsHandle {
+                rows,
+                column_names,
+                current_row: Vec::new(),
+                current_null: Vec::new(),
+                last_err: None,
+            })
+        },
+    ));
+    let handle = result.unwrap_or_else(|panic| Err(panic_message(&panic)));
     match handle {
         Ok(h) => Box::into_raw(Box::new(h)),
         Err(e) => {
@@ -1044,10 +1046,7 @@ pub unsafe extern "C" fn pg_datalake_rows_open_path(
 /// # Safety
 /// `session` must be NULL or a live handle from pg_datalake_scan_new.
 #[no_mangle]
-pub unsafe extern "C" fn pg_datalake_scan_task_size(
-    session: *mut ScanSession,
-    idx: u64,
-) -> i64 {
+pub unsafe extern "C" fn pg_datalake_scan_task_size(session: *mut ScanSession, idx: u64) -> i64 {
     let Some(s) = (unsafe { session.as_ref() }) else {
         return 0;
     };
@@ -2127,16 +2126,17 @@ mod tests {
         .unwrap();
         w.push(&[crate::parquet::CellValue::Int64(1)]).unwrap();
         w.push(&[crate::parquet::CellValue::Int64(2)]).unwrap();
-        let wf = w.write_file(
-            &crate::storage::StorageIo::open(
-                &crate::storage::parse_location(&location).unwrap(),
-                None,
+        let wf = w
+            .write_file(
+                &crate::storage::StorageIo::open(
+                    &crate::storage::parse_location(&location).unwrap(),
+                    None,
+                )
+                .unwrap(),
+                "data",
+                0,
             )
-            .unwrap(),
-            "data",
-            0,
-        )
-        .unwrap();
+            .unwrap();
         let data_path = format!("{location}/{}", wf.key);
         let data_size = wf.file_size_in_bytes;
 
@@ -2155,8 +2155,11 @@ mod tests {
         )
         .unwrap();
         std::fs::create_dir_all(dir.path().join("table").join("metadata")).unwrap();
-        std::fs::write(dir.path().join("table").join("metadata").join("m0.avro"), &manifest_bytes)
-            .unwrap();
+        std::fs::write(
+            dir.path().join("table").join("metadata").join("m0.avro"),
+            &manifest_bytes,
+        )
+        .unwrap();
         let list_bytes = crate::snapshot_write::build_manifest_list_bytes(&[
             crate::manifest::ManifestListEntry {
                 manifest_path: format!("{location}/metadata/m0.avro"),
@@ -2175,8 +2178,11 @@ mod tests {
             },
         ])
         .unwrap();
-        std::fs::write(dir.path().join("table").join("metadata").join("snap.avro"), list_bytes)
-            .unwrap();
+        std::fs::write(
+            dir.path().join("table").join("metadata").join("snap.avro"),
+            list_bytes,
+        )
+        .unwrap();
 
         let metadata_json = format!(
             r#"{{"format-version": 2,
@@ -2273,9 +2279,7 @@ mod tests {
             };
             assert!(!rows.is_null(), "rows_open_path: {}", errmsg(&err));
             let mut got = |h: *mut RowsHandle| -> i64 {
-                let st = unsafe {
-                    pg_datalake_rows_next(h, err.as_mut_ptr() as *mut _, err.len())
-                };
+                let st = unsafe { pg_datalake_rows_next(h, err.as_mut_ptr() as *mut _, err.len()) };
                 assert_eq!(st, 0, "row expected, status {st}: {}", errmsg(&err));
                 unsafe { CStr::from_ptr(pg_datalake_rows_col_text(h, 0)) }
                     .to_string_lossy()
@@ -2321,10 +2325,7 @@ mod tests {
         let body = md_capture.lock().unwrap().clone();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         let snap = &v["updates"][0]["snapshot"];
-        assert_eq!(
-            snap["summary"]["operation"], "overwrite",
-            "{body}"
-        );
+        assert_eq!(snap["summary"]["operation"], "overwrite", "{body}");
         assert_eq!(snap["summary"]["deleted-data-files"], "1", "{body}");
         assert_eq!(snap["summary"]["deleted-records"], "2", "{body}");
 

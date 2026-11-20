@@ -602,10 +602,7 @@ mod tests {
             let _ = req.respond(tiny_http::Response::from_string(
                 r#"{"defaults": {}, "overrides": {}}"#,
             ));
-            let resp_body = format!(
-                r#"{{"metadata-location": "{}", "config": {{}}}}"#,
-                md_loc
-            );
+            let resp_body = format!(r#"{{"metadata-location": "{}", "config": {{}}}}"#, md_loc);
             let req = server.recv().unwrap(); // loadTable (write_table_open)
             let _ = req.respond(tiny_http::Response::from_string(resp_body.clone()));
             let req = server.recv().unwrap(); // loadTable (commit_append)
@@ -656,9 +653,7 @@ mod tests {
         // wrote; verify it parses back with the deleted path + counts
         let snap_id: i64 = {
             let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-            v["updates"][0]["snapshot"]["snapshot-id"]
-                .as_i64()
-                .unwrap()
+            v["updates"][0]["snapshot"]["snapshot-id"].as_i64().unwrap()
         };
         let list_file = std::fs::read_dir(dir.path().join("metadata"))
             .unwrap()
@@ -673,10 +668,16 @@ mod tests {
             .expect("commit's manifest-list written to the store");
         let list =
             crate::manifest::parse_manifest_list(&std::fs::read(&list_file).unwrap()).unwrap();
-        assert_eq!(list.len(), 2, "carried base manifest + new manifest");
-        let manifest_rel = list[1].manifest_path.trim_start_matches(&format!("{location}/"));
+        // the carried manifest is REWRITTEN in place (deleted entry flips
+        // there); a deletion-only commit writes no new data manifest
+        assert_eq!(list.len(), 1, "rewritten carried manifest only: {list:?}");
+        assert_eq!(list[0].deleted_files_count, Some(1));
+        let manifest_rel = list[0]
+            .manifest_path
+            .trim_start_matches(&format!("{location}/"));
         let entries =
-            crate::manifest::parse_manifest(&std::fs::read(dir.path().join(manifest_rel)).unwrap()).unwrap();
+            crate::manifest::parse_manifest(&std::fs::read(dir.path().join(manifest_rel)).unwrap())
+                .unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(
             entries[0].status,
@@ -704,17 +705,17 @@ mod tests {
             let _ = req.respond(tiny_http::Response::from_string(
                 r#"{"defaults": {}, "overrides": {}}"#,
             ));
-            let resp_body = format!(
-                r#"{{"metadata-location": "{}", "config": {{}}}}"#,
-                md_loc
-            );
+            let resp_body = format!(r#"{{"metadata-location": "{}", "config": {{}}}}"#, md_loc);
             let req = server.recv().unwrap(); // loadTable (write_table_open)
             let _ = req.respond(tiny_http::Response::from_string(resp_body.clone()));
             let req = server.recv().unwrap(); // loadTable (commit_append)
             let _ = req.respond(tiny_http::Response::from_string(resp_body));
             // NO commit request may arrive
             if let Ok(Some(extra)) = server.recv_timeout(std::time::Duration::from_secs(1)) {
-                panic!("commit must abort before any commit request; got {}", extra.url());
+                panic!(
+                    "commit must abort before any commit request; got {}",
+                    extra.url()
+                );
             }
         });
 

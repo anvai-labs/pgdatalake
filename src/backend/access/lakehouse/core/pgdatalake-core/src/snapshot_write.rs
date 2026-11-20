@@ -289,7 +289,10 @@ pub fn build_manifest_bytes(
                 "sequence_number".into(),
                 V::Union(1, Box::new(V::Long(sequence))),
             ),
-            ("file_sequence_number".into(), V::Union(0, Box::new(V::Null))),
+            (
+                "file_sequence_number".into(),
+                V::Union(0, Box::new(V::Null)),
+            ),
             ("data_file".into(), data_file),
         ]);
         writer
@@ -299,6 +302,161 @@ pub fn build_manifest_bytes(
     writer
         .into_inner()
         .map_err(|e| StorageError::Config(format!("manifest close: {e}")))
+}
+
+/// Serialize fully-parsed manifest entries (status + per-entry identity +
+/// full data_file record) — the manifest-REWRITE path of overwrite
+/// commits. Unpartitioned only: a partitioned entry cannot be re-emitted
+/// without the partition spec's field-id mapping, and the managed write
+/// gate rejects partitioned tables.
+pub fn build_manifest_bytes_entries(
+    entries: &[crate::manifest::ManifestEntry],
+) -> Result<Vec<u8>, StorageError> {
+    let schema = AvroSchema::parse_str(MANIFEST_ENTRY_WRITE_SCHEMA_V2)
+        .map_err(|e| StorageError::Config(format!("manifest write schema: {e}")))?;
+    let col_sizes = field_schema(&schema, "column_sizes")
+        .ok_or_else(|| StorageError::Config("manifest write schema: no column_sizes".into()))?;
+    let lower = field_schema(&schema, "lower_bounds")
+        .ok_or_else(|| StorageError::Config("manifest write schema: no lower_bounds".into()))?;
+
+    let mut writer = Writer::new(&schema, Vec::new());
+    for e in entries {
+        let df = &e.data_file;
+        if df.partition.as_ref().map(|p| match p {
+            serde_json::Value::Object(o) => !o.is_empty(),
+            serde_json::Value::Null => false,
+            _ => true,
+        }) == Some(true)
+        {
+            return Err(StorageError::Config(format!(
+                "manifest rewrite: partitioned entry {} cannot be re-emitted                  (managed writes cover unpartitioned tables)",
+                df.file_path
+            )));
+        }
+        let opt_long_map = |m: &BTreeMap<i64, i64>| {
+            if m.is_empty() {
+                V::Union(0, Box::new(V::Null))
+            } else {
+                V::Union(1, Box::new(avro_long_map(&col_sizes, m)))
+            }
+        };
+        let opt_bytes_map = |m: &BTreeMap<i64, Vec<u8>>| {
+            if m.is_empty() {
+                V::Union(0, Box::new(V::Null))
+            } else {
+                V::Union(1, Box::new(avro_bytes_map(&lower, m)))
+            }
+        };
+        let data_file = V::Record(vec![
+            ("content".into(), V::Int(df.content as i32)),
+            ("file_path".into(), V::String(df.file_path.clone())),
+            ("file_format".into(), V::String(df.file_format.clone())),
+            ("partition".into(), V::Union(1, Box::new(V::Record(vec![])))),
+            ("record_count".into(), V::Long(df.record_count)),
+            ("file_size_in_bytes".into(), V::Long(df.file_size_in_bytes)),
+            ("column_sizes".into(), opt_long_map(&df.column_sizes)),
+            ("value_counts".into(), opt_long_map(&df.value_counts)),
+            (
+                "null_value_counts".into(),
+                opt_long_map(&df.null_value_counts),
+            ),
+            (
+                "nan_value_counts".into(),
+                opt_long_map(&df.nan_value_counts),
+            ),
+            ("lower_bounds".into(), opt_bytes_map(&df.lower_bounds)),
+            ("upper_bounds".into(), opt_bytes_map(&df.upper_bounds)),
+            (
+                "key_metadata".into(),
+                match &df.key_metadata {
+                    Some(b) => V::Union(1, Box::new(V::Bytes(b.clone()))),
+                    None => V::Union(0, Box::new(V::Null)),
+                },
+            ),
+            (
+                "split_offsets".into(),
+                match &df.split_offsets {
+                    Some(v) => V::Union(
+                        1,
+                        Box::new(V::Array(v.iter().map(|x| V::Long(*x as i64)).collect())),
+                    ),
+                    None => V::Union(0, Box::new(V::Null)),
+                },
+            ),
+            (
+                "equality_ids".into(),
+                match &df.equality_ids {
+                    Some(v) => V::Union(
+                        1,
+                        Box::new(V::Array(v.iter().map(|x| V::Int(*x)).collect())),
+                    ),
+                    None => V::Union(0, Box::new(V::Null)),
+                },
+            ),
+            (
+                "sort_order_id".into(),
+                match df.sort_order_id {
+                    Some(v) => V::Union(1, Box::new(V::Int(v))),
+                    None => V::Union(0, Box::new(V::Null)),
+                },
+            ),
+        ]);
+        let entry = V::Record(vec![
+            ("status".into(), V::Int(e.status as i32)),
+            ("snapshot_id".into(), V::Long(e.snapshot_id)),
+            (
+                "sequence_number".into(),
+                match e.sequence_number {
+                    Some(v) => V::Union(1, Box::new(V::Long(v))),
+                    None => V::Union(0, Box::new(V::Null)),
+                },
+            ),
+            (
+                "file_sequence_number".into(),
+                match e.file_sequence_number {
+                    Some(v) => V::Union(1, Box::new(V::Long(v))),
+                    None => V::Union(0, Box::new(V::Null)),
+                },
+            ),
+            ("data_file".into(), data_file),
+        ]);
+        writer
+            .append(entry)
+            .map_err(|e| StorageError::Config(format!("manifest append: {e}")))?;
+    }
+    writer
+        .into_inner()
+        .map_err(|e| StorageError::Config(format!("manifest close: {e}")))
+}
+
+/// Manifest REWRITE for overwrite commits (M2 slice 28): flip every entry
+/// whose path is in `deleted_paths` to DELETED (identity preserved) and
+/// survivors to EXISTING. Returns the new manifest bytes plus
+/// (live_entries, deleted_entries) counts. Entries whose content is not
+/// DATA are never rewritten (delete files have no COW semantics).
+pub fn rewrite_manifest_with_deletes(
+    bytes: &[u8],
+    deleted_paths: &[String],
+) -> Result<(Vec<u8>, usize, usize), StorageError> {
+    let entries = crate::manifest::parse_manifest(bytes)?;
+    let mut live = 0usize;
+    let mut deleted = 0usize;
+    let mut out = entries;
+    for e in &mut out {
+        if e.data_file.content != crate::manifest::DataContent::Data {
+            live += 1;
+            continue;
+        }
+        if deleted_paths.iter().any(|p| *p == e.data_file.file_path) {
+            e.status = crate::manifest::ManifestEntryStatus::Deleted;
+            deleted += 1;
+        } else {
+            e.status = crate::manifest::ManifestEntryStatus::Existing;
+            live += 1;
+        }
+    }
+    let bytes = build_manifest_bytes_entries(&out)?;
+    Ok((bytes, live, deleted))
 }
 
 /// Serialize a manifest-list (v2 shape). Content/count fields take the
@@ -331,14 +489,26 @@ pub fn build_manifest_list_bytes(
                 "added_files_count".into(),
                 V::Int(e.added_files_count.unwrap_or(0) as i32),
             ),
-            ("existing_files_count".into(), V::Int(0)),
-            ("deleted_files_count".into(), V::Int(0)),
+            (
+                "existing_files_count".into(),
+                V::Int(e.existing_files_count.unwrap_or(0) as i32),
+            ),
+            (
+                "deleted_files_count".into(),
+                V::Int(e.deleted_files_count.unwrap_or(0) as i32),
+            ),
             (
                 "added_rows_count".into(),
                 V::Long(e.added_rows_count.unwrap_or(0)),
             ),
-            ("existing_rows_count".into(), V::Long(0)),
-            ("deleted_rows_count".into(), V::Long(0)),
+            (
+                "existing_rows_count".into(),
+                V::Long(e.existing_rows_count.unwrap_or(0)),
+            ),
+            (
+                "deleted_rows_count".into(),
+                V::Long(e.deleted_rows_count.unwrap_or(0)),
+            ),
             // unpartitioned: null partition summary
             ("partitions".into(), V::Union(0, Box::new(V::Null))),
             ("key_metadata".into(), V::Union(0, Box::new(V::Null))),
@@ -427,41 +597,109 @@ pub fn write_snapshot(
         }
     };
 
-    // manifest avro (the ADDED entries + the DELETED entries of this
-    // snapshot)
-    let manifest_bytes = build_manifest_bytes(new_files, &deleted_files, snapshot_id, sequence)?;
-    let manifest_key = keyed(format!(
-        "metadata/{}-{}-m0.avro",
-        snapshot_id,
-        Uuid::new_v4()
-    ));
-    io.put_bytes(&manifest_key, manifest_bytes.clone())?;
-    let manifest_path = format!(
-        "{loc}/{}",
-        manifest_key
-            .strip_prefix(&format!("{key_prefix}/"))
-            .unwrap_or(&manifest_key)
-    );
+    // M2 slice 28 interop: deletion carries via MANIFEST REWRITE, not a
+    // separate DELETED-only manifest. Carried manifests touching a
+    // deleted path are re-serialized with the entry flipped to DELETED
+    // (identity preserved) and survivors to EXISTING — the Java/Trino
+    // convention. pyiceberg 0.12 plans with discard_deleted semantics and
+    // never applies cross-manifest deletions, so a DELETED entry in the
+    // NEW manifest would resurrect the overwritten file for independent
+    // readers (caught live in the slice-28 acceptance run).
+    let mut carried = carried_manifests;
+    let mut deleted_entries_total = 0usize;
+    if !deleted_files.is_empty() {
+        let loc_prefix = format!("{loc}/");
+        let del_paths: Vec<String> = deleted_files.iter().map(|d| d.file_path.clone()).collect();
+        let mut rewritten = Vec::with_capacity(carried.len());
+        for mle in carried.into_iter() {
+            let rel = mle.manifest_path.strip_prefix(&loc_prefix).ok_or_else(|| {
+                StorageError::Config(format!(
+                    "overwrite commit: carried manifest {} is outside the table location",
+                    mle.manifest_path
+                ))
+            })?;
+            let bytes = io.get_bytes(&keyed(rel.to_string()))?;
+            let entries = crate::manifest::parse_manifest(&bytes)?;
+            let touched = entries.iter().any(|e| {
+                e.data_file.content == crate::manifest::DataContent::Data
+                    && del_paths.contains(&e.data_file.file_path)
+            });
+            if !touched {
+                rewritten.push(mle);
+                continue;
+            }
+            let (new_bytes, live_count, deleted_count) =
+                rewrite_manifest_with_deletes(&bytes, &del_paths)?;
+            deleted_entries_total += deleted_count;
+            let live_rows: i64 = crate::manifest::parse_manifest(&new_bytes)?
+                .iter()
+                .filter(|e| e.status != crate::manifest::ManifestEntryStatus::Deleted)
+                .map(|e| e.data_file.record_count)
+                .sum();
+            let new_rel = format!("metadata/{}-rn0.avro", Uuid::new_v4());
+            io.put_bytes(&keyed(new_rel.clone()), new_bytes.clone())?;
+            rewritten.push(crate::manifest::ManifestListEntry {
+                manifest_path: format!("{loc}/{new_rel}"),
+                manifest_length: new_bytes.len() as i64,
+                partition_spec_id: mle.partition_spec_id,
+                content: Some(0),
+                added_snapshot_id: mle.added_snapshot_id,
+                added_files_count: Some(0),
+                existing_files_count: Some(live_count as i64),
+                deleted_files_count: Some(deleted_count as i64),
+                added_rows_count: Some(0),
+                existing_rows_count: Some(live_rows),
+                deleted_rows_count: Some(deleted_files.iter().map(|f| f.record_count).sum()),
+                sequence_number: mle.sequence_number,
+                min_sequence_number: mle.min_sequence_number,
+            });
+        }
+        carried = rewritten;
+    }
 
-    // manifest-list avro: carried base manifests + this snapshot's
-    let list_entry = crate::manifest::ManifestListEntry {
-        manifest_path,
-        manifest_length: manifest_bytes.len() as i64,
-        partition_spec_id,
-        content: Some(0),
-        added_snapshot_id: snapshot_id,
-        added_files_count: Some(new_files.len() as i64),
-        existing_files_count: Some(0),
-        deleted_files_count: Some(deleted_files.len() as i64),
-        added_rows_count: Some(new_files.iter().map(|f| f.record_count).sum()),
-        existing_rows_count: Some(0),
-        deleted_rows_count: Some(deleted_files.iter().map(|f| f.record_count).sum()),
-        sequence_number: Some(sequence),
-        min_sequence_number: Some(sequence),
-    };
-    let carried_len = carried_manifests.len();
-    let mut list_entries = carried_manifests;
-    list_entries.push(list_entry);
+    // manifest avro (the ADDED entries of this snapshot; deletions ride
+    // in the rewritten carried manifests). A deletion-only commit (every
+    // row of every touched file removed) writes no new manifest at all.
+    let mut data_manifest_keys: Vec<String> = Vec::new();
+    let mut list_entries = carried;
+    let carried_len = list_entries.len();
+    if !new_files.is_empty() {
+        let manifest_bytes = build_manifest_bytes(new_files, &[], snapshot_id, sequence)?;
+        let manifest_key = keyed(format!(
+            "metadata/{}-{}-m0.avro",
+            snapshot_id,
+            Uuid::new_v4()
+        ));
+        io.put_bytes(&manifest_key, manifest_bytes.clone())?;
+        data_manifest_keys.push(manifest_key.clone());
+        let manifest_path = format!(
+            "{loc}/{}",
+            manifest_key
+                .strip_prefix(&format!("{key_prefix}/"))
+                .unwrap_or(&manifest_key)
+        );
+        let list_entry = crate::manifest::ManifestListEntry {
+            manifest_path,
+            manifest_length: manifest_bytes.len() as i64,
+            partition_spec_id,
+            content: Some(0),
+            added_snapshot_id: snapshot_id,
+            added_files_count: Some(new_files.len() as i64),
+            existing_files_count: Some(0),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(new_files.iter().map(|f| f.record_count).sum()),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            sequence_number: Some(sequence),
+            min_sequence_number: Some(sequence),
+        };
+        list_entries.push(list_entry);
+    }
+    if list_entries.is_empty() {
+        return Err(StorageError::Config(
+            "write path: snapshot would reference no manifests (empty commit)".into(),
+        ));
+    }
     let list_bytes = build_manifest_list_bytes(&list_entries)?;
     let list_rel = format!("metadata/snap-{}-0-{}.avro", snapshot_id, Uuid::new_v4());
     let list_key = keyed(list_rel.clone());
@@ -486,8 +724,15 @@ pub fn write_snapshot(
         ("added-files-size".to_string(), total_bytes.to_string()),
     ]);
     if !deleted_files.is_empty() {
-        summary.insert("deleted-data-files".to_string(), deleted_files.len().to_string());
+        summary.insert(
+            "deleted-data-files".to_string(),
+            deleted_files.len().to_string(),
+        );
         summary.insert("deleted-records".to_string(), deleted_rows.to_string());
+        summary.insert(
+            "rewritten-manifests".to_string(),
+            deleted_entries_total.to_string(),
+        );
     }
     let snapshot = Snapshot {
         snapshot_id,
@@ -499,9 +744,11 @@ pub fn write_snapshot(
         summary,
         schema_id,
     };
+    let mut written_keys = data_manifest_keys;
+    written_keys.push(list_key);
     Ok(WrittenSnapshot {
         snapshot,
-        written_keys: vec![manifest_key, list_key],
+        written_keys,
     })
 }
 
@@ -920,6 +1167,67 @@ mod carry_tests {
         let _ = written_b.written_keys;
     }
 
+    /// Manifest rewrite interop (M2 slice 28): carried manifests with
+    /// overwritten files are REWRITTEN with the entries flipped to DELETED
+    /// (the Java/Trino convention — pyiceberg 0.12 plans with
+    /// discard_deleted semantics and never applies cross-manifest
+    /// deletions, so a separate DELETED-only manifest would resurrect the
+    /// file for independent readers). Per-entry identity (snapshot_id,
+    /// sequence, file_sequence_number, metrics) is preserved; survivors
+    /// flip to EXISTING.
+    #[test]
+    fn rewrite_manifest_flips_deleted_entries() {
+        use crate::snapshot_write::rewrite_manifest_with_deletes;
+        let f_x = NewDataFile {
+            file_path: "file://w/t/data/x.parquet".into(),
+            record_count: 4,
+            file_size_in_bytes: 4096,
+            ..Default::default()
+        };
+        let f_y = NewDataFile {
+            file_path: "file://w/t/data/y.parquet".into(),
+            record_count: 2,
+            file_size_in_bytes: 2048,
+            ..Default::default()
+        };
+        let bytes = build_manifest_bytes(&[f_x, f_y], &[], 42, 1).unwrap();
+
+        let (rewritten, live, deleted) =
+            rewrite_manifest_with_deletes(&bytes, &["file://w/t/data/x.parquet".to_string()])
+                .unwrap();
+        assert_eq!(live, 1);
+        assert_eq!(deleted, 1);
+
+        let entries = crate::manifest::parse_manifest(&rewritten).unwrap();
+        assert_eq!(entries.len(), 2);
+        let by_path = |p: &str| entries.iter().find(|e| e.data_file.file_path == p).unwrap();
+        assert_eq!(
+            by_path("file://w/t/data/x.parquet").status,
+            crate::manifest::ManifestEntryStatus::Deleted,
+            "overwritten file flips to DELETED"
+        );
+        assert_eq!(
+            by_path("file://w/t/data/x.parquet").snapshot_id,
+            42,
+            "original add snapshot_id preserved"
+        );
+        assert_eq!(
+            by_path("file://w/t/data/x.parquet").sequence_number,
+            Some(1),
+            "original sequence preserved"
+        );
+        assert_eq!(
+            by_path("file://w/t/data/x.parquet").data_file.record_count,
+            4,
+            "identity fields ride with the DELETED entry"
+        );
+        assert_eq!(
+            by_path("file://w/t/data/y.parquet").status,
+            crate::manifest::ManifestEntryStatus::Existing,
+            "survivor flips to EXISTING"
+        );
+    }
+
     /// COW overwrite (M2 slice 28): snapshot B DELETES A's data file and
     /// ADDS a rewritten one. The written manifest carries a DELETED entry
     /// for A's file (path + counts preserved), the manifest-list entry
@@ -1014,15 +1322,27 @@ mod carry_tests {
 
         // summary: overwrite operation + deletion counts
         assert_eq!(
-            written_b.snapshot.summary.get("operation").map(String::as_str),
+            written_b
+                .snapshot
+                .summary
+                .get("operation")
+                .map(String::as_str),
             Some("overwrite")
         );
         assert_eq!(
-            written_b.snapshot.summary.get("deleted-data-files").map(String::as_str),
+            written_b
+                .snapshot
+                .summary
+                .get("deleted-data-files")
+                .map(String::as_str),
             Some("1")
         );
         assert_eq!(
-            written_b.snapshot.summary.get("deleted-records").map(String::as_str),
+            written_b
+                .snapshot
+                .summary
+                .get("deleted-records")
+                .map(String::as_str),
             Some("2")
         );
 
