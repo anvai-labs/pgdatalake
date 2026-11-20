@@ -257,11 +257,19 @@
     installed pyiceberg 0.12 (requirements tag "type", updates tag
     "action", explicit-null snapshot-id). 59 cargo tests incl. scripted
     mock-catalog 409->re-plan->success and budget-exhaustion paths.
-  - slice 26 — `USING lakehouse` TableAM skeleton: pg_am.dat
-    [core-allowlist] row + catversion bump; tableam handler struct with
-    scan callbacks DELEGATING to the existing FDW scan pipeline;
-    CREATE TABLE ... USING lakehouse FORMAT iceberg round-trip in
-    regress (metadata-only table, no writes yet).
+  - slice 26 — DONE 2026-11-19 (tableam.c + extension SQL, regress
+    green): `USING lakehouse` TableAM skeleton. PLAN AMENDMENT: the
+    pg_am.dat [core-allowlist] row + catversion bump turned out
+    unnecessary — runtime CREATE ACCESS METHOD (in lakehouse--1.0.sql)
+    registers the AM as an ordinary pg_am row, zero core edits. Scan
+    callbacks DELEGATE to the FDW session pipeline (shared lakehouse.h:
+    LakehouseOptions + lakehouse_OpenSession + BuildSelectorJson moved
+    out of fdw.c statics); identity lives in lakehouse.managed_tables +
+    lakehouse.attach_table (slice 27 wires it at CREATE time; drop-GC
+    via sql_drop event trigger). Regress tableam.sql: AM round-trip,
+    relam wiring, default_table_access_method, unattached-scan clean
+    error, unreachable-endpoint 08000 fail-fast parity with the FDW,
+    INSERT 0A000, re-attach idempotence, DROP hygiene.
   - slice 27 — INSERT: per-txn batch accumulator (tuple→columnar),
     pre-commit flush per doc 07 §2 steps 1-5, own-writes overlay
     visibility, abort = orphan files (GC'd later); regress INSERT

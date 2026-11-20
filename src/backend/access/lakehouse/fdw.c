@@ -47,20 +47,10 @@
 
 #include "pg_datalake_core.h"
 
-/* options for one foreign table (server opts + table opts, table wins) */
-typedef struct LakehouseOptions
-{
-	char	   *endpoint;
-	char	   *warehouse;
-	char	   *token;
-	char	   *namespace;		/* levels before the last '.' of the table opt */
-	char	   *table;			/* last '.'-level of the table option */
-	char	   *s3_endpoint;
-	char	   *s3_access_key;
-	char	   *s3_secret_key;
-	char	   *predicate_json; /* translated quals (slice 15) */
-	char	   *snapshot_id;	/* time travel pin (slice 18); NULL = current */
-}			LakehouseOptions;
+#include "lakehouse.h"
+
+/* LakehouseOptions moved to lakehouse.h (M2 slice 26): the table access
+ * method shares the option block and the session pipeline. */
 
 /* shared task-claim counter for parallel scans (slice 17) */
 typedef struct LakehouseShared
@@ -228,10 +218,8 @@ ExtractOptions(Oid foreigntableid, LakehouseOptions * opts)
 	}
 }
 
-static char *BuildSelectorJson(const char *sel);
-
-static ScanSession *
-OpenSession(LakehouseOptions * opts, const char *rte_selector)
+ScanSession *
+lakehouse_OpenSession(LakehouseOptions * opts, const char *rte_selector)
 {
 	char		errbuf[1024];
 	ScanSession *session;
@@ -243,7 +231,7 @@ OpenSession(LakehouseOptions * opts, const char *rte_selector)
 	 * the current snapshot.
 	 */
 	if (rte_selector != NULL && rte_selector[0] != '\0')
-		sel_json = BuildSelectorJson(rte_selector);
+		sel_json = lakehouse_BuildSelectorJson(rte_selector);
 	else if (opts->snapshot_id != NULL)
 		sel_json = psprintf("{\"kind\":\"id\",\"value\":" INT64_FORMAT "}",
 							pg_strtoint64(opts->snapshot_id));
@@ -283,8 +271,8 @@ OpenSession(LakehouseOptions * opts, const char *rte_selector)
  * the FFI. The C-side canonical form is validated at parse-analysis time
  * (parse_clause.c), so the value parts are known-safe here.
  */
-static char *
-BuildSelectorJson(const char *sel)
+char *
+lakehouse_BuildSelectorJson(const char *sel)
 {
 	StringInfoData buf;
 	const char *p;
@@ -324,7 +312,7 @@ lakehouse_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 	ExtractOptions(foreigntableid, &opts);
 	/* query-level time travel pin (slice 19) */
 	rte = root->simple_rte_array[baserel->relid];
-	session = OpenSession(&opts, rte->lakehouse_snapshot);
+	session = lakehouse_OpenSession(&opts, rte->lakehouse_snapshot);
 	task_count = pg_datalake_scan_task_count(session);
 	for (uint64 i = 0; i < task_count; i++)
 		total_rows += (double) pg_datalake_scan_task_rows(session, i);
@@ -675,7 +663,7 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 	/* predicate_json must be set on opts BEFORE OpenSession (slice 15) */
 	if (state->predicate_json != NULL)
 		state->opts.predicate_json = state->predicate_json;
-	state->session = OpenSession(&state->opts, state->rte_selector);
+	state->session = lakehouse_OpenSession(&state->opts, state->rte_selector);
 	state->task_count = pg_datalake_scan_task_count(state->session);
 	state->rows = NULL;
 	state->current_task = 0;
@@ -830,7 +818,7 @@ lakehouse_ReScanForeignScan(ForeignScanState *node)
 	}
 	if (state->session == NULL)
 	{
-		state->session = OpenSession(&state->opts, state->rte_selector);
+		state->session = lakehouse_OpenSession(&state->opts, state->rte_selector);
 		state->task_count = pg_datalake_scan_task_count(state->session);
 	}
 	state->current_task = 0;

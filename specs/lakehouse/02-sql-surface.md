@@ -76,7 +76,20 @@ WITH (catalog = 'prod', location = 's3://anvai-warehouse/public/sessions',
 ```
 
 - `USING lakehouse FORMAT iceberg` + `DEFAULT_TABLE_ACCESS_METHOD = lakehouse` makes it the
-  default for a database (opt-in per-DB via ALTER DATABASE).
+  default for a database (opt-in per-DB via ALTER DATABASE). The AM registers at
+  extension install time via runtime `CREATE ACCESS METHOD` (an ordinary pg_am
+  row) — no bootstrap-catalog edits. Slice-26 note: `FORMAT iceberg` and
+  `PARTITION BY` parsing arrive with managed DDL (slice 27+); until then
+  `USING lakehouse` alone is the working surface.
+- Table identity (which remote Iceberg table this relation maps to) lives in
+  `lakehouse.managed_tables` (relid PK + identity + endpoint + s3 + snapshot
+  pin), attached per table; slice 27 wires the row automatically at CREATE
+  time. DROP removes the row via the `lakehouse_drop_gc` event trigger (table
+  AMs get no drop hook). Supported in the skeleton: scans (delegating to the
+  FDW session pipeline — one scan engine, two attach surfaces) and
+  `DEFAULT_TABLE_ACCESS_METHOD`. Cleanly rejected until their slices: INSERT
+  (27), UPDATE/DELETE/TRUNCATE (28), MERGE (29), indexes / parallel scans /
+  TOAST / CLUSTER / TABLESPACE moves (29+).
 - Iceberg partition spec derived from `PARTITION BY`; supported partition
   transforms v1: identity, year, month, day, hour, bucket[N], truncate[W].
   Syntax: `PARTITION BY RANGE (month(at)), HASH (bucket(16, uid))` — parsed by the

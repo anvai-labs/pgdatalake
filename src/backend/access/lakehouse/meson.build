@@ -37,6 +37,7 @@ pg_datalake_core_dep = declare_dependency(
 
 lakehouse_sources = files(
   'lakehouse_core.c',
+  'tableam.c',
   'fdw.c',
 )
 
@@ -73,7 +74,7 @@ tests += {
   'sd': meson.project_source_root() / 'src/test/regress/lakehouse',
   'bd': meson.current_build_dir(),
   'regress': {
-    'sql': ['version', 'scan_files', 'fdw', 'time_travel'],
+    'sql': ['version', 'scan_files', 'fdw', 'time_travel', 'tableam'],
     'test_kwargs': {'timeout': 120},
     'deps': [lakehouse],
   },
