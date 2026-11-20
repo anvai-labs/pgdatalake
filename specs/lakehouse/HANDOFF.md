@@ -727,3 +727,22 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     benign: worker detects id mismatch and re-pins). REMAINING
     overall: #8 type-boundary statuses, #1 tail (two-writer
     concurrency, independent-reader verification); M2 #28/#29.
+  - 13-implementation-review Blocker #8a (read path) — FIXED
+    2026-11-20 d25b89f3f63 (88 cargo tests; regress green; live reads
+    verified): (a) ROW/EOF/ERROR status on pg_datalake_rows_next — a
+    caught panic used to return false = EOF (silent result-set
+    truncation); Iterate loops (FDW + TableAM) abort with
+    ERRCODE_DATA_EXCEPTION + bounded diagnostic. (b) Open-time Arrow
+    type validation over the FULL read set (eq-delete columns too) —
+    unsupported types used to surface as per-cell SQL NULL (fabricated
+    empty data); now a loud Config error before any row. (c)
+    LargeUtf8/LargeBinary decode with their own array types (the
+    shared downcast silently NULLed them). (d) Interior NUL in text =
+    ERROR (was silently EMPTY). (e) write_push/flush/commit carry the
+    catch_unwind boundary (shared panic_message helper). Spec:
+    05-types.md #8a section. REMAINING #8b (write path): name-Datum
+    routing, dropped-attribute schema/row mismatch, decimal scale
+    reconciliation, whole-row validation before builder mutation,
+    counted projection fields (vs comma CSV), typmod pass-through,
+    bytea_output independence, fixed[16]-vs-UUID disambiguation by
+    iceberg field type. Then #1 tail; M2 #28/#29.
