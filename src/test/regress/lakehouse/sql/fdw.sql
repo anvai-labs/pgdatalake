@@ -12,16 +12,20 @@ WHERE n.nspname = 'lakehouse' AND p.proname = 'lakehouse_fdw_handler';
 CREATE FOREIGN DATA WRAPPER lakehouse_wrapper
     HANDLER lakehouse.lakehouse_fdw_handler;
 CREATE SERVER smoke_server FOREIGN DATA WRAPPER lakehouse_wrapper
-    OPTIONS (endpoint 'http://127.0.0.1:9', warehouse 'wh');
+    OPTIONS (endpoint 'http://127.0.0.1:9', warehouse 'wh',
+             s3_endpoint 'http://s3:9000');
+
+-- credentials live in the USER MAPPING (13-review #6 authority model):
+-- server = transport, mapping = secrets, table = identity only
+CREATE USER MAPPING FOR CURRENT_USER SERVER smoke_server
+    OPTIONS (s3_access_key 'key', s3_secret_key 'secret');
 
 -- ordinary catalog row: relkind 'f', listed by \d-equivalent queries
 CREATE FOREIGN TABLE lakehouse_ft (
     id bigint,
     name text
 ) SERVER smoke_server
-    OPTIONS (table 'analytics.events',
-             s3_endpoint 'http://s3:9000',
-             s3_access_key 'key', s3_secret_key 'secret');
+    OPTIONS (table 'analytics.events');
 
 SELECT c.relkind, n.nspname, c.relname
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -65,6 +69,7 @@ WHERE c.relname = 'lakehouse_ft_pinned';
 DROP FOREIGN TABLE lakehouse_ft_pinned;
 
 DROP FOREIGN TABLE lakehouse_ft;
+DROP USER MAPPING FOR CURRENT_USER SERVER smoke_server;
 DROP SERVER smoke_server;
 DROP FOREIGN DATA WRAPPER lakehouse_wrapper;
 DROP EXTENSION lakehouse;

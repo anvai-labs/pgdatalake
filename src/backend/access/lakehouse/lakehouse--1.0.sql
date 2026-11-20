@@ -12,6 +12,9 @@ AS 'MODULE_PATHNAME', 'pg_lakehouse_version'
 LANGUAGE C STABLE PARALLEL SAFE;
 
 -- M1 slice 9: scan planning over a REST-catalog table (FFI-backed SRF).
+-- SECURITY (13-review blocker #6): scan_files takes a caller-chosen
+-- endpoint and credentials — an arbitrary-egress primitive — so EXECUTE
+-- is revoked from PUBLIC; superusers grant it explicitly.
 CREATE FUNCTION lakehouse.scan_files(
     endpoint      text,
     warehouse     text,
@@ -25,12 +28,30 @@ RETURNS TABLE(file_path text, record_count bigint)
 AS 'MODULE_PATHNAME', 'pg_lakehouse_scan_files'
 LANGUAGE C VOLATILE STRICT;
 
+REVOKE EXECUTE ON FUNCTION lakehouse.scan_files(text, text, text, text, text,
+                                                text, text, text) FROM PUBLIC;
+
+-- Option validator (13-review blocker #6, doc 09 authority model): each
+-- option has exactly one legal home — transport on SERVERS, secrets on
+-- USER MAPPINGS, relation identity/pin on FOREIGN TABLES. Unknown and
+-- misplaced options are rejected at DDL (and again on use, so legacy
+-- pre-validator definitions cannot silently use unmapped credentials).
+CREATE FUNCTION lakehouse.lakehouse_fdw_validator(text[], oid)
+RETURNS void
+AS 'MODULE_PATHNAME', 'lakehouse_fdw_validator'
+LANGUAGE C STRICT;
+
 -- M1 slice 11: the foreign-data wrapper handler (doc 01 D1: external
 -- tables attach via the FDW and appear as ordinary pg_class rows).
 CREATE FUNCTION lakehouse.lakehouse_fdw_handler()
 RETURNS fdw_handler
 AS 'MODULE_PATHNAME', 'lakehouse_fdw_handler'
 LANGUAGE C;
+
+-- the canonical wrapper: ships WITH the validator
+CREATE FOREIGN DATA WRAPPER lakehouse_fdw
+    HANDLER lakehouse.lakehouse_fdw_handler
+    VALIDATOR lakehouse.lakehouse_fdw_validator;
 
 -- M2 slice 26: the `USING lakehouse` TABLE access method (doc 01 D2,
 -- doc 02 §3). Runtime CREATE ACCESS METHOD — no bootstrap-catalog edits.
@@ -101,3 +122,8 @@ CREATE FUNCTION lakehouse.create_remote(target regclass)
 RETURNS text
 AS 'MODULE_PATHNAME', 'lakehouse_create_remote'
 LANGUAGE C VOLATILE;
+
+-- SECURITY (13-review blocker #6): create_remote issues external DDL —
+-- remote creation requires owner or delegated management authority
+-- (checked in the C entry), so EXECUTE is not PUBLIC by default.
+REVOKE EXECUTE ON FUNCTION lakehouse.create_remote(regclass) FROM PUBLIC;

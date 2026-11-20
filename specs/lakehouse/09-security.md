@@ -90,12 +90,41 @@ schema dumps, and plain catalog reads. Therefore:
 - WITH-options on managed tables MUST NOT carry credential values
   (token, s3_access_key, s3_secret_key). The parser rejects them with
   a pointing hint (implemented, slice 28-prep).
-- Interim state: the attach row (lakehouse.managed_tables) still
-  stores credentials and is itself dumpable. FULL FIX (required
-  before any production use): server-managed credentials only —
-  either user mappings over a lakehouse foreign server (postgres_fdw
-  pattern) or secure GUCs; table identity options (table, endpoint,
-  warehouse, s3_endpoint) may stay in WITH-options/attach rows.
+- Interim state: RESOLVED for the managed side (13-review #6): the
+  attach row carries identity + server oid only; credentials resolve
+  from USER MAPPINGS on the referenced server (postgres_fdw pattern).
 - Tracked as the doc 09 workstream; blocks M2's production-readiness
   claim, not the M2 gate itself (fixture credentials are fake per
   RULES §6).
+
+## FDW option authority (2026-11-20, 13-review blocker #6)
+
+Each option has exactly one legal home, enforced at DDL by
+`lakehouse.lakehouse_fdw_validator` (shipped wired onto the canonical
+`lakehouse_fdw` wrapper) and enforced AGAIN on use by `ExtractOptions`,
+so legacy pre-validator definitions error instead of silently using
+credentials that were never mapped:
+
+| Home | Options | Rationale |
+|---|---|---|
+| SERVER | `endpoint`, `warehouse`, `s3_endpoint` | transport identity; dumpable by design, contains no secrets |
+| USER MAPPING | `token`, `s3_access_key`, `s3_secret_key` | per-user, ACL-controlled, one place to rotate |
+| FOREIGN TABLE | `table`, `snapshot_id` | relation identity + time-travel pin |
+
+- A table-level `s3_endpoint` is rejected: a storage destination the
+  server's credentials were not scoped to (credential/destination
+  repurposing).
+- Foreign tables resolve credentials from the user mapping of the
+  **invoking user** (postgres_fdw precedent). View semantics: a view
+  reader scans under their OWN mapping — a view owner who wants
+  delegated access maps their readers on the server; a missing mapping
+  is a loud `user mapping not found` at plan time, never anonymous
+  access.
+- `lakehouse.scan_files` (caller-chosen endpoint + credentials =
+  arbitrary-egress primitive) and `lakehouse.create_remote` (external
+  DDL; ownership checked in C) are `REVOKE`d from PUBLIC; grant
+  explicitly to operators only.
+- The drop-gc event trigger must not interfere with unrelated DDL —
+  the GC only touches rows for relations the drop actually removed;
+  ordinary owners drop their own heap tables unaffected (regress:
+  fdw_auth).

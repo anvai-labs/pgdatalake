@@ -12,15 +12,18 @@ CREATE EXTENSION lakehouse;
 CREATE FOREIGN DATA WRAPPER lakehouse_wrapper
     HANDLER lakehouse.lakehouse_fdw_handler;
 CREATE SERVER smoke_server FOREIGN DATA WRAPPER lakehouse_wrapper
-    OPTIONS (endpoint 'http://127.0.0.1:9', warehouse 'wh');
+    OPTIONS (endpoint 'http://127.0.0.1:9', warehouse 'wh',
+             s3_endpoint 'http://s3:9000');
+
+-- credentials on the user mapping (13-review #6 authority model)
+CREATE USER MAPPING FOR CURRENT_USER SERVER smoke_server
+    OPTIONS (s3_access_key 'key', s3_secret_key 'secret');
 
 CREATE FOREIGN TABLE lakehouse_ft (
     id bigint,
     name text
 ) SERVER smoke_server
-    OPTIONS (table 'analytics.events',
-             s3_endpoint 'http://s3:9000',
-             s3_access_key 'key', s3_secret_key 'secret');
+    OPTIONS (table 'analytics.events');
 
 CREATE TABLE local_t (id bigint);
 INSERT INTO local_t VALUES (1), (2);
@@ -75,6 +78,7 @@ SELECT count(*) FROM lakehouse_ft_plain_v;
 DROP VIEW lakehouse_ft_v, lakehouse_ft_ts_v, lakehouse_ft_plain_v;
 DROP TABLE local_t;
 DROP FOREIGN TABLE lakehouse_ft;
+DROP USER MAPPING FOR CURRENT_USER SERVER smoke_server;
 DROP SERVER smoke_server;
 DROP FOREIGN DATA WRAPPER lakehouse_wrapper;
 DROP EXTENSION lakehouse;

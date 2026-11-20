@@ -43,6 +43,11 @@
 #include "catalog/pg_operator.h"
 #include "utils/syscache.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/pg_foreign_data_wrapper.h"
+#include "catalog/pg_foreign_server.h"
+#include "catalog/pg_foreign_table.h"
+#include "catalog/pg_user_mapping.h"
+#include "access/reloptions.h"
 #include "lib/stringinfo.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/nodes.h"
@@ -70,6 +75,81 @@ typedef struct LakehouseShared
  * limitation, documented in the retro.
  */
 static LakehouseShared * lakehouse_shared_state = NULL;
+
+/*
+ * Option homes (13-review #6, doc 09 authority model): each option has
+ * exactly one legal home. Transport identity lives on the SERVER,
+ * secrets on the USER MAPPING (per-user, ACL-controlled, one place to
+ * rotate), relation identity/pin on the FOREIGN TABLE. The validator
+ * enforces this at DDL; ExtractOptions enforces it again on use, so a
+ * legacy pre-validator definition errors instead of silently using
+ * credentials that were never authorized through a mapping.
+ */
+#define LOPT_SERVER		(1 << 0)
+#define LOPT_MAPPING	(1 << 1)
+#define LOPT_TABLE		(1 << 2)
+
+typedef struct LakehouseOptSpec
+{
+	const char *name;
+	int			homes;
+}			LakehouseOptSpec;
+
+static const LakehouseOptSpec lakehouse_opt_specs[] = {
+	{"endpoint", LOPT_SERVER},
+	{"warehouse", LOPT_SERVER},
+	{"s3_endpoint", LOPT_SERVER},
+	{"token", LOPT_MAPPING},
+	{"s3_access_key", LOPT_MAPPING},
+	{"s3_secret_key", LOPT_MAPPING},
+	{"table", LOPT_TABLE},
+	{"snapshot_id", LOPT_TABLE},
+};
+
+static const LakehouseOptSpec *
+find_lakehouse_option(const char *name)
+{
+	int			i;
+
+	for (i = 0; i < lengthof(lakehouse_opt_specs); i++)
+		if (strcmp(lakehouse_opt_specs[i].name, name) == 0)
+			return &lakehouse_opt_specs[i];
+	return NULL;
+}
+
+/* human-readable home name for validator/use-time diagnostics */
+static const char *
+option_home_name(int home_flag)
+{
+	switch (home_flag)
+	{
+		case LOPT_SERVER:
+			return "servers";
+		case LOPT_MAPPING:
+			return "user mappings";
+		case LOPT_TABLE:
+			return "foreign tables";
+	}
+	return "the lakehouse wrapper's supported objects";
+}
+
+static void
+reject_misplaced_option(const char *defname, const char *object_kind,
+						int home_flag)
+{
+	const LakehouseOptSpec *spec = find_lakehouse_option(defname);
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+			 spec != NULL ?
+			 errmsg("option \"%s\" is not allowed on %s", defname,
+					object_kind) :
+			 errmsg("invalid option \"%s\"", defname),
+			 spec != NULL ?
+			 errdetail("Option \"%s\" belongs on %s.", defname,
+					   option_home_name(spec->homes)) :
+			 0));
+}
 
 /* per-executor-node state */
 typedef struct LakehouseExecState
@@ -122,6 +202,65 @@ static void lakehouse_ExplainForeignScan(ForeignScanState *node,
 
 PG_FUNCTION_INFO_V1(lakehouse_fdw_handler);
 
+PG_FUNCTION_INFO_V1(lakehouse_fdw_validator);
+
+/*
+ * Canonical option validator (13-review #6): reject unknown and
+ * misplaced options at DDL, so a wrapper created with
+ * VALIDATOR lakehouse.lakehouse_fdw_validator cannot carry bearer
+ * secrets on servers/tables or repurpose destinations on mappings.
+ */
+Datum
+lakehouse_fdw_validator(PG_FUNCTION_ARGS)
+{
+	Oid			catalog = PG_GETARG_OID(1);
+	List	   *deflist;
+	ListCell   *lc;
+	int			home_flag = 0;
+	const char *object_kind = "this object type";
+
+	switch (catalog)
+	{
+		case ForeignDataWrapperRelationId:
+			object_kind = "foreign data wrappers";
+			break;
+		case ForeignServerRelationId:
+			home_flag = LOPT_SERVER;
+			object_kind = "servers";
+			break;
+		case UserMappingRelationId:
+			home_flag = LOPT_MAPPING;
+			object_kind = "user mappings";
+			break;
+		case ForeignTableRelationId:
+			home_flag = LOPT_TABLE;
+			object_kind = "foreign tables";
+			break;
+	}
+
+	deflist = untransformRelOptions(PG_GETARG_DATUM(0));
+	foreach(lc, deflist)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+		const LakehouseOptSpec *spec = find_lakehouse_option(def->defname);
+
+		if (spec == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+					 errmsg("invalid option \"%s\"", def->defname)));
+		if (home_flag == 0 || (spec->homes & home_flag) == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+					 errmsg("option \"%s\" is not allowed on %s",
+							def->defname, object_kind),
+					 errdetail("Option \"%s\" belongs on %s.",
+							   def->defname,
+							   option_home_name(spec->homes))));
+	}
+
+	PG_RETURN_VOID();
+}
+
 Datum
 lakehouse_fdw_handler(PG_FUNCTION_ARGS)
 {
@@ -153,15 +292,24 @@ lakehouse_fdw_handler(PG_FUNCTION_ARGS)
 }
 
 /*
- * Merge server + table options (table wins). The Iceberg namespace is the
- * part before the last '.' of the table option; the table name is the rest
- * (doc 03 §3: last namespace level == Postgres schema).
+ * Resolve the FDW session options (13-review #6 authority model):
+ * transport identity from the SERVER, relation identity/pin from the
+ * FOREIGN TABLE, credentials from the USER MAPPING of the effective
+ * user (invoker semantics: a view reader selects through their own
+ * mapping; postgres_fdw precedent). Misplaced options — including a
+ * table-level storage endpoint or legacy table-level credentials —
+ * are rejected on use, so pre-validator definitions cannot silently
+ * attach credentials that were never mapped for this user. The
+ * Iceberg namespace is the part before the last '.' of the table
+ * option; the table name is the rest (doc 03 §3: last namespace
+ * level == Postgres schema).
  */
 static void
 ExtractOptions(Oid foreigntableid, LakehouseOptions * opts)
 {
 	ForeignServer *server;
 	ForeignTable *table;
+	UserMapping *um;
 	ListCell   *lc;
 	char	   *table_opt = NULL;
 
@@ -169,6 +317,7 @@ ExtractOptions(Oid foreigntableid, LakehouseOptions * opts)
 	table = GetForeignTable(foreigntableid);
 	server = GetForeignServer(table->serverid);
 
+	/* server: transport identity only, never secrets */
 	foreach(lc, server->options)
 	{
 		DefElem    *def = (DefElem *) lfirst(lc);
@@ -177,32 +326,43 @@ ExtractOptions(Oid foreigntableid, LakehouseOptions * opts)
 			opts->endpoint = defGetString(def);
 		else if (strcmp(def->defname, "warehouse") == 0)
 			opts->warehouse = defGetString(def);
-		else if (strcmp(def->defname, "token") == 0)
-			opts->token = defGetString(def);
 		else if (strcmp(def->defname, "s3_endpoint") == 0)
 			opts->s3_endpoint = defGetString(def);
-		else if (strcmp(def->defname, "s3_access_key") == 0)
-			opts->s3_access_key = defGetString(def);
-		else if (strcmp(def->defname, "s3_secret_key") == 0)
-			opts->s3_secret_key = defGetString(def);
-		else if (strcmp(def->defname, "snapshot_id") == 0)
-			opts->snapshot_id = defGetString(def);
+		else
+			reject_misplaced_option(def->defname, "servers", LOPT_SERVER);
 	}
+
+	/* table: identity + snapshot pin, never credentials/destinations */
 	foreach(lc, table->options)
 	{
 		DefElem    *def = (DefElem *) lfirst(lc);
 
 		if (strcmp(def->defname, "table") == 0)
 			table_opt = defGetString(def);
-		else if (strcmp(def->defname, "s3_endpoint") == 0)
-			opts->s3_endpoint = defGetString(def);
+		else if (strcmp(def->defname, "snapshot_id") == 0)
+			opts->snapshot_id = defGetString(def);
+		else
+			reject_misplaced_option(def->defname, "foreign tables",
+									LOPT_TABLE);
+	}
+
+	/* credentials: the user mapping for the effective (invoking) user */
+	um = GetUserMapping(GetUserId(), server->serverid);
+	foreach(lc, um->options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "token") == 0)
+			opts->token = defGetString(def);
 		else if (strcmp(def->defname, "s3_access_key") == 0)
 			opts->s3_access_key = defGetString(def);
 		else if (strcmp(def->defname, "s3_secret_key") == 0)
 			opts->s3_secret_key = defGetString(def);
-		else if (strcmp(def->defname, "snapshot_id") == 0)
-			opts->snapshot_id = defGetString(def);
+		else
+			reject_misplaced_option(def->defname, "user mappings",
+									LOPT_MAPPING);
 	}
+
 	if (table_opt == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_ERROR),
