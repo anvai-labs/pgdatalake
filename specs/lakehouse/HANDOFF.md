@@ -329,10 +329,25 @@
       None}) + Trino (7|seven, 8|NULL) on the freshly created table.
       RestCatalog gained create_namespace/create_table (spec wire
       shapes; tolerant decode). Remote CREATE went from manual pyiceberg
-      helper to SQL. STILL TODO in managed DDL: wire attach+create
-      INTO the CREATE statement itself (WITH-reloptions are heap-
-      dispatched by relkind in this tree, so the identity inputs need
-      either a reloptions core hook or the event-trigger route).
+      helper to SQL.
+  - slice 28-prep — DONE 2026-11-20 (DECISION + core patch): managed
+    DDL UX decided by thought experiment over three alternatives
+    (one-statement CREATE ... WITH vs multi-statement attach flow vs
+    wrapper functions) under 5-year scenarios (pg_dump/restore, ORM/
+    migrations, multi-AM ecosystem, upstreamability): ONE-STATEMENT
+    CREATE ... USING lakehouse WITH (...) wins; attach/create_remote
+    stay as internals. [core-allowlist] TableAmRoutine.
+    relation_reloptions hook + table_am_reloptions() dispatch in
+    reloptions.c (extract path) + tablecmds.c (CREATE/ALTER validate
+    path, AM resolved from stmt->accessMethod or
+    default_table_access_method). No catversion impact. Our AM parses
+    endpoint/warehouse/token/table/s3_*/snapshot_id into a fixed-order
+    NUL-packed bytea (rd_options); identity resolves WITH-options
+    FIRST, attach row second — attach_table optional when WITH carries
+    the identity. Regress: WITH-options scan fail-fast, unknown-key +
+    missing-table rejections (22023), NULL-options guard (segfault
+    caught live). Upstream regress suite green on the patch. Upstream
+    patch + proposal being filed from the core commit.
   - slice 28 — UPDATE/DELETE as COW (rewrite affected files, reuse
     slice-20 delete reading for concurrent reads), TRUNCATE (empty
     snapshot commit); regress vs heap parity.
