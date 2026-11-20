@@ -589,3 +589,47 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     acceptance list, lands with M2 #29 ceremony). REMAINING overall:
     #4 tail (typed representation, operator allowlist), #6 FDW side,
     #7, #8, blocker #1 tail.
+  - 13-implementation-review Blocker #4 — CLOSED 2026-11-20 (two
+    commits; earlier pieces landed pre-summary: exact BoundVal::Int
+    2^53-conservative pruning, epoch-correct date/timestamptz values,
+    float4out/float8out shortest round-trip, NaN/Inf no-pushdown,
+    buffer-safe escapes).
+    (a) PLANNER (5f3ad99ea2d, 81 cargo tests, TDD): unknown partition
+    spec = loud decode error (old silent default-spec fallback could
+    prune against the WRONG spec after evolution; tolerance kept: a
+    table with NO partition-specs at all resolves spec-0 to the
+    implicit empty spec, provably cannot mis-prune); missing current
+    schema with a predicate = loud error (old per-file continue
+    discarded EVERY file -> plausible empty result); identity-partition
+    matching proves spec field source-id == predicate column's schema
+    field ID (name reuse across drop+re-add must not compare the new
+    column against the old column's partition member); inconclusive
+    keeps the file.
+    (b) FDW (ea62dfd2653, TDD LIVE against Lakekeeper+S3 fixtures,
+    ground truth via identical heap tables, two disjoint-range files
+    with real pyiceberg bounds): operator allowlist = pg_catalog
+    namespaces only (same-named user operator pdtest.< pushed as
+    byte-lt: ground truth {Banana} -> returned 0 rows, now stays
+    local); ordering pushes only under byte-ordered collations (C) —
+    ICU en-US column lt 'B': ground truth 2 rows -> returned 0, now
+    stays local; eq pushes only under deterministic collations
+    (und-u-ks-level1 ci eq 'APPLE': ground truth {apple} -> 0, now
+    local); growable StringInfo JSON encoder escapes control chars
+    (newline constant previously failed the Rust serde decode
+    outright) + encodes field names; default branch returns NULL —
+    no arbitrary user output functions called during eligibility
+    (only text/varchar/name push; bpchar excluded: trailing-blank-
+    insensitive eq is not byte eq). ALL acceptance queries now equal
+    heap ground truth; deterministic-eq and C-ordered pushdowns still
+    prune; 2^53 exact. Spec: 06-execution.md amendments (#4 planner,
+    #4 FDW + the corrected never-correctness claim).
+    FOLLOW-UP (perf, not correctness): our own manifest writer emits
+    empty lower/upper bounds — bounds pruning is inert on PG-written
+    tables until the writer collects parquet stats (WrittenFile has
+    no stats today). Landing stats unlocks the pushdown equivalence
+    acceptance matrix on our own tables too.
+    REMAINING overall per the review: #6 FDW side (wrapper validator,
+    foreign-table literal-credential removal, transport policy,
+    OAuth refresh), #7 parallel per-scan queues, #8 type-boundary
+    statuses, #1 tail (create-only PUTs, two-writer concurrency,
+    independent-reader verification).
