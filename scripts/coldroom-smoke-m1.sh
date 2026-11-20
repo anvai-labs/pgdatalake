@@ -2,8 +2,9 @@
 # M1 cold-room smoke ceremony (RULES §9) — proves milestone/m1 from a fresh
 # clone + fresh fixture stack: build, upstream suite, lakehouse regress,
 # live read path (PyIceberg fixtures), time-travel mechanics.
-# Usage: COLDROOM=/tmp/coldroom-pg bash scripts/coldroom-smoke-m1.sh
-# (run from INSIDE the fresh clone root; expects `make` + docker + venv)
+# Usage: COLDROOM=/tmp/coldroom-pg PYTHON_VENB=/path/to/venv bash scripts/coldroom-smoke-m1.sh
+# (run from INSIDE the fresh clone root; expects `make` + docker + a pyiceberg venv
+#  at PYTHON_VENB or build/venv — fixture generation needs pyiceberg+pyarrow)
 set -x
 COLDROOM="${COLDROOM:-/tmp/coldroom-pg}"
 cd "$COLDROOM"
@@ -30,8 +31,8 @@ cargo test --manifest-path src/backend/access/lakehouse/core/pgdatalake-core/Car
 echo "PASS: cargo tests"
 
 # 5. live read path: generate PyIceberg fixtures and read them through the FDW
-build/venv/bin/python scripts/gen_fixtures.py || { echo "FAIL: gen_fixtures"; exit 1; }
-build/venv/bin/python scripts/gen_conformance_fixtures.py || { echo "FAIL: gen_conformance_fixtures"; exit 1; }
+"${PYTHON_VENB:-build/venv}/bin/python" scripts/gen_fixtures.py || { echo "FAIL: gen_fixtures"; exit 1; }
+"${PYTHON_VENB:-build/venv}/bin/python" scripts/gen_conformance_fixtures.py || { echo "FAIL: gen_conformance_fixtures"; exit 1; }
 echo "PASS: fixture generation"
 
 # 6. live SQL verification against a scratch cluster
