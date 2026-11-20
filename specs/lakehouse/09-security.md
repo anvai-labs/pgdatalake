@@ -81,3 +81,21 @@ then ERROR. Tokens live only in backend-local memory (never in shared memory).
   present.
 - Immutability abuse: impossible to write into a table whose catalog ref moved —
   AssertRefSnapshotId on every commit prevents "lost update by stale plan".
+
+## Managed-table credentials (2026-11-20, GPT-6 review finding)
+
+AM options live in pg_class.reloptions and are exposed by pg_dump,
+schema dumps, and plain catalog reads. Therefore:
+
+- WITH-options on managed tables MUST NOT carry credential values
+  (token, s3_access_key, s3_secret_key). The parser rejects them with
+  a pointing hint (implemented, slice 28-prep).
+- Interim state: the attach row (lakehouse.managed_tables) still
+  stores credentials and is itself dumpable. FULL FIX (required
+  before any production use): server-managed credentials only —
+  either user mappings over a lakehouse foreign server (postgres_fdw
+  pattern) or secure GUCs; table identity options (table, endpoint,
+  warehouse, s3_endpoint) may stay in WITH-options/attach rows.
+- Tracked as the doc 09 workstream; blocks M2's production-readiness
+  claim, not the M2 gate itself (fixture credentials are fake per
+  RULES §6).
