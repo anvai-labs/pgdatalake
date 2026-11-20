@@ -662,3 +662,25 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     explicit OAuth config resolution + refresh-token invalidation,
     type-conflict responses instead of "409" string search, ambient
     cloud credentials opt-in. Then #7, #8, #1 tail.
+  - 13-implementation-review Blocker #6 (transport) — FIXED 2026-11-20
+    f8336a8746e (85 cargo tests; live acceptance re-run green on the
+    fixture stack): (a) TABLE-ROOT SCOPE GATE: plan_scan checks every
+    hop (manifest list, manifests, data/delete paths) against the
+    table location — same scheme/bucket, segment-aware prefix
+    (s3://b/a does not admit s3://b/ab); violations are loud decode
+    errors. (b) file:// stores DEFAULT-DENY with a cfg(test)-only
+    opt-in — the shipped binary structurally cannot open
+    catalog-supplied local paths (monotonic global flag, gate tested
+    directly on the constructor so parallel tests never race).
+    (c) AMBIENT CREDENTIALS REMOVED (stricter than the review's
+    opt-in wording): static S3 keys are REQUIRED — missing keys are a
+    loud config error pointing at the user mapping, never an IMDS
+    probe (the 20s retry storms observed live pre-fix). (d) plain
+    HTTP only for explicit http:// endpoints; absent endpoint = AWS =
+    TLS-only. Fixture manifests relocated under the table location
+    (real catalog layout). Spec: 04-storage.md §7 transport policy.
+    REMAINING #6 (REST client): URL userinfo/query redaction +
+    response-body truncation in errors, same-origin redirect policy,
+    explicit OAuth config resolution + refresh invalidation,
+    type-conflict responses instead of "409" string search. Then #7,
+    #8, #1 tail; M2 #28/#29.
