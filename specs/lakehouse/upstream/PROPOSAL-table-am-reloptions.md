@@ -84,3 +84,30 @@ patch commit message (below), plus the motivating-consumer paragraph.
 - Consumer AM regression suite exercises CREATE/ALTER/relcache paths:
   with-options identity, unknown-key rejection at CREATE, ALTER
   SET/RESET round-trip via relcache.
+
+## Fair evaluation addendum (2026-11-20, post thread re-read)
+
+CF #4866 verdict on the reloptions piece specifically: mechanism = the
+SAME TableAmRoutine callback (named `reloptions` there), "less
+debatable", reviewed to ready; objections were mechanical only
+(redundant relkind if -> assert; duplicated index_reloptions decl;
+missing includes; Mark Dilger: "could use some regression tests").
+The series was returned as a whole, not for reloptions design reasons.
+
+Consequences for v2 (before sending):
+1. NAME: align the callback with the CF lineage (`reloptions`) so the
+   review continues an existing thread rather than starting a rival.
+2. TESTS IN THE PATCH: upstream-visible regression tests are a hard
+   requirement (Dilger's request) — add a minimal in-tree test AM
+   module (dummy_table_am style) exercising the callback through
+   CREATE/ALTER/relcache; the consumer suite alone does not count.
+3. PRESETS: state honestly that autovacuum/toast option packages are
+   NOT included; full ownership without presets is the deliberate
+   first step (Davis's extension-learn-by-doing argument); presets
+   are follow-up work.
+4. ALTER semantics: options must satisfy the (possibly new) AM after
+   SET ACCESS METHOD; failures surface at ALTER time — same rule the
+   CF series used.
+5. NOT claiming: this does not decouple build_reloptions from the
+   static relOpts registry (Paquier's fuller vision); it is the
+   narrow, reviewable first slice both prior efforts point toward.
