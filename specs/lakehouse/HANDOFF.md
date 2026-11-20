@@ -404,3 +404,17 @@
 
 `specs/lakehouse/RULES.md` is binding: allowlist-limited core edits, branch
 layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
+  - GPT-6 review fixes — DONE 2026-11-20: (1) CORRECTNESS: rd_options
+    now carries a valid StdRdOptions prefix (autovacuum's
+    extractRelOptions copy can't read past our buffer) with identity as
+    a NUL-packed tail blob; standard keys (fillfactor, autovacuum)
+    parse via default_reloptions. (2) SECURITY: token/s3 keys are no
+    longer accepted in WITH-options (rejected with a hint); they merge
+    from the attach row unconditionally. (3) merge semantics: WITH
+    identity wins, attach row supplies credentials + any NULL fields.
+    Live-verified (WITH-options create_remote + INSERT + count with
+    attach-row credentials); lakehouse suite + clippy green. REMAINING
+    from the triage: credential storage in the attach TABLE itself is
+    still dumpable — full fix = user-mapping/server-based credentials
+    (doc 09); SET ACCESS METHOD + matview/partitioned AM-resolution
+    tests; CF #5631 v14 consumer evaluation.

@@ -45,6 +45,8 @@
 #include "miscadmin.h"
 #include "storage/smgr.h"
 #include "utils/lsyscache.h"
+#include "access/reloptions.h"
+#include "utils/rel.h"
 #include "utils/builtins.h"
 #include "utils/fmgrprotos.h"
 #include "utils/rel.h"
@@ -99,8 +101,13 @@ ExtractManagedIdentity(Oid relid, LakehouseOptions *opts)
 	TupleTableSlot *slot;
 	bool		found = false;
 	char	   *identity = NULL;
+	char	   *opts_token = NULL;
+	char	   *opts_ak = NULL;
+	char	   *opts_sk = NULL;
+	char	   *opts_endpoint = NULL;
 
-	memset(opts, 0, sizeof(*opts));
+	/* merge mode: caller's opts (possibly from WITH-options) keeps its
+	 * identity fields; only NULL fields get filled from the attach row */
 	mt = table_open(get_managed_tables_relid(), AccessShareLock);
 	scan = table_beginscan(mt, GetActiveSnapshot(), 0, NULL, 0);
 	/* the slot type must be the scanned table's AM's own (heap scans
@@ -120,6 +127,7 @@ ExtractManagedIdentity(Oid relid, LakehouseOptions *opts)
 			for (i = 2; i <= 9; i++)
 			{
 				char	  **field = NULL;
+				char	  **local_slot = NULL;
 
 				v = slot_getattr(slot, i, &isnull);
 				if (isnull)
@@ -151,8 +159,21 @@ ExtractManagedIdentity(Oid relid, LakehouseOptions *opts)
 						field = &opts->snapshot_id;
 						break;
 				}
-				if (field != NULL)
+				if (i == 3)
+					local_slot = &opts_endpoint;
+				else if (i == 5)
+					local_slot = &opts_token;
+				else if (i == 7)
+					local_slot = &opts_ak;
+				else if (i == 8)
+					local_slot = &opts_sk;
+				if (field != NULL && (field == &opts->token ||
+									  field == &opts->s3_access_key ||
+									  field == &opts->s3_secret_key ||
+									  *field == NULL))
 					*field = text_to_cstring(DatumGetTextPP(v));
+				if (local_slot != NULL)
+					*local_slot = *field;
 			}
 			found = true;
 			break;
@@ -163,6 +184,23 @@ ExtractManagedIdentity(Oid relid, LakehouseOptions *opts)
 	table_endscan(scan);
 	table_close(mt, AccessShareLock);
 
+	if (found)
+	{
+		if (opts->table != NULL && identity != NULL)
+		{
+			/* caller already has an identity (WITH-options): take only
+			 * credential fields (token, s3 keys) from the attach row */
+			if (opts->token == NULL)
+				opts->token = opts_token;
+			if (opts->s3_access_key == NULL)
+				opts->s3_access_key = opts_ak;
+			if (opts->s3_secret_key == NULL)
+				opts->s3_secret_key = opts_sk;
+			if (opts->endpoint == NULL)
+				opts->endpoint = opts_endpoint;
+			return true;
+		}
+	}
 	if (found && identity != NULL)
 	{
 		/* namespace = before the last '.', table = after (doc 03 §3) */
@@ -445,104 +483,172 @@ append_cell_json(StringInfoData *buf, Form_pg_attribute attr, Datum v,
 /* ---------------- WITH-options (managed CREATE, slice 28) ---------------- */
 
 /*
- * The lakehouse WITH-options payload: NUL-separated values in FIXED order
- * (option i ends where the i-th NUL is). Written by
- * lakehouse_relation_reloptions at CREATE, decoded via
- * decode_lakehouse_reloptions at access time.
+ * rd_options layout (GPT-6 review finding #2): the bytea MUST carry a
+ * valid StdRdOptions prefix — autovacuum casts extractRelOptions()
+ * results to StdRdOptions* and copies sizeof(StdRdOptions), so a bare
+ * NUL-packed string layout gets read past. Our identity rides AFTER the
+ * standard struct as a NUL-packed blob (see LAKEHOUSE_RLOPT_BLOB), and
+ * standard keys (fillfactor, autovacuum, ...) parse via
+ * default_reloptions like on any heap table.
  */
+typedef struct LakehouseRelOptions
+{
+	int32		vl_len_;		/* varlena header */
+	StdRdOptions std;			/* standard prefix core reads safely */
+	int32		blob_len;		/* bytes of identity blob following */
+	char		blob[FLEXIBLE_ARRAY_MEMBER]; /* "table\0endpoint\0warehouse\0s3_endpoint\0" */
+}			LakehouseRelOptions;
+
 static const char *lakehouse_relopt_keys[] = {
-	"endpoint", "warehouse", "token", "table",
-	"s3_endpoint", "s3_access_key", "s3_secret_key", "snapshot_id",
+	"table", "endpoint", "warehouse", "s3_endpoint",
 };
-#define LAKEHOUSE_NUM_RELOPTS 8
+#define LAKEHOUSE_NUM_RELOPTS 4
+
+/* credentials (token, s3_access_key, s3_secret_key) are deliberately NOT
+ * table options: they live in the attach row / secure settings (doc 09)
+ * and must never enter pg_class.reloptions, which pg_dump exposes. */
 
 /*
- * [core-allowlist consumer] parse the raw WITH (...) list into our bytea.
- * Unknown keys error loudly (a typo'd endpoint should never silently
- * fall back to the attach path).
+ * [core-allowlist consumer] parse the raw WITH (...) list: our keys go
+ * into the identity blob, everything else validates via
+ * default_reloptions (fillfactor and friends keep working), unknown
+ * keys error loudly.
  */
 static bytea *
 lakehouse_relation_reloptions(Datum reloptions, bool validate)
 {
-	/* no WITH (...) at all — plain heap-default relation options */
-	if (DatumGetPointer(reloptions) == NULL)
-		return NULL;
-	ArrayType  *array = DatumGetArrayTypeP(reloptions);
-	Datum	   *elems;
-	int			nelems;
 	char	   *values[LAKEHOUSE_NUM_RELOPTS] = {0};
-	StringInfoData buf;
-	bytea	   *out;
+	bytea	   *std;
+	StringInfoData blob;
+	int32		std_len;
+	 LakehouseRelOptions *out;
 	int			i;
 
-	deconstruct_array(array, TEXTOID, -1, false, TYPALIGN_INT,
-					 &elems, NULL, &nelems);
+	if (DatumGetPointer(reloptions) == NULL)
+		return NULL;
 
-	for (i = 0; i < nelems; i++)
 	{
-		char	   *raw = TextDatumGetCString(elems[i]);
-		char	   *eq = strchr(raw, '=');
-		char	   *key;
-		char	   *val;
-		bool		known = false;
+		ArrayType  *array = DatumGetArrayTypeP(reloptions);
+		Datum	   *elems;
+		int			nelems;
 
-		key = raw;
-		val = eq ? eq + 1 : "";
-		if (eq != NULL)
-			*eq = '\0';
-		for (int k = 0; k < LAKEHOUSE_NUM_RELOPTS; k++)
+		deconstruct_array(array, TEXTOID, -1, false, TYPALIGN_INT,
+						  &elems, NULL, &nelems);
+		for (i = 0; i < nelems; i++)
 		{
-			if (strcmp(key, lakehouse_relopt_keys[k]) == 0)
+			char	   *raw = TextDatumGetCString(elems[i]);
+			char	   *eq = strchr(raw, '=');
+			char	   *key = raw;
+			char	   *val = "";
+			bool		known = false;
+
+			if (eq != NULL)
 			{
-				values[k] = val;
-				known = true;
-				break;
+				*eq = '\0';
+				val = eq + 1;
 			}
+			for (int k = 0; k < LAKEHOUSE_NUM_RELOPTS; k++)
+			{
+				if (strcmp(key, lakehouse_relopt_keys[k]) == 0)
+				{
+					values[k] = val;
+					known = true;
+					break;
+				}
+			}
+			if (!known)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("lakehouse: unrecognized option \"%s\"", key),
+						 errhint("Known options: table, endpoint, warehouse, "
+								 "s3_endpoint (credentials come from the attach "
+								 "row or secure settings, never table options).")));
 		}
-		if (!known)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("lakehouse: unrecognized option \"%s\"", key),
-					 errhint("Known options: endpoint, warehouse, token, table, "
-							 "s3_endpoint, s3_access_key, s3_secret_key, snapshot_id.")));
 	}
 
-	/* an identity without a table option is meaningless */
-	if (values[3] == NULL)
+	if (values[0] == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("lakehouse: the \"table\" option is required"),
-				 errhint("WITH (table 'namespace.table_name', endpoint '...')")));
+				 errhint("WITH (table = 'namespace.table_name', endpoint = '...')")));
 
-	initStringInfo(&buf);
+	/* standard keys (with ours stripped) -> StdRdOptions */
+	{
+		ArrayType  *array = DatumGetArrayTypeP(reloptions);
+		Datum	   *elems;
+		int			nelems;
+		Datum	   *keep;
+		int			nkeep = 0;
+
+		deconstruct_array(array, TEXTOID, -1, false, TYPALIGN_INT,
+						  &elems, NULL, &nelems);
+		keep = (Datum *) palloc(nelems * sizeof(Datum));
+		for (i = 0; i < nelems; i++)
+		{
+			char	   *raw = TextDatumGetCString(elems[i]);
+			char	   *eq = strchr(raw, '=');
+			bool		ours = false;
+
+			if (eq != NULL)
+				*eq = '\0';
+			for (int k = 0; k < LAKEHOUSE_NUM_RELOPTS; k++)
+				if (strcmp(raw, lakehouse_relopt_keys[k]) == 0)
+					ours = true;
+			if (!ours)
+				keep[nkeep++] = elems[i];
+		}
+		if (nkeep > 0)
+		{
+			array = construct_array_builtin(keep, nkeep, TEXTOID);
+			std = default_reloptions(PointerGetDatum(array), validate,
+									 RELOPT_KIND_HEAP);
+		}
+		else
+			std = NULL;
+	}
+
+	/* identity blob: table, endpoint, warehouse, s3_endpoint (NUL-packed) */
+	initStringInfo(&blob);
 	for (i = 0; i < LAKEHOUSE_NUM_RELOPTS; i++)
 	{
 		if (values[i] != NULL)
-			appendStringInfoString(&buf, values[i]);
-		appendStringInfoChar(&buf, '\0');
+			appendStringInfoString(&blob, values[i]);
+		appendStringInfoChar(&blob, '\0');
 	}
-	out = (bytea *) palloc(buf.len + VARHDRSZ);
-	SET_VARSIZE(out, buf.len + VARHDRSZ);
-	memcpy(VARDATA(out), buf.data, buf.len);
-	return out;
+
+	std_len = std != NULL ? VARSIZE(std) : offsetof(StdRdOptions, autovacuum) + sizeof(AutoVacOpts);
+	out = (LakehouseRelOptions *)
+		palloc0(VARHDRSZ + offsetof(LakehouseRelOptions, blob) + blob.len);
+	SET_VARSIZE(out, VARHDRSZ + offsetof(LakehouseRelOptions, blob) + blob.len);
+	if (std != NULL)
+		memcpy(&out->std, VARDATA(std), Min(std_len, sizeof(StdRdOptions)));
+	out->blob_len = blob.len;
+	memcpy(out->blob, blob.data, blob.len);
+	return (bytea *) out;
 }
 
 /*
- * Decode the bytea back into a LakehouseOptions (palloc'd strings).
- * Returns false when the relation carries no WITH-options.
+ * Decode rd_options into opts (identity + endpoint fields). Returns
+ * false when the relation carries no WITH-options. Credentials are NOT
+ * here by design — the caller merges them from the attach row.
  */
 static bool
 decode_lakehouse_reloptions(Relation rel, LakehouseOptions *opts)
 {
 	bytea	   *raw = rel->rd_options;
+	LakehouseRelOptions *ro;
 	char	   *p;
 	int			i;
 
 	if (raw == NULL)
 		return false;
 
+	ro = (LakehouseRelOptions *) raw;
+	if (VARSIZE(raw) < offsetof(LakehouseRelOptions, blob) + ro->blob_len)
+		return false;			/* foreign/legacy layout: ignore safely */
+
 	memset(opts, 0, sizeof(*opts));
-	p = VARDATA(raw);
+	p = ro->blob;
 	for (i = 0; i < LAKEHOUSE_NUM_RELOPTS; i++)
 	{
 		char	  **field = NULL;
@@ -553,28 +659,16 @@ decode_lakehouse_reloptions(Relation rel, LakehouseOptions *opts)
 		switch (i)
 		{
 			case 0:
-				field = &opts->endpoint;
-				break;
-			case 1:
-				field = &opts->warehouse;
-				break;
-			case 2:
-				field = &opts->token;
-				break;
-			case 3:
 				field = &opts->table;
 				break;
-			case 4:
+			case 1:
+				field = &opts->endpoint;
+				break;
+			case 2:
+				field = &opts->warehouse;
+				break;
+			case 3:
 				field = &opts->s3_endpoint;
-				break;
-			case 5:
-				field = &opts->s3_access_key;
-				break;
-			case 6:
-				field = &opts->s3_secret_key;
-				break;
-			case 7:
-				field = &opts->snapshot_id;
 				break;
 		}
 		if (p > start)
@@ -630,11 +724,13 @@ get_write_entry(Relation rel)
 		entry->natts = 0;
 		entry->tupdesc = NULL;
 		memset(&entry->opts, 0, sizeof(entry->opts));
-		/* WITH-options identity (managed CREATE) wins over the attach row */
+		/* WITH-options identity wins; attach row still supplies the
+		 * credentials (they never live in reloptions — doc 09) */
 		entry->have_identity = decode_lakehouse_reloptions(rel, &entry->opts);
-		if (!entry->have_identity)
-			entry->have_identity =
-				ExtractManagedIdentity(relid, &entry->opts);
+		if (!ExtractManagedIdentity(relid, &entry->opts))
+			entry->have_identity = entry->have_identity;
+		else if (!entry->have_identity)
+			entry->have_identity = true;
 		if (!entry->have_identity)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -763,8 +859,12 @@ lakehouse_scan_begin(Relation rel, Snapshot snapshot,
 	else
 		scan->rs_base.rs_instrument = NULL;
 
-	if (!decode_lakehouse_reloptions(rel, &scan->opts) &&
-		!ExtractManagedIdentity(RelationGetRelid(rel), &scan->opts))
+	{
+		bool		with_identity = decode_lakehouse_reloptions(rel, &scan->opts);
+		bool		attach_identity =
+			ExtractManagedIdentity(RelationGetRelid(rel), &scan->opts);
+
+		if (!with_identity && !attach_identity)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("managed table %s has no lakehouse identity",
@@ -774,6 +874,7 @@ lakehouse_scan_begin(Relation rel, Snapshot snapshot,
 				 errhint("SELECT lakehouse.attach_table('%s'::regclass, "
 						 "'namespace.table_name', endpoint => '...');",
 						 RelationGetRelationName(rel))));
+	}
 
 	lakehouse_scan_common_setup(scan, rel, NULL);
 	if (write_entries != NULL)
