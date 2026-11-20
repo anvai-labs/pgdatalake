@@ -23,7 +23,7 @@ struct FooterJson {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-struct BlobJson {
+pub struct BlobJson {
     #[serde(rename = "type")]
     blob_type: String,
     offset: u64,

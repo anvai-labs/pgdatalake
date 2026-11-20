@@ -2727,7 +2727,7 @@ mod dv_fixture_tests {
         assert_eq!(plan.delete_tasks.len(), 1, "one DV (puffin) delete file");
 
         let schema = md.current_schema().expect("current schema");
-        let deletes = load_row_deletes(&plan, None, &schema).expect("load deletes (DV decode)");
+        let deletes = load_row_deletes(&plan, None, schema).expect("load deletes (DV decode)");
         let data_path = plan.tasks[0].entry.data_file.file_path.clone();
         let row_deletes = deletes
             .for_task(&data_path, plan.tasks[0].sequence_number, false)
@@ -2794,7 +2794,8 @@ mod dv_trino_fixture_tests {
         std::fs::create_dir_all(dst.join("data")).unwrap();
 
         // metadata JSON: string remap (uncompressed)
-        for f in ["00002-01a1faef-257d-7771-8e08-77571d3a8d2metadata.json"] {
+        {
+            let f = "00002-01a1faef-257d-7771-8e08-77571d3a8d2metadata.json";
             let out = remap(
                 &std::fs::read(src.join("metadata").join(f)).unwrap(),
                 s3_prefix,
@@ -2889,7 +2890,7 @@ mod dv_trino_fixture_tests {
         assert_eq!(plan.delete_tasks.len(), 1, "one DV delete file");
 
         let schema = md.current_schema().expect("schema");
-        let deletes = load_row_deletes(&plan, None, &schema).expect("load deletes");
+        let deletes = load_row_deletes(&plan, None, schema).expect("load deletes");
         let data_path = plan.tasks[0].entry.data_file.file_path.clone();
         let row_deletes = deletes
             .for_task(&data_path, plan.tasks[0].sequence_number, false)
