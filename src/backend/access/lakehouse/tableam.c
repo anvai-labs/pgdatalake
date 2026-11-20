@@ -245,6 +245,7 @@ typedef struct LakehouseWriteEntry
 	/* own-writes overlay: staged tuples, copied datum-wise into mcxt */
 	Datum	   *staged_values;
 	bool	   *staged_isnull;
+	SubTransactionId *staged_subids; /* owning subxact per staged row */
 	int			staged_rows;
 	int			natts;
 	TupleDesc	tupdesc;
@@ -255,6 +256,9 @@ typedef struct LakehouseWriteEntry
 
 static HTAB *write_entries = NULL;
 
+static void append_cell_json(StringInfoData *buf, Form_pg_attribute attr,
+								 Datum v, bool isnull);
+
 static void
 lakehouse_xact_callback(XactEvent event, void *arg)
 {
@@ -263,6 +267,19 @@ lakehouse_xact_callback(XactEvent event, void *arg)
 
 	if (write_entries == NULL)
 		return;
+
+	/*
+	 * Two-phase commit is rejected with pending managed writes BEFORE
+	 * prepare (13-review blocker #3): a prepared transaction's remote
+	 * commit decision must survive crashes, which this AM's recovery
+	 * protocol does not yet support.
+	 */
+	if (event == XACT_EVENT_PRE_PREPARE && write_entries != NULL &&
+		hash_get_num_entries(write_entries) > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("two-phase commit is not supported with managed lakehouse writes"),
+				 errdetail("ROLLBACK or COMMIT the transaction before PREPARE.")));
 
 	if (event == XACT_EVENT_PRE_COMMIT || event == XACT_EVENT_PARALLEL_PRE_COMMIT)
 	{
@@ -275,11 +292,43 @@ lakehouse_xact_callback(XactEvent event, void *arg)
 		hash_seq_init(&seq, write_entries);
 		while ((entry = hash_seq_search(&seq)) != NULL)
 		{
-			if (entry->ws == NULL)
+			if (entry->ws == NULL || entry->staged_rows == 0)
 				continue;
 			{
 				char		errbuf[1024];
 				char	   *loc;
+				TupleDesc	tupdesc = entry->tupdesc;
+				StringInfoData row;
+				int			i;
+
+				/* push the SURVIVING staged rows (post subxact pruning)
+				 * into the accumulator now, then flush + commit */
+				for (i = 0; i < entry->staged_rows; i++)
+				{
+					int			k;
+
+					initStringInfo(&row);
+					appendStringInfoChar(&row, '[');
+					for (k = 0; k < tupdesc->natts; k++)
+					{
+						if (k > 0)
+							appendStringInfoChar(&row, ',');
+						append_cell_json(&row,
+										 TupleDescAttr(tupdesc, k),
+										 entry->staged_values[(size_t) i * entry->natts + k],
+										 entry->staged_isnull[(size_t) i * entry->natts + k]);
+					}
+					appendStringInfoChar(&row, ']');
+
+					errbuf[0] = '\0';
+					if (!pg_datalake_write_push(entry->ws, row.data,
+												errbuf, sizeof(errbuf)))
+						ereport(ERROR,
+								(errcode(ERRCODE_DATA_EXCEPTION),
+								 errmsg("lakehouse: could not stage row: %s",
+										errbuf)));
+					pfree(row.data);
+				}
 
 				errbuf[0] = '\0';
 				loc = pg_datalake_write_commit(entry->ws, 3, errbuf, sizeof(errbuf));
@@ -727,6 +776,7 @@ get_write_entry(Relation rel)
 											ALLOCSET_DEFAULT_SIZES);
 		entry->staged_values = NULL;
 		entry->staged_isnull = NULL;
+		entry->staged_subids = NULL;
 		entry->staged_rows = 0;
 		entry->natts = 0;
 		entry->tupdesc = NULL;
@@ -1042,13 +1092,12 @@ lakehouse_tuple_insert(Relation rel, TupleTableSlot *slot, CommandId cid,
 {
 	LakehouseWriteEntry *entry = get_write_entry(rel);
 	TupleDesc	tupdesc = RelationGetDescr(rel);
-	StringInfoData row;
-	int			i;
 	char		errbuf[1024];
 
 	slot_getallattrs(slot);
 
-	/* first insert opens the FFI write session (loadTable + writer) */
+	/* first insert opens the FFI write session (loadTable + writer):
+	 * validates identity/credentials early, fail-fast per doc 03 §5 */
 	if (entry->ws == NULL)
 	{
 		char	   *schema_json = build_schema_json(tupdesc);
@@ -1072,23 +1121,13 @@ lakehouse_tuple_insert(Relation rel, TupleTableSlot *slot, CommandId cid,
 							errbuf)));
 	}
 
-	/* tuple -> typed row JSON (datum arithmetic, no text formatting) */
-	initStringInfo(&row);
-	appendStringInfoChar(&row, '[');
-	for (i = 0; i < tupdesc->natts; i++)
-	{
-		if (i > 0)
-			appendStringInfoChar(&row, ',');
-		append_cell_json(&row, TupleDescAttr(tupdesc, i),
-						 slot->tts_values[i], slot->tts_isnull[i]);
-	}
-	appendStringInfoChar(&row, ']');
-
-	errbuf[0] = '\0';
-	if (!pg_datalake_write_push(entry->ws, row.data, errbuf, sizeof(errbuf)))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_EXCEPTION),
-				 errmsg("lakehouse: could not stage row: %s", errbuf)));
+	/*
+	 * Rows are NOT pushed to the Rust writer here. Staging is C-side
+	 * only (the overlay copy below); rows reach the parquet accumulator
+	 * at PRE-COMMIT, AFTER subtransaction pruning. Pushing at insert
+	 * time leaked savepoint-rolled-back rows into the committed snapshot
+	 * (13-review blocker #3).
+	 */
 
 	/* own-writes overlay: copy the tuple into the txn-scoped entry */
 	{
@@ -1101,6 +1140,8 @@ lakehouse_tuple_insert(Relation rel, TupleTableSlot *slot, CommandId cid,
 				palloc(tupdesc->natts * sizeof(Datum) * 64);
 			entry->staged_isnull = (bool *)
 				palloc(tupdesc->natts * sizeof(bool) * 64);
+			entry->staged_subids = (SubTransactionId *)
+				palloc(sizeof(SubTransactionId) * 64);
 		}
 		else if (entry->staged_rows % 64 == 0)
 		{
@@ -1112,7 +1153,15 @@ lakehouse_tuple_insert(Relation rel, TupleTableSlot *slot, CommandId cid,
 				repalloc(entry->staged_isnull,
 						 tupdesc->natts * sizeof(bool) *
 						 (entry->staged_rows + 64));
+			entry->staged_subids = (SubTransactionId *)
+				repalloc(entry->staged_subids,
+						 sizeof(SubTransactionId) *
+						 (entry->staged_rows + 64));
 		}
+		entry->staged_subids[entry->staged_rows] =
+			GetCurrentSubTransactionId();
+		elog(LOG, "lakehouse staged row at subid %u",
+			 GetCurrentSubTransactionId());
 		for (j = 0; j < tupdesc->natts; j++)
 		{
 			entry->staged_values[(size_t) entry->staged_rows * tupdesc->natts + j] =
@@ -1500,10 +1549,58 @@ static const TableAmRoutine lakehouse_tableam_methods = {
 	.amoptions = lakehouse_relation_reloptions,
 };
 
+/*
+ * SUBXACT_EVENT_ABORT_SUB: discard staged rows owned by the aborted
+ * subtransaction (or its descendants). ROLLBACK TO SAVEPOINT must hide
+ * them again — otherwise rolled-back inserts stay visible through the
+ * own-writes overlay and, worse, get published at main commit
+ * (13-review blocker #3).
+ */
+static void
+lakehouse_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+						   SubTransactionId parentSubid, void *arg)
+{
+	HASH_SEQ_STATUS seq;
+	LakehouseWriteEntry *entry;
+
+	if (event != SUBXACT_EVENT_ABORT_SUB || write_entries == NULL)
+	{
+		elog(LOG, "lakehouse subxact event %d subid %u", (int) event, mySubid);
+		return;
+	}
+	elog(LOG, "lakehouse ABORT_SUB subid %u", mySubid);
+	hash_seq_init(&seq, write_entries);
+	while ((entry = hash_seq_search(&seq)) != NULL)
+	{
+		int			w = 0;
+		int			i;
+
+		if (entry->staged_rows == 0)
+			continue;
+		for (i = 0; i < entry->staged_rows; i++)
+		{
+			if (entry->staged_subids[i] >= mySubid)
+				continue;		/* owned by the aborted subxact tree */
+			for (int k = 0; k < entry->natts; k++)
+			{
+				entry->staged_values[(size_t) w * entry->natts + k] =
+					entry->staged_values[(size_t) i * entry->natts + k];
+				entry->staged_isnull[(size_t) w * entry->natts + k] =
+					entry->staged_isnull[(size_t) i * entry->natts + k];
+			}
+			entry->staged_subids[w] = entry->staged_subids[i];
+			w++;
+		}
+		entry->staged_rows = w;
+	}
+	(void) parentSubid;
+}
+
 void
 _PG_init(void)
 {
 	RegisterXactCallback(lakehouse_xact_callback, NULL);
+	RegisterSubXactCallback(lakehouse_subxact_callback, NULL);
 }
 
 /* pg_am oid of the lakehouse AM (resolved once per backend) */

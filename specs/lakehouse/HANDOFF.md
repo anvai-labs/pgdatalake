@@ -526,3 +526,23 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     position-delete sequence/partition applicability, empty-projection
     open_all branch, delete-specific pruning rule, map/list nested
     field IDs.
+  - 13-implementation-review Blocker #3 — FIXED (narrow contract)
+    2026-11-20 (live-verified): (a) SUBTRANSACTION ROLLBACK discards
+    staged rows — rows are staged C-side ONLY (per-row
+    SubTransactionId); SUBXACT_EVENT_ABORT_SUB prunes rows owned by the
+    aborted subxact tree; rows reach the Rust parquet accumulator at
+    PRE-COMMIT, AFTER pruning — the deferred-push design. (The first
+    attempt pushed at INSERT time and leaked savepoint-rolled-back rows
+    into the committed snapshot; caught live and redesigned.)
+    (b) PREPARE is rejected with pending managed writes at
+    XACT_EVENT_PRE_PREPARE (FEATURE_NOT_SUPPORTED — the AM's recovery
+    protocol does not support crash-safe prepared remote commits yet).
+    (c) Mixed multi-table commits stay per-relation (documented, not
+    atomic); savepoint + commit verified live: INSERT 50 kept, INSERT
+    51 rolled back to savepoint, count = 1. PREPARE error path leaves
+    the table usable. REMAINING #3: crash-recovery/reconciliation
+    protocol, unknown-outcome verification, operator procedures
+    (doc 07 hardening). REMAINING overall per the review: #5 tail
+    (position-delete applicability, empty-projection branch, nested
+    field IDs, delete-specific pruning), #4 tail (typed representation,
+    operator allowlist), #6 FDW side, #7, #8, blocker #1 tail.
