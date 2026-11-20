@@ -58,6 +58,9 @@ pub struct TableWriteState {
     pub table_uuid: uuid::Uuid,
     pub base_snapshot_id: Option<i64>,
     pub last_sequence_number: Option<i64>,
+    /// manifest-list key of the BASE snapshot (blocker #1: appends carry
+    /// its live manifests forward)
+    pub base_manifest_list: Option<String>,
     pub location: String,
     pub schema_id: Option<i64>,
     pub partition_spec_id: i32,
@@ -140,10 +143,12 @@ impl CatalogClient {
                 })?;
             field_ids.insert(name.clone(), field.id);
         }
+        let base_manifest_list = md.current_snapshot().map(|snap| snap.manifest_list.clone());
         Ok(TableWriteState {
             table_uuid: md.table_uuid,
             base_snapshot_id: md.current_snapshot_id,
             last_sequence_number: md.last_sequence_number,
+            base_manifest_list,
             location: md.location.clone(),
             schema_id: Some(md.current_schema_id),
             partition_spec_id: md.default_partition_spec_id.unwrap_or(0),
@@ -167,6 +172,16 @@ impl CatalogClient {
     ) -> Result<(String, crate::catalog::metadata::Snapshot), crate::storage::StorageError> {
         let loc = crate::storage::parse_location(&st.location)?;
         let io = crate::storage::StorageIo::open(&loc, Some(&st.s3))?;
+
+        // blocker #1: carry the base snapshot's LIVE manifests (data AND
+        // delete) into the child snapshot's manifest list
+        let carried_manifests = match &st.base_manifest_list {
+            Some(path) => {
+                let bytes = io.get_bytes(path)?;
+                crate::manifest::parse_manifest_list(&bytes)?
+            }
+            None => Vec::new(),
+        };
         let written = crate::snapshot_write::write_snapshot(
             &io,
             &st.location,
@@ -181,6 +196,7 @@ impl CatalogClient {
                 last_sequence_number: st.last_sequence_number,
                 schema_id: st.schema_id,
                 partition_spec_id: st.partition_spec_id,
+                carried_manifests,
             },
         )?;
 

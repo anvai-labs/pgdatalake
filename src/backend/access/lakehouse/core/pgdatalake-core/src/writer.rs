@@ -15,6 +15,14 @@ use crate::storage::{StorageError, StorageIo};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use std::sync::Arc;
 
+/// Identity + metrics of one written data file (from write_file).
+#[derive(Debug, Clone)]
+pub struct WrittenFile {
+    pub key: String,
+    pub record_count: i64,
+    pub file_size_in_bytes: i64,
+}
+
 /// One column of the write schema. `field_id` stamps the parquet footer
 /// with `PARQUET:field_id` — other engines' readers (Trino, pyiceberg)
 /// map parquet columns to the Iceberg schema BY FIELD ID, so without it
@@ -355,24 +363,35 @@ impl BatchWriter {
     }
 
     /// Write accumulated rows as one file under `key_prefix` (a /data/
-    /// directory key), returning the object key. File naming is
-    /// deterministic per M4's orphan-GC rule: <prefix>/<rows>-<seq>.parquet.
+    /// directory key), returning the identity of the written object. The
+    /// name carries a random per-flush UUID: equal-size batches from
+    /// different transactions MUST NOT collide on one key, or the second
+    /// PUT silently overwrites bytes the first snapshot still references
+    /// (13-implementation-review blocker #1). The uuid is also the orphan
+    /// GC identity (M4).
     pub fn write_file(
         &mut self,
         io: &StorageIo,
         key_prefix: &str,
         seq: usize,
-    ) -> Result<String, StorageError> {
+    ) -> Result<WrittenFile, StorageError> {
         let rows = self.rows;
         let bytes = self.flush_bytes()?;
+        let size = bytes.len() as i64;
+        let flush_id = uuid::Uuid::new_v4();
         let key = format!(
-            "{}/{}-{}.parquet",
+            "{}/{}-{}-{}.parquet",
             key_prefix.trim_end_matches('/'),
             rows,
+            flush_id,
             seq
         );
         io.put_bytes(&key, bytes)?;
-        Ok(key)
+        Ok(WrittenFile {
+            key,
+            record_count: rows as i64,
+            file_size_in_bytes: size,
+        })
     }
 }
 
@@ -531,10 +550,13 @@ mod tests {
             .unwrap();
         assert_eq!(w.num_rows(), 2);
 
-        let key = w.write_file(&io, "table/data", 0).unwrap();
-        assert!(key.starts_with("table/data/2-0.parquet"), "{key}");
+        let wf = w.write_file(&io, "table/data", 0).unwrap();
+        assert!(wf.key.starts_with("table/data/2-"), "{}", wf.key);
+        assert_eq!(wf.record_count, 2);
+        assert!(wf.file_size_in_bytes > 0);
 
-        let mut rows = crate::parquet::ParquetRows::open(&io, &key, &["id", "name", "at"]).unwrap();
+        let mut rows =
+            crate::parquet::ParquetRows::open(&io, &wf.key, &["id", "name", "at"]).unwrap();
         assert!(rows.next());
         assert_eq!(rows.value(0), CellValue::Int64(1));
         assert_eq!(rows.value(1), CellValue::Str("alpha".into()));
@@ -621,11 +643,11 @@ mod tests {
             CellValue::Bytes(vec![0xde, 0xad]),
         ])
         .unwrap();
-        let key = w.write_file(&io, "t/data", 0).unwrap();
+        let wf = w.write_file(&io, "t/data", 0).unwrap();
 
         let mut rows = crate::parquet::ParquetRows::open(
             &io,
-            &key,
+            &wf.key,
             &["b", "i", "f", "d", "day", "t", "dec", "u", "bin"],
         )
         .unwrap();
@@ -747,9 +769,9 @@ mod tests {
             w.push(&[CellValue::Int64(i), CellValue::Null, CellValue::Null])
                 .unwrap();
         }
-        let key = w.write_file(&io, "t/data", 7).unwrap();
-        assert!(key.contains("1000-7.parquet"), "{key}");
-        let mut rows = crate::parquet::ParquetRows::open(&io, &key, &["id"]).unwrap();
+        let wf = w.write_file(&io, "t/data", 7).unwrap();
+        assert_eq!(wf.record_count, 1000);
+        let mut rows = crate::parquet::ParquetRows::open(&io, &wf.key, &["id"]).unwrap();
         let mut seen = 0;
         while rows.next() {
             seen += 1;

@@ -262,9 +262,9 @@ pub fn build_manifest_list_bytes(
             ("manifest_path".into(), V::String(e.manifest_path.clone())),
             ("manifest_length".into(), V::Long(e.manifest_length)),
             ("partition_spec_id".into(), V::Int(e.partition_spec_id)),
-            // 0 = DATA manifests only in appends (delete manifests arrive
-            // with the COW slice)
-            ("content".into(), V::Int(0)),
+            // carry each manifest's own content (0 data / 1 pos-deletes /
+            // 2 eq-deletes); new appends are DATA
+            ("content".into(), V::Int(e.content.unwrap_or(0))),
             (
                 "sequence_number".into(),
                 V::Long(e.sequence_number.unwrap_or(0)),
@@ -309,6 +309,12 @@ pub struct SnapshotParams {
     pub last_sequence_number: Option<i64>,
     pub schema_id: Option<i64>,
     pub partition_spec_id: i32,
+    /// The base snapshot's LIVE manifests, parsed by the caller from its
+    /// manifest-list. CRITICAL: an append must carry the base's live data
+    /// AND delete manifests forward, or the child snapshot drops
+    /// everything the base contained (13-implementation-review blocker
+    /// #1). Empty = first snapshot.
+    pub carried_manifests: Vec<crate::manifest::ManifestListEntry>,
 }
 
 /// Result of assembling a snapshot on the object store.
@@ -338,6 +344,7 @@ pub fn write_snapshot(
         last_sequence_number,
         schema_id,
         partition_spec_id,
+        carried_manifests,
     } = params;
     if new_files.is_empty() {
         return Err(StorageError::Config(
@@ -378,11 +385,12 @@ pub fn write_snapshot(
             .unwrap_or(&manifest_key)
     );
 
-    // manifest-list avro (single DATA manifest for appends)
+    // manifest-list avro: carried base manifests + this snapshot's
     let list_entry = crate::manifest::ManifestListEntry {
         manifest_path,
         manifest_length: manifest_bytes.len() as i64,
         partition_spec_id,
+        content: Some(0),
         added_snapshot_id: snapshot_id,
         added_files_count: Some(new_files.len() as i64),
         existing_files_count: Some(0),
@@ -393,7 +401,10 @@ pub fn write_snapshot(
         sequence_number: Some(sequence),
         min_sequence_number: Some(sequence),
     };
-    let list_bytes = build_manifest_list_bytes(&[list_entry])?;
+    let carried_len = carried_manifests.len();
+    let mut list_entries = carried_manifests;
+    list_entries.push(list_entry);
+    let list_bytes = build_manifest_list_bytes(&list_entries)?;
     let list_rel = format!("metadata/snap-{}-0-{}.avro", snapshot_id, Uuid::new_v4());
     let list_key = keyed(list_rel.clone());
     io.put_bytes(&list_key, list_bytes)?;
@@ -411,6 +422,7 @@ pub fn write_snapshot(
         summary: BTreeMap::from([
             ("operation".to_string(), "append".to_string()),
             ("added-data-files".to_string(), new_files.len().to_string()),
+            ("carried-manifests".to_string(), carried_len.to_string()),
             ("added-records".to_string(), total_rows.to_string()),
             ("added-files-size".to_string(), total_bytes.to_string()),
         ]),
@@ -480,12 +492,11 @@ mod tests {
         .unwrap();
         w.push(&[crate::parquet::CellValue::Int64(1)]).unwrap();
         w.push(&[crate::parquet::CellValue::Int64(2)]).unwrap();
-        let key = w.write_file(&io, "data", 0).unwrap();
-        let bytes = io.get_bytes(&key).unwrap();
+        let wf = w.write_file(&io, "data", 0).unwrap();
         let new_files = vec![NewDataFile {
-            file_path: format!("{location}/{key}"),
-            record_count: 2,
-            file_size_in_bytes: bytes.len() as i64,
+            file_path: format!("{location}/{}", wf.key),
+            record_count: wf.record_count,
+            file_size_in_bytes: wf.file_size_in_bytes,
             ..Default::default()
         }];
 
@@ -502,6 +513,7 @@ mod tests {
                 last_sequence_number: md.last_sequence_number,
                 schema_id: Some(0),
                 partition_spec_id: 0,
+                carried_manifests: Vec::new(),
             },
         )
         .expect("write_snapshot");
@@ -619,6 +631,7 @@ mod tests {
             manifest_path: "file://w/t/metadata/m0.avro".into(),
             manifest_length: manifest_bytes.len() as i64,
             partition_spec_id: 0,
+            content: Some(0),
             added_snapshot_id: 42,
             added_files_count: Some(1),
             existing_files_count: None,
@@ -638,5 +651,195 @@ mod tests {
         assert_eq!(e.manifest_length, manifest_bytes.len() as i64);
         assert_eq!(e.partition_spec_id, 0);
         assert_eq!(e.added_snapshot_id, 42);
+    }
+}
+
+#[cfg(test)]
+mod carry_tests {
+    use super::*;
+    use crate::catalog::metadata::{
+        FormatVersion, IcebergType, IcebergTypeMarker, Schema, SnapshotRef, TableMetadata,
+    };
+    use crate::storage::parse_location;
+    use std::collections::BTreeMap;
+
+    fn one_col_metadata(location: &str) -> TableMetadata {
+        TableMetadata {
+            format_version: FormatVersion::V2,
+            table_uuid: uuid::Uuid::nil(),
+            location: location.to_string(),
+            last_sequence_number: Some(0),
+            schemas: vec![Schema {
+                struct_type: IcebergTypeMarker::Struct,
+                schema_id: 0,
+                fields: vec![crate::catalog::metadata::Field {
+                    id: 1,
+                    name: "id".into(),
+                    required: false,
+                    r#type: IcebergType::Long,
+                    doc: None,
+                }],
+            }],
+            current_schema_id: 0,
+            snapshots: vec![],
+            current_snapshot_id: None,
+            properties: BTreeMap::new(),
+            partition_specs: vec![],
+            default_partition_spec_id: Some(0),
+            refs: BTreeMap::new(),
+        }
+    }
+
+    /// ACCEPTANCE (13-implementation-review blocker #1): append A, then B
+    /// (separate sessions/keys). The child snapshot B must CARRY A's
+    /// manifest forward; A's data file must be intact and distinct from
+    /// B's; a pinned read of A still yields A's row and the current read
+    /// yields A+B. A manifest with a DELETE entry is carried with its
+    /// content preserved.
+    #[test]
+    fn append_a_then_b_preserves_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = format!("file://{}", dir.path().display());
+        let loc = parse_location(&location).unwrap();
+        let io = StorageIo::open(&loc, None).unwrap();
+
+        let mut w = crate::writer::BatchWriter::new(vec![crate::writer::WriteColumn {
+            name: "id".into(),
+            ty: IcebergType::Long,
+            field_id: Some(1),
+        }])
+        .unwrap();
+        w.push(&[crate::parquet::CellValue::Int64(1)]).unwrap();
+        let wf_a = w.write_file(&io, "data", 0).unwrap();
+        let file_a = NewDataFile {
+            file_path: format!("{location}/{}", wf_a.key),
+            record_count: wf_a.record_count,
+            file_size_in_bytes: wf_a.file_size_in_bytes,
+            ..Default::default()
+        };
+
+        // snapshot A
+        let written_a = write_snapshot(
+            &io,
+            &location,
+            std::slice::from_ref(&file_a),
+            SnapshotParams {
+                snapshot_id: 100,
+                timestamp_ms: 1,
+                parent_snapshot_id: None,
+                last_sequence_number: Some(0),
+                schema_id: Some(0),
+                partition_spec_id: 0,
+                carried_manifests: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        // append B in a FRESH session: the keys must differ from A's
+        let mut w2 = crate::writer::BatchWriter::new(vec![crate::writer::WriteColumn {
+            name: "id".into(),
+            ty: IcebergType::Long,
+            field_id: Some(1),
+        }])
+        .unwrap();
+        w2.push(&[crate::parquet::CellValue::Int64(2)]).unwrap();
+        let wf_b = w2.write_file(&io, "data", 0).unwrap();
+        assert_ne!(wf_a.key, wf_b.key, "equal-size batches MUST NOT collide");
+        let file_b = NewDataFile {
+            file_path: format!("{location}/{}", wf_b.key),
+            record_count: wf_b.record_count,
+            file_size_in_bytes: wf_b.file_size_in_bytes,
+            ..Default::default()
+        };
+
+        // B carries A's live manifests forward (parsed from A's list)
+        let list_a_key = written_a
+            .snapshot
+            .manifest_list
+            .trim_start_matches(&format!("{location}/"))
+            .to_string();
+        let carried =
+            crate::manifest::parse_manifest_list(&io.get_bytes(&list_a_key).unwrap()).unwrap();
+        assert_eq!(carried.len(), 1);
+        let written_b = write_snapshot(
+            &io,
+            &location,
+            std::slice::from_ref(&file_b),
+            SnapshotParams {
+                snapshot_id: 101,
+                timestamp_ms: 2,
+                parent_snapshot_id: Some(100),
+                last_sequence_number: Some(1),
+                schema_id: Some(0),
+                partition_spec_id: 0,
+                carried_manifests: carried,
+            },
+        )
+        .unwrap();
+
+        // B's list = A's manifest + B's manifest; A's bytes intact
+        let list_b = crate::manifest::parse_manifest_list(
+            &io.get_bytes(
+                written_b
+                    .snapshot
+                    .manifest_list
+                    .trim_start_matches(&format!("{location}/")),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(list_b.len(), 2, "A carried + B new");
+        let paths: Vec<String> = list_b.iter().map(|e| e.manifest_path.clone()).collect();
+        assert!(
+            paths.iter().any(|p| p.contains("/100-")),
+            "A manifest carried; paths: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.contains("/101-")),
+            "B manifest present; paths: {paths:?}"
+        );
+        // A's data file bytes: still row 1 (not overwritten by B)
+        let a_key = file_a.file_path.trim_start_matches(&format!("{location}/"));
+        let mut rows = crate::parquet::ParquetRows::open(&io, a_key, &["id"]).unwrap();
+        assert!(rows.next());
+        assert_eq!(
+            rows.value(0),
+            crate::parquet::CellValue::Int64(1),
+            "A's file intact"
+        );
+        assert!(!rows.next());
+
+        // pinned read of A vs current: plan_scan per snapshot
+        let mut md = one_col_metadata(&location);
+        for (sid, wsnap) in [(100i64, &written_a.snapshot), (101, &written_b.snapshot)] {
+            md.snapshots.push(wsnap.clone());
+            md.current_snapshot_id = Some(sid);
+            md.refs.insert(
+                "main".into(),
+                SnapshotRef {
+                    snapshot_id: sid,
+                    kind: "branch".into(),
+                    min_snapshots_to_keep: None,
+                    max_snapshot_age_ms: None,
+                },
+            );
+        }
+        let plan_cur = crate::scan::plan_scan(&md, None, None, None).unwrap();
+        assert_eq!(plan_cur.data_files, 2, "current sees A+B");
+        let plan_a = crate::scan::plan_scan(
+            &md,
+            Some(&crate::catalog::metadata::SnapshotSelector::Id { value: 100 }),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan_a.data_files, 1, "pinned A sees only A");
+        let (io_a, key_a) =
+            crate::scan::open_for(&plan_a.tasks[0].entry.data_file.file_path, None).unwrap();
+        let mut rows = crate::parquet::ParquetRows::open(&io_a, &key_a, &["id"]).unwrap();
+        assert!(rows.next());
+        assert_eq!(rows.value(0), crate::parquet::CellValue::Int64(1));
+        assert!(!rows.next());
+        let _ = written_b.written_keys;
     }
 }

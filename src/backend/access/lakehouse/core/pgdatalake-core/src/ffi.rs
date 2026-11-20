@@ -757,22 +757,22 @@ pub unsafe extern "C" fn pg_datalake_write_flush(
     } else {
         format!("{}/data", ws.key_prefix)
     };
-    let key = match ws.writer.write_file(&ws.io, &data_dir, ws.file_seq) {
-        Ok(k) => k,
+    let wf = match ws.writer.write_file(&ws.io, &data_dir, ws.file_seq) {
+        Ok(w) => w,
         Err(e) => {
             unsafe { set_err(err_buf, err_len, &format!("write flush: {e}")) };
             return false;
         }
     };
     ws.file_seq += 1;
-    let bytes = ws.io.get_bytes(&key).unwrap_or_default();
     // the manifest stores the LOCATION URI; the put key may carry the S3
     // bucket-root prefix, which the location already includes
     let rel_key = if ws.key_prefix.is_empty() {
-        key.as_str()
+        wf.key.as_str()
     } else {
-        key.strip_prefix(&format!("{}/", ws.key_prefix))
-            .unwrap_or(&key)
+        wf.key
+            .strip_prefix(&format!("{}/", ws.key_prefix))
+            .unwrap_or(&wf.key)
     };
     // metric maps keyed by the TABLE's field ids
     let ids: Vec<i64> = ws
@@ -782,17 +782,10 @@ pub unsafe extern "C" fn pg_datalake_write_flush(
         .collect();
     let mut file = crate::snapshot_write::NewDataFile {
         file_path: format!("{}/{rel_key}", ws.state.location.trim_end_matches('/')),
-        record_count: 0,
-        file_size_in_bytes: bytes.len() as i64,
+        record_count: wf.record_count,
+        file_size_in_bytes: wf.file_size_in_bytes,
         ..Default::default()
     };
-    // record count = rows written, from the deterministic key name
-    // (<rows>-<seq>.parquet — slice 24's orphan-GC naming rule)
-    if let Some(stem) = key.rsplit('/').next() {
-        if let Some(rows) = stem.split('-').next() {
-            file.record_count = rows.parse().unwrap_or(0);
-        }
-    }
     for id in &ids {
         file.value_counts.insert(*id, file.record_count);
     }

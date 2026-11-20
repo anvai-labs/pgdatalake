@@ -435,3 +435,17 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     preset helper heap_reloptions_for_am (dropped in port; propose
     upstream or re-add per review), and the security finding
     (credentials never in options) as review input.
+  - 13-implementation-review Blocker #1 — PARTIALLY FIXED 2026-11-20
+    (Rust core, 66 cargo tests): (a) data files now carry a per-flush
+    UUID in the key (write_file returns WrittenFile{key, record_count,
+    file_size_in_bytes} — no GET-based measurement, no name-parsing);
+    equal-size batches from separate sessions can no longer overwrite
+    each other (acceptance: A-then-B test — pinned read of A yields A,
+    current yields A+B, A's bytes intact). (b) write_snapshot carries
+    the BASE snapshot's live manifests (data AND delete, content field
+    now parsed on ManifestListEntry) into the child's manifest list —
+    the child no longer drops the parent's history. REMAINING from
+    blocker #1: create-only PUT semantics (object-store conditional
+    write), two-writer concurrency, externally-written base with
+    deletes, independent-reader verification. Blockers #2-#8 queued in
+    review order.

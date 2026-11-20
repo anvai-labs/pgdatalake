@@ -47,6 +47,9 @@ pub struct ManifestListEntry {
     pub manifest_path: String,
     pub manifest_length: i64,
     pub partition_spec_id: i32,
+    /// v2: 0 = data, 1 = position deletes, 2 = equality deletes (None for
+    /// v1 files). Needed to carry manifests forward across snapshots.
+    pub content: Option<i32>,
     pub added_snapshot_id: i64,
     pub added_files_count: Option<i64>,
     pub existing_files_count: Option<i64>,
@@ -111,11 +114,21 @@ fn entry_from_value(v: &apache_avro::types::Value) -> Result<ManifestListEntry, 
                 )))
             }
         };
+        let content = match fields.iter().find(|(fk, _)| fk == "content") {
+            Some((_, apache_avro::types::Value::Union(_, inner))) => match **inner {
+                apache_avro::types::Value::Int(i) => Some(i),
+                apache_avro::types::Value::Null => None,
+                ref o => return Err(StorageError::Decode(format!("content: {o:?}"))),
+            },
+            Some((_, apache_avro::types::Value::Int(i))) => Some(*i),
+            _ => None,
+        };
         return Ok(ManifestListEntry {
             manifest_path: get_str("manifest_path")?,
             manifest_length: get_i64("manifest_length")?
                 .ok_or_else(|| StorageError::Decode("manifest_length: null".into()))?,
             partition_spec_id: spec,
+            content,
             added_snapshot_id: get_i64("added_snapshot_id")?
                 .ok_or_else(|| StorageError::Decode("added_snapshot_id: null".into()))?,
             added_files_count: get_i64("added_files_count")?,
