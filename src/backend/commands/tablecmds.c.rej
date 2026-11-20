@@ -1,0 +1,25 @@
+diff a/src/backend/commands/tablecmds.c b/src/backend/commands/tablecmds.c	(rejected hunks)
+@@ -959,6 +984,11 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
+ 		case RELKIND_PARTITIONED_TABLE:
+ 			(void) partitioned_table_reloptions(reloptions, true);
+ 			break;
++		case RELKIND_RELATION:
++		case RELKIND_MATVIEW:
++			(void) table_reloptions(GetTableAmOptions(accessMethodId),
++									relkind, reloptions, true);
++			break;
+ 		default:
+ 			(void) heap_reloptions(relkind, reloptions, true);
+ 	}
+@@ -17361,7 +17443,10 @@ ATExecSetRelOptions(Relation rel, List *defList, AlterTableType operation,
+ 	{
+ 		case RELKIND_RELATION:
+ 		case RELKIND_MATVIEW:
+-			(void) heap_reloptions(rel->rd_rel->relkind, newOptions, true);
++			if (!deferValidation)
++				(void) table_reloptions(RelationGetTableAmOptions(rel),
++										rel->rd_rel->relkind,
++										newOptions, true);
+ 			break;
+ 		case RELKIND_PARTITIONED_TABLE:
+ 			(void) partitioned_table_reloptions(newOptions, true);

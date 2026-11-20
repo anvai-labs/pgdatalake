@@ -1490,7 +1490,7 @@ static const TableAmRoutine lakehouse_tableam_methods = {
 	.scan_set_tidrange = lakehouse_scan_set_tidrange,
 	.scan_getnextslot_tidrange = lakehouse_scan_getnextslot_tidrange,
 
-	.relation_reloptions = lakehouse_relation_reloptions,
+	.amoptions = lakehouse_relation_reloptions,
 };
 
 void

@@ -418,3 +418,20 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     still dumpable — full fix = user-mapping/server-based credentials
     (doc 09); SET ACCESS METHOD + matview/partitioned AM-resolution
     tests; CF #5631 v14 consumer evaluation.
+  - CF #5631 PORT — DONE 2026-11-20 (branch cf5631-port, all suites
+    green + live smoke): the fork now runs Dunstan's amoptions contract
+    (CF #5631 v13/14): TableAmRoutine.amoptions + has_std_options_prefix,
+    table_reloptions/RelationGetTableAmOptions dispatch, dummy_table_am
+    upstream module, our scratch hook removed. Our lakehouse AM sets
+    .amoptions (same parse semantics; StdRdOptions prefix + identity
+    tail; credentials from attach row only). Port battle scars: a
+    splice over-deleted DefineRelation's transformRelOptions block
+    (caught live: pg_class.reloptions stored NULL; restored with
+    Dunstan's switch). Live smoke green: WITH-options + attach creds ->
+    create_remote -> INSERT -> count = 1. Port decisions to carry into
+    the CF #5631 review reply: matview dispatch (our fix; check if
+    Dunstan covers), our destination-AM SET ACCESS METHOD validation
+    (superseded by his deferValidation flow — reconcile semantics),
+    preset helper heap_reloptions_for_am (dropped in port; propose
+    upstream or re-add per review), and the security finding
+    (credentials never in options) as review input.
