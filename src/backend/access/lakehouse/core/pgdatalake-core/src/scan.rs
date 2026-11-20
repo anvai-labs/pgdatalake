@@ -2710,9 +2710,24 @@ mod dv_fixture_tests {
 
     #[test]
     fn java_v3_dv_fixture_reads_with_deletions_applied() {
-        let _dir =
+        // The fixture's committed metadata carries its generation location
+        // (/tmp/v3fixture/table). Reproduce that layout on any machine by
+        // copying the checked-in tree there first — portability bug caught
+        // by the first all-branch CI run (passed only where /tmp/v3fixture
+        // happened to exist).
+        let src_dir =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v3_dv_table");
         crate::storage::test_allow_local_stores();
+        let _dir = std::path::Path::new("/tmp/v3fixture/table");
+        for sub in ["metadata", "data"] {
+            let _ = std::fs::remove_dir_all(_dir.join(sub));
+            std::fs::create_dir_all(_dir.join(sub)).expect("create fixture layout");
+            for entry in std::fs::read_dir(src_dir.join(sub)).expect("fixture subdirs") {
+                let entry = entry.expect("fixture entry");
+                std::fs::copy(entry.path(), _dir.join(sub).join(entry.file_name()))
+                    .expect("copy fixture file");
+            }
+        }
         let md_path = _dir.join("metadata").join("v3.metadata.json");
         let md_text = std::fs::read_to_string(&md_path).expect("fixture metadata");
         let md: TableMetadata = serde_json::from_str(&md_text).expect("parse fixture metadata");
