@@ -708,6 +708,92 @@ mod tests {
         assert!(!rows.next());
     }
 
+    /// Perf ground truth (13-review robustness question: is row-JSON the
+    /// write bottleneck, or is MessagePack/a binary format warranted?).
+    /// #[ignore]d — timing is machine-relative; run explicitly:
+    ///   cargo test -p pgdatalake-core --lib -- --ignored bench --nocapture
+    #[test]
+    #[ignore]
+    fn bench_write_push_json_throughput() {
+        let cols = vec![
+            WriteColumn {
+                name: "id".into(),
+                ty: IcebergType::Long,
+                field_id: None,
+            },
+            WriteColumn {
+                name: "name".into(),
+                ty: IcebergType::String,
+                field_id: None,
+            },
+            WriteColumn {
+                name: "at".into(),
+                ty: IcebergType::Timestamptz,
+                field_id: None,
+            },
+            WriteColumn {
+                name: "amt".into(),
+                ty: IcebergType::Decimal {
+                    precision: 10,
+                    scale: 3,
+                },
+                field_id: None,
+            },
+            WriteColumn {
+                name: "flag".into(),
+                ty: IcebergType::Boolean,
+                field_id: None,
+            },
+        ];
+        let rows_json: Vec<String> = (0..100_000)
+            .map(|i| {
+                let amount = format!("{}.{}", i % 10_000, i % 1_000);
+                format!(
+                    "[{},\"row-{i}\",{{\"ts\":{}}},{{\"dec\":\"{amount}\"}},{}]",
+                    i,
+                    1_700_000_000_000_000u64 + i,
+                    i % 2 == 0
+                )
+            })
+            .collect();
+        let mut w = BatchWriter::new(cols.clone()).unwrap();
+        // full pipeline per row, exactly what the C side pays today:
+        // JSON text -> serde DOM -> typed cells -> arrow builders
+        let t0 = std::time::Instant::now();
+        for r in &rows_json {
+            let v: serde_json::Value = serde_json::from_str(r).unwrap();
+            let cells = parse_row_json(&cols, &v).unwrap();
+            w.push(&cells).unwrap();
+        }
+        let dt = t0.elapsed();
+        let nrows = rows_json.len();
+        // arrow-builder append alone (any format must pay this)
+        drop(w);
+        let mut w2 = BatchWriter::new(cols.clone()).unwrap();
+        let t1 = std::time::Instant::now();
+        for i in 0..nrows as i64 {
+            w2.push(&[
+                CellValue::Int64(i),
+                CellValue::Str(format!("row-{i}")),
+                CellValue::TimestampMicros(1_700_000_000_000_000 + i),
+                CellValue::Str(format!("{}.{}", i % 10_000, i % 1_000)),
+                CellValue::Bool(i % 2 == 0),
+            ])
+            .unwrap();
+        }
+        let builder_dt = t1.elapsed();
+        println!(
+            "write staging JSON pipeline: {} rows in {:?} = {:.0} rows/s \
+             ({:.2}M cells/s); arrow-append-only floor: {:?} = {:.0} rows/s",
+            nrows,
+            dt,
+            nrows as f64 / dt.as_secs_f64(),
+            nrows as f64 * 5.0 / dt.as_secs_f64() / 1e6,
+            builder_dt,
+            nrows as f64 / builder_dt.as_secs_f64(),
+        );
+    }
+
     /// TDD anchor (M2 slice 24): write -> read round-trip through OUR reader,
     /// including NULLs.
     #[test]

@@ -141,3 +141,30 @@ These root targets are forwarded to `src/test/lakehouse/` by a small block in th
 root `Makefile` (`[core-allowlist]`, 2026-11-19) — it is only reachable in
 meson-only trees (no `GNUmakefile`), which is the supported build mode; see
 RULES.md §9 for the meson-vs-autoconf note.
+
+### Write-staging serialization decision (2026-11-20)
+
+Question raised in review follow-up: should the managed-write row
+transport (C → Rust staging) use MessagePack or another binary format
+instead of the typed JSON array?
+
+**Measured** (`bench_write_push_json_throughput`, release, 5-column
+rows, 100k): full JSON pipeline (serde parse → typed cells → arrow
+builders) = **2.34M rows/s (11.7M cells/s)**; arrow-append floor =
+7.16M rows/s. Per-row staging cost ≈ 430 ns.
+
+**Decision: keep the typed JSON array.** The staging step runs at ~
+2.3M rows/s while the pipeline's dominant costs are per-FLUSH (S3 PUT
+≈ ms) and per-COMMIT (catalog RTT ≈ ms) — and the READ path's row-by-
+row transport measured ~2.7k rows/s at M1 (q3, slice-24 target), three
+orders of magnitude slower. A binary format (MessagePack included) buys
+≤ 2-3× on a step that is <1% of pipeline time, costs a new dependency
+(rmp-serde still builds a DOM unless hand-rolled), and forfeits the
+debuggability that made the #8b correctness fixes easy to verify.
+MessagePack specifically is NOT the better choice: it keeps the DOM
+allocation profile while dropping readability.
+
+Re-visit triggers: a scaled write benchmark (M4 perf gate) showing
+staging >5% of pipeline, or the columnar-batch staging refactor
+(natural home for a typed binary row format if one lands). The bench
+stays `#[ignore]`d for explicit re-runs.
