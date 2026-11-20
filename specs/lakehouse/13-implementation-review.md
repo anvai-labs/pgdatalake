@@ -143,3 +143,20 @@ returned (doc 14 §3 V0, TDD `v3_tables_are_rejected_loudly_on_read`), and a
 manifest entry with an unknown `content` value (v3 DV = 3) fails the
 manifest decode loudly (pre-existing, verified). Full DV application is
 slice V1 in specs/lakehouse/14-v3-conformance.md.)*
+
+---
+
+*(2026-11-20 M2 slice 29 — Blocker #1's tail is CLOSED. Two-writer ceremony
+live-verified against Lakekeeper + SeaweedFS with pyiceberg as the second
+writer and the independent reader: (A) pyiceberg commits, PG commits on top —
+the retry re-plans from the fresh base and carries the foreign manifest
+forward, both readers agree; (B) a PG transaction open across a concurrent
+pyiceberg commit hits AssertRefSnapshotId 409, retries, and both readers see
+the union; (C) PG tombstones a file that pyiceberg concurrently rewrites —
+the overwrite liveness check aborts the commit loudly (lost-update
+protection) with clean rollback, and both readers agree afterward. MERGE on
+managed tables (matched UPDATE/DELETE, NOT MATCHED insert, NOT MATCHED BY
+SOURCE delete) decomposes through the slice-28 hooks with no new code.
+Release-hold rationale for the WRITE path is therefore satisfied; remaining
+hold items are the read-side gaps tracked in this doc's other blockers and
+doc 14's v3 gates.)*

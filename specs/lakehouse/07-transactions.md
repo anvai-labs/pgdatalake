@@ -84,6 +84,21 @@ feature error (M3).
   **No partial commit ever exists remotely** — that is Iceberg's core guarantee
   and we rely on it.
 
+*(M2 slice 29, 2026-11-20 — MERGE needs no new AM code.)* `MERGE INTO`
+decomposes entirely through the slice-28 DML contract: matched UPDATEs/
+DELETEs use `tuple_fetch_row_version` + tombstone capture (one overwrite
+commit at PRE-COMMIT), NOT-MATCHED INSERTs use the staging path. Live:
+matched UPDATE + NOT-MATCHED INSERT + matched DELETE + NOT MATCHED BY
+SOURCE delete verified against pyiceberg ground truth. **Two-writer
+ceremony (closes 13-review #1's tail):** (A) foreign writer commits, PG
+commits on top — carried forward, readers agree; (B) a PG transaction open
+across a foreign commit takes the AssertRefSnapshotId 409, retries from the
+fresh base, readers agree; (C) PG tombstones a file a foreign writer
+concurrently rewrites — the overwrite liveness check aborts loudly, clean
+rollback, readers agree. Independent-reader agreement verified with
+pyiceberg after every commit kind (append, overwrite/MERGE, foreign
+append/rewrite).
+
 ## 3. Isolation & conflict semantics
 
 - **Read Committed (default)**: statement-level snapshots; two concurrent writers

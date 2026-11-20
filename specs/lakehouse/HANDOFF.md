@@ -812,3 +812,23 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     read-your-writes; pyiceberg agreement after commit; subxact rollback
     pruning; 12+8 stress txns clean under gdb + native. REMAINING: #29
     MERGE + ceremony (two-writer + independent reader = the #1 tail).
+  - M2 slice 29 (MERGE + ceremony) — DONE 2026-11-20 (live, NO new code for
+    MERGE): MERGE INTO decomposes through the slice-28 DML contract —
+    matched UPDATE/DELETE via tuple_fetch_row_version + tombstones, NOT
+    MATCHED insert via staging, one overwrite commit at PRE-COMMIT. All
+    branch kinds live-verified vs pyiceberg (matched UPDATE, NOT MATCHED
+    INSERT, matched DELETE, NOT MATCHED BY SOURCE delete). CEREMONY (the
+    #1 tail) CLOSED — two-writer interleaves live vs Lakekeeper/SeaweedFS
+    with pyiceberg 0.12 as writer #2 + independent reader: (A) foreign
+    commit then PG commit = carried forward, agree; (B) PG txn open across
+    foreign commit = 409 retry re-plans fresh base, agree; (C) PG tombstone
+    vs foreign COW rewrite = overwrite liveness check ABORTS loudly,
+    rollback clean, agree after. pyiceberg writing notes: static fixture
+    S3 keys are read-only — writes need Lakekeeper's VENDED credentials
+    (load_catalog with ONLY uri+warehouse; pyiceberg sends the
+    vended-credentials delegation header; Lakekeeper vends remote signing
+    via S3V4RestSigner; SeaweedFS PUTs are intermittently flaky — retry).
+    v3 pass landed first (266fc05de88, doc 14): scan_table rejects v3
+    reads loudly until DV slice. BLOCKER #1 TAIL CLOSED. M2 REMAINING:
+    none — M2 slices 24-29 all done. Next: read-side slice V1 (DV apply,
+    doc 14) or M3 slice 24 (columnar batch reads, THE perf fix).
