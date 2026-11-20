@@ -206,6 +206,33 @@
     accepts Int/Long singles in unions alongside pyiceberg's shapes.
     SPEC: 10-testing.md §2 interop-gate status amended (outstanding:
     Spark eq-deletes, Trino codec matrix, Trino-reads-our-writes at M2).
+  - slice 23 M1 TPC-DS gate + rescan fix: dataset = TPC-DS SF=10 via
+    duckdb dsdgen (21 tables, 3.1GB parquet on S3; store_sales 28.8M
+    rows). PRUNING EVIDENCE: identity-partitioned store_sales (18,240
+    files) -> WHERE ss_sold_date_sk = 2450992 examined 18,240 / pruned
+    18,230 / tasks 10, exact count, 3.6s incl. planning over 18k
+    manifests; negative control documented (unpartitioned dsdgen output
+    cannot bounds-prune — every file spans the full date range; correct,
+    and the motivating case for optimize). TIMINGS: full scale q1 1.2s /
+    q2 18.0s / q3 >60min terminated (CPU-bound; row-by-row FDW
+    transport = known M1 bottleneck, fix path slice 24 columnar batch
+    reads); sampled-scale (1% facts) ALL 10 QUERIES GREEN 0 errors
+    (q1 1.33s q2 .36s q3 .21s q4 2.31s q5 7.26s q6 .5s q7 2.97s q8 1.0s
+    q9 7.26s q10 5.3s). Engine findings: (1) FIXED
+    ReScanForeignScan re-planned per rescan (catalog round-trip +
+    manifest fetch) — merge-join inner rescans made join queries take
+    minutes; now rewind-only, session reused, snapshot pinned at open.
+    (2) RECORDED correlated-subplan pathology (q6: per-outer-row full
+    foreign scan of item, no index available) — fix path remote
+    parameterization or hash-subplan conversion (M2/M3). Evidence
+    ledger: src/test/lakehouse/fixtures/gate-evidence-m1-tpcds.md.
+    TPC-DS helpers: duckdb dsdgen -> /tmp/tpcds parquet ->
+    scripts-driven PyIceberg write (transient scripts in /tmp during the
+    gate run; worth promoting to scripts/ if the fixture is reused).
+    Cross-engine: proximadb session (proximadb-e4) benchmarking the
+    same fixture (native/DataFusion/DuckDB) against these numbers;
+    results land in 10-testing.md when delivered. M1 gate is GREEN
+    pending the cold-room ceremony (scripts/coldroom-smoke-m1.sh).
   - **Next slices**: M1 conformance
     gate (Trino-written tables, TPC-DS subset, perf vs doc 10 §5) ->
     smoke ceremony -> M1 retro + tag milestone/m1.

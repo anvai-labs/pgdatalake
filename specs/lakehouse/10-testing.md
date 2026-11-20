@@ -51,6 +51,16 @@ pyiceberg's shapes. Outstanding gate variants: Spark-written eq-deletes
 (eq path is unit-covered), Trino codec matrix, and "Trino reads a table
 we wrote" (needs our M2 writer).
 
+*(M1 gate status, 2026-11-19: read-half conformance green on PyIceberg
+fixtures incl. full type matrix; Trino-written table queryable incl. MoR
+position-delete application; TPC-DS q1–q10 all execute with 0 errors —
+pruning evidence 18,240 examined / 18,230 pruned, full-scale timings q1
+1.2s / q2 18.0s / q3 recorded as a >60-min row-transport bottleneck with
+fix path (columnar batch reads, M2 slice 24); evidence ledger at
+`src/test/lakehouse/fixtures/gate-evidence-m1-tpcds.md`. Outstanding
+gate variants deferred: Spark-written eq-deletes (unit-covered), Trino
+codec matrix, "Trino reads a table we wrote" (M2).)*
+
 ## 3. PostgreSQL regression suites
 
 - `src/test/regress/lakehouse/` — SQL/expected pairs (join iceberg vs heap,

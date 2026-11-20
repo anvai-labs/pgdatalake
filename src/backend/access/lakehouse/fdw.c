@@ -814,18 +814,25 @@ lakehouse_ReScanForeignScan(ForeignScanState *node)
 {
 	LakehouseExecState *state = (LakehouseExecState *) node->fdw_state;
 
+	/*
+	 * Rewind only: the planned session is REUSED. Merge/NestLoop join inner
+	 * rescans call this many times per statement — a full re-plan here (the
+	 * original implementation) costs a catalog round-trip + manifest fetch
+	 * PER RESCAN and made join-shaped TPC-DS queries take minutes (caught by
+	 * the M1 gate, slice 23). Within one statement the remote snapshot cannot
+	 * move underneath us in any visible way: the scan is pinned to the plan's
+	 * snapshot at open time.
+	 */
 	if (state->rows != NULL)
 	{
 		pg_datalake_rows_close(state->rows);
 		state->rows = NULL;
 	}
-	if (state->session != NULL)
+	if (state->session == NULL)
 	{
-		pg_datalake_scan_free(state->session);
+		state->session = OpenSession(&state->opts, state->rte_selector);
+		state->task_count = pg_datalake_scan_task_count(state->session);
 	}
-	/* fresh plan: the remote snapshot may have moved since the last scan */
-	state->session = OpenSession(&state->opts, state->rte_selector);
-	state->task_count = pg_datalake_scan_task_count(state->session);
 	state->current_task = 0;
 }
 
