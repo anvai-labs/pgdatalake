@@ -66,7 +66,126 @@ Alternatives considered and rejected in [11-related-work.md](11-related-work.md)
 embedding DuckDB (license/perf/fork-weight), Arrow C++ (build-system weight,
 exception-safety across `ereport`).
 
+## 1a. Component map (whole-system view, 2026-11-20)
+
+*(Mermaid renders on GitHub; module names are the real ones in the tree —
+Rust under `src/backend/access/lakehouse/core/pgdatalake-core/src/`, C
+under `src/backend/access/lakehouse/`.)*
+
+```mermaid
+flowchart TB
+    subgraph SQL["Postgres SQL surface"]
+        FDW["lakehouse_fdw
+external tables (read)"]
+        AM["lakehouse TableAM
+managed tables (DML)"]
+        DDL["lakehouse.attach_table / create_remote
+pg_lakehouse.* views"]
+    end
+
+    subgraph C["C glue — src/backend/access/lakehouse/"]
+        FFI["ffi boundary
+pg_datalake_core.h (cbindgen)"]
+        BF["batch_fill.c
+typed batch -> Datum fast path
+(exact maps + byte-identical fallback)"]
+        SCAN["scan / Iterate paths
+fdw.c Iterate, tableam scan_getnextslot"]
+        WRT["write entry
+stage_slot, tombstones, PRE_COMMIT rewrite
++ commit_overwrite"]
+    end
+
+    subgraph RUST["pgdatalake-core (Rust, single ffi.rs boundary)"]
+        SESSION["session.rs
+scan plan, commit_append
+lost-update liveness"]
+        CATALOG["catalog/metadata.rs
+REST client, v2+v3 metadata
+specs/snapshots"]
+        PLAN["scan.rs
+manifest filtering, pruning,
+DV + eq/pos delete load"]
+        PQ["parquet.rs
+arrow-rs reader; typed BatchView
+render_row (per-row) + next_batch (per-batch)"]
+        PUF["puffin.rs
+v3 deletion-vector containers"]
+        MAN["manifest.rs / snapshot_write.rs
+manifest list rewrite,
+overwrite + deleted entries"]
+        WRITER["writer.rs
+BatchWriter: rows -> parquet"]
+        STOR["storage.rs
+S3 / ADLS / GCS / local
+(scope-gated parse_location)"]
+    end
+
+    subgraph REMOTE["Cloud / fixtures"]
+        RESTC["REST catalog
+Lakekeeper / Glue / Nessie"]
+        OBJ["object store
+S3 / ADLS / GCS / SeaweedFS"]
+    end
+
+    SQL --> C
+    FDW --> SCAN
+    AM --> SCAN
+    AM --> WRT
+    C --> FFI
+    SCAN --> BF
+    SCAN --> FFI
+    WRT --> FFI
+    FFI --> SESSION
+    SESSION --> CATALOG
+    SESSION --> PLAN
+    PLAN --> PQ
+    PLAN --> PUF
+    PLAN --> MAN
+    WRT --> WRITER
+    SESSION --> MAN
+    PQ --> STOR
+    STOR --> OBJ
+    CATALOG --> RESTC
+```
+
+**Read hot path** (M3-R1 — the measured 3.2x):
+
+```mermaid
+flowchart LR
+    t[file/task] --> o[rows_open]
+    o --> b[rows_batch_next
+one arrow batch]
+    b --> v["typed views + live_idx + nulls"]
+    v --> m[batch_fill map
+kind x atttypid x typmod]
+    m -- exact --> d["Datum built directly
+(bool/i64/f64/ts/date/text/bytea)"]
+    m -- unprovable --> f[cell_text + InputFunctionCall
+byte-identical fallback]
+    d & f --> s[slot / heap_form_tuple]
+```
+
+**Write path (COW, slice 28):**
+
+```mermaid
+sequenceDiagram
+    participant X as txn DML
+    participant E as write entry (mcxt)
+    participant W as BatchWriter
+    participant R as catalog (REST)
+    X->>E: INSERT stage / UPDATE+DELETE tombstone(file,abs row)
+    Note over X: reads merge overlay + tombstone filter
+    X->>E: PRE_COMMIT
+    E->>W: rewrite tombstoned base files (survivors)
+    E->>W: push staged rows
+    W->>R: PUT files + commit_overwrite (deleted entries)
+    R-->>E: 409? re-plan + liveness check, retry 3
+    R-->>E: new snapshot id
+```
+
 ## 2. Layer responsibilities
+
 
 ### Layer 1 — `pgdatalake-core` (Rust)
 - **Catalog clients**: REST (v1 spec: `GET /v1/config`, `loadTable`, `createTable`,
