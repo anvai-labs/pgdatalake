@@ -330,11 +330,15 @@ pub unsafe extern "C" fn pg_datalake_rows_open(
             return Err("NULL scan session".into());
         };
         let projection = borrow_string(projection);
-        let projection: Vec<&str> = if projection.is_empty() {
+        // counted JSON ARRAY (13-review #8b): comma-separated names broke
+        // on column names containing commas
+        let projection_owned: Vec<String> = if projection.is_empty() {
             Vec::new()
         } else {
-            projection.split(',').map(|c| c.trim()).collect()
+            serde_json::from_str(&projection)
+                .map_err(|e| format!("projection is not a JSON array: {e}"))?
         };
+        let projection: Vec<&str> = projection_owned.iter().map(|s| s.as_str()).collect();
         let file_path = s
             .plan
             .tasks
@@ -1433,7 +1437,7 @@ mod tests {
         // manifest entry is NOT a task (count stayed 1) and reading task 0
         // skips absolute position 1 (id=2)
         {
-            let proj = CString::new("id").unwrap();
+            let proj = CString::new(r#"["id"]"#).unwrap();
             let rows = unsafe {
                 pg_datalake_rows_open(session, 0, proj.as_ptr(), err.as_mut_ptr(), err.len())
             };
@@ -1768,7 +1772,7 @@ mod tests {
         assert_eq!(unsafe { pg_datalake_scan_task_count(session) }, 1);
         assert_eq!(unsafe { pg_datalake_scan_task_rows(session, 0) }, 2);
         {
-            let proj = CString::new("id").unwrap();
+            let proj = CString::new(r#"["id"]"#).unwrap();
             let rows = unsafe {
                 pg_datalake_rows_open(session, 0, proj.as_ptr(), err.as_mut_ptr(), err.len())
             };

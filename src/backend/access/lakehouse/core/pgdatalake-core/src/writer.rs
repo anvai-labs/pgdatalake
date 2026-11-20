@@ -154,7 +154,9 @@ fn parse_time_us(s: &str) -> Option<i64> {
 }
 
 /// Unscaled i128 from canonical decimal text (`-5.00`, `123.45`).
-fn parse_decimal_unscaled(s: &str) -> Option<i128> {
+/// (unscaled value, textual scale) — the caller reconciles the scale to
+/// the column's declared target (13-review #8b).
+fn parse_decimal_parts(s: &str) -> Option<(i128, u32)> {
     let (sign, body) = match s.strip_prefix('-') {
         Some(b) => (-1i128, b),
         None => (1i128, s.strip_prefix('+').unwrap_or(s)),
@@ -169,9 +171,9 @@ fn parse_decimal_unscaled(s: &str) -> Option<i128> {
     let mut unscaled: i128 = int_part.parse().ok()?;
     for c in frac_part.chars() {
         unscaled = unscaled.checked_mul(10)?;
-        unscaled += (c as u8 - b'0') as i128;
+        unscaled = unscaled.checked_add(c.to_digit(10)? as i128)?;
     }
-    Some(sign * unscaled)
+    Some((sign * unscaled, frac_part.len() as u32))
 }
 
 fn hex_uuid_bytes(s: &str) -> Option<Vec<u8>> {
@@ -247,6 +249,94 @@ impl BatchWriter {
                 self.builders.len()
             )));
         }
+        // PASS 1 — validate the ENTIRE row before mutating any builder
+        // (13-review #8b): a bad cell mid-row used to leave earlier
+        // builders advanced, misaligning every subsequent row in the
+        // batch. Text-parsing cells (date/time/decimal/uuid) and
+        // type-pairing checks run here; PASS 2 can then append without
+        // mid-row failure.
+        for (i, v) in row.iter().enumerate() {
+            use IcebergType as IT;
+            match (&self.builders[i], v) {
+                (Builder::Bool(_), CellValue::Bool(_)) | (Builder::Bool(_), CellValue::Null) => {}
+                (Builder::Int32(_), CellValue::Int64(x)) => {
+                    if !(*x >= i32::MIN as i64 && *x <= i32::MAX as i64) {
+                        return Err(StorageError::Config(format!(
+                            "write path: column {} value {:?} overflows int32",
+                            self.columns[i].name, v
+                        )));
+                    }
+                }
+                (Builder::Int32(_), CellValue::Null)
+                | (Builder::Int64(_), CellValue::Int64(_))
+                | (Builder::Int64(_), CellValue::Null)
+                | (Builder::Float32(_), CellValue::Float64(_))
+                | (Builder::Float32(_), CellValue::Null)
+                | (Builder::Float64(_), CellValue::Float64(_))
+                | (Builder::Float64(_), CellValue::Null)
+                | (Builder::Str(_), CellValue::Str(_))
+                | (Builder::Str(_), CellValue::Null)
+                | (Builder::Binary(_), CellValue::Bytes(_))
+                | (Builder::Binary(_), CellValue::Null)
+                | (Builder::TsUs(_), CellValue::TimestampMicros(_))
+                | (Builder::TsUs(_), CellValue::Null) => {}
+                (Builder::Date32(_), CellValue::Str(x)) => {
+                    parse_date_days(x).ok_or_else(|| {
+                        StorageError::Config(format!("write path: bad date text {x:?}"))
+                    })?;
+                }
+                (Builder::Date32(_), CellValue::Null) => {}
+                (Builder::Time64Us(_), CellValue::Str(x)) => {
+                    parse_time_us(x).ok_or_else(|| {
+                        StorageError::Config(format!("write path: bad time text {x:?}"))
+                    })?;
+                }
+                (Builder::Time64Us(_), CellValue::Null) => {}
+                (Builder::Decimal(_), CellValue::Str(x)) => {
+                    let (unscaled, text_scale) = parse_decimal_parts(x).ok_or_else(|| {
+                        StorageError::Config(format!("write path: bad decimal text {x:?}"))
+                    })?;
+                    let (precision, scale) = match &self.columns[i].ty {
+                        IT::Decimal { precision, scale } => (*precision, *scale),
+                        other => unreachable!("decimal builder non-decimal column {other:?}"),
+                    };
+                    if text_scale > scale {
+                        return Err(StorageError::Config(format!(
+                            "write path: decimal {x:?} has {} fractional digits, \
+                             column scale is {scale} (losing digits is not allowed)",
+                            text_scale
+                        )));
+                    }
+                    let rescaled = unscaled
+                        .checked_mul(10i128.pow(scale - text_scale))
+                        .ok_or_else(|| {
+                            StorageError::Config(format!(
+                                "write path: decimal {x:?} overflows the column's scale"
+                            ))
+                        })?;
+                    let max = 10i128.pow(precision);
+                    if rescaled.abs() >= max {
+                        return Err(StorageError::Config(format!(
+                            "write path: decimal {x:?} exceeds precision {precision}"
+                        )));
+                    }
+                }
+                (Builder::Decimal(_), CellValue::Null) => {}
+                (Builder::Uuid(_), CellValue::Str(x)) => {
+                    hex_uuid_bytes(x).ok_or_else(|| {
+                        StorageError::Config(format!("write path: bad uuid text {x:?}"))
+                    })?;
+                }
+                (Builder::Uuid(_), CellValue::Null) => {}
+                (b, v) => {
+                    return Err(StorageError::Config(format!(
+                        "write path: column {} got mismatched value {v:?} (builder {b:?})",
+                        self.columns[i].name
+                    )))
+                }
+            }
+        }
+        // PASS 2 — append; every possible failure was rejected above.
         for (i, v) in row.iter().enumerate() {
             match (&mut self.builders[i], v) {
                 (Builder::Bool(b), CellValue::Bool(x)) => b.append_value(*x),
@@ -284,10 +374,15 @@ impl BatchWriter {
                 (Builder::TsUs(b), CellValue::TimestampMicros(x)) => b.append_value(*x),
                 (Builder::TsUs(b), CellValue::Null) => b.append_null(),
                 (Builder::Decimal(b), CellValue::Str(x)) => {
-                    let unscaled = parse_decimal_unscaled(x).ok_or_else(|| {
-                        StorageError::Config(format!("write path: bad decimal text {x:?}"))
-                    })?;
-                    b.append_value(unscaled)
+                    // PASS 1 validated parse + scale reconciliation; redo
+                    // the (cheap) conversion for the append
+                    let (unscaled, text_scale) = parse_decimal_parts(x)
+                        .ok_or_else(|| StorageError::Config("write path: bad decimal".into()))?;
+                    let scale = match &self.columns[i].ty {
+                        IcebergType::Decimal { scale, .. } => *scale,
+                        other => unreachable!("non-decimal column {other:?}"),
+                    };
+                    b.append_value(unscaled * 10i128.pow(scale - text_scale))
                 }
                 (Builder::Decimal(b), CellValue::Null) => b.append_null(),
                 (Builder::Uuid(b), CellValue::Str(x)) => {
@@ -526,6 +621,91 @@ mod tests {
                 field_id: None,
             },
         ]
+    }
+
+    /// 13-review #8b: decimal text reconciles to the COLUMN's scale —
+    /// the textual fractional digits used to become the unscaled value
+    /// verbatim, silently rescaling the number (123.45 into a scale-3
+    /// column read back as 12.345).
+    #[test]
+    fn decimal_scale_reconciles_to_column() {
+        let cols = vec![WriteColumn {
+            name: "amt".into(),
+            ty: IcebergType::Decimal {
+                precision: 10,
+                scale: 3,
+            },
+            field_id: None,
+        }];
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
+        let io = StorageIo::open(
+            &parse_location(&format!("file://{}", dir.path().display())).unwrap(),
+            None,
+        )
+        .unwrap();
+        let mut w = BatchWriter::new(cols.clone()).unwrap();
+        w.push(&[CellValue::Str("123.45".into())]).unwrap();
+        let wf = w.write_file(&io, "table/data", 0).unwrap();
+        let mut rows = crate::parquet::ParquetRows::open(&io, &wf.key, &["amt"]).unwrap();
+        assert!(rows.next());
+        match rows.value(0) {
+            CellValue::Str(txt) => {
+                assert_eq!(txt, "123.450", "value must land at scale 3");
+            }
+            other => panic!("expected decimal text, got {other:?}"),
+        }
+        // more fractional digits than the target scale: loud error, no
+        // silent truncation
+        let mut w2 = BatchWriter::new(cols).unwrap();
+        assert!(w2.push(&[CellValue::Str("1.2345".into())]).is_err());
+    }
+
+    /// 13-review #8b: the WHOLE row validates before any builder mutates —
+    /// a bad cell in the middle used to leave earlier builders advanced,
+    /// misaligning every subsequent row in the batch.
+    #[test]
+    fn failed_row_does_not_corrupt_the_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
+        let io = StorageIo::open(
+            &parse_location(&format!("file://{}", dir.path().display())).unwrap(),
+            None,
+        )
+        .unwrap();
+        let mut w = BatchWriter::new(cols()).unwrap();
+        // row 1 OK
+        w.push(&[
+            CellValue::Int64(1),
+            CellValue::Str("ok".into()),
+            CellValue::TimestampMicros(1),
+        ])
+        .unwrap();
+        // row 2 has a BAD middle cell (int in a string column)
+        assert!(w
+            .push(&[
+                CellValue::Int64(2),
+                CellValue::Int64(99),
+                CellValue::TimestampMicros(2),
+            ])
+            .is_err());
+        // row 3 must land correctly aligned
+        w.push(&[
+            CellValue::Int64(3),
+            CellValue::Str("after".into()),
+            CellValue::TimestampMicros(3),
+        ])
+        .unwrap();
+        let wf = w.write_file(&io, "table/data", 0).unwrap();
+        assert_eq!(wf.record_count, 2, "failed row contributes nothing");
+        let mut rows =
+            crate::parquet::ParquetRows::open(&io, &wf.key, &["id", "name", "at"]).unwrap();
+        assert!(rows.next());
+        assert_eq!(rows.value(0), CellValue::Int64(1));
+        assert!(rows.next());
+        assert_eq!(rows.value(0), CellValue::Int64(3));
+        assert_eq!(rows.value(1), CellValue::Str("after".into()));
+        assert!(!rows.next());
     }
 
     /// TDD anchor (M2 slice 24): write -> read round-trip through OUR reader,

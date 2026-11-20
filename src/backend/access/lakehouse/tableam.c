@@ -311,6 +311,12 @@ lakehouse_xact_callback(XactEvent event, void *arg)
 					appendStringInfoChar(&row, '[');
 					for (k = 0; k < tupdesc->natts; k++)
 					{
+						/* dropped attributes are omitted from the schema
+						 * (build_schema_json) and from the row too — the
+						 * cell count must match the column count
+						 * (13-review #8b) */
+						if (TupleDescAttr(tupdesc, k)->attisdropped)
+							continue;
 						if (k > 0)
 							appendStringInfoChar(&row, ',');
 						append_cell_json(&row,
@@ -495,9 +501,16 @@ append_cell_json(StringInfoData *buf, Form_pg_attribute attr, Datum v,
 			}
 		case TEXTOID:
 		case VARCHAROID:
-		case NAMEOID:
-		case BPCHAROID:
 			escape_json(buf, DatumGetCString(DirectFunctionCall1(textout, v)));
+			break;
+		case NAMEOID:
+			/* name Datums are NameData*, NOT varlena text — routing them
+			 * through textout read garbage (13-review #8b) */
+			escape_json(buf, DatumGetCString(DirectFunctionCall1(nameout, v)));
+			break;
+		case BPCHAROID:
+			/* padded-blank semantics live in bpcharout */
+			escape_json(buf, DatumGetCString(DirectFunctionCall1(bpcharout, v)));
 			break;
 		case DATEOID:
 			/* PG date = days since 2000-01-01; Iceberg = days since epoch */
@@ -526,10 +539,21 @@ append_cell_json(StringInfoData *buf, Form_pg_attribute attr, Datum v,
 			appendStringInfoChar(buf, '}');
 			break;
 		case BYTEAOID:
-			appendStringInfoString(buf, "{\"b\": ");
-			escape_json(buf, DatumGetCString(DirectFunctionCall1(byteaout, v)));
-			appendStringInfoChar(buf, '}');
+		{
+			/* hex-encode DIRECTLY: byteaout follows the bytea_output GUC
+			 * (escape vs hex), which would silently corrupt stored bytes
+			 * under bytea_output=escape (13-review #8b) */
+			bytea	   *b = DatumGetByteaPP(v);
+			const unsigned char *raw = (const unsigned char *) VARDATA_ANY(b);
+			int			blen = VARSIZE_ANY_EXHDR(b);
+			int			j;
+
+			appendStringInfoString(buf, "{\"b\": \"\\\\x");
+			for (j = 0; j < blen; j++)
+				appendStringInfo(buf, "%02x", raw[j]);
+			appendStringInfoString(buf, "\"}");
 			break;
+		}
 		default:
 			/* build_schema_json rejected it before we ever got a row */
 			elog(ERROR, "lakehouse: unexpected column type in managed insert");
@@ -840,8 +864,11 @@ lakehouse_scan_common_setup(LakehouseTableScanDesc scan, Relation rel,
 	scan->typioparams = (Oid *) palloc0(tupdesc->natts * sizeof(Oid));
 	scan->slot_index = (int *) palloc0(tupdesc->natts * sizeof(int));
 
-	/* projection: visible attribute names, in attribute order */
+	/* projection: visible attribute names, in attribute order — a counted
+	 * JSON ARRAY, not comma-separated: column names may contain commas
+	 * (13-review #8b) */
 	initStringInfo(&proj);
+	appendStringInfoChar(&proj, '[');
 	for (i = 0; i < tupdesc->natts; i++)
 	{
 		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
@@ -853,13 +880,14 @@ lakehouse_scan_common_setup(LakehouseTableScanDesc scan, Relation rel,
 		}
 		if (!first_col)
 			appendStringInfoChar(&proj, ',');
-		appendStringInfoString(&proj, NameStr(attr->attname));
+		escape_json(&proj, NameStr(attr->attname)); /* emits its own quotes */
 		first_col = false;
 		getTypeInputInfo(attr->atttypid,
 						 &scan->in_funcs[i].fn_oid,
 						 &scan->typioparams[i]);
 		fmgr_info(scan->in_funcs[i].fn_oid, &scan->in_funcs[i]);
 	}
+	appendStringInfoChar(&proj, ']');
 	{
 		int			proj_col = 0;
 
@@ -1082,7 +1110,8 @@ lakehouse_scan_getnextslot(TableScanDesc bscan, ScanDirection direction,
 				}
 				slot->tts_values[i] = InputFunctionCall(&scan->in_funcs[i],
 							pg_datalake_rows_col_text(scan->rows, pcol),
-							scan->typioparams[i], -1);
+							scan->typioparams[i],
+							TupleDescAttr(tupdesc, i)->atttypmod);
 				slot->tts_isnull[i] = false;
 			}
 			ExecStoreVirtualTuple(slot);

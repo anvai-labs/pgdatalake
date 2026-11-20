@@ -136,3 +136,35 @@ Remaining #8 write-path items (typmod, name-Datum, dropped-attribute
 row/schema mismatch, decimal scale reconciliation, whole-row validation
 before builder mutation, counted projection fields, bytea_output
 independence) are the 8b slice.
+
+## Write-path type fixes (2026-11-20, 13-review blocker #8b)
+
+- **`name` columns routed through `textout`** — name Datums are
+  `NameData*`, not varlena text; they now go through `nameout` (and
+  bpchar through `bpcharout`, keeping its padded-blank semantics).
+- **bytea independent of `bytea_output`** — the write path hex-encodes
+  directly; `bytea_output=escape` used to silently change the stored
+  bytes.
+- **Decimal scale reconciliation** — the textual fractional digits
+  became the unscaled value verbatim, silently rescaling numbers
+  (123.45 into a scale-3 column read back as 12.345). Text now
+  reconciles to the column's declared scale; more fractional digits
+  than the scale is a loud error (digits are never dropped), with
+  precision overflow checked.
+- **Whole-row validation before builder mutation** — a bad cell
+  mid-row used to leave earlier arrow builders advanced, misaligning
+  every subsequent row in the batch. `push` now validates the entire
+  row (type pairing, text parses, scale/precision, int32 range)
+  before appending; a rejected row contributes nothing.
+- **Dropped attributes** — the schema omits them but the row carried
+  them (cell/column count mismatch); the row loop skips them too.
+- **Counted projection fields** — the reader projection is a JSON
+  array instead of comma-separated names, which broke on column names
+  containing commas.
+- **typmod pass-through** — input conversions receive the attribute's
+  real `atttypmod` instead of -1.
+
+Live acceptance (fixture stack): `name`/`varchar`/`bytea`/`numeric(10,3)`
+managed table written under `bytea_output=escape`, read back through
+PostgreSQL AND an independent pyiceberg reader — bytes exact
+(`b'\xde\x00\xad'`), decimals at scale 3, comma-containing names intact.

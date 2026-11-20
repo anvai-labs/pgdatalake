@@ -48,6 +48,7 @@
 #include "catalog/pg_foreign_table.h"
 #include "catalog/pg_user_mapping.h"
 #include "access/reloptions.h"
+#include "utils/json.h"
 #include "lib/stringinfo.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/nodes.h"
@@ -929,8 +930,11 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 	state->typioparams = (Oid *) palloc0(tupdesc->natts * sizeof(Oid));
 	state->slot_index = (int *) palloc0(tupdesc->natts * sizeof(int));
 
-	/* projection: visible attribute names, in attribute order */
+	/* projection: visible attribute names, in attribute order — a counted
+	 * JSON ARRAY, not comma-separated: column names may contain commas
+	 * (13-review #8b) */
 	initStringInfo(&proj);
+	appendStringInfoChar(&proj, '[');
 	for (int i = 0; i < tupdesc->natts; i++)
 	{
 		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
@@ -942,13 +946,15 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 		}
 		if (!first_col)
 			appendStringInfoChar(&proj, ',');
-		appendStringInfoString(&proj, NameStr(attr->attname));
+		escape_json(&proj, NameStr(attr->attname)); /* emits its own quotes */
 		first_col = false;
 		getTypeInputInfo(attr->atttypid,
 						 &state->in_funcs[i].fn_oid,
 						 &state->typioparams[i]);
 		fmgr_info(state->in_funcs[i].fn_oid, &state->in_funcs[i]);
 	}
+	appendStringInfoChar(&proj, ']');
+
 	/* renumber projection columns (dropped slots don't occupy positions) */
 	{
 		int			proj_col = 0;
@@ -1102,7 +1108,8 @@ lakehouse_IterateForeignScan(ForeignScanState *node)
 				values[i] = InputFunctionCall(&state->in_funcs[i],
 											  pg_datalake_rows_col_text(state->rows,
 																		pcol),
-											  state->typioparams[i], -1);
+											  state->typioparams[i],
+											  TupleDescAttr(tupdesc, i)->atttypmod);
 				nulls[i] = false;
 			}
 			tuple = heap_form_tuple(tupdesc, values, nulls);
