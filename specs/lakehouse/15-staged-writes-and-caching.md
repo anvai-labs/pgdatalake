@@ -137,7 +137,7 @@ data, not credentials — but it still must not escape backup tooling).
 (Trino, Spark) do NOT see the rows until the publisher commits an
 Iceberg snapshot. PG sees them immediately (delta read-through, §3.4).
 This is a real semantic change vs doc 07 §2's "commit includes remote
-commit" and is gated on it: §7 requires it be opt-in per table
+commit" and is gated on it: §7.3/R2 requires it be opt-in per table
 (`lakehouse.write_mode = 'staged'`, default remains 'cow') until the
 whole doc is implemented and lived with.
 
@@ -345,19 +345,78 @@ If the invalidation cost or staleness risk outstrips the benefit in
 measurement, this layer is dropped — recorded here so the ambition
 doesn't silently become a correctness hazard.
 
-## 7. Rollout ordering (each step independently shippable + revertible)
+## 7. Prerequisites & rollout (refined 2026-11-20 — verified against code)
 
-1. **Ranged reads + metadata cache (6.2/6.3)** — pure win, no semantics.
-   (Depends on 13-review #2's bounded memory work landing first.)
-2. **Staged INSERT mode (§3, §4)** behind `lakehouse.write_mode =
-   'staged'`, appends only, off by default; docs 06/07/08 amended in
-   the same commit per the binding rules.
-3. **V3 DV write mode (doc 14)** — prerequisite for staged DML.
-4. **Staged DELETE/UPDATE via DVs + publisher-merged rewrites** (P3
-   amortization).
-5. **Compaction-as-a-service (§5)** — thresholds only; adaptive policy
-   once thresholds are validated.
-6. **Result cache (6.4)** — only if measured worthwhile.
+### 7.0 Status snapshot (what exists today vs what this doc needs)
+
+| Prereq facility | Status (verified 2026-11-20) | Blocks |
+|---|---|---|
+| own-writes overlay + tombstones (file, abs-row) | ✅ slice 28 (`tableam.c` LakehouseWriteEntry, tomb_files) | A, §3.4 |
+| manifest rewrite + overwrite commit + liveness retry | ✅ slice 28 (`snapshot_write.rs`, `session.rs commit_append`) | B |
+| user-mapping credential path (publisher needs it too) | ✅ slice 26 (`attach_table`, postgres_fdw model) | B |
+| typed row staging (BatchWriter row-JSON push) | ✅ slices 24/26 (`writer.rs`) | A, B |
+| **ranged/partial object reads** | ❌ `storage.rs get_bytes` fetches whole objects only | D (block cache), 13-review #2 |
+| **size-bounded writer rollover** (`target_file_size`, row-group, compression knobs) | ❌ writer emits one file-set per session, no rollover | G3 coalescing |
+| **`lakehouse.*` GUC surface** (write_mode, publish_max_lag, cache dir/size) | ❌ zero lakehouse GUCs exist | everything configurable |
+| **DV write mode** (doc 14 V3: Puffin emission, DV manifest entries, `format_version` at create_remote) | ❌ read-only DV support (V1/V2) | staged DML (D2's second phase) |
+| **background worker infra** (publisher/compaction worker class, work queue) | ❌ none (doc 08 M4 unstarted) | B, C |
+| **per-table advisory-lock + published-snapshot ledger** | ❌ none | B (§4.4 idempotency) |
+| sanitizer/coverage CI tiers (doc 10 §1a) | ⚠️ spec'd, workflow jobs not yet added | confidence, not function |
+
+### 7.1 Dependency DAG
+
+```mermaid
+flowchart LR
+    P0[P0 ranged reads
++ block cache core] --> R1[R1 metadata +
+block cache]
+    P1[P1 writer rollover
+knobs] --> R2[R2 staged INSERT mode]
+    P2[P2 GUC surface
+write_mode et al] --> R2
+    P3[P3 delta store +
+WAL rmgr] --> R2
+    P4[P4 publisher worker
++ ledger + locks] --> R2
+    R2 --> R3[R3 DV write mode
+doc 14 V3]
+    R3 --> R4[R4 staged DML
+publisher-merged rewrites]
+    P5[P5 optimize trigger
+layer] --> R5[R5 compaction
+as-a-service]
+    P0 --> P5
+    R4 --> P5
+    R1 --> R6[R6 result cache
+only if measured]
+```
+
+### 7.2 Prerequisite slices (each TDD, each independently mergeable per RULES §1a)
+
+| Slice | Deliverable | Acceptance (test-first) | Unblocks |
+|---|---|---|---|
+| **P0** | `storage.rs get_range(path, offset, len)` + footer-driven reads (parquet metadata tail, then column chunks); block cache layer behind StorageIo keyed `(warehouse, path, range)`, LRU, 0700 dir | byte-identity vs `get_bytes` on the S3/local fixtures; range-count assertions on a fixture table (EXPLAIN/LIMIT GET counts — 13-review perf #1 metrics); cache eviction under size cap; NO invalidation path (immutable-path law, §6.2) | R1, P5 |
+| **P1** | `BatchWriter` rolls files at `target_file_size` (GUC-backed), row-group size + compression codec knobs | writer test: N-row push > threshold produces ceil-sized file SET with exact row split; pyiceberg reads the set | R2 |
+| **P2** | GUC family `lakehouse.*` (allowlist: `guc_tables.c`, `postgresql.conf.sample`): `write_mode`, `target_file_size`, `publish_max_lag`, `delta_dir`, `cache_dir`, `cache_max_bytes` | negative tests (invalid enum rejected), postmaster-restart persistence, `SHOW`/`ALTER SYSTEM` round-trip | R2 |
+| **P3** | delta store: segment format (typed rows + tombstones), custom rmgr (allowlist rmgr ID registration + catversion), replay reconstruction, startup enumeration | **crash tests**: kill-9 after COMMIT-ack → replay rebuilds delta → read-your-writes identical pre/post restart; rmgr chunked-record round-trip > XLogRecordMaxSize | R2 |
+| **P4** | publisher bgworker (dynamic worker, per-table advisory lease), emission via P1, published-snapshot ledger (fsync'd), idempotent publish (§4.4) | the §4.3 crash-window table AS tests (kill at each boundary); duplicate-publish no-op test; 409 retry re-plan test; lag enforcement (publish_max_lag) | R2 |
+| **P5** | optimize trigger layer on the publisher worker: rule thresholds wired to doc 08's analyze stats | fixture table driven past each threshold → compaction fires → post-state assertions (file counts, deleted-record fraction); off-by-default verified | R5 |
+
+Ordering law: **P0 → P1 → P2 → P3 → P4** is the staged-INSERT critical path
+(P0/P1/P2 are parallelizable); R3 (doc 14 V3) can proceed in parallel with
+P3/P4 since it gates only R4. No slice starts before its acceptance test is
+written and failing (RULES §8).
+
+### 7.3 Rollout steps (unchanged targets, now with prereq bindings)
+
+| Step | Ships | Requires |
+|---|---|---|
+| **R1** metadata + block cache (read-side win, zero semantics) | 6.2/6.3 | P0 |
+| **R2** staged INSERT mode (off by default) | §3, §4 | P0–P4 |
+| **R3** DV write mode | doc 14 V3 | independent of R2 |
+| **R4** staged DML via DVs + publisher-merged rewrites | §3.5 second phase | R2 + R3 |
+| **R5** compaction-as-a-service | §5 | P5 (P0, R4 recommended) |
+| **R6** result cache | 6.4 | R1 + measurement gate |
 
 ## 8. Open questions (decisions owed before implementation)
 
