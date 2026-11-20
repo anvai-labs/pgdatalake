@@ -145,6 +145,16 @@ Interop note: PyIceberg 0.12 `table.delete()` performs COW rewrites (no
 delete files); MoR delete fixtures for live verification come from
 Spark/Trino in the M1 conformance gate, or from our own M2 writer.
 
+*(M2 slice 28 amendment, 2026-11-20 — managed UPDATE/DELETE shipped as COW.)*
+Managed-table DELETE/UPDATE record tombstones (base file + row index) and
+PRE-COMMIT rewrites each affected file into the overwrite snapshot; the
+originals become DELETED entries carried via MANIFEST REWRITE (doc 07 §2 —
+pyiceberg ≤0.12 does not apply cross-manifest deletions, so a DELETED entry
+in the new manifest alone resurrects the file for independent readers).
+Live acceptance: mixed INSERT/UPDATE/DELETE transaction with in-transaction
+read-your-writes, pyiceberg agreement after commit, subxact-rollback
+tombstone pruning, and time-travel snapshots intact.
+
 DV write format: Puffin blob with `deletion-vector-v1` spec (v3), referenced from
 snapshot summary → manifest entries. Bloom-filter acceleration (table property
 `write.dv.filter.bloom`), default on for tables > 1GB.

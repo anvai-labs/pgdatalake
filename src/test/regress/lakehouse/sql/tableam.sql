@@ -194,3 +194,56 @@ EXCEPTION WHEN OTHERS THEN
 END $$;
 
 DROP TABLE lakehouse_wt;
+
+-- slice 28: UPDATE/DELETE on managed tables (copy-on-write). The offline
+-- surface: against an unreachable catalog the DML scan fails fast with
+-- connection_exception (08000) — no silent success, no partial state.
+-- The full live pipeline (tombstones, PRE-COMMIT rewrite, overwrite
+-- commit, independent-reader agreement) is the slice-28 live acceptance.
+DO $$
+DECLARE
+    st text;
+BEGIN
+    DELETE FROM lakehouse_mt WHERE id = 1;
+    RAISE EXCEPTION 'unreachable managed DELETE did not error';
+EXCEPTION WHEN OTHERS THEN
+    GET STACKED DIAGNOSTICS st = RETURNED_SQLSTATE;
+    IF st <> '08000' THEN
+        RAISE EXCEPTION 'unexpected SQLSTATE %', st;
+    END IF;
+END $$;
+
+DO $$
+DECLARE
+    st text;
+BEGIN
+    UPDATE lakehouse_mt SET id = 2 WHERE id = 1;
+    RAISE EXCEPTION 'unreachable managed UPDATE did not error';
+EXCEPTION WHEN OTHERS THEN
+    GET STACKED DIAGNOSTICS st = RETURNED_SQLSTATE;
+    IF st <> '08000' THEN
+        RAISE EXCEPTION 'unexpected SQLSTATE %', st;
+    END IF;
+END $$;
+
+-- rows inserted in the same transaction are not addressable: the DML
+-- scan errors instead of silently mis-targeting (tombstones reference
+-- base-snapshot files; staged rows have no remote identity yet)
+DO $$
+DECLARE
+    st text;
+BEGIN
+    BEGIN
+        INSERT INTO lakehouse_mt VALUES (1, 'x');
+        DELETE FROM lakehouse_mt WHERE id = 1;
+        RAISE EXCEPTION 'staged-row DELETE did not error';
+    EXCEPTION WHEN OTHERS THEN
+        GET STACKED DIAGNOSTICS st = RETURNED_SQLSTATE;
+        IF st <> '08000' THEN
+            RAISE EXCEPTION 'unexpected SQLSTATE %', st;
+        END IF;
+        RAISE;
+    END;
+EXCEPTION WHEN OTHERS THEN
+    NULL; -- the INSERT's connection failure is the expected offline surface
+END $$;

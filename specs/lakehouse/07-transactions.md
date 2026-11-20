@@ -39,6 +39,40 @@ ABORT:
   7. staged files are orphans → orphan GC after lakehouse.orphan_grace_period
 ```
 
+*(M2 slice 28 amendment, 2026-11-20 — UPDATE/DELETE are copy-on-write.)*
+`tuple_update`/`tuple_delete` never touch bytes: the scan encodes each row's
+identity as a TID `(base-snapshot task, row index)`, and the DML hook records
+a **tombstone** `(file path, row index)` in the transaction's per-relation
+write state. Reads in the same transaction filter tombstoned rows (read-your-
+deletes); staged new rows ride the existing own-writes overlay and remain
+sub-xact prunable (tombstones carry per-row subxact ids too — a rolled-back
+DELETE never rewrites a file). At PRE-COMMIT, before the staged-row push:
+
+1. **Rewrite pass** — each tombstoned file is re-read FROM THE BASE SNAPSHOT
+   (never the catalog's current snapshot: that would race a concurrent
+   writer; the commit's liveness check is the backstop) and its surviving
+   rows are re-encoded exactly like staged rows into the flush pipeline.
+2. **One overwrite snapshot** — rewritten files + staged rows are ADDED;
+   every touched original becomes a DELETED entry; summary says
+   `operation=overwrite` with deleted-data-files/deleted-records.
+3. **Interop: deletions carry via MANIFEST REWRITE** — carried manifests
+   touching a deleted path are re-serialized in place with the entry flipped
+   to DELETED (original snapshot_id/sequence/metrics preserved) and
+   survivors to EXISTING. pyiceberg ≤0.12 plans with discard_deleted
+   semantics and does NOT apply cross-manifest deletions, so a DELETED
+   entry emitted in the new snapshot's manifest resurrects the file for
+   independent readers (caught live in the slice-28 acceptance). The
+   Java/Trino rewrite convention is the portable one.
+4. **Lost-update protection** — every retry attempt re-verifies each deleted
+   path is still live in the fresh base (via plan_scan's DELETED
+   exclusion); a concurrent writer that removed or rewrote the file aborts
+   the commit loudly instead of re-deleting against foreign state.
+
+Executor contract: non-FDW UPDATE fetches the old row via
+`tuple_fetch_row_version` — a point read of the encoded (task, rowidx) from
+the pinned base file. `SELECT ... FOR UPDATE` (row locking) is still a clean
+feature error (M3).
+
 **Failure windows are explicit:**
 - crash between (1) and (3): orphans, cleaned later. No visible effect.
 - crash between (3) and (4): the Iceberg commit succeeded; on next metadata

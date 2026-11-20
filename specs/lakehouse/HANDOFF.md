@@ -770,3 +770,45 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     both render canonical text today). REMAINING overall: #1 tail
     (two-writer concurrency, independent-reader verification);
     M2 #28 UPDATE/DELETE COW, #29 MERGE + ceremony.
+  - M2 slice 28 (UPDATE/DELETE COW) — DONE 2026-11-20 (core ada a856/f8c639c/
+    b70af08/fb63861/2697e1e + tableam C commit; live-verified vs pyiceberg):
+    TOMBSTONE model — scan encodes TID (task, rowidx; block=fanout-encoded,
+    offset=rowidx&0x7FF+1), tuple_delete/tuple_update record (file,rowidx)
+    in the per-txn per-rel entry (per-row subxact ids: savepoint rollback
+    prunes tombstones; the file record drops when its last tombstone rolls
+    back). PRE-COMMIT: rewrite pass re-reads each tombstoned file FROM THE
+    BASE SNAPSHOT via pg_datalake_rows_open_path (write-session creds,
+    table-root scope gate), survivors re-encoded exactly like staged rows
+    (input fns + append_cell_json), then ONE overwrite commit: rewritten +
+    staged files ADDED, originals DELETED, summary operation=overwrite.
+    tuple_fetch_row_version implemented (the executor calls it on EVERY
+    UPDATE to build the new tuple) — point read of the encoded position.
+    tuple_lock still unsupported (clean error, M3). Staged rows carry
+    invalid tids; deleting/updating them = loud error (same-statement
+    overlay rows are unaddressable, matching FDW practice).
+    INTEROP (caught live): pyiceberg 0.12 plans discard_deleted and does
+    NOT apply cross-manifest deletions — DELETED entries in the NEW
+    manifest resurrected overwritten files for the independent reader.
+    FIX: deletions carry via MANIFEST REWRITE (Java/Trino convention):
+    carried manifests touching a deleted path are re-serialized with the
+    entry flipped to DELETED (original snapshot_id/seq/metrics kept),
+    survivors to EXISTING; list serializer no longer hardcodes
+    existing/deleted counts to 0; deletion-only commits write NO new data
+    manifest. Liveness: every retry re-verifies deleted paths are live in
+    the fresh base via plan_scan — a concurrent rewrite aborts loudly
+    (lost-update protection; unit-tested abort-before-commit).
+    BUGS FIXED EN ROUTE (all live-caught): repalloc(NULL) on first
+    tombstone (segfault); own-writes overlay not served after files drain
+    (EOF path skipped staged rows); entry->tupdesc/opts allocated in the
+    EXECUTOR context — freed at ExecutorEnd, read at PRE-COMMIT
+    (intermittent garbage palloc sizes + segfaults; valgrind caught reads
+    of an ExecutorEnd-freed block; fix: entire entry init in the txn
+    mcxt). OPERATIONAL: NEVER cp over lakehouse.so of a RUNNING server
+    (shared_preload_libraries='lakehouse' — the startup process maps it
+    too; hot-swap produced random segfaults in unrelated processes);
+    stop -> copy -> start. Managed time travel (FOR ... AS OF on AM
+    scans) is NOT yet wired — selectors remain FDW-only (follow-up
+    noted). Live acceptance: mixed INSERT/UPDATE/DELETE txn with in-txn
+    read-your-writes; pyiceberg agreement after commit; subxact rollback
+    pruning; 12+8 stress txns clean under gdb + native. REMAINING: #29
+    MERGE + ceremony (two-writer + independent reader = the #1 tail).

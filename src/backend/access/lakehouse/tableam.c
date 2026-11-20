@@ -237,6 +237,24 @@ ExtractManagedIdentity(Oid relid, LakehouseOptions *opts)
  * callback, so an entry is always current-txn (the own-writes overlay
  * relies on that).
  */
+/*
+ * COW UPDATE/DELETE state (M2 slice 28). A deleted/updated row is a
+ * TOMBSTONE: (base-snapshot file, 0-based row index). Affected files are
+ * REWRITTEN at PRE-COMMIT (surviving rows pushed as new files, the
+ * original committed as a DELETED manifest entry — copy-on-write, doc 07
+ * §3). Rows are never modified in place; the file's bytes are history.
+ */
+typedef struct LakehouseTombFile
+{
+	char	   *path;			/* base-snapshot file URI (mcxt-owned) */
+	uint64	   *rows;			/* 0-based row indexes, sorted ascending */
+	SubTransactionId *row_subids; /* owning subxact per tombstone */
+	int			nrows;
+	int			rows_cap;
+	int64		record_count;	/* identity of the DELETED manifest entry */
+	int64		file_size_in_bytes;
+}			LakehouseTombFile;
+
 typedef struct LakehouseWriteEntry
 {
 	Oid			relid;
@@ -252,12 +270,55 @@ typedef struct LakehouseWriteEntry
 	/* identity, resolved at first insert */
 	LakehouseOptions opts;
 	bool		have_identity;
+	/* COW tombstones (slice 28): linear scan over AFFECTED FILES (small:
+	 * files one statement touches), sorted rows + bsearch within a file */
+	LakehouseTombFile **tomb_files;
+	int			n_tomb_files;
+	int			tomb_cap;
+	/* input-function plumbing for the PRE-COMMIT rewrite pass (reads a
+	 * base file, re-encodes surviving rows exactly like staged ones) */
+	FmgrInfo   *in_funcs;
+	Oid		   *typioparams;
+	bool		have_in_funcs;
 }			LakehouseWriteEntry;
+
+/* TID encoding (slice 28): block = task_idx * MAX_OFFSET + (rowidx >> 11),
+ * offset = (rowidx & 0x7FF) + 1 — offset stays within MaxOffsetNumber,
+ * rowidx up to ~4M per task, task_idx up to ~1M. Row indexes beyond the
+ * encoding range error loudly at DML time rather than mis-targeting. */
+#define LAKEHOUSE_TID_FANOUT MaxOffsetNumber
+
+/*
+ * Scan↔DML registry: the scan that produced a tid, per relid. DELETE/
+ * UPDATE call tuple_delete/UPDATE with only (rel, tid) — the executor's
+ * target scan is alive at that moment and its pinned snapshot's task
+ * list maps tid → (file, rowidx). One entry per relid; concurrent scans
+ * of the same rel (self-join) plan the SAME snapshot and task list, so
+ * resolution is identical whichever scan is registered.
+ */
+typedef struct LakehouseTableScanDescData LakehouseTableScanDescData;
+
+typedef struct LakehouseScanRegistryEntry
+{
+	Oid			relid;
+	LakehouseTableScanDescData *scan;
+	SubTransactionId subid;
+}			LakehouseScanRegistryEntry;
+
+static HTAB *scan_registry = NULL;
 
 static HTAB *write_entries = NULL;
 
 static void append_cell_json(StringInfoData *buf, Form_pg_attribute attr,
 								 Datum v, bool isnull);
+static LakehouseTombFile *tomb_file_get(LakehouseWriteEntry *entry,
+										const char *path, bool create);
+static void tomb_file_add_row(LakehouseWriteEntry *entry,
+							  LakehouseTombFile *tf, uint64 rowidx);
+static bool tomb_file_has_row(const LakehouseTombFile *tf, uint64 rowidx);
+static void open_write_session(LakehouseWriteEntry *entry, TupleDesc tupdesc);
+static char *build_projection_json(TupleDesc tupdesc);
+static void ensure_in_funcs(LakehouseWriteEntry *entry);
 
 static void
 lakehouse_xact_callback(XactEvent event, void *arg)
@@ -292,7 +353,8 @@ lakehouse_xact_callback(XactEvent event, void *arg)
 		hash_seq_init(&seq, write_entries);
 		while ((entry = hash_seq_search(&seq)) != NULL)
 		{
-			if (entry->ws == NULL || entry->staged_rows == 0)
+			if (entry->ws == NULL || (entry->staged_rows == 0 &&
+									  entry->n_tomb_files == 0))
 				continue;
 			{
 				char		errbuf[1024];
@@ -300,6 +362,108 @@ lakehouse_xact_callback(XactEvent event, void *arg)
 				TupleDesc	tupdesc = entry->tupdesc;
 				StringInfoData row;
 				int			i;
+
+				/*
+				 * COW rewrite pass (slice 28): each tombstoned file is
+				 * re-read from the BASE snapshot; surviving rows are
+				 * converted (input functions) and re-encoded exactly like
+				 * staged rows. The original files ride to the commit as
+				 * DELETED entries. Reading the CURRENT snapshot here would
+				 * be a lost-update race — a concurrent writer may have
+				 * already replaced these files; the commit's liveness
+				 * check catches that and aborts.
+				 */
+				for (i = 0; i < entry->n_tomb_files; i++)
+				{
+					LakehouseTombFile *tf = entry->tomb_files[i];
+					char	   *proj = build_projection_json(tupdesc);
+					RowsHandle *rows;
+					uint64		src_row = 0;
+					int			survivors = 0;
+
+					ensure_in_funcs(entry);
+					errbuf[0] = '\0';
+					rows = pg_datalake_rows_open_path(entry->ws,
+													  tf->path,
+													  proj,
+													  errbuf, sizeof(errbuf));
+					if (rows == NULL)
+						ereport(ERROR,
+								(errcode(ERRCODE_IO_ERROR),
+								 errmsg("lakehouse: COW rewrite could not open %s: %s",
+										tf->path, errbuf)));
+					for (;;)
+					{
+						char		nst_err[1024];
+						int			nst;
+
+						nst_err[0] = '\0';
+						nst = pg_datalake_rows_next(rows, nst_err,
+													sizeof(nst_err));
+						if (nst == 1)
+							break;
+						if (nst == 2)
+							ereport(ERROR,
+									(errcode(ERRCODE_DATA_EXCEPTION),
+									 errmsg("lakehouse: COW rewrite read failed in %s: %s",
+											tf->path,
+											nst_err[0] != '\0' ? nst_err : "unknown error")));
+						if (!tomb_file_has_row(tf, src_row))
+						{
+							int			k;
+							bool		first_col = true;
+
+							initStringInfo(&row);
+							appendStringInfoChar(&row, '[');
+							for (k = 0; k < tupdesc->natts; k++)
+							{
+								int			pcol;
+								Form_pg_attribute attr = TupleDescAttr(tupdesc, k);
+
+								if (attr->attisdropped)
+									continue;
+								/* projection column = ordinal among visible attrs */
+								pcol = k;
+								for (int vis = 0; vis < k; vis++)
+									if (TupleDescAttr(tupdesc, vis)->attisdropped)
+										pcol--;
+								if (pg_datalake_rows_col_null(rows, pcol))
+								{
+									if (!first_col)
+										appendStringInfoChar(&row, ',');
+									appendStringInfoString(&row, "null");
+								}
+								else
+								{
+									Datum		v = InputFunctionCall(&entry->in_funcs[k],
+											pg_datalake_rows_col_text(rows, pcol),
+											entry->typioparams[k],
+											attr->atttypmod);
+
+									if (!first_col)
+										appendStringInfoChar(&row, ',');
+									append_cell_json(&row, attr, v, false);
+								}
+								first_col = false;
+							}
+							appendStringInfoChar(&row, ']');
+							errbuf[0] = '\0';
+							if (!pg_datalake_write_push(entry->ws, row.data,
+														errbuf, sizeof(errbuf)))
+								ereport(ERROR,
+										(errcode(ERRCODE_DATA_EXCEPTION),
+										 errmsg("lakehouse: COW rewrite could not re-stage surviving row of %s: %s",
+												tf->path, errbuf)));
+							pfree(row.data);
+							survivors++;
+						}
+						src_row++;
+					}
+					pg_datalake_rows_close(rows);
+					elog(LOG, "lakehouse COW rewrite: %s -> %d surviving rows "
+						 "(%lld tombstoned)", tf->path, survivors,
+						 (long long) tf->nrows);
+				}
 
 				/* push the SURVIVING staged rows (post subxact pruning)
 				 * into the accumulator now, then flush + commit */
@@ -337,7 +501,35 @@ lakehouse_xact_callback(XactEvent event, void *arg)
 				}
 
 				errbuf[0] = '\0';
-				loc = pg_datalake_write_commit(entry->ws, 3, errbuf, sizeof(errbuf));
+				if (entry->n_tomb_files > 0)
+				{
+					/* overwrite commit (slice 28): staged/rewritten files
+					 * ADDED, the tombstoned originals DELETED entries */
+					StringInfoData del;
+					int			j;
+
+					initStringInfo(&del);
+					appendStringInfoChar(&del, '[');
+					for (j = 0; j < entry->n_tomb_files; j++)
+					{
+						LakehouseTombFile *tf = entry->tomb_files[j];
+
+						if (j > 0)
+							appendStringInfoChar(&del, ',');
+						appendStringInfoChar(&del, '[');
+						escape_json(&del, tf->path); /* emits its own quotes */
+						appendStringInfo(&del, ", %lld, %lld]",
+										 (long long) tf->record_count,
+										 (long long) tf->file_size_in_bytes);
+					}
+					appendStringInfoChar(&del, ']');
+					loc = pg_datalake_write_commit_overwrite(entry->ws, del.data,
+															 3, errbuf,
+															 sizeof(errbuf));
+					pfree(del.data);
+				}
+				else
+					loc = pg_datalake_write_commit(entry->ws, 3, errbuf, sizeof(errbuf));
 				if (loc == NULL)
 					ereport(ERROR,
 							(errcode(ERRCODE_CONNECTION_EXCEPTION),
@@ -429,6 +621,66 @@ iceberg_type_name(Form_pg_attribute attr)
 					 errdetail("Managed-table primitive coverage follows doc 05's mapping; nested types land with their own slices.")));
 			return "";			/* unreachable */
 	}
+}
+
+/* projection for pg_datalake_rows_open_path: counted JSON array of the
+ * relation's visible attribute names (same shape as the scan projection). */
+static char *
+build_projection_json(TupleDesc tupdesc)
+{
+	StringInfoData proj;
+	bool		first_col = true;
+	int			i;
+
+	initStringInfo(&proj);
+	appendStringInfoChar(&proj, '[');
+	for (i = 0; i < tupdesc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+
+		if (attr->attisdropped)
+			continue;
+		if (!first_col)
+			appendStringInfoChar(&proj, ',');
+		escape_json(&proj, NameStr(attr->attname)); /* emits its own quotes */
+		first_col = false;
+	}
+	appendStringInfoChar(&proj, ']');
+	return proj.data;
+}
+
+/* input-function plumbing for the PRE-COMMIT rewrite pass: surviving rows
+ * read from a base file are converted to datums and re-encoded exactly
+ * like staged rows (one code path for every cell type). */
+static void
+ensure_in_funcs(LakehouseWriteEntry *entry)
+{
+	TupleDesc	tupdesc = entry->tupdesc;
+	int			i;
+
+	if (entry->have_in_funcs)
+		return;
+	{
+		MemoryContext old = MemoryContextSwitchTo(entry->mcxt);
+
+		entry->in_funcs = (FmgrInfo *)
+			palloc0(tupdesc->natts * sizeof(FmgrInfo));
+		entry->typioparams = (Oid *)
+			palloc0(tupdesc->natts * sizeof(Oid));
+		for (i = 0; i < tupdesc->natts; i++)
+		{
+			Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+
+			if (attr->attisdropped)
+				continue;
+			getTypeInputInfo(attr->atttypid,
+							 &entry->in_funcs[i].fn_oid,
+							 &entry->typioparams[i]);
+			fmgr_info(entry->in_funcs[i].fn_oid, &entry->in_funcs[i]);
+		}
+		MemoryContextSwitchTo(old);
+	}
+	entry->have_in_funcs = true;
 }
 
 /* schema_json for pg_datalake_write_new, from the relation's tupdesc */
@@ -804,6 +1056,12 @@ get_write_entry(Relation rel)
 		entry->staged_rows = 0;
 		entry->natts = 0;
 		entry->tupdesc = NULL;
+		entry->tomb_files = NULL;
+		entry->n_tomb_files = 0;
+		entry->tomb_cap = 0;
+		entry->in_funcs = NULL;
+		entry->typioparams = NULL;
+		entry->have_in_funcs = false;
 		memset(&entry->opts, 0, sizeof(entry->opts));
 		/* WITH-options identity wins; attach row still supplies the
 		 * credentials (they never live in reloptions — doc 09) */
@@ -822,10 +1080,252 @@ get_write_entry(Relation rel)
 					 errhint("SELECT lakehouse.attach_table('%s'::regclass, "
 							 "'namespace.table_name', endpoint => '...');",
 							 RelationGetRelationName(rel))));
-		entry->tupdesc = CreateTupleDescCopyConstr(RelationGetDescr(rel));
-		entry->natts = entry->tupdesc->natts;
+		/*
+		 * EVERYTHING the PRE-COMMIT callback touches must live in the
+		 * txn-scoped mcxt — the executor's per-query context (where this
+		 * code first runs, inside a statement) is RESET at ExecutorEnd.
+		 * tupdesc/opts allocated in the calling context were freed memory
+		 * by the time PRE-COMMIT read them (intermittent garbage attribute
+		 * names -> garbage palloc sizes / crashes, caught by valgrind as
+		 * reads of an ExecutorEnd-freed block).
+		 */
+		{
+			MemoryContext old = MemoryContextSwitchTo(entry->mcxt);
+
+			entry->tupdesc = CreateTupleDescCopyConstr(RelationGetDescr(rel));
+			entry->natts = entry->tupdesc->natts;
+			/* re-copy the identity strings into the txn mcxt (decode
+			 * helpers pstrdup into the caller's context) */
+			if (entry->opts.endpoint != NULL)
+				entry->opts.endpoint = pstrdup(entry->opts.endpoint);
+			if (entry->opts.warehouse != NULL)
+				entry->opts.warehouse = pstrdup(entry->opts.warehouse);
+			if (entry->opts.token != NULL)
+				entry->opts.token = pstrdup(entry->opts.token);
+			if (entry->opts.namespace != NULL)
+				entry->opts.namespace = pstrdup(entry->opts.namespace);
+			if (entry->opts.table != NULL)
+				entry->opts.table = pstrdup(entry->opts.table);
+			if (entry->opts.s3_endpoint != NULL)
+				entry->opts.s3_endpoint = pstrdup(entry->opts.s3_endpoint);
+			if (entry->opts.s3_access_key != NULL)
+				entry->opts.s3_access_key = pstrdup(entry->opts.s3_access_key);
+			if (entry->opts.s3_secret_key != NULL)
+				entry->opts.s3_secret_key = pstrdup(entry->opts.s3_secret_key);
+			MemoryContextSwitchTo(old);
+		}
 	}
 	return entry;
+}
+
+/* ---------------- COW tombstone plumbing (slice 28) ---------------- */
+
+/* Find (or lazily create) the tombstone file record for `path`. */
+static LakehouseTombFile *
+tomb_file_get(LakehouseWriteEntry *entry, const char *path, bool create)
+{
+	MemoryContext old = MemoryContextSwitchTo(entry->mcxt);
+	LakehouseTombFile *tf = NULL;
+	int			i;
+
+	for (i = 0; i < entry->n_tomb_files; i++)
+	{
+		if (strcmp(entry->tomb_files[i]->path, path) == 0)
+		{
+			tf = entry->tomb_files[i];
+			break;
+		}
+	}
+	if (tf == NULL && create)
+	{
+		if (entry->tomb_cap == 0)
+		{
+			entry->tomb_cap = 8;
+			entry->tomb_files = (LakehouseTombFile **)
+				palloc(entry->tomb_cap * sizeof(LakehouseTombFile *));
+		}
+		else if (entry->n_tomb_files == entry->tomb_cap)
+		{
+			entry->tomb_cap *= 2;
+			entry->tomb_files = (LakehouseTombFile **)
+				repalloc(entry->tomb_files,
+						 entry->tomb_cap * sizeof(LakehouseTombFile *));
+		}
+		tf = (LakehouseTombFile *) palloc(sizeof(LakehouseTombFile));
+		tf->path = pstrdup(path);
+		tf->rows = NULL;
+		tf->row_subids = NULL;
+		tf->nrows = 0;
+		tf->rows_cap = 0;
+		tf->record_count = 0;
+		tf->file_size_in_bytes = 0;
+		entry->tomb_files[entry->n_tomb_files++] = tf;
+	}
+	MemoryContextSwitchTo(old);
+	return tf;
+}
+
+/* Record a tombstoned row (sorted insert; duplicates are idempotent). */
+static void
+tomb_file_add_row(LakehouseWriteEntry *entry, LakehouseTombFile *tf,
+				  uint64 rowidx)
+{
+	MemoryContext old = MemoryContextSwitchTo(entry->mcxt);
+	int			lo = 0;
+	int			hi = tf->nrows;
+
+	while (lo < hi)
+	{
+		int			mid = (lo + hi) / 2;
+
+		if (tf->rows[mid] < rowidx)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	if (lo < tf->nrows && tf->rows[lo] == rowidx)
+	{
+		MemoryContextSwitchTo(old);
+		return;
+	}
+	if (tf->nrows == tf->rows_cap)
+	{
+		tf->rows_cap = tf->rows_cap == 0 ? 16 : tf->rows_cap * 2;
+		tf->rows = tf->rows == NULL
+			? (uint64 *) palloc(tf->rows_cap * sizeof(uint64))
+			: (uint64 *) repalloc(tf->rows, tf->rows_cap * sizeof(uint64));
+		tf->row_subids = tf->row_subids == NULL
+			? (SubTransactionId *) palloc(tf->rows_cap * sizeof(SubTransactionId))
+			: (SubTransactionId *) repalloc(tf->row_subids,
+											tf->rows_cap * sizeof(SubTransactionId));
+	}
+	memmove(&tf->rows[lo + 1], &tf->rows[lo],
+			(tf->nrows - lo) * sizeof(uint64));
+	memmove(&tf->row_subids[lo + 1], &tf->row_subids[lo],
+			(tf->nrows - lo) * sizeof(SubTransactionId));
+	tf->rows[lo] = rowidx;
+	tf->row_subids[lo] = GetCurrentSubTransactionId();
+	tf->nrows++;
+	MemoryContextSwitchTo(old);
+}
+
+static bool
+tomb_file_has_row(const LakehouseTombFile *tf, uint64 rowidx)
+{
+	int			lo = 0;
+	int			hi = tf->nrows;
+
+	while (lo < hi)
+	{
+		int			mid = (lo + hi) / 2;
+
+		if (tf->rows[mid] < rowidx)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo < tf->nrows && tf->rows[lo] == rowidx;
+}
+
+/* Record the file identity carried into the DELETED manifest entry. */
+static void
+tomb_file_note_meta(LakehouseTombFile *tf, int64 record_count,
+					int64 file_size_in_bytes)
+{
+	tf->record_count = record_count;
+	tf->file_size_in_bytes = file_size_in_bytes;
+}
+
+/* Decode a tid produced by the managed scan into (task, rowidx). */
+static void
+decode_lakehouse_tid(ItemPointer tid, uint64 *task_idx, uint64 *rowidx)
+{
+	BlockNumber blk = ItemPointerGetBlockNumber(tid);
+	OffsetNumber off = ItemPointerGetOffsetNumber(tid);
+
+	*task_idx = (uint64) blk / LAKEHOUSE_TID_FANOUT;
+	*rowidx = ((uint64) (blk % LAKEHOUSE_TID_FANOUT) << 11) | (uint64) (off - 1);
+}
+
+/* The live managed scan for `relid`, or NULL (error reported by caller). */
+static LakehouseTableScanDescData *
+lookup_scan_for_dml(Oid relid)
+{
+	if (scan_registry == NULL)
+		return NULL;
+	{
+		bool		found;
+		LakehouseScanRegistryEntry *re = (LakehouseScanRegistryEntry *)
+			hash_search(scan_registry, &relid, HASH_FIND, &found);
+
+		return found ? re->scan : NULL;
+	}
+}
+
+/* Register/unregister the target scan (scan_begin/scan_end). */
+static void
+register_scan_for_dml(Oid relid, LakehouseTableScanDescData *scan)
+{
+	if (scan == NULL)
+		return;
+	if (scan_registry == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(LakehouseScanRegistryEntry);
+		scan_registry = hash_create("lakehouse managed scan registry", 8,
+									&ctl, HASH_ELEM | HASH_BLOBS);
+	}
+	{
+		bool		found;
+		LakehouseScanRegistryEntry *re = (LakehouseScanRegistryEntry *)
+			hash_search(scan_registry, &relid, HASH_ENTER, &found);
+
+		re->scan = scan;
+		re->subid = GetCurrentSubTransactionId();
+	}
+}
+
+static void
+unregister_scan_for_dml(Oid relid, LakehouseTableScanDescData *scan)
+{
+	if (scan_registry == NULL)
+		return;
+	{
+		bool		found;
+		LakehouseScanRegistryEntry *re = (LakehouseScanRegistryEntry *)
+			hash_search(scan_registry, &relid, HASH_FIND, &found);
+
+		if (found && re->scan == scan)
+			hash_search(scan_registry, &relid, HASH_REMOVE, NULL);
+	}
+}
+
+/* Drop registry entries created above the aborted subtransaction —
+ * their scan descs die with the aborted executor context. */
+static void
+prune_scan_registry_above(SubTransactionId subid)
+{
+	if (scan_registry == NULL)
+		return;
+	{
+		HASH_SEQ_STATUS seq;
+		LakehouseScanRegistryEntry *re;
+
+		hash_seq_init(&seq, scan_registry);
+		while ((re = hash_seq_search(&seq)) != NULL)
+		{
+			if (re->subid >= subid)
+			{
+				Oid			relid = re->relid;
+
+				hash_seq_term(&seq);
+				hash_search(scan_registry, &relid, HASH_REMOVE, NULL);
+				hash_seq_init(&seq, scan_registry);
+			}
+		}
+	}
 }
 
 /* ---------------- scan state ---------------- */
@@ -847,6 +1347,11 @@ typedef struct LakehouseTableScanDescData
 	 * relation has no open write state) */
 	LakehouseWriteEntry *entry;
 	uint64		staged_pos;
+	/* COW tids (slice 28): 0-based row index within the current task, and
+	 * the task's file path (session-owned CString pointer, stable) for
+	 * tombstone filtering */
+	uint64		row_in_task;
+	const char *cur_task_path;
 }			LakehouseTableScanDescData;
 typedef LakehouseTableScanDescData *LakehouseTableScanDesc;
 
@@ -962,6 +1467,8 @@ lakehouse_scan_begin(Relation rel, Snapshot snapshot,
 	}
 
 	lakehouse_scan_common_setup(scan, rel, NULL);
+	scan->row_in_task = 0;
+	scan->cur_task_path = NULL;
 	if (write_entries != NULL)
 	{
 		bool		found;
@@ -971,6 +1478,7 @@ lakehouse_scan_begin(Relation rel, Snapshot snapshot,
 		if (!found)
 			scan->entry = NULL;
 	}
+	register_scan_for_dml(RelationGetRelid(rel), scan);
 	return (TableScanDesc) scan;
 }
 
@@ -989,6 +1497,7 @@ lakehouse_scan_end(TableScanDesc bscan)
 		pg_datalake_scan_free(scan->session);
 		scan->session = NULL;
 	}
+	unregister_scan_for_dml(RelationGetRelid(scan->rs_base.rs_rd), scan);
 	if (scan->rs_base.rs_flags & SO_TEMP_SNAPSHOT)
 		UnregisterSnapshot(scan->rs_base.rs_snapshot);
 	RelationDecrementReferenceCount(scan->rs_base.rs_rd);
@@ -1021,33 +1530,6 @@ lakehouse_scan_getnextslot(TableScanDesc bscan, ScanDirection direction,
 
 	/* ScanDirection ignored: files iterate in stored order only */
 
-	/* own-writes overlay (doc 07 §2): after the snapshot's files, yield
-	 * the rows this transaction staged but has not committed yet */
-	if (scan->entry != NULL &&
-		scan->current_task >= scan->task_count)
-	{
-		LakehouseWriteEntry *entry = scan->entry;
-
-		while (scan->staged_pos < entry->staged_rows)
-		{
-			int			k;
-			Datum	   *row = entry->staged_values +
-				(size_t) scan->staged_pos * entry->natts;
-			bool	   *nulls = entry->staged_isnull +
-				(size_t) scan->staged_pos * entry->natts;
-
-			scan->staged_pos++;
-			ExecClearTuple(slot);
-			for (k = 0; k < tupdesc->natts; k++)
-			{
-				slot->tts_values[k] = row[k];
-				slot->tts_isnull[k] = nulls[k];
-			}
-			ExecStoreVirtualTuple(slot);
-			return true;
-		}
-	}
-
 	for (;;)
 	{
 		if (scan->rows == NULL)
@@ -1055,8 +1537,37 @@ lakehouse_scan_getnextslot(TableScanDesc bscan, ScanDirection direction,
 			char		errbuf[1024];
 			const char *file;
 
+			/* own-writes overlay (doc 07 §2): after the snapshot's files
+			 * drain, yield the rows this transaction staged but has not
+			 * committed yet. This runs on EVERY exhausted call (not once):
+			 * a tombstone skip can drain the last task mid-loop, and the
+			 * staged rows must still be served. */
 			if (scan->current_task >= scan->task_count)
+			{
+				LakehouseWriteEntry *entry = scan->entry;
+
+				while (entry != NULL &&
+					   scan->staged_pos < entry->staged_rows)
+				{
+					int			k;
+					Datum	   *row = entry->staged_values +
+						(size_t) scan->staged_pos * entry->natts;
+					bool	   *nulls = entry->staged_isnull +
+						(size_t) scan->staged_pos * entry->natts;
+
+					scan->staged_pos++;
+					ExecClearTuple(slot);
+					ItemPointerSetInvalid(&slot->tts_tid);
+					for (k = 0; k < tupdesc->natts; k++)
+					{
+						slot->tts_values[k] = row[k];
+						slot->tts_isnull[k] = nulls[k];
+					}
+					ExecStoreVirtualTuple(slot);
+					return true;
+				}
 				return false;
+			}
 
 			errbuf[0] = '\0';
 			file = pg_datalake_scan_task_file(scan->session,
@@ -1072,6 +1583,8 @@ lakehouse_scan_getnextslot(TableScanDesc bscan, ScanDirection direction,
 						 errmsg("lakehouse: could not open task %llu (%s): %s",
 								(unsigned long long) scan->current_task,
 								file, errbuf)));
+			scan->row_in_task = 0;
+			scan->cur_task_path = file;
 		}
 
 		/* 13-review #8: explicit ROW/EOF/ERROR — a caught panic used to
@@ -1097,7 +1610,33 @@ lakehouse_scan_getnextslot(TableScanDesc bscan, ScanDirection direction,
 			}
 		}
 		{
+			/* COW read-your-deletes: rows tombstoned earlier in THIS
+			 * transaction are filtered here, exactly like the rewrite
+			 * pass filters them at PRE-COMMIT */
+			if (scan->entry != NULL && scan->entry->n_tomb_files > 0 &&
+				scan->cur_task_path != NULL)
+			{
+				LakehouseTombFile *tf = tomb_file_get(scan->entry,
+													  scan->cur_task_path,
+													  false);
+
+				if (tf != NULL &&
+					tomb_file_has_row(tf, scan->row_in_task))
+				{
+					scan->row_in_task++;
+					continue;
+				}
+			}
 			ExecClearTuple(slot);
+			/* COW tid (slice 28): (task, rowidx) — the identity
+			 * tuple_delete/tuple_update decode back into the base
+			 * snapshot's file + row position */
+			ItemPointerSetBlockNumber(&slot->tts_tid,
+									  (BlockNumber) (scan->current_task *
+										LAKEHOUSE_TID_FANOUT +
+										(scan->row_in_task >> 11)));
+			ItemPointerSetOffsetNumber(&slot->tts_tid,
+									   (OffsetNumber) ((scan->row_in_task & 0x7FF) + 1));
 			for (i = 0; i < tupdesc->natts; i++)
 			{
 				int			pcol = scan->slot_index[i];
@@ -1115,6 +1654,7 @@ lakehouse_scan_getnextslot(TableScanDesc bscan, ScanDirection direction,
 				slot->tts_isnull[i] = false;
 			}
 			ExecStoreVirtualTuple(slot);
+			scan->row_in_task++;
 			return true;
 		}
 	}
@@ -1132,96 +1672,154 @@ lakehouse_scan_getnextslot(TableScanDesc bscan, ScanDirection direction,
 						   what))); \
 	} while (0)
 
+/* Open the FFI write session lazily (first insert or first tombstone):
+ * validates identity/credentials early, fail-fast per doc 03 §5. */
+static void
+open_write_session(LakehouseWriteEntry *entry, TupleDesc tupdesc)
+{
+	char		errbuf[1024];
+
+	if (entry->ws != NULL)
+		return;
+	errbuf[0] = '\0';
+	entry->ws = pg_datalake_write_new(entry->opts.endpoint,
+									  entry->opts.warehouse
+									  ? entry->opts.warehouse : "",
+									  entry->opts.token ? entry->opts.token : "",
+									  entry->opts.namespace,
+									  entry->opts.table,
+									  entry->opts.s3_endpoint,
+									  entry->opts.s3_access_key,
+									  entry->opts.s3_secret_key,
+									  build_schema_json(tupdesc),
+									  errbuf, sizeof(errbuf));
+	if (entry->ws == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_EXCEPTION),
+				 errmsg("lakehouse: could not open write session: %s",
+						errbuf)));
+}
+
+/* Own-writes overlay: copy the tuple into the txn-scoped entry. Rows are
+ * NOT pushed to the Rust writer here — staging is C-side only; rows
+ * reach the parquet accumulator at PRE-COMMIT, AFTER subtransaction
+ * pruning. Pushing at insert time leaked savepoint-rolled-back rows into
+ * the committed snapshot (13-review blocker #3). */
+static void
+stage_slot(LakehouseWriteEntry *entry, TupleTableSlot *slot, TupleDesc tupdesc)
+{
+	int			j;
+	MemoryContext old = MemoryContextSwitchTo(entry->mcxt);
+
+	if (entry->staged_rows == 0)
+	{
+		entry->staged_values = (Datum *)
+			palloc(tupdesc->natts * sizeof(Datum) * 64);
+		entry->staged_isnull = (bool *)
+			palloc(tupdesc->natts * sizeof(bool) * 64);
+		entry->staged_subids = (SubTransactionId *)
+			palloc(sizeof(SubTransactionId) * 64);
+	}
+	else if (entry->staged_rows % 64 == 0)
+	{
+		entry->staged_values = (Datum *)
+			repalloc(entry->staged_values,
+					 tupdesc->natts * sizeof(Datum) *
+					 (entry->staged_rows + 64));
+		entry->staged_isnull = (bool *)
+			repalloc(entry->staged_isnull,
+					 tupdesc->natts * sizeof(bool) *
+					 (entry->staged_rows + 64));
+		entry->staged_subids = (SubTransactionId *)
+			repalloc(entry->staged_subids,
+					 sizeof(SubTransactionId) *
+					 (entry->staged_rows + 64));
+	}
+	entry->staged_subids[entry->staged_rows] =
+		GetCurrentSubTransactionId();
+	for (j = 0; j < tupdesc->natts; j++)
+	{
+		entry->staged_values[(size_t) entry->staged_rows * tupdesc->natts + j] =
+			slot->tts_isnull[j]
+			? (Datum) 0
+			: datumCopy(slot->tts_values[j],
+						TupleDescAttr(tupdesc, j)->attbyval,
+						TupleDescAttr(tupdesc, j)->attlen);
+		entry->staged_isnull[(size_t) entry->staged_rows * tupdesc->natts + j] =
+			slot->tts_isnull[j];
+	}
+	entry->staged_rows++;
+	MemoryContextSwitchTo(old);
+}
+
+/*
+ * COW tombstone capture (slice 28): decode the scan-produced tid into
+ * (base file, rowidx), record it + the file's DELETED-entry identity.
+ * The write session opens here too — a DELETE-only transaction still
+ * commits an (overwrite) snapshot and must fail fast on bad credentials.
+ */
+static void
+capture_tombstone(Relation rel, ItemPointer tid)
+{
+	LakehouseWriteEntry *entry = get_write_entry(rel);
+	LakehouseTableScanDescData *scan = lookup_scan_for_dml(RelationGetRelid(rel));
+	uint64		task_idx;
+	uint64		rowidx;
+
+	if (scan == NULL || scan->session == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("lakehouse: %s cannot resolve row identity for DELETE/UPDATE",
+						RelationGetRelationName(rel)),
+				 errdetail("The tid was not produced by a live managed scan of this relation "
+						   "in this transaction (rows staged by an earlier INSERT in the same "
+						   "transaction are not yet addressable).")));
+	if (ItemPointerGetOffsetNumber(tid) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("lakehouse: cannot modify a row inserted in this transaction"),
+				 errdetail("Rows staged by INSERT in the same transaction have no remote "
+						   "identity yet; commit first.")));
+	decode_lakehouse_tid(tid, &task_idx, &rowidx);
+	if (task_idx >= pg_datalake_scan_task_count(scan->session))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("lakehouse: DELETE/UPDATE tid names task %llu, "
+						"outside the pinned snapshot's %llu tasks",
+						(unsigned long long) task_idx,
+						(unsigned long long) pg_datalake_scan_task_count(scan->session))));
+	{
+		int64		nrows = pg_datalake_scan_task_rows(scan->session, task_idx);
+		int64		size = pg_datalake_scan_task_size(scan->session, task_idx);
+		const char *file = pg_datalake_scan_task_file(scan->session, task_idx);
+		LakehouseTombFile *tf;
+
+		if (rowidx >= (uint64) nrows)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("lakehouse: DELETE/UPDATE tid row %llu is outside "
+							"task %llu (%lld rows)",
+							(unsigned long long) rowidx,
+							(unsigned long long) task_idx,
+							(long long) nrows)));
+		open_write_session(entry, entry->tupdesc);
+		tf = tomb_file_get(entry, file, true);
+		tomb_file_add_row(entry, tf, rowidx);
+		tomb_file_note_meta(tf, nrows, size);
+	}
+}
+
 static void
 lakehouse_tuple_insert(Relation rel, TupleTableSlot *slot, CommandId cid,
 					   uint32 options, BulkInsertStateData *bistate)
 {
 	LakehouseWriteEntry *entry = get_write_entry(rel);
-	TupleDesc	tupdesc = RelationGetDescr(rel);
-	char		errbuf[1024];
 
 	slot_getallattrs(slot);
-
-	/* first insert opens the FFI write session (loadTable + writer):
-	 * validates identity/credentials early, fail-fast per doc 03 §5 */
-	if (entry->ws == NULL)
-	{
-		char	   *schema_json = build_schema_json(tupdesc);
-
-		errbuf[0] = '\0';
-		entry->ws = pg_datalake_write_new(entry->opts.endpoint,
-										  entry->opts.warehouse
-										  ? entry->opts.warehouse : "",
-										  entry->opts.token ? entry->opts.token : "",
-										  entry->opts.namespace,
-										  entry->opts.table,
-										  entry->opts.s3_endpoint,
-										  entry->opts.s3_access_key,
-										  entry->opts.s3_secret_key,
-										  schema_json,
-										  errbuf, sizeof(errbuf));
-		if (entry->ws == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_CONNECTION_EXCEPTION),
-					 errmsg("lakehouse: could not open write session: %s",
-							errbuf)));
-	}
-
-	/*
-	 * Rows are NOT pushed to the Rust writer here. Staging is C-side
-	 * only (the overlay copy below); rows reach the parquet accumulator
-	 * at PRE-COMMIT, AFTER subtransaction pruning. Pushing at insert
-	 * time leaked savepoint-rolled-back rows into the committed snapshot
-	 * (13-review blocker #3).
-	 */
-
-	/* own-writes overlay: copy the tuple into the txn-scoped entry */
-	{
-		int			j;
-		MemoryContext old = MemoryContextSwitchTo(entry->mcxt);
-
-		if (entry->staged_rows == 0)
-		{
-			entry->staged_values = (Datum *)
-				palloc(tupdesc->natts * sizeof(Datum) * 64);
-			entry->staged_isnull = (bool *)
-				palloc(tupdesc->natts * sizeof(bool) * 64);
-			entry->staged_subids = (SubTransactionId *)
-				palloc(sizeof(SubTransactionId) * 64);
-		}
-		else if (entry->staged_rows % 64 == 0)
-		{
-			entry->staged_values = (Datum *)
-				repalloc(entry->staged_values,
-						 tupdesc->natts * sizeof(Datum) *
-						 (entry->staged_rows + 64));
-			entry->staged_isnull = (bool *)
-				repalloc(entry->staged_isnull,
-						 tupdesc->natts * sizeof(bool) *
-						 (entry->staged_rows + 64));
-			entry->staged_subids = (SubTransactionId *)
-				repalloc(entry->staged_subids,
-						 sizeof(SubTransactionId) *
-						 (entry->staged_rows + 64));
-		}
-		entry->staged_subids[entry->staged_rows] =
-			GetCurrentSubTransactionId();
-		elog(LOG, "lakehouse staged row at subid %u",
-			 GetCurrentSubTransactionId());
-		for (j = 0; j < tupdesc->natts; j++)
-		{
-			entry->staged_values[(size_t) entry->staged_rows * tupdesc->natts + j] =
-				slot->tts_isnull[j]
-				? (Datum) 0
-				: datumCopy(slot->tts_values[j],
-							TupleDescAttr(tupdesc, j)->attbyval,
-							TupleDescAttr(tupdesc, j)->attlen);
-			entry->staged_isnull[(size_t) entry->staged_rows * tupdesc->natts + j] =
-				slot->tts_isnull[j];
-		}
-		entry->staged_rows++;
-		MemoryContextSwitchTo(old);
-	}
+	open_write_session(entry, RelationGetDescr(rel));
+	stage_slot(entry, slot, RelationGetDescr(rel));
+	elog(LOG, "lakehouse staged row at subid %u",
+		 GetCurrentSubTransactionId());
 }
 
 static void
@@ -1251,23 +1849,43 @@ lakehouse_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
 	LAKEHOUSE_UNSUPPORTED("INSERT", "27");
 }
 
+/*
+ * DELETE (COW, slice 28): tombstone (file, rowidx). The rewrite + commit
+ * happen at PRE-COMMIT; the row vanishes from THIS transaction's reads
+ * immediately via the tombstone filter in scan_getnextslot. TM_Ok always:
+ * Iceberg has no concurrent-tuple visibility to conflict with (snapshot
+ * isolation is enforced at COMMIT by AssertRefSnapshotId — a conflicting
+ * concurrent writer aborts the transaction, not the row).
+ */
 static TM_Result
 lakehouse_tuple_delete(Relation rel, ItemPointer tid, CommandId cid,
 					   uint32 options, Snapshot snapshot, Snapshot crosscheck,
 					   bool wait, TM_FailureData *tmfd)
 {
-	LAKEHOUSE_UNSUPPORTED("DELETE", "28");
-	return TM_Ok;				/* unreachable */
+		capture_tombstone(rel, tid);
+	return TM_Ok;
 }
 
+/*
+ * UPDATE (COW, slice 28) = tombstone the old row + stage the new row.
+ * One PRE-COMMIT: affected files rewritten without the old rows, the
+ * staged new rows committed as new files, one overwrite snapshot.
+ */
 static TM_Result
 lakehouse_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 					   CommandId cid, uint32 options, Snapshot snapshot,
 					   Snapshot crosscheck, bool wait, TM_FailureData *tmfd,
 					   LockTupleMode *lockmode, TU_UpdateIndexes *update_indexes)
 {
-	LAKEHOUSE_UNSUPPORTED("UPDATE", "28");
-	return TM_Ok;				/* unreachable */
+	LakehouseWriteEntry *entry;
+
+	slot_getallattrs(slot);
+	capture_tombstone(rel, otid);
+	entry = get_write_entry(rel);
+	stage_slot(entry, slot, RelationGetDescr(rel));
+	*lockmode = LockTupleExclusive;
+	*update_indexes = TU_None;
+	return TM_Ok;
 }
 
 static TM_Result
@@ -1276,7 +1894,7 @@ lakehouse_tuple_lock(Relation rel, ItemPointer tid, Snapshot snapshot,
 					 LockWaitPolicy wait_policy, uint8 flags,
 					 TM_FailureData *tmfd)
 {
-	LAKEHOUSE_UNSUPPORTED("row locking", "28");
+	LAKEHOUSE_UNSUPPORTED("row locking (SELECT ... FOR UPDATE)", "29");
 	return TM_Ok;				/* unreachable */
 }
 
@@ -1375,12 +1993,91 @@ lakehouse_fetch_tid(Relation rel, ItemPointer tid, Snapshot snapshot,
 	return false;				/* unreachable */
 }
 
+/*
+ * Row-version fetch (slice 28): the executor calls this on every UPDATE
+ * to build the new tuple from the old one. A managed table answers it by
+ * point-reading the (task, rowidx) the tid encodes — the base file as
+ * pinned by this transaction's scan. No tombstone filter: the tid refers
+ * to a row the scan already emitted (post-filter).
+ */
 static bool
 lakehouse_tuple_fetch_row_version(Relation rel, ItemPointer tid,
 								  Snapshot snapshot, TupleTableSlot *slot)
 {
-	LAKEHOUSE_UNSUPPORTED("row-version fetches", "27");
-	return false;				/* unreachable */
+	LakehouseTableScanDescData *scan = lookup_scan_for_dml(RelationGetRelid(rel));
+	uint64		task_idx;
+	uint64		rowidx;
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	char		errbuf[1024];
+	RowsHandle *rows;
+	uint64		i;
+	int			k;
+
+	if (scan == NULL || scan->session == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("lakehouse: %s cannot resolve row identity for row-version fetch",
+						RelationGetRelationName(rel)),
+				 errdetail("The tid was not produced by a live managed scan of this relation "
+						   "in this transaction.")));
+	if (ItemPointerGetOffsetNumber(tid) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("lakehouse: cannot fetch a row inserted in this transaction")));
+	decode_lakehouse_tid(tid, &task_idx, &rowidx);
+	if (task_idx >= pg_datalake_scan_task_count(scan->session))
+		return false;
+	if (rowidx >= (uint64) pg_datalake_scan_task_rows(scan->session, task_idx))
+		return false;
+
+	errbuf[0] = '\0';
+	rows = pg_datalake_rows_open(scan->session, task_idx,
+								 scan->projection_csv,
+								 errbuf, sizeof(errbuf));
+	if (rows == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_IO_ERROR),
+				 errmsg("lakehouse: row-version fetch could not open task %llu: %s",
+						(unsigned long long) task_idx,
+						errbuf[0] != '\0' ? errbuf : "unknown error")));
+	for (i = 0; i <= rowidx; i++)
+	{
+		char		nst_err[1024];
+		int			nst;
+
+		nst_err[0] = '\0';
+		nst = pg_datalake_rows_next(rows, nst_err, sizeof(nst_err));
+		if (nst == 1)
+		{
+			pg_datalake_rows_close(rows);
+			return false;		/* file shrank under us */
+		}
+		if (nst == 2)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_EXCEPTION),
+					 errmsg("lakehouse: row-version fetch read failed: %s",
+							nst_err[0] != '\0' ? nst_err : "unknown error")));
+	}
+	ExecClearTuple(slot);
+	for (k = 0; k < tupdesc->natts; k++)
+	{
+		int			pcol = scan->slot_index[k];
+
+		if (pcol < 0 || pg_datalake_rows_col_null(rows, pcol))
+		{
+			slot->tts_values[k] = PointerGetDatum(NULL);
+			slot->tts_isnull[k] = true;
+			continue;
+		}
+		slot->tts_values[k] = InputFunctionCall(&scan->in_funcs[k],
+				  pg_datalake_rows_col_text(rows, pcol),
+				  scan->typioparams[k],
+				  TupleDescAttr(tupdesc, k)->atttypmod);
+		slot->tts_isnull[k] = false;
+	}
+	ExecStoreVirtualTuple(slot);
+	pg_datalake_rows_close(rows);
+	return true;
 }
 
 static bool
@@ -1639,6 +2336,40 @@ lakehouse_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 		}
 		entry->staged_rows = w;
 	}
+	/* COW tombstones captured in the aborted subxact tree are discarded
+	 * too — a savepoint-rolled-back DELETE must not rewrite a file */
+	if (event == SUBXACT_EVENT_ABORT_SUB && write_entries != NULL)
+	{
+		hash_seq_init(&seq, write_entries);
+		while ((entry = hash_seq_search(&seq)) != NULL)
+		{
+			int			w;
+			int			i;
+
+			for (i = 0, w = 0; i < entry->n_tomb_files; i++)
+			{
+				LakehouseTombFile *tf = entry->tomb_files[i];
+				int			r;
+				int			rw = 0;
+
+				for (r = 0; r < tf->nrows; r++)
+				{
+					if (tf->row_subids[r] >= mySubid)
+						continue;	/* owned by the aborted subxact tree */
+					tf->rows[rw] = tf->rows[r];
+					tf->row_subids[rw] = tf->row_subids[r];
+					rw++;
+				}
+				tf->nrows = rw;
+				if (rw > 0)
+					entry->tomb_files[w++] = tf;
+				/* fully abandoned: the file record is dropped (no DELETED
+				 * entry rides to the commit for a rolled-back DELETE) */
+			}
+			entry->n_tomb_files = w;
+		}
+	}
+	prune_scan_registry_above(mySubid);
 	(void) parentSubid;
 }
 
