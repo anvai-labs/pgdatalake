@@ -118,7 +118,7 @@ fn type_to_value(t: &IcebergType) -> serde_json::Value {
         Decimal { precision, scale } => format!("decimal({precision},{scale})").into(),
         Struct(fields) => serde_json::json!({ "type": "struct", "fields": fields }),
         List(inner) => serde_json::json!({ "type": "list", "element": inner }),
-        Map { key, value } => serde_json::json!({ "type": "map", "keys": key, "values": value }),
+        Map { key, value } => serde_json::json!({ "type": "map", "key": key, "value": value }),
     }
 }
 
@@ -178,8 +178,8 @@ fn parse_type(v: &serde_json::Value) -> Option<IcebergType> {
             }
             "list" => Some(List(Box::new(parse_type(o.get("element")?)?))),
             "map" => Some(Map {
-                key: Box::new(parse_type(o.get("keys")?)?),
-                value: Box::new(parse_type(o.get("values")?)?),
+                key: Box::new(parse_type(o.get("key").or_else(|| o.get("keys"))?)?),
+                value: Box::new(parse_type(o.get("value").or_else(|| o.get("values"))?)?),
             }),
             _ => None,
         },
@@ -318,7 +318,15 @@ pub struct TableMetadata {
     pub properties: BTreeMap<String, String>,
     #[serde(default)]
     pub partition_specs: Vec<PartitionSpec>,
-    #[serde(default)]
+    /// Iceberg's wire name is `default-spec-id`; some writers emitted
+    /// `default-partition-spec-id` and we read that legacy spelling too
+    /// (13-review blocker #5: the misspelling made every real table's
+    /// default spec silently None, and commits fell back to spec zero).
+    #[serde(
+        default,
+        rename = "default-spec-id",
+        alias = "default-partition-spec-id"
+    )]
     pub default_partition_spec_id: Option<i32>,
     #[serde(default)]
     pub refs: BTreeMap<String, SnapshotRef>,
@@ -421,7 +429,7 @@ mod tests {
             "sort-orders": [{"order-id": 0, "fields": []}],
             "default-sort-order-id": 0,
             "partition-specs": [{"spec-id": 0, "fields": []}],
-            "default-partition-spec-id": 0,
+            "default-spec-id": 0,
             "properties": {"write.format.default": "parquet"}
         }"#;
         let md: TableMetadata = serde_json::from_str(json).expect("parse v2 metadata");
@@ -567,7 +575,7 @@ mod tests {
                      "field-id": 1002}
                 ]}
             ],
-            "default-partition-spec-id": 1
+            "default-spec-id": 1
         }"#;
         let md: TableMetadata = serde_json::from_str(json).expect("parse partition specs");
         assert_eq!(md.partition_specs.len(), 2);
@@ -683,5 +691,87 @@ mod tests {
                 name: "nope".into()
             })
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod wire_name_tests {
+    use super::*;
+
+    /// ACCEPTANCE (13-review blocker #5): the SPEC wire names parse —
+    /// `default-spec-id` (nonzero!) and map types with `key`/`value`
+    /// members. The old code only knew the misspelled
+    /// `default-partition-spec-id` and `keys`/`values`, silently zeroing
+    /// the default spec and failing to load otherwise-readable tables
+    /// that contain a map column.
+    #[test]
+    fn spec_wire_names_parse() {
+        let json = r#"{
+            "format-version": 2,
+            "table-uuid": "9c12d441-03fe-11ed-8122-d358e75d12eb",
+            "location": "s3://warehouse/t",
+            "schemas": [{"type": "struct", "schema-id": 0, "fields": [
+                {"id": 1, "name": "tags", "required": false,
+                 "type": {"type": "map",
+                          "key-id": 3, "key": "string",
+                          "value-id": 4, "value": "long",
+                          "value-required": false}},
+                {"id": 2, "name": "part", "required": false, "type": "long"}
+            ]}],
+            "current-schema-id": 0,
+            "partition-specs": [{"spec-id": 1, "fields": [
+                {"name": "part", "transform": "identity", "source-id": 2, "field-id": 5}
+            ]}],
+            "default-spec-id": 1
+        }"#;
+        let md: TableMetadata = serde_json::from_str(json).expect("parse spec-shaped metadata");
+        assert_eq!(md.default_partition_spec_id, Some(1), "spec wire name");
+        let schema = md.current_schema().unwrap();
+        match &schema.fields[0].r#type {
+            IcebergType::Map { key, value } => {
+                assert_eq!(**key, IcebergType::String);
+                assert_eq!(**value, IcebergType::Long);
+            }
+            other => panic!("expected map, got {other:?}"),
+        }
+        assert_eq!(md.partition_spec(1).unwrap().fields.len(), 1);
+        // the writer must emit the parsed default spec, not fall back to 0
+        assert_eq!(
+            md.default_partition_spec_id,
+            Some(md.partition_spec(1).unwrap().spec_id)
+        );
+    }
+
+    /// Round-trip: a map type serializes the SPEC members.
+    #[test]
+    fn map_type_serializes_spec_members() {
+        let t = IcebergType::Map {
+            key: Box::new(IcebergType::String),
+            value: Box::new(IcebergType::Long),
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(json.contains("\"key\""), "{json}");
+        assert!(json.contains("\"value\""), "{json}");
+        assert!(!json.contains("\"keys\""), "{json}");
+    }
+
+    /// Legacy misspelling still parses (tolerance for old writers).
+    #[test]
+    fn legacy_misspellings_tolerated() {
+        let json = r#"{
+            "format-version": 2,
+            "table-uuid": "9c12d441-03fe-11ed-8122-d358e75d12eb",
+            "location": "s3://warehouse/t",
+            "schemas": [{"type": "struct", "schema-id": 0, "fields": [
+                {"id": 1, "name": "m", "required": false,
+                 "type": {"type": "map", "keys": "string", "values": "long"}}
+            ]}],
+            "current-schema-id": 0,
+            "default-partition-spec-id": 2
+        }"#;
+        let md: TableMetadata = serde_json::from_str(json).unwrap();
+        assert_eq!(md.default_partition_spec_id, Some(2));
+        let schema = md.current_schema().unwrap();
+        assert!(matches!(schema.fields[0].r#type, IcebergType::Map { .. }));
     }
 }

@@ -144,14 +144,14 @@ fn decode_bound(bytes: &[u8], ty: &crate::catalog::metadata::IcebergType) -> Opt
 /// Coerce a JSON predicate literal into the bound-comparable form for
 /// the field's type. Integer fields take exact i64 literals (a float
 /// literal on an integer field is incomparable -> conservative keep).
-fn coerce_value(v: &serde_json::Value, ty: &crate::catalog::metadata::IcebergType) -> Option<BoundVal> {
+fn coerce_value(
+    v: &serde_json::Value,
+    ty: &crate::catalog::metadata::IcebergType,
+) -> Option<BoundVal> {
     use crate::catalog::metadata::IcebergType as IT;
     Some(match (ty, v) {
         (_, serde_json::Value::String(s)) => BoundVal::Str(s.clone()),
-        (
-            IT::Int | IT::Long | IT::Timestamp | IT::Timestamptz,
-            serde_json::Value::Number(n),
-        ) => {
+        (IT::Int | IT::Long | IT::Timestamp | IT::Timestamptz, serde_json::Value::Number(n)) => {
             // exact only when integral and in i64 range; anything else is
             // incomparable against an i64 bound (conservative keep)
             let i = n.as_i64()?;
@@ -1469,7 +1469,7 @@ mod tests {
 #[cfg(test)]
 mod prune_i64_tests {
     use super::*;
-    use crate::catalog::metadata::{Field, IcebergType, Schema, IcebergTypeMarker};
+    use crate::catalog::metadata::{Field, IcebergType, IcebergTypeMarker, Schema};
 
     fn md() -> crate::catalog::metadata::TableMetadata {
         use crate::catalog::metadata::{FormatVersion, TableMetadata};

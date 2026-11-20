@@ -500,3 +500,16 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     validator + ExtractOptions literal-credential removal for FOREIGN
     tables, scan_files ACL, transport policy (scheme/origin/redirect,
     redaction), OAuth refresh, sentinel-string dump verification.
+  - 13-implementation-review Blocker #5 (metadata wire) — FIXED
+    2026-11-20 (72 cargo tests): the wire misspellings the review
+    called out are real and now fixed — TableMetadata reads the spec
+    name default-spec-id (legacy default-partition-spec-id tolerated
+    via serde alias; every real table's default spec was silently None
+    and commits fell back to spec zero), and map types parse BOTH
+    key/value (spec, pyiceberg alias-confirmed) and keys/values
+    (legacy) while serializing the spec members. TDD: spec-shaped
+    metadata with nonzero default-spec-id + map column loads; map
+    serializes spec members; legacy tolerance test. REMAINING #5:
+    equality_ids-driven equality deletes, position-delete sequence/
+    partition applicability, empty-projection open_all branch,
+    delete-specific pruning rule, map/list nested field IDs.
