@@ -515,7 +515,13 @@ pub fn load_row_deletes(
                             )))
                         }
                     };
-                    loaded.positions_by_file.entry(fp).or_default().insert(pos);
+                    loaded
+                        .positions_by_file
+                        .entry(fp)
+                        .or_default()
+                        .entry(t.sequence_number)
+                        .or_default()
+                        .insert(pos);
                 }
             }
             crate::manifest::DataContent::EqualityDeletes => {
@@ -1621,7 +1627,6 @@ mod eq_delete_binding_tests {
     use crate::parquet::CellValue;
     use apache_avro::types::{Record, Value};
     use apache_avro::{Schema as AvroSchema, Writer};
-    
 
     /// ACCEPTANCE (13-review blocker #5): an equality delete file with an
     /// EXTRA non-key column still matches rows — the key columns come

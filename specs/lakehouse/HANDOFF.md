@@ -546,3 +546,21 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     (position-delete applicability, empty-projection branch, nested
     field IDs, delete-specific pruning), #4 tail (typed representation,
     operator allowlist), #6 FDW side, #7, #8, blocker #1 tail.
+  - 13-implementation-review Blocker #5 tail (part) — FIXED 2026-11-20
+    (75 cargo tests): (a) POSITION-DELETE SEQUENCE APPLICABILITY:
+    positions_by_file now maps path -> (delete seq -> positions);
+    for_task applies a position delete only when its sequence >= the
+    data file's sequence (v2 applicability) — path/position alone
+    over-applied when a path was reused by a later write. (b)
+    EMPTY-PROJECTION BRANCH: rows_open no longer routes count(*)-style
+    scans through open_all (which silently dropped position deletes) —
+    always open_with_deletes, which skips deleted absolute rows even
+    with zero projected columns. (c) PARTITIONED FLAG: partition
+    is_some() conflated the empty record (our own unpartitioned files)
+    with a partitioned spec — equality deletes on our own writes were
+    wrongly rejected; empty object / null now mean unpartitioned.
+    TDD: sequence applicability (data seq > delete seq not applied),
+    empty-projection position-delete skip, partitioned-flag via the
+    eq-delete binding test. REMAINING #5: delete-specific pruning rule,
+    map/list nested field IDs, manifest inheritance with null
+    snapshot IDs.

@@ -81,8 +81,15 @@ pub struct RowDeletes {
 /// per-data-file [`RowDeletes`] at rows-open time.
 #[derive(Debug, Default, Clone)]
 pub struct LoadedDeletes {
-    /// data file path -> deleted absolute positions
-    pub positions_by_file: std::collections::BTreeMap<String, std::collections::BTreeSet<u64>>,
+    /// data file path -> (delete sequence -> deleted absolute positions).
+    /// Per-sequence so `for_task` can enforce v2 applicability: a position
+    /// delete with sequence N applies to data files with sequence <= N
+    /// (13-review blocker #5 — path/position alone over-applies when a
+    /// path is reused by a later write).
+    pub positions_by_file: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<i64, std::collections::BTreeSet<u64>>,
+    >,
     /// equality delete tuples (from every eq delete file of the snapshot)
     pub equality: Vec<EqDeleteMatch>,
 }
@@ -106,12 +113,23 @@ impl LoadedDeletes {
                  (partition-scoped application is a later M1 slice)"
             )));
         }
+        let positions = self
+            .positions_by_file
+            .get(file_path)
+            .map(|by_seq| {
+                let mut out = std::collections::BTreeSet::new();
+                // v2 applicability: delete seq N applies to data files
+                // with sequence <= N
+                for (seq, set) in by_seq {
+                    if *seq >= task_sequence_number {
+                        out.extend(set.iter().copied());
+                    }
+                }
+                out
+            })
+            .unwrap_or_default();
         Ok(RowDeletes {
-            positions: self
-                .positions_by_file
-                .get(file_path)
-                .cloned()
-                .unwrap_or_default(),
+            positions,
             equality: self
                 .equality
                 .iter()
@@ -915,5 +933,94 @@ mod tests {
         assert_eq!(rows.value(1), CellValue::Str("00:00:00.000000".into()));
         assert_eq!(rows.value(2), CellValue::Null);
         assert!(!rows.next());
+    }
+}
+
+#[cfg(test)]
+mod pos_delete_applicability_tests {
+    use super::*;
+
+    fn loaded_with_seq(seq: i64, positions: &[u64]) -> LoadedDeletes {
+        let mut ld = LoadedDeletes::default();
+        let e = ld
+            .positions_by_file
+            .entry("file:///t/data/f.parquet".into())
+            .or_default()
+            .entry(seq)
+            .or_default();
+        for p in positions {
+            e.insert(*p);
+        }
+        ld
+    }
+
+    /// ACCEPTANCE (13-review blocker #5, position-delete applicability):
+    /// a position delete with sequence 5 applies to data files with
+    /// sequence <= 5, and must NOT touch a data file whose sequence is
+    /// higher (rows written after the delete was issued). The old
+    /// path/position-only map applied unconditionally.
+    #[test]
+    fn position_delete_sequence_applicability() {
+        let ld = loaded_with_seq(5, &[0, 2]);
+        // data file seq 3 <= 5: applies
+        let rd = ld.for_task("file:///t/data/f.parquet", 3, false).unwrap();
+        assert!(rd.positions.contains(&0) && rd.positions.contains(&2));
+        // data file seq 7 > 5: written after the delete -> NOT applied
+        let rd = ld.for_task("file:///t/data/f.parquet", 7, false).unwrap();
+        assert!(rd.positions.is_empty());
+    }
+
+    /// Empty-projection scans must still apply position deletes: the old
+    /// open_all branch in rows_open silently counted deleted rows. This
+    /// exercises open_with_deletes with an empty projection: next()
+    /// skips deleted absolute rows even though no columns are read.
+    #[test]
+    fn empty_projection_still_applies_positions() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field as AF, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let aschema = ArrowSchema::new(vec![AF::new("id", DataType::Int64, false)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(aschema),
+            vec![Arc::new(Int64Array::from(vec![10, 11, 12]))],
+        )
+        .unwrap();
+        let f = std::fs::File::create(dir.path().join("f.parquet")).unwrap();
+        let mut w = parquet::arrow::ArrowWriter::try_new(f, batch.schema(), None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let mut ld = LoadedDeletes::default();
+        let e = ld
+            .positions_by_file
+            .entry(format!("file://{}/f.parquet", dir.path().display()))
+            .or_default()
+            .entry(9)
+            .or_default();
+        e.insert(1); // row 11 is deleted
+
+        let key = "f.parquet".to_string();
+        let io = StorageIo::open(
+            &crate::storage::parse_location(&format!("file://{}", dir.path().display())).unwrap(),
+            None,
+        )
+        .unwrap();
+        let rd = ld
+            .for_task(
+                &format!("file://{}/f.parquet", dir.path().display()),
+                9,
+                false,
+            )
+            .unwrap();
+        let rows = ParquetRows::open_with_deletes(&io, &key, &[], rd).unwrap();
+        let mut seen = 0;
+        let mut r = rows;
+        while r.next() {
+            seen += 1;
+        }
+        assert_eq!(seen, 2, "deleted row 11 skipped even with empty projection");
     }
 }

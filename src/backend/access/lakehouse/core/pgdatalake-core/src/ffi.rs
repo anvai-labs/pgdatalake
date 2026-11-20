@@ -328,23 +328,31 @@ pub unsafe extern "C" fn pg_datalake_rows_open(
             .tasks
             .get(task_idx as usize)
             .ok_or_else(|| format!("task {task_idx} out of range"))?;
+        // partitioned means the partition struct carries REAL fields —
+        // an empty record is the unpartitioned marker (13-review blocker
+        // #5: is_some() treated every unpartitioned file as partitioned,
+        // wrongly rejecting equality deletes on our own writes)
+        let partitioned = task
+            .entry
+            .data_file
+            .partition
+            .as_ref()
+            .map(|p| match p {
+                serde_json::Value::Object(o) => !o.is_empty(),
+                serde_json::Value::Null => false,
+                _ => true,
+            })
+            .unwrap_or(false);
         let row_deletes = s
             .deletes
-            .for_task(
-                &file_path,
-                task.sequence_number,
-                task.entry.data_file.partition.is_some(),
-            )
+            .for_task(&file_path, task.sequence_number, partitioned)
             .map_err(|e| e.to_string())?;
-        let rows = if projection.is_empty() && row_deletes.equality.is_empty() {
-            crate::parquet::ParquetRows::open_all(&io, &key).map_err(|e| e.to_string())?
-        } else {
-            if projection.is_empty() {
-                return Err("delete application requires a projection (M1)".to_string());
-            }
+        // ALWAYS through open_with_deletes: the old empty-projection
+        // open_all branch silently dropped position deletes from
+        // count(*)-style scans (13-review blocker #5)
+        let rows =
             crate::parquet::ParquetRows::open_with_deletes(&io, &key, &projection, row_deletes)
-                .map_err(|e| e.to_string())?
-        };
+                .map_err(|e| e.to_string())?;
         let column_names = rows
             .column_names()
             .iter()
