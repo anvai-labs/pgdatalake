@@ -1602,8 +1602,8 @@ untransformRelOptions(Datum options)
 bytea *
 table_am_reloptions(char relkind, Datum reloptions, bool validate, Oid relam)
 {
-	if (relkind == RELKIND_RELATION && OidIsValid(relam) &&
-		relam != HEAP_TABLE_AM_OID)
+	if ((relkind == RELKIND_RELATION || relkind == RELKIND_MATVIEW) &&
+		OidIsValid(relam) && relam != HEAP_TABLE_AM_OID)
 	{
 		HeapTuple	amtup = SearchSysCache1(AMOID, ObjectIdGetDatum(relam));
 
