@@ -504,7 +504,6 @@ pub struct WriteSession {
     flushed: Vec<crate::snapshot_write::NewDataFile>,
     file_seq: usize,
     staged_rows: usize,
-    next_snapshot_id: i64,
 }
 
 /// Open a write session. `schema_json` is `[{"name": ..., "type":
@@ -650,26 +649,6 @@ pub unsafe extern "C" fn pg_datalake_write_new(
         Ok(io) => io,
         Err(e) => return fail(format!("lakehouse write open: {e}"), err_buf, err_len),
     };
-    // snapshot ids: one past the max seen (server may assign differently,
-    // but REST commits accept client-chosen ids — pyiceberg does the same)
-    let next_snapshot_id = state
-        .last_sequence_number
-        .unwrap_or(0)
-        .checked_mul(1000)
-        .and_then(|v| {
-            v.checked_add(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| (d.as_millis() % 1000) as i64)
-                    .unwrap_or(0),
-            )
-        })
-        .unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(1)
-        });
     let key_prefix = match crate::storage::parse_location(&state.location) {
         Ok(crate::storage::Location::S3 { key, .. }) => key.trim_matches('/').to_string(),
         _ => String::new(),
@@ -686,7 +665,6 @@ pub unsafe extern "C" fn pg_datalake_write_new(
         flushed: Vec::new(),
         file_seq: 0,
         staged_rows: 0,
-        next_snapshot_id,
     });
     Box::into_raw(ws)
 }
@@ -819,18 +797,12 @@ pub unsafe extern "C" fn pg_datalake_write_commit(
         return std::ptr::null_mut();
     }
     let ns_refs: Vec<&str> = ws.namespace.iter().map(|s| s.as_str()).collect();
-    let snapshot_id = ws.next_snapshot_id;
-    match ws.client.commit_append(
-        &ws.state,
-        &ns_refs,
-        &ws.table,
-        &ws.flushed,
-        snapshot_id,
-        retries,
-    ) {
-        Ok((loc, _snapshot)) => {
+    match ws
+        .client
+        .commit_append(&ws.state, &ns_refs, &ws.table, &ws.flushed, retries)
+    {
+        Ok(loc) => {
             ws.flushed.clear();
-            ws.next_snapshot_id += 1;
             match std::ffi::CString::new(loc) {
                 Ok(c) => c.into_raw(),
                 Err(_) => std::ptr::null_mut(),

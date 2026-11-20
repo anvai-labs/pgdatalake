@@ -125,6 +125,28 @@ impl CatalogClient {
         let s3 = self.s3_client.merged(&cfg);
         let (io, key) = crate::scan::open_for(&lt.metadata_location, Some(&s3))?;
         let md = crate::storage::fetch_metadata(&io, &key)?;
+        // writer capability gates (13-implementation-review blocker #2:
+        // "Initially allow only write formats and unpartitioned schemas
+        // the writer can actually emit")
+        match md.format_version {
+            crate::catalog::metadata::FormatVersion::V2 => {}
+            other => {
+                return Err(crate::storage::StorageError::Config(format!(
+                    "write path: table {table} is format-version {:?}; this writer emits v2",
+                    other
+                )))
+            }
+        }
+        if let Some(spec) = md
+            .default_partition_spec_id
+            .and_then(|id| md.partition_spec(id))
+        {
+            if !spec.fields.is_empty() {
+                return Err(crate::storage::StorageError::Config(format!(
+                    "write path: table {table} is partitioned; this writer emits unpartitioned tables only"
+                )));
+            }
+        }
         let schema = md.current_schema().ok_or_else(|| {
             crate::storage::StorageError::Config(format!(
                 "write path: table {table} has no current schema"
@@ -157,86 +179,132 @@ impl CatalogClient {
         })
     }
 
-    /// Flush + assemble + COMMIT an append snapshot (doc 07 §2 steps 1-3).
-    /// Requirements are rebuilt from a fresh loadTable on every attempt
-    /// (the appends are additive, so only the base pin moves); retries
-    /// bounded by `retries`. Returns the new metadata-location.
+    /// Flush + assemble + COMMIT an append snapshot (doc 07 §2 steps 1-3,
+    /// rebuilt per 13-implementation-review blocker #2): EVERY attempt
+    /// reloads metadata, binds the requirement to the ORIGINAL table
+    /// uuid (a replacement table aborts, never gets adopted), re-derives
+    /// parent/sequence/carried manifests from the fresh base, assembles
+    /// a fresh snapshot with a collision-resistant id, and never replays
+    /// stale requirements. Fatal assembly errors abort without retry.
     pub fn commit_append(
         &self,
         st: &TableWriteState,
         namespace: &[&str],
         table: &str,
         new_files: &[crate::snapshot_write::NewDataFile],
-        snapshot_id: i64,
         retries: u32,
-    ) -> Result<(String, crate::catalog::metadata::Snapshot), crate::storage::StorageError> {
+    ) -> Result<String, crate::storage::StorageError> {
+        use crate::catalog::commit::{TableRequirement, TableUpdate};
         let loc = crate::storage::parse_location(&st.location)?;
         let io = crate::storage::StorageIo::open(&loc, Some(&st.s3))?;
 
-        // blocker #1: carry the base snapshot's LIVE manifests (data AND
-        // delete) into the child snapshot's manifest list
-        let carried_manifests = match &st.base_manifest_list {
-            Some(path) => {
-                let bytes = io.get_bytes(path)?;
-                crate::manifest::parse_manifest_list(&bytes)?
-            }
-            None => Vec::new(),
-        };
-        let written = crate::snapshot_write::write_snapshot(
-            &io,
-            &st.location,
-            new_files,
-            crate::snapshot_write::SnapshotParams {
-                snapshot_id,
-                timestamp_ms: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0),
-                parent_snapshot_id: st.base_snapshot_id,
-                last_sequence_number: st.last_sequence_number,
-                schema_id: st.schema_id,
-                partition_spec_id: st.partition_spec_id,
-                carried_manifests,
-            },
-        )?;
-
-        let updates = vec![
-            crate::catalog::commit::TableUpdate::AddSnapshot {
-                snapshot: written.snapshot.clone(),
-            },
-            crate::catalog::commit::TableUpdate::SetSnapshotRef {
-                ref_name: "main".into(),
-                kind: crate::catalog::commit::RefKind::Branch,
-                snapshot_id,
-                min_snapshots_to_keep: None,
-                max_snapshot_age_ms: None,
-            },
-        ];
         let resp = self
             .rest
             .commit_with_retry(
                 namespace,
                 table,
                 |lt| {
-                    let md = lt.metadata.as_ref();
-                    (
+                    // the FRESH base is authoritative per attempt; a
+                    // table replaced under us has a different uuid and
+                    // the requirement fails server-side (never adopted)
+                    // verified current metadata per attempt: in-band when
+                    // the catalog serves it, else fetch the referenced
+                    // metadata file (13-review blocker #2)
+                    let md_owned;
+                    let md = match lt.metadata.as_ref() {
+                        Some(m) => m,
+                        None => {
+                            let (mio, mkey) =
+                                crate::scan::open_for(&lt.metadata_location, Some(&st.s3))
+                                    .map_err(|e| {
+                                        crate::catalog::rest::RestError::Http(e.to_string())
+                                    })?;
+                            md_owned =
+                                crate::storage::fetch_metadata(&mio, &mkey).map_err(|e| {
+                                    crate::catalog::rest::RestError::Http(e.to_string())
+                                })?;
+                            &md_owned
+                        }
+                    };
+                    let base_seq = md.last_sequence_number;
+                    let parent = md.current_snapshot_id;
+                    let base_list = md.current_snapshot().map(|snap| snap.manifest_list.clone());
+
+                    // blocker #1: carry the fresh base's live manifests
+                    let carried = match &base_list {
+                        Some(path) => {
+                            let (cio, ckey) =
+                                crate::scan::open_for(path, Some(&st.s3)).map_err(|e| {
+                                    crate::catalog::rest::RestError::Http(e.to_string())
+                                })?;
+                            crate::manifest::parse_manifest_list(&cio.get_bytes(&ckey).map_err(
+                                |e| crate::catalog::rest::RestError::Http(e.to_string()),
+                            )?)
+                            .map_err(|e| crate::catalog::rest::RestError::Http(e.to_string()))?
+                        }
+                        None => Vec::new(),
+                    };
+
+                    // collision-resistant positive id (entropy + time),
+                    // NOT sequence-derived (two writers can share a seq)
+                    let snapshot_id = {
+                        let u = uuid::Uuid::new_v4().as_u128();
+                        let ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(1);
+                        ((ms << 20) | ((u >> 44) as i64 & 0xF_FFFF)) & i64::MAX
+                    };
+
+                    let written = crate::snapshot_write::write_snapshot(
+                        &io,
+                        &st.location,
+                        new_files,
+                        crate::snapshot_write::SnapshotParams {
+                            snapshot_id,
+                            timestamp_ms: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as i64)
+                                .unwrap_or(0),
+                            parent_snapshot_id: parent,
+                            last_sequence_number: base_seq,
+                            schema_id: st.schema_id,
+                            partition_spec_id: st.partition_spec_id,
+                            carried_manifests: carried,
+                        },
+                    )
+                    .map_err(|e| crate::catalog::rest::RestError::Http(e.to_string()))?;
+
+                    let updates = vec![
+                        TableUpdate::AddSnapshot {
+                            snapshot: written.snapshot.clone(),
+                        },
+                        TableUpdate::SetSnapshotRef {
+                            ref_name: "main".into(),
+                            kind: crate::catalog::commit::RefKind::Branch,
+                            snapshot_id,
+                            min_snapshots_to_keep: None,
+                            max_snapshot_age_ms: None,
+                        },
+                    ];
+                    Ok((
                         vec![
-                            crate::catalog::commit::TableRequirement::AssertTableUUID {
-                                uuid: md.map(|m| m.table_uuid).unwrap_or(st.table_uuid),
+                            TableRequirement::AssertTableUUID {
+                                uuid: st.table_uuid,
                             },
-                            crate::catalog::commit::TableRequirement::AssertRefSnapshotId {
+                            TableRequirement::AssertRefSnapshotId {
                                 r#ref: "main".into(),
-                                snapshot_id: md.and_then(|m| m.current_snapshot_id),
+                                snapshot_id: parent,
                             },
                         ],
-                        updates.clone(),
-                    )
+                        updates,
+                    ))
                 },
                 retries,
                 std::time::Duration::from_millis(50),
             )
             .map_err(|e| crate::storage::StorageError::Config(e.to_string()))?;
-        Ok((resp.metadata_location, written.snapshot))
+        Ok(resp.metadata_location)
     }
 
     /// Create the remote Iceberg table (managed CREATE, slice 27c):
@@ -286,6 +354,7 @@ impl CatalogClient {
         Ok(resp.metadata_location)
     }
 
+    /// config -> loadTable -> metadata -> plan. Returns the plan plus the
     /// config -> loadTable -> metadata -> plan. Returns the plan plus the
     /// effective storage options (needed later to open task files).
     pub fn scan_table(

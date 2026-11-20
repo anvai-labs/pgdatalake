@@ -254,12 +254,12 @@ impl RestCatalog {
         backoff: Duration,
     ) -> Result<CommitTableResponse, RestError>
     where
-        F: FnMut(&LoadTableResult) -> (Vec<TableRequirement>, Vec<TableUpdate>),
+        F: FnMut(&LoadTableResult) -> Result<(Vec<TableRequirement>, Vec<TableUpdate>), RestError>,
     {
         let mut attempt = 0u32;
         loop {
             let loaded = self.load_table(namespace, table)?;
-            let (requirements, updates) = plan(&loaded);
+            let (requirements, updates) = plan(&loaded)?;
             match self.commit_table(namespace, table, requirements, updates) {
                 Ok(resp) => return Ok(resp),
                 Err(e @ RestError::Conflict(_)) if attempt < max_retries => {
@@ -551,7 +551,7 @@ mod tests {
                 "events",
                 |loaded| {
                     bases.push(loaded.metadata.as_ref().unwrap().current_snapshot_id);
-                    append_plan(loaded)
+                    Ok(append_plan(loaded))
                 },
                 3,
                 Duration::ZERO,
@@ -599,7 +599,13 @@ mod tests {
 
         let err = mock
             .catalog()
-            .commit_with_retry(&["analytics"], "events", append_plan, 2, Duration::ZERO)
+            .commit_with_retry(
+                &["analytics"],
+                "events",
+                |l| Ok(append_plan(l)),
+                2,
+                Duration::ZERO,
+            )
             .unwrap_err();
 
         mock.join();

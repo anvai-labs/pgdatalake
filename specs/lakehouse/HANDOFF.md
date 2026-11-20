@@ -449,3 +449,19 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     write), two-writer concurrency, externally-written base with
     deletes, independent-reader verification. Blockers #2-#8 queued in
     review order.
+  - 13-implementation-review Blocker #2 — FIXED 2026-11-20 (Rust core,
+    66 cargo tests + upstream regress + live smoke): commit_append now
+    REBUILDS the commit per attempt against verified current metadata —
+    (a) requirement binds the ORIGINAL table uuid (a replacement table
+    aborts server-side, never adopted); (b) parent/sequence/carried
+    manifests re-derived from the FRESH loadTable (fetching the
+    referenced metadata file when the catalog omits in-band metadata);
+    (c) collision-resistant positive snapshot ids (time<<20 | uuid
+    entropy) replacing seq*1000+millis; (d) plan closures return
+    Result — assembly errors abort without retry, only
+    CommitFailedException retries; (e) write_table_open gates: v2
+    format only, unpartitioned only (writer capability limits, per
+    review). Obsolete seq-derived snapshot-id plumbing removed. NEXT
+    blockers: #3 txn boundary, #4 predicate serialization (2^53
+    pruning bug), #5 delete schema binding, #6 credential authority,
+    #7 per-scan queues, #8 type statuses.
