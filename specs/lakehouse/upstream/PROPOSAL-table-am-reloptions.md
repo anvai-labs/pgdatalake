@@ -111,3 +111,32 @@ Consequences for v2 (before sending):
 5. NOT claiming: this does not decouple build_reloptions from the
    static relOpts registry (Paquier's fuller vision); it is the
    narrow, reviewable first slice both prior efforts point toward.
+
+## v2 (2026-11-20) — CF #4866 feedback addressed point-by-point
+
+Citing the reviewer feedback on "Custom reloptions for table AM"
+(0009/0002 in the series) directly:
+
+- Mark Dilger: "could use some regression tests" -> v2 ships
+  src/test/modules/tableam_reloptions: a heap-delegating test AM whose
+  regression suite covers CREATE-time AM-owned option acceptance,
+  unknown-key rejection (no silent ignore), heap-key delegation,
+  plain-heap rejection of AM keys (effective-AM dispatch), ALTER SET
+  relcache re-parse, and SET ACCESS METHOD option-ownership transfer.
+- Pavel Borisov (redundant relkind if -> assert; duplicated decl) ->
+  our dispatch has no redundant relkind block (NULL callback =
+  heap_reloptions directly); declaration lives only in reloptions.h.
+- Japin Li (missing includes) -> v2's reloptions.c carries explicit
+  includes for tableam/pg_am/syscache.
+- Naming aligned to the CF lineage: the callback is
+  TableAmRoutine.reloptions (CF v5 named it exactly that).
+- SGML docs added (doc/src/sgml/tableam.sgml, "Table Access Method
+  Relation Options"): Riggs's docs requirement.
+- Still scoped out, honestly: shared preset option packages
+  (autovacuum/toast) and the fuller relOpts-registry decoupling —
+  deliberate first slice per the 2020 thread consensus and Davis's
+  extension-learn-by-doing argument.
+
+Branch anvai-labs:table-am-reloptions carries v2; the format-patch in
+this directory is regenerated from it. EMAIL STILL HELD until the
+patch builds + tests green and the user approves.
