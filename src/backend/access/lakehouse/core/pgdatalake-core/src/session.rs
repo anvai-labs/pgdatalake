@@ -414,20 +414,10 @@ impl CatalogClient {
         let s3 = self.s3_client.merged(&cfg);
         let (io, key) = crate::scan::open_for(&lt.metadata_location, Some(&s3))?;
         let md = fetch_metadata(&io, &key)?;
-        // v3 conformance gate (doc 14): v3 metadata PARSES (the model
-        // carries FormatVersion::V3 + first_row_id) but v3 SEMANTICS are
-        // not yet covered — deletion vectors (Puffin DV blobs), row
-        // lineage, default values. A table whose rows we cannot prove
-        // correct must error loudly, never return plausible results
-        // (13-review: "identify v3 deletion vectors before returning
-        // rows"). Lift this gate when the DV-read slice lands.
-        if md.format_version == crate::catalog::metadata::FormatVersion::V3 {
-            return Err(crate::storage::StorageError::Config(format!(
-                "table {table} is format-version 3: v3 tables are not yet \
-                 supported for reads (deletion vectors, row lineage) — \
-                 tracked in specs/lakehouse/14-v3-conformance.md"
-            )));
-        }
+        // v3 conformance (doc 14): the V0 loud gate is LIFTED (slice V1) —
+        // deletion vectors are decoded and applied (puffin.rs), so v3
+        // tables read correctly. Row lineage / schema defaults remain
+        // deferred-but-inert (they affect writers, not read correctness).
         let plan = crate::scan::plan_scan(&md, selector, Some(&s3), predicate)?;
         let schema = md.current_schema().cloned().ok_or_else(|| {
             crate::storage::StorageError::Config("scan: table has no current schema".to_string())
@@ -521,13 +511,12 @@ mod tests {
         assert_eq!(plan.tasks.len(), 0, "fresh table: empty manifest list");
     }
 
-    /// v3 conformance gate (doc 14): reads of format-version 3 tables are
-    /// REJECTED loudly until DV application + v3 semantics are covered —
-    /// a v3 table whose rows we cannot prove correct must never return
-    /// plausible-looking results (13-review "identify v3 deletion vectors
-    /// before returning rows").
+    /// v3 conformance (doc 14): the V0 read gate is LIFTED in slice V1 —
+    /// deletion vectors are decoded and applied, so format-version 3
+    /// tables scan (this fixture: an empty v3 table; the DV-apply matrix
+    /// is the Java-written fixture test in scan.rs).
     #[test]
-    fn v3_tables_are_rejected_loudly_on_read() {
+    fn v3_tables_scan_after_gate_lift() {
         let dir = tempfile::tempdir().unwrap();
         crate::storage::test_allow_local_stores();
         std::fs::create_dir_all(dir.path().join("metadata")).unwrap();
@@ -569,14 +558,10 @@ mod tests {
             &S3ClientOptions::default(),
         )
         .unwrap();
-        let err = client
+        let (plan, _s3, _schema) = client
             .scan_table(&["analytics"], "t", None, None)
-            .expect_err("v3 read must be rejected");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("format-version 3") || msg.contains("v3"),
-            "rejection must name the version: {msg}"
-        );
+            .expect("v3 table scans after the gate lift");
+        assert_eq!(plan.tasks.len(), 0, "empty v3 table: no tasks");
     }
 
     /// Unreachable catalogs error with the endpoint in the message (the C

@@ -832,3 +832,24 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     reads loudly until DV slice. BLOCKER #1 TAIL CLOSED. M2 REMAINING:
     none — M2 slices 24-29 all done. Next: read-side slice V1 (DV apply,
     doc 14) or M3 slice 24 (columnar batch reads, THE perf fix).
+  - V1 slice (doc 14) — DONE 2026-11-20 (puffin.rs + scan routing + gate
+    lift, TDD): v3 DELETION VECTORS read/apply. Fixture = the Apache
+    Iceberg JAVA reference implementation (1.10.0 HadoopTables, JDK 23
+    needs -Djava.security.manager=allow for Hadoop; maven project at
+    /tmp/v3fixture, NOT in-repo) writing a v3 table + deletion-vector-v1
+    puffin; pyiceberg 0.12 CANNOT write DVs but its DV DECODER verified
+    the blob (positions [2,4]). Fixture checked in at
+    pgdatalake-core/tests/fixtures/v3_dv_table (HadoopTables writes BARE
+    local paths — parse_location now accepts scheme-less absolute paths
+    as Local, same default-deny + scope gates). WIRE NOTES: DV blob
+    framing = [len BE][DV1\n][data][crc BE] where len covers magic+data
+    only; data = [count LE64][key LE32][roaring portable]*; row ids =
+    key*2^32 + pos; DV manifests = content=position-deletes +
+    file-format PUFFIN (uppercase from Java — routing is
+    case-insensitive); DVs fold into position-deletes with an
+    i64::MAX sentinel sequence (always applicable). pyiceberg 0.12
+    local scan planning does NOT apply DVs (read all 6 rows) — our
+    reader is the applying engine. V0 read gate LIFTED (v3 tables
+    scan; the old gate test rewritten). E2E: Java fixture → plan →
+    DV decode → {1,2,4,6}. 100 cargo tests green. V2 remainder:
+    pyiceberg format_version=3 COW tables + Trino gate.

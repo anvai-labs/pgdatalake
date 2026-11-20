@@ -77,6 +77,14 @@ pub fn parse_location(loc: &str) -> Result<Location, StorageError> {
             url: loc.trim_end_matches('/').to_string(),
         });
     }
+    // Hadoop-style bare absolute paths (the Iceberg Java writer's local
+    // convention) are Local locations — same default-deny + table-root
+    // scope gates as file:// URIs apply downstream.
+    if loc.starts_with('/') {
+        return Ok(Location::Local {
+            root: loc.trim_end_matches('/').to_string(),
+        });
+    }
     Err(StorageError::Config(format!("unsupported location: {loc}")))
 }
 

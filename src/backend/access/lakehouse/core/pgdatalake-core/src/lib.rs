@@ -16,6 +16,7 @@ pub mod catalog;
 pub mod ffi;
 pub mod manifest;
 pub mod parquet;
+pub mod puffin;
 pub mod scan;
 pub mod session;
 pub mod snapshot_write;

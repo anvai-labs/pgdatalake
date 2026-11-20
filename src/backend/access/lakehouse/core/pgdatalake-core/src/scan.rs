@@ -522,7 +522,13 @@ pub fn plan_scan(
         // are over its keys, not the surviving rows). Deletes are
         // pruned only by the proven delete-specific rule, partition
         // applicability.
-        let is_delete = e.data_file.content != crate::manifest::DataContent::Data;
+        // v3 deletion vectors (slice V1, doc 14): DVs are registered as
+        // manifest entries whose file_format is PUFFIN — the content
+        // value may be POSITION_DELETES (Java writer) but the container
+        // format is the authoritative routing signal. Everything else
+        // keeps the content-based routing with loud unknowns.
+        let is_delete = e.data_file.content != crate::manifest::DataContent::Data
+            || e.data_file.file_format.eq_ignore_ascii_case("puffin");
         if let Some(pred) = predicate {
             if let Some(partition) = &e.data_file.partition {
                 if !partition_matches(spec, schema.unwrap(), partition, pred) {
@@ -574,6 +580,25 @@ pub fn load_row_deletes(
     let mut loaded = LoadedDeletes::default();
     for t in &plan.delete_tasks {
         let (io, key) = open_for(&t.entry.data_file.file_path, s3)?;
+
+        // v3 deletion vectors: a PUFFIN-format delete file carries DV
+        // blobs, each naming its referenced data file via a blob property;
+        // positions apply unconditionally (i64::MAX sentinel sequence).
+        // Application itself rides the position-delete machinery.
+        if t.entry.data_file.file_format.eq_ignore_ascii_case("puffin") {
+            let bytes = io.get_bytes(&key)?;
+            for dv in crate::puffin::decode_dv_container(&bytes)? {
+                loaded
+                    .positions_by_file
+                    .entry(dv.referenced_data_file)
+                    .or_default()
+                    .entry(i64::MAX)
+                    .or_default()
+                    .extend(dv.positions.iter());
+            }
+            continue;
+        }
+
         let mut rows = crate::parquet::ParquetRows::open_all(&io, &key)?;
         match t.entry.data_file.content {
             crate::manifest::DataContent::PositionDeletes => {
@@ -2671,5 +2696,66 @@ mod eq_delete_binding_tests {
         );
         let _ = md;
         let _ = md;
+    }
+}
+
+/// V1 acceptance (doc 14): the FULL Java-written v3 fixture — metadata →
+/// plan → DV load (puffin decode) → row read with DVs applied. Ground
+/// truth: positions {2,4} deleted from the 6-row data file → ids
+/// {1, 2, 4, 6} survive. pyiceberg decodes the same blob (see the
+/// fixture provenance note in puffin.rs).
+#[cfg(test)]
+mod dv_fixture_tests {
+    use super::*;
+
+    #[test]
+    fn java_v3_dv_fixture_reads_with_deletions_applied() {
+        let _dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v3_dv_table");
+        crate::storage::test_allow_local_stores();
+        let md_path = _dir.join("metadata").join("v3.metadata.json");
+        let md_text = std::fs::read_to_string(&md_path).expect("fixture metadata");
+        let md: TableMetadata = serde_json::from_str(&md_text).expect("parse fixture metadata");
+        assert_eq!(
+            md.format_version,
+            crate::catalog::metadata::FormatVersion::V3,
+            "the fixture is format-version 3"
+        );
+
+        let plan = plan_scan(&md, None, None, None).expect("plan_scan");
+        assert_eq!(plan.data_files, 1, "one data file");
+        assert_eq!(plan.delete_tasks.len(), 1, "one DV (puffin) delete file");
+
+        let schema = md.current_schema().expect("current schema");
+        let deletes = load_row_deletes(&plan, None, &schema).expect("load deletes (DV decode)");
+        let data_path = plan.tasks[0].entry.data_file.file_path.clone();
+        let row_deletes = deletes
+            .for_task(&data_path, plan.tasks[0].sequence_number, false)
+            .expect("for_task");
+        assert_eq!(
+            row_deletes.positions,
+            [2u64, 4u64]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "DV positions 2,4 apply to the data file"
+        );
+
+        let (io, key) = open_for(&data_path, None).expect("open data file");
+        let mut rows =
+            crate::parquet::ParquetRows::open_with_deletes(&io, &key, &["id"], row_deletes)
+                .expect("open rows");
+        let mut ids = Vec::new();
+        while rows.next() {
+            match rows.value(0) {
+                crate::parquet::CellValue::Int64(v) => ids.push(v),
+                other => panic!("unexpected id cell: {other:?}"),
+            }
+        }
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![1, 2, 4, 6],
+            "positions 2,4 deleted => ids 3,5 gone"
+        );
     }
 }

@@ -31,7 +31,7 @@ managed writes · **D** = deferred, gated loudly until landed ·
 | 1 | Metadata model: schemas, snapshots (+`first-row-id`), refs, partition specs, sort orders, summary maps | R/W | **Parsed** — `catalog/metadata.rs` decodes `format-version: 3` and the v3 snapshot fields; unit-tested |
 | 2 | Read gate: v3 tables before semantics are covered | R | **Loud gate** — `scan_table` rejects format-version 3 with a message naming this doc. Lifted by slice V1/V2 (§3) |
 | 3 | Manifest `content` routing: DATA / POSITION_DELETES / EQUALITY_DELETES applied | R | **Done** — slice 20 + 13-review #5 (v2 delete application, live-verified); **unknown content values (e.g. DV = 3) fail the manifest decode loudly** (`manifest.rs` — no silent fallback) |
-| 4 | **Deletion vectors, read** — Puffin `deletion-vector-v1` blobs; manifest DV fields (`referenced-data-file`, `content-offset`, `content-size-in-snapshot`); per-file bitmap build, bloom-filter acceleration | R | **Missing — slice V1.** Until then gate #2 keeps v3 tables out |
+| 4 | **Deletion vectors, read** — Puffin `deletion-vector-v1` blobs; manifest DV fields (`referenced-data-file`, `content-offset`, `content-size-in-snapshot`); per-file bitmap build, bloom-filter acceleration | R | **DONE (V1, 2026-11-20)** — `puffin.rs` decodes containers written by the Apache Iceberg JAVA reference writer (fixture checked in at `pgdatalake-core/tests/fixtures/v3_dv_table/`); DV entries route by `file_format=puffin` (content value varies by writer) and apply via the position-delete machinery with an always-applicable sentinel sequence; the V0 read gate is lifted; positions verified by pyiceberg's own DV decoder against the same bytes. Bloom-filter acceleration remains a later refinement (perf, not correctness) |
 | 5 | Deletion vectors, write (`merge_on_read` mode, `lakehouse.write_mode`) | W | **Missing — slice V3.** Managed writes are COW-only today (slice 28), which is v3-legal: DVs are optional for writers |
 | 6 | Equality deletes — v3 DEPRECATES them (DVs replace) | R (read) | Applied (v2 interop requirement). **Re-scope note:** the planned `equality_delete` write mode (doc 06 §3) is interop-only; DVs are the v3-oriented MoR vehicle |
 | 7 | Row lineage (`first-row-id` propagation on writes) | D | Parsed only; the writer does not maintain lineage. v3 writers SHOULD propagate — slice V4 alongside the writer's v3 emission |
@@ -51,19 +51,24 @@ managed writes · **D** = deferred, gated loudly until landed ·
 - Loud unknown-manifest-content decode (#3): a v3 DV manifest entry can
   never be planned as data (pre-existing behavior, verified this pass).
 
-**V1 — DV read/apply (the correctness slice).** Parse the v3 manifest DV
-fields, load Puffin `deletion-vector-v1` blobs from the snapshot summary's
-DV registry, build per-file row-id bitmaps, apply at row-read time
-(bloom-filter acceleration per doc 06 §3 uses file stats — later
-refinement). Lift gate #2 to accept v3 tables **with DVs** once
-pyiceberg-written DV fixtures verify equal ground truth. This is the last
-read-correctness hole in the delete matrix (position/equality/DV).
+**V1 — DV read/apply: DONE 2026-11-20.** The fixture pipeline: the Apache
+Iceberg Java reference implementation (1.10.0, HadoopTables) wrote a v3
+table + DV puffin (the writer of record for v3 bytes — pyiceberg 0.12
+cannot write DVs); pyiceberg's own DV decoder independently verified the
+blob (positions [2,4]); our `puffin.rs` decodes the same container and the
+end-to-end test applies them through plan → load → row read (6 rows →
+{1,2,4,6}). Wire-format notes captured en route: the DV length field
+covers magic+data only (CRC excluded, LE footer size/count/keys, BE blob
+length); DV manifests carry `content=position-deletes` + `file-format:
+PUFFIN` (Java writes the uppercase form — routing is case-insensitive);
+pyiceberg 0.12's local scan planning does NOT yet apply DVs (our reader
+is the engine that does). Remaining refinement: bloom-filter acceleration
+(perf). Gate #2 lifted.
 
-**V2 — v3 fixture matrix.** pyiceberg 0.12 writes `format_version=3`
-(pass the flag; it defaults to 2): COW-only v3 tables first (metadata,
-plan, read back through our pipeline), then DV tables under V1. Gate #2
-lifts to "v3 accepted" when the matrix is green. Cross-engine read gate:
-Trino against our v3 fixtures.
+**V2 — v3 fixture matrix (partially done).** The Java COW-less DV matrix
+is in place (see V1). Remaining: pyiceberg `format_version=3` COW tables
+through our pipeline, and a Trino read gate against our v3 fixtures. Gate
+#2 is already lifted.
 
 **V3 — DV write mode + v3 emission.** `lakehouse.write_mode =
 merge_on_read` emits DVs (Puffin blobs + manifest entries); the writer
