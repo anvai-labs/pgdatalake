@@ -135,6 +135,18 @@ the table's own location root and the store surface is constrained:
   profile slice adds an operator-facing opt-in.
 - **Plain HTTP only for explicit `http://` endpoints** (fixture
   stores); unconfigured endpoints mean AWS — TLS-only.
-- **Redaction and redirect policy** (REST hops, URL userinfo/query
-  redaction, response-body truncation) land with the REST-client
-  slice (follow-up, same blocker).
+- **Redaction (implemented 2026-11-20):** `redact_url` masks userinfo
+  and query values in every REST error message; scheme/host/path stay
+  for diagnosis.
+- **Redirect policy (implemented):** same-origin per hop — a catalog
+  redirect that crosses origins fails the request ("catalog redirect
+  crosses origins ... refused") instead of silently following and
+  sending the bearer token elsewhere.
+- **OAuth (implemented):** `TokenProvider::token()` is loud — a failed
+  fetch with no cache errors the request (never an empty bearer), and
+  a cached token is served stale only within its hard TTL; past TTL a
+  refresh failure fails the request.
+- **Typed conflicts (implemented):** REST 409s surface as
+  `RestError::Conflict` -> `StorageError::Conflict` -> FFI err_kind=1;
+  callers branch on the KIND — never by searching messages for
+  "409" (create_remote's string search is gone).

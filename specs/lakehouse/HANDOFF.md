@@ -684,3 +684,21 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     explicit OAuth config resolution + refresh invalidation,
     type-conflict responses instead of "409" string search. Then #7,
     #8, #1 tail; M2 #28/#29.
+  - 13-implementation-review Blocker #6 (REST client) — FIXED
+    2026-11-20 571c4085806 (85 cargo tests; live typed-conflict
+    verified): (a) REDACTION: redact_url masks userinfo + query values
+    in every RestError site (rest.rs + commit.rs). (b) REDIRECTS:
+    same-origin-per-hop policy — cross-origin catalog redirects fail
+    loudly with a redacted message (mock 302 test). (c) OAUTH LOUD:
+    TokenProvider::token() -> Result — no-cache fetch failures error
+    the request (never an empty bearer); stale serving bounded by the
+    hard TTL (expired + failed refresh = loud error). (d) TYPED
+    CONFLICTS: RestError::Conflict -> StorageError::Conflict -> FFI
+    err_kind out-param -> tableam.c branches on kind; the "409"
+    string search in create_remote is GONE (and createTable now maps
+    409 to Conflict at all — live: create_remote returns "exists"
+    via the typed path). Spec: 04-storage.md §7 updated from
+    follow-up to implemented. BLOCKER #6 NOW FULLY CLOSED.
+    REMAINING overall: #7 parallel per-scan queues, #8 type-boundary
+    statuses, #1 tail (two-writer concurrency, independent-reader
+    verification); M2 #28 UPDATE/DELETE COW, #29 MERGE + ceremony.
