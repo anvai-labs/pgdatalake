@@ -19,3 +19,4 @@ pub mod parquet;
 pub mod scan;
 pub mod session;
 pub mod storage;
+pub mod writer;
