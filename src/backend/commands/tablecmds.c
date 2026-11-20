@@ -17887,6 +17887,34 @@ ATPrepSetAccessMethod(AlteredTableInfo *tab, Relation rel, const char *amname)
 	if (rel->rd_rel->relam == amoid)
 		return;
 
+	/*
+	 * The option set that survives the switch must satisfy the
+	 * DESTINATION access method: re-validate the relation's current
+	 * options through the new AM's parser and reject the ALTER (which
+	 * preserves the original AM, options, and rows) if any option fails.
+	 * An incompatible option can be RESET, or replaced via SET (...)
+	 * in the same ALTER, before or alongside the AM switch. [core-
+	 * allowlist 2026-11-20, GPT-6 adversarial review finding #3]
+	 */
+	if (rel->rd_options != NULL)
+	{
+		HeapTuple	tup = SearchSysCache1(RELOID,
+										  ObjectIdGetDatum(RelationGetRelid(rel)));
+
+		if (HeapTupleIsValid(tup))
+		{
+			bool		isnull;
+			Datum		reloptions = SysCacheGetAttr(RELOID, tup,
+													 Anum_pg_class_reloptions,
+													 &isnull);
+
+			ReleaseSysCache(tup);
+			if (!isnull)
+				(void) table_am_reloptions(RELKIND_RELATION, reloptions,
+										   true, amoid);
+		}
+	}
+
 	/* Save info for Phase 3 to do the real work */
 	tab->rewrite |= AT_REWRITE_ACCESS_METHOD;
 	tab->newAccessMethod = amoid;
