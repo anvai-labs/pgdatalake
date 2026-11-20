@@ -145,11 +145,12 @@ pub unsafe extern "C" fn pg_datalake_scan_new(
         };
         client
             .scan_table(&ns_levels, &table, predicate.as_ref(), selector.as_ref())
-            .and_then(|(p, s3)| {
+            .and_then(|(p, s3, schema)| {
                 // slice 20: load the snapshot's delete files up front (they
                 // are small relative to data; every read of this scan needs
-                // them)
-                crate::scan::load_row_deletes(&p, Some(&s3))
+                // them). The schema binds equality deletes to their key
+                // columns (13-review blocker #5).
+                crate::scan::load_row_deletes(&p, Some(&s3), &schema)
                     .map(|d| ScanSession::from_plan(p, s3, d))
             })
             .map_err(|e| e.to_string())

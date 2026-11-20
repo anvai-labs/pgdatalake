@@ -363,7 +363,8 @@ impl CatalogClient {
         table: &str,
         predicate: Option<&ScanPredicate>,
         selector: Option<&crate::catalog::metadata::SnapshotSelector>,
-    ) -> Result<(ScanPlan, S3Options), crate::storage::StorageError> {
+    ) -> Result<(ScanPlan, S3Options, crate::catalog::metadata::Schema), crate::storage::StorageError>
+    {
         let cfg = self
             .rest
             .fetch_config(Some(&self.warehouse))
@@ -377,7 +378,10 @@ impl CatalogClient {
         let (io, key) = crate::scan::open_for(&lt.metadata_location, Some(&s3))?;
         let md = fetch_metadata(&io, &key)?;
         let plan = crate::scan::plan_scan(&md, selector, Some(&s3), predicate)?;
-        Ok((plan, s3))
+        let schema = md.current_schema().cloned().ok_or_else(|| {
+            crate::storage::StorageError::Config("scan: table has no current schema".to_string())
+        })?;
+        Ok((plan, s3, schema))
     }
 }
 
@@ -458,7 +462,7 @@ mod tests {
             &S3ClientOptions::default(),
         )
         .unwrap();
-        let (plan, _s3) = client
+        let (plan, _s3, _schema) = client
             .scan_table(&["analytics"], "events", None, None)
             .expect("scan");
         assert_eq!(plan.snapshot_id, 42);

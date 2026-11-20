@@ -513,3 +513,16 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     equality_ids-driven equality deletes, position-delete sequence/
     partition applicability, empty-projection open_all branch,
     delete-specific pruning rule, map/list nested field IDs.
+  - 13-implementation-review Blocker #5 (equality binding) — FIXED
+    2026-11-20 (73 cargo tests): load_row_deletes binds equality-delete
+    key columns to the manifest's equality_ids via the TABLE schema
+    (id -> name) instead of "every column in the delete file" — an
+    extra non-key column no longer prevents a valid delete from
+    matching. scan_table returns the schema; an unresolvable
+    equality_id is a loud Decode error (never a silently partial key);
+    manifests without equality_ids keep the all-columns fallback.
+    Acceptance test: delete file with key id + extra "note" column
+    kills only the keyed row; unresolvable id errors. REMAINING #5:
+    position-delete sequence/partition applicability, empty-projection
+    open_all branch, delete-specific pruning rule, map/list nested
+    field IDs.

@@ -473,6 +473,7 @@ pub fn plan_scan(
 pub fn load_row_deletes(
     plan: &ScanPlan,
     s3: Option<&S3Options>,
+    schema: &crate::catalog::metadata::Schema,
 ) -> Result<crate::parquet::LoadedDeletes, StorageError> {
     use crate::parquet::{CellValue, EqDeleteMatch, LoadedDeletes};
 
@@ -519,10 +520,49 @@ pub fn load_row_deletes(
             }
             crate::manifest::DataContent::EqualityDeletes => {
                 let names = rows.column_names().to_vec();
+                // bind the key columns to the manifest's equality_ids via
+                // the TABLE schema (13-review blocker #5: using every
+                // column in the delete file makes extra non-key columns
+                // prevent a valid delete from matching). A manifest
+                // without equality_ids (non-spec file) falls back to all
+                // columns; an unresolvable id is a loud error, never a
+                // silently partial key.
+                let id_to_name: std::collections::BTreeMap<i64, String> = schema
+                    .fields
+                    .iter()
+                    .map(|f| (f.id, f.name.clone()))
+                    .collect();
+                let key_cols: Vec<(usize, String)> =
+                    match t.entry.data_file.equality_ids.as_ref() {
+                        Some(ids) if !ids.is_empty() => ids
+                            .iter()
+                            .map(|id| {
+                                let name = id_to_name.get(&(*id as i64)).ok_or_else(|| {
+                                    StorageError::Decode(format!(
+                                        "equality delete file {}: equality_id {} is not in the table schema",
+                                        t.entry.data_file.file_path, id
+                                    ))
+                                })?;
+                                let idx = names.iter().position(|n| n == name).ok_or_else(|| {
+                                    StorageError::Decode(format!(
+                                        "equality delete file {}: projected column {} ({}) missing",
+                                        t.entry.data_file.file_path, id, name
+                                    ))
+                                })?;
+                                Ok((idx, name.clone()))
+                            })
+                            .collect::<Result<Vec<_>, StorageError>>()?,
+                        _ => names
+                            .iter()
+                            .enumerate()
+                            .map(|(i, n)| (i, n.clone()))
+                            .collect(),
+                    };
                 while rows.next() {
-                    let values: Vec<CellValue> = (0..names.len()).map(|i| rows.value(i)).collect();
+                    let values: Vec<CellValue> =
+                        key_cols.iter().map(|(i, _)| rows.value(*i)).collect();
                     loaded.equality.push(EqDeleteMatch {
-                        columns: names.clone(),
+                        columns: key_cols.iter().map(|(_, n)| n.clone()).collect(),
                         values,
                         sequence_number: t.sequence_number,
                     });
@@ -1571,5 +1611,291 @@ mod prune_i64_tests {
             value: serde_json::json!(9.007199254740993e15),
         };
         assert!(bounds_keep(&df, md.current_schema().unwrap(), &pred));
+    }
+}
+
+#[cfg(test)]
+mod eq_delete_binding_tests {
+    use super::*;
+    use crate::catalog::metadata::{Field, IcebergType, IcebergTypeMarker, Schema};
+    use crate::parquet::CellValue;
+    use apache_avro::types::{Record, Value};
+    use apache_avro::{Schema as AvroSchema, Writer};
+    
+
+    /// ACCEPTANCE (13-review blocker #5): an equality delete file with an
+    /// EXTRA non-key column still matches rows — the key columns come
+    /// from the manifest's equality_ids via the TABLE schema, not from
+    /// "every column in the delete file". An unresolvable equality_id is
+    /// a loud error (never a silently partial key).
+    #[test]
+    fn equality_delete_binds_to_equality_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = format!("file://{}", dir.path().display());
+        let loc = parse_location(&location).unwrap();
+        let _io = StorageIo::open(&loc, None).unwrap();
+
+        let schema = Schema {
+            struct_type: IcebergTypeMarker::Struct,
+            schema_id: 0,
+            fields: vec![
+                Field {
+                    id: 1,
+                    name: "id".into(),
+                    required: false,
+                    r#type: IcebergType::Long,
+                    doc: None,
+                },
+                Field {
+                    id: 2,
+                    name: "region".into(),
+                    required: false,
+                    r#type: IcebergType::String,
+                    doc: None,
+                },
+            ],
+        };
+
+        // data file: rows id 1,2 (region us)
+        {
+            use arrow::array::{Int64Array, StringArray};
+            use arrow::datatypes::{DataType, Field as AF, Schema as ArrowSchema};
+            use arrow::record_batch::RecordBatch;
+            use std::sync::Arc;
+            std::fs::create_dir_all(dir.path().join("data")).unwrap();
+            let aschema = ArrowSchema::new(vec![
+                AF::new("id", DataType::Int64, false),
+                AF::new("region", DataType::Utf8, false),
+            ]);
+            let batch = RecordBatch::try_new(
+                Arc::new(aschema),
+                vec![
+                    Arc::new(Int64Array::from(vec![1, 2])),
+                    Arc::new(StringArray::from(vec!["us", "us"])),
+                ],
+            )
+            .unwrap();
+            let f = std::fs::File::create(dir.path().join("data").join("d.parquet")).unwrap();
+            let mut w = parquet::arrow::ArrowWriter::try_new(f, batch.schema(), None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+        }
+
+        // equality delete file: key = id (equality_ids [1]) PLUS an extra
+        // non-key column "note" that must NOT participate in matching
+        {
+            use arrow::array::{Int64Array, StringArray};
+            use arrow::datatypes::{DataType, Field as AF, Schema as ArrowSchema};
+            use arrow::record_batch::RecordBatch;
+            use std::sync::Arc;
+            let aschema = ArrowSchema::new(vec![
+                AF::new("id", DataType::Int64, false),
+                AF::new("note", DataType::Utf8, false),
+            ]);
+            let batch = RecordBatch::try_new(
+                Arc::new(aschema),
+                vec![
+                    Arc::new(Int64Array::from(vec![1])),
+                    Arc::new(StringArray::from(vec!["delete-me-now"])),
+                ],
+            )
+            .unwrap();
+            let f = std::fs::File::create(dir.path().join("data").join("eq.parquet")).unwrap();
+            let mut w = parquet::arrow::ArrowWriter::try_new(f, batch.schema(), None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+        }
+
+        // plan: data task + equality delete task (equality_ids [1])
+        let md = crate::catalog::metadata::TableMetadata {
+            format_version: crate::catalog::metadata::FormatVersion::V2,
+            table_uuid: uuid::Uuid::nil(),
+            location: location.clone(),
+            last_sequence_number: Some(2),
+            schemas: vec![schema.clone()],
+            current_schema_id: 0,
+            snapshots: vec![crate::catalog::metadata::Snapshot {
+                snapshot_id: 42,
+                sequence_number: Some(2),
+                first_row_id: None,
+                parent_snapshot_id: None,
+                timestamp_ms: 1,
+                manifest_list: format!("{location}/mn-list.avro"),
+                summary: Default::default(),
+                schema_id: Some(0),
+            }],
+            current_snapshot_id: Some(42),
+            properties: Default::default(),
+            partition_specs: vec![],
+            default_partition_spec_id: Some(0),
+            refs: Default::default(),
+        };
+
+        // manifest: data + equality delete (content 2, equality_ids [1])
+        let schema_a = AvroSchema::parse_str(crate::manifest::MANIFEST_ENTRY_SCHEMA_V2).unwrap();
+        let mut writer = Writer::new(&schema_a, Vec::new());
+        for (status, path, rows, content, seq, eq_ids) in [
+            (
+                1i32,
+                format!("{location}/data/d.parquet"),
+                2i64,
+                0i32,
+                2i64,
+                None,
+            ),
+            (
+                1,
+                format!("{location}/data/eq.parquet"),
+                1,
+                2,
+                3i64,
+                Some(vec![1i32]),
+            ),
+        ] {
+            let mut entry = Record::new(&schema_a).unwrap();
+            entry.put("status", Value::Int(status));
+            entry.put("snapshot_id", Value::Long(42));
+            entry.put(
+                "sequence_number",
+                Value::Union(1, Box::new(Value::Long(seq))),
+            );
+            entry.put(
+                "file_sequence_number",
+                Value::Union(1, Box::new(Value::Long(1))),
+            );
+            let ids_v: Vec<Value> = eq_ids
+                .unwrap_or_default()
+                .into_iter()
+                .map(Value::Int)
+                .collect();
+            let data_file = Value::Record(vec![
+                ("content".into(), Value::Int(content)),
+                ("file_path".into(), Value::String(path)),
+                ("file_format".into(), Value::String("parquet".into())),
+                (
+                    "partition".into(),
+                    Value::Union(1, Box::new(Value::Record(vec![]))),
+                ),
+                ("record_count".into(), Value::Long(rows)),
+                ("file_size_in_bytes".into(), Value::Long(4096)),
+                (
+                    "column_sizes".into(),
+                    Value::Union(1, Box::new(Value::Array(vec![]))),
+                ),
+                (
+                    "value_counts".into(),
+                    Value::Union(1, Box::new(Value::Array(vec![]))),
+                ),
+                (
+                    "null_value_counts".into(),
+                    Value::Union(1, Box::new(Value::Array(vec![]))),
+                ),
+                (
+                    "nan_value_counts".into(),
+                    Value::Union(1, Box::new(Value::Array(vec![]))),
+                ),
+                (
+                    "lower_bounds".into(),
+                    Value::Union(1, Box::new(Value::Array(vec![]))),
+                ),
+                (
+                    "upper_bounds".into(),
+                    Value::Union(1, Box::new(Value::Array(vec![]))),
+                ),
+                (
+                    "key_metadata".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "split_offsets".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "equality_ids".into(),
+                    Value::Union(1, Box::new(Value::Array(ids_v))),
+                ),
+                (
+                    "sort_order_id".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+            ]);
+            entry.put("data_file", data_file);
+            writer.append(entry).unwrap();
+        }
+        std::fs::write(dir.path().join("mn.avro"), writer.into_inner().unwrap()).unwrap();
+
+        // manifest list (via the tested writer)
+        let list_bytes = crate::snapshot_write::build_manifest_list_bytes(&[
+            crate::manifest::ManifestListEntry {
+                manifest_path: format!("{location}/mn.avro"),
+                manifest_length: 4096,
+                partition_spec_id: 0,
+                content: Some(0),
+                added_snapshot_id: 42,
+                added_files_count: Some(2),
+                existing_files_count: Some(0),
+                deleted_files_count: Some(0),
+                added_rows_count: Some(3),
+                existing_rows_count: Some(0),
+                deleted_rows_count: Some(0),
+                sequence_number: Some(2),
+                min_sequence_number: Some(2),
+            },
+        ])
+        .unwrap();
+        std::fs::write(dir.path().join("mn-list.avro"), list_bytes).unwrap();
+
+        let md_ref = md.current_snapshot().unwrap().manifest_list.clone();
+        let (lio, lkey) = open_for(&md_ref, None).unwrap();
+        let _ = lio.get_bytes(&lkey).unwrap();
+        let md2 = {
+            let mut m = md.clone();
+            m.snapshots[0].manifest_list = format!("{location}/mn-list.avro");
+            m
+        };
+        let _ = md_ref;
+        let plan = plan_scan(&md2, None, None, None).unwrap();
+        assert_eq!(plan.data_files, 1);
+        assert_eq!(plan.delete_tasks.len(), 1, "equality delete is a task");
+
+        // load deletes with the schema: key binds to [id] via equality_ids
+        let loaded = load_row_deletes(&plan, None, &schema).unwrap();
+        assert_eq!(loaded.equality.len(), 1);
+        let m = &loaded.equality[0];
+        assert_eq!(m.columns, vec!["id"], "extra non-key column excluded");
+        assert_eq!(m.values, vec![CellValue::Int64(1)]);
+
+        // applied to the data file: row id=1 dies, id=2 survives
+        let (dio, dkey) = open_for(&plan.tasks[0].entry.data_file.file_path, None).unwrap();
+        let rd = loaded
+            .for_task(&plan.tasks[0].entry.data_file.file_path, 2, false)
+            .unwrap();
+        let mut rows =
+            crate::parquet::ParquetRows::open_with_deletes(&dio, &dkey, &["id"], rd).unwrap();
+        let mut ids = Vec::new();
+        while rows.next() {
+            if let CellValue::Int64(v) = rows.value(0) {
+                ids.push(v);
+            }
+        }
+        assert_eq!(
+            ids,
+            vec![2],
+            "equality delete killed id=1; extra column ignored"
+        );
+
+        // an unresolvable equality_id is a loud error
+        let md_bad_schema = {
+            let mut m = schema.clone();
+            m.fields[0].id = 99; // schema no longer knows id 1
+            m
+        };
+        let err = load_row_deletes(&plan, None, &md_bad_schema).unwrap_err();
+        assert!(
+            matches!(err, StorageError::Decode(ref m) if m.contains("not in the table schema")),
+            "{err}"
+        );
+        let _ = md;
+        let _ = md;
     }
 }
