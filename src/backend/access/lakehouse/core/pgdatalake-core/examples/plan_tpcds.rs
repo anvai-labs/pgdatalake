@@ -1,7 +1,7 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use pgdatalake_core::catalog::rest::{RestCatalog, StaticToken};
     let cat = RestCatalog::new("http://localhost:8181/catalog", Box::new(StaticToken(String::new()))).unwrap();
-    let cfg = cat.fetch_config(Some("smoke")).unwrap();
+    cat.fetch_config(Some("smoke")).unwrap();
     let lt = cat.load_table(&["tpcds"], "store_sales").unwrap();
     let loc = pgdatalake_core::storage::parse_location(&lt.metadata_location).unwrap();
     let s3 = pgdatalake_core::storage::S3Options {
