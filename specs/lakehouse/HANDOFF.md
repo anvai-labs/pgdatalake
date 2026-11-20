@@ -270,10 +270,29 @@
     relam wiring, default_table_access_method, unattached-scan clean
     error, unreachable-endpoint 08000 fail-fast parity with the FDW,
     INSERT 0A000, re-attach idempotence, DROP hygiene.
-  - slice 27 — INSERT: per-txn batch accumulator (tuple→columnar),
-    pre-commit flush per doc 07 §2 steps 1-5, own-writes overlay
-    visibility, abort = orphan files (GC'd later); regress INSERT
-    visible-after-commit + rollback-invisible.
+  - slice 27 — INSERT, SPLIT into two commits (2026-11-20 planning,
+    after slice 26 showed the gap): the missing piece between slice 24
+    (parquet data files) and slice 25 (commitTable client) is ICEBERG
+    METADATA WRITING:
+    - 27a (Rust, cargo-tested end-to-end): manifest avro writer +
+      manifest-list avro writer (apache-avro 0.17 is already the read
+      dep; writer schemas embedded per-table for partitions) + snapshot
+      assembly (data files -> manifest -> manifest-list -> AddSnapshot +
+      SetSnapshotRef updates) + file metrics (record_count,
+      column_sizes, value/null counts; bounds optional at skeleton —
+      empty maps are legal). End-to-end cargo test: BatchWriter -> files
+      on file:// store -> snapshot commit against the tiny_http mock
+      catalog -> read back through OUR plan_scan and verify rows. That
+      test is the write-path conformance anchor.
+    - 27b (C TableAM): tuple_insert accumulates CellValues into a
+      per-txn BatchWriter (RegisterXactCallback for pre-commit flush
+      per doc 07 §2 steps 1-5: flush -> build commit -> commitTable via
+      commit_with_retry), own-writes overlay (scan yields staged rows
+      after file rows), abort = discard (no files flushed pre-commit ->
+      nothing orphaned). CI has a LIVE fixture stack (datalake-ci
+      brings up SeaweedFS+Lakekeeper), so regress INSERT can be
+      end-to-end: INSERT visible-after-commit + rollback-invisible
+      against localhost fixtures.
   - slice 28 — UPDATE/DELETE as COW (rewrite affected files, reuse
     slice-20 delete reading for concurrent reads), TRUNCATE (empty
     snapshot commit); regress vs heap parity.
