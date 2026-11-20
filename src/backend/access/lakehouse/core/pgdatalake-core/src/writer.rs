@@ -15,11 +15,15 @@ use crate::storage::{StorageError, StorageIo};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use std::sync::Arc;
 
-/// One column of the write schema.
+/// One column of the write schema. `field_id` stamps the parquet footer
+/// with `PARQUET:field_id` — other engines' readers (Trino, pyiceberg)
+/// map parquet columns to the Iceberg schema BY FIELD ID, so without it
+/// they read empty columns (27b live-cycle finding).
 #[derive(Debug, Clone)]
 pub struct WriteColumn {
     pub name: String,
     pub ty: IcebergType,
+    pub field_id: Option<i64>,
 }
 
 /// Columnar accumulator accepting rows of `CellValue` (M2 insert path).
@@ -304,7 +308,14 @@ impl BatchWriter {
     pub fn flush_bytes(&mut self) -> Result<Vec<u8>, StorageError> {
         let mut fields = Vec::with_capacity(self.columns.len());
         for c in &self.columns {
-            fields.push(Field::new(&c.name, arrow_type(&c.ty)?, true));
+            let mut f = Field::new(&c.name, arrow_type(&c.ty)?, true);
+            if let Some(id) = c.field_id {
+                f = f.with_metadata(std::collections::HashMap::from([(
+                    "PARQUET:field_id".to_string(),
+                    id.to_string(),
+                )]));
+            }
+            fields.push(f);
         }
         let schema = Arc::new(ArrowSchema::new(fields));
         let batch = arrow::record_batch::RecordBatch::try_new(
@@ -483,14 +494,17 @@ mod tests {
             WriteColumn {
                 name: "id".into(),
                 ty: IcebergType::Long,
+                field_id: None,
             },
             WriteColumn {
                 name: "name".into(),
                 ty: IcebergType::String,
+                field_id: None,
             },
             WriteColumn {
                 name: "at".into(),
                 ty: IcebergType::Timestamp,
+                field_id: None,
             },
         ]
     }
@@ -548,26 +562,32 @@ mod tests {
             WriteColumn {
                 name: "b".into(),
                 ty: IcebergType::Boolean,
+                field_id: None,
             },
             WriteColumn {
                 name: "i".into(),
                 ty: IcebergType::Int,
+                field_id: None,
             },
             WriteColumn {
                 name: "f".into(),
                 ty: IcebergType::Float,
+                field_id: None,
             },
             WriteColumn {
                 name: "d".into(),
                 ty: IcebergType::Double,
+                field_id: None,
             },
             WriteColumn {
                 name: "day".into(),
                 ty: IcebergType::Date,
+                field_id: None,
             },
             WriteColumn {
                 name: "t".into(),
                 ty: IcebergType::Time,
+                field_id: None,
             },
             WriteColumn {
                 name: "dec".into(),
@@ -575,14 +595,17 @@ mod tests {
                     precision: 12,
                     scale: 2,
                 },
+                field_id: None,
             },
             WriteColumn {
                 name: "u".into(),
                 ty: IcebergType::Uuid,
+                field_id: None,
             },
             WriteColumn {
                 name: "bin".into(),
                 ty: IcebergType::Binary,
+                field_id: None,
             },
         ])
         .unwrap();
@@ -629,18 +652,22 @@ mod tests {
             WriteColumn {
                 name: "i".into(),
                 ty: IcebergType::Long,
+                field_id: None,
             },
             WriteColumn {
                 name: "s".into(),
                 ty: IcebergType::String,
+                field_id: None,
             },
             WriteColumn {
                 name: "d".into(),
                 ty: IcebergType::Date,
+                field_id: None,
             },
             WriteColumn {
                 name: "ts".into(),
                 ty: IcebergType::Timestamptz,
+                field_id: None,
             },
             WriteColumn {
                 name: "dec".into(),
@@ -648,14 +675,17 @@ mod tests {
                     precision: 12,
                     scale: 2,
                 },
+                field_id: None,
             },
             WriteColumn {
                 name: "u".into(),
                 ty: IcebergType::Uuid,
+                field_id: None,
             },
             WriteColumn {
                 name: "b".into(),
                 ty: IcebergType::Binary,
+                field_id: None,
             },
         ];
         let row = parse_row_json(

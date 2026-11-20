@@ -31,24 +31,24 @@ pub const MANIFEST_ENTRY_WRITE_SCHEMA_V2: &str = r#"{
         {"name": "snapshot_id", "type": "long", "field-id": 1},
         {"name": "sequence_number", "type": ["null", "long"], "field-id": 3},
         {"name": "file_sequence_number", "type": ["null", "long"], "field-id": 4},
-        {"name": "data_file", "type": {
-            "type": "record", "name": "data_file", "field-id": 2,
+        {"name": "data_file", "field-id": 2, "type": {
+            "type": "record", "name": "data_file",
             "fields": [
                 {"name": "content", "type": "int", "field-id": 134},
                 {"name": "file_path", "type": "string", "field-id": 100},
                 {"name": "file_format", "type": "string", "field-id": 101},
-                {"name": "partition", "type": ["null", {"type": "record", "name": "r_part", "field-id": 102, "fields": []}], "field-id": 102},
+                {"name": "partition", "type": ["null", {"type": "record", "name": "r102", "fields": []}], "field-id": 102},
                 {"name": "record_count", "type": "long", "field-id": 103},
                 {"name": "file_size_in_bytes", "type": "long", "field-id": 104},
-                {"name": "column_sizes", "type": ["null", {"type": "array", "field-id": 108, "items": {"type": "record", "name": "kv_long", "field-id": 117, "fields": [{"name": "key", "type": "int", "field-id": 117}, {"name": "value", "type": "long", "field-id": 118}]}}], "field-id": 108},
-                {"name": "value_counts", "type": ["null", {"type": "array", "field-id": 109, "items": {"type": "record", "name": "kv_long_v2", "field-id": 119, "fields": [{"name": "key", "type": "int", "field-id": 119}, {"name": "value", "type": "long", "field-id": 120}]}}], "field-id": 109},
-                {"name": "null_value_counts", "type": ["null", {"type": "array", "field-id": 110, "items": {"type": "record", "name": "kv_long_v3", "field-id": 121, "fields": [{"name": "key", "type": "int", "field-id": 121}, {"name": "value", "type": "long", "field-id": 122}]}}], "field-id": 110},
-                {"name": "nan_value_counts", "type": ["null", {"type": "array", "field-id": 137, "items": {"type": "record", "name": "kv_long_v4", "field-id": 138, "fields": [{"name": "key", "type": "int", "field-id": 138}, {"name": "value", "type": "long", "field-id": 139}]}}], "field-id": 137},
-                {"name": "lower_bounds", "type": ["null", {"type": "array", "field-id": 125, "items": {"type": "record", "name": "kv_bytes_v1", "field-id": 126, "fields": [{"name": "key", "type": "int", "field-id": 126}, {"name": "value", "type": "bytes", "field-id": 127}]}}], "field-id": 125},
-                {"name": "upper_bounds", "type": ["null", {"type": "array", "field-id": 128, "items": {"type": "record", "name": "kv_bytes_v2", "field-id": 129, "fields": [{"name": "key", "type": "int", "field-id": 129}, {"name": "value", "type": "bytes", "field-id": 130}]}}], "field-id": 128},
+                {"name": "column_sizes", "type": ["null", {"type": "array", "logicalType": "map", "items": {"type": "record", "name": "kv_long", "fields": [{"name": "key", "type": "int", "field-id": 117}, {"name": "value", "type": "long", "field-id": 118}]}}], "field-id": 108},
+                {"name": "value_counts", "type": ["null", {"type": "array", "logicalType": "map", "items": {"type": "record", "name": "kv_long_v2", "fields": [{"name": "key", "type": "int", "field-id": 119}, {"name": "value", "type": "long", "field-id": 120}]}}], "field-id": 109},
+                {"name": "null_value_counts", "type": ["null", {"type": "array", "logicalType": "map", "items": {"type": "record", "name": "kv_long_v3", "fields": [{"name": "key", "type": "int", "field-id": 121}, {"name": "value", "type": "long", "field-id": 122}]}}], "field-id": 110},
+                {"name": "nan_value_counts", "type": ["null", {"type": "array", "logicalType": "map", "items": {"type": "record", "name": "kv_long_v4", "fields": [{"name": "key", "type": "int", "field-id": 138}, {"name": "value", "type": "long", "field-id": 139}]}}], "field-id": 137},
+                {"name": "lower_bounds", "type": ["null", {"type": "array", "logicalType": "map", "items": {"type": "record", "name": "kv_bytes_v1", "fields": [{"name": "key", "type": "int", "field-id": 126}, {"name": "value", "type": "bytes", "field-id": 127}]}}], "field-id": 125},
+                {"name": "upper_bounds", "type": ["null", {"type": "array", "logicalType": "map", "items": {"type": "record", "name": "kv_bytes_v2", "fields": [{"name": "key", "type": "int", "field-id": 129}, {"name": "value", "type": "bytes", "field-id": 130}]}}], "field-id": 128},
                 {"name": "key_metadata", "type": ["null", "bytes"], "field-id": 131},
-                {"name": "split_offsets", "type": ["null", {"type": "array", "field-id": 132, "items": "int"}], "field-id": 132},
-                {"name": "equality_ids", "type": ["null", {"type": "array", "field-id": 135, "items": "int"}], "field-id": 135},
+                {"name": "split_offsets", "type": ["null", {"type": "array", "element-id": 133, "items": "long"}], "field-id": 132},
+                {"name": "equality_ids", "type": ["null", {"type": "array", "element-id": 136, "items": "int"}], "field-id": 135},
                 {"name": "sort_order_id", "type": ["null", "int"], "field-id": 140}
             ]
         }}
@@ -74,7 +74,7 @@ pub const MANIFEST_LIST_WRITE_SCHEMA_V2: &str = r#"{
         {"name": "added_rows_count", "type": "long", "field-id": 512},
         {"name": "existing_rows_count", "type": "long", "field-id": 513},
         {"name": "deleted_rows_count", "type": "long", "field-id": 514},
-        {"name": "partitions", "type": ["null", {"type": "array", "field-id": 508, "items": {"type": "record", "name": "r_partsum", "field-id": 509, "fields": [
+        {"name": "partitions", "type": ["null", {"type": "array", "element-id": 508, "items": {"type": "record", "name": "r508", "fields": [
             {"name": "contains_null", "type": "boolean", "field-id": 509},
             {"name": "contains_nan", "type": ["null", "boolean"], "field-id": 518},
             {"name": "lower_bound", "type": ["null", "bytes"], "field-id": 510},
@@ -347,11 +347,36 @@ pub fn write_snapshot(
     let sequence = last_sequence_number.unwrap_or(0) + 1;
     let loc = location.trim_end_matches('/').to_string();
 
+    // StorageIo key semantics: S3 keys are relative to the BUCKET (the
+    // location's path prefix must be re-appended), Local keys are
+    // relative to the location root (no prefix).
+    let key_prefix = match crate::storage::parse_location(location)? {
+        crate::storage::Location::S3 { key, .. } => key.trim_matches('/').to_string(),
+        // Local roots carry the prefix; Http locations aren't writable here
+        _ => String::new(),
+    };
+    let keyed = |rel: String| -> String {
+        if key_prefix.is_empty() {
+            rel
+        } else {
+            format!("{key_prefix}/{rel}")
+        }
+    };
+
     // manifest avro (the ADDED entries of this snapshot)
     let manifest_bytes = build_manifest_bytes(new_files, snapshot_id, sequence)?;
-    let manifest_key = format!("metadata/{}-{}-m0.avro", snapshot_id, Uuid::new_v4());
+    let manifest_key = keyed(format!(
+        "metadata/{}-{}-m0.avro",
+        snapshot_id,
+        Uuid::new_v4()
+    ));
     io.put_bytes(&manifest_key, manifest_bytes.clone())?;
-    let manifest_path = format!("{loc}/{manifest_key}");
+    let manifest_path = format!(
+        "{loc}/{}",
+        manifest_key
+            .strip_prefix(&format!("{key_prefix}/"))
+            .unwrap_or(&manifest_key)
+    );
 
     // manifest-list avro (single DATA manifest for appends)
     let list_entry = crate::manifest::ManifestListEntry {
@@ -369,7 +394,8 @@ pub fn write_snapshot(
         min_sequence_number: Some(sequence),
     };
     let list_bytes = build_manifest_list_bytes(&[list_entry])?;
-    let list_key = format!("metadata/snap-{}-0-{}.avro", snapshot_id, Uuid::new_v4());
+    let list_rel = format!("metadata/snap-{}-0-{}.avro", snapshot_id, Uuid::new_v4());
+    let list_key = keyed(list_rel.clone());
     io.put_bytes(&list_key, list_bytes)?;
 
     // summary per the spec's snapshot summary keys (writers may add more)
@@ -381,7 +407,7 @@ pub fn write_snapshot(
         first_row_id: None,
         parent_snapshot_id,
         timestamp_ms,
-        manifest_list: format!("{loc}/{list_key}"),
+        manifest_list: format!("{loc}/{list_rel}"),
         summary: BTreeMap::from([
             ("operation".to_string(), "append".to_string()),
             ("added-data-files".to_string(), new_files.len().to_string()),
@@ -449,6 +475,7 @@ mod tests {
         let mut w = crate::writer::BatchWriter::new(vec![crate::writer::WriteColumn {
             name: "id".into(),
             ty: IcebergType::Long,
+            field_id: None,
         }])
         .unwrap();
         w.push(&[crate::parquet::CellValue::Int64(1)]).unwrap();

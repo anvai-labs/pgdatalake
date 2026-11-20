@@ -28,6 +28,10 @@
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "access/heaptoast.h"
+#include "utils/memutils.h"
+#include "utils/datum.h"
+#include "nodes/miscnodes.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/storage_xlog.h"
@@ -45,6 +49,11 @@
 #include "utils/syscache.h"
 
 #include "lakehouse.h"
+
+#include "utils/json.h"
+#include "utils/numeric.h"
+#include "utils/typcache.h"
+#include "varatt.h"
 
 /* ---------------- identity catalog lookup ---------------- */
 
@@ -170,6 +179,314 @@ ExtractManagedIdentity(Oid relid, LakehouseOptions *opts)
 	return found;
 }
 
+/* ---------------- managed-write state (M2 slice 27b) ---------------- */
+
+/*
+ * Per-transaction, per-relation write state. Table AMs are stateless
+ * between callbacks, so INSERTs accumulate here; the xact callback
+ * commits at PRE-COMMIT (doc 07 §2 step 2-3) and frees at abort. The
+ * hash lives for exactly one transaction — it is destroyed in the
+ * callback, so an entry is always current-txn (the own-writes overlay
+ * relies on that).
+ */
+typedef struct LakehouseWriteEntry
+{
+	Oid			relid;
+	WriteSession *ws;			/* FFI write session; NULL until 1st insert */
+	MemoryContext mcxt;			/* all entry allocations live here */
+	/* own-writes overlay: staged tuples, copied datum-wise into mcxt */
+	Datum	   *staged_values;
+	bool	   *staged_isnull;
+	int			staged_rows;
+	int			natts;
+	TupleDesc	tupdesc;
+	/* identity, resolved at first insert */
+	LakehouseOptions opts;
+	bool		have_identity;
+}			LakehouseWriteEntry;
+
+static HTAB *write_entries = NULL;
+
+static void
+lakehouse_xact_callback(XactEvent event, void *arg)
+{
+	HASH_SEQ_STATUS seq;
+	LakehouseWriteEntry *entry;
+
+	if (write_entries == NULL)
+		return;
+
+	if (event == XACT_EVENT_PRE_COMMIT || event == XACT_EVENT_PARALLEL_PRE_COMMIT)
+	{
+		/*
+		 * doc 07 §2 steps 2-3: flush + build commit + commitTable with
+		 * bounded retry. An error here aborts the transaction (the ABORT
+		 * callback then frees the sessions) — no partial commit ever
+		 * exists remotely (Iceberg's core guarantee).
+		 */
+		hash_seq_init(&seq, write_entries);
+		while ((entry = hash_seq_search(&seq)) != NULL)
+		{
+			if (entry->ws == NULL)
+				continue;
+			{
+				char		errbuf[1024];
+				char	   *loc;
+
+				errbuf[0] = '\0';
+				loc = pg_datalake_write_commit(entry->ws, 3, errbuf, sizeof(errbuf));
+				if (loc == NULL)
+					ereport(ERROR,
+							(errcode(ERRCODE_CONNECTION_EXCEPTION),
+							 errmsg("lakehouse: managed commit failed for %s: %s",
+									get_rel_name(entry->relid) ? get_rel_name(entry->relid) : "?",
+									errbuf)));
+				pg_datalake_write_commit_result_free(loc);
+			}
+		}
+	}
+
+	/* teardown: free FFI sessions + the hash. PRE_COMMIT's commit errors
+	 * leave the state intact so the ABORT callback reaps it. */
+	if (event == XACT_EVENT_PRE_COMMIT || event == XACT_EVENT_ABORT ||
+		event == XACT_EVENT_PARALLEL_ABORT ||
+		event == XACT_EVENT_COMMIT || event == XACT_EVENT_PREPARE ||
+		event == XACT_EVENT_PARALLEL_COMMIT ||
+		event == XACT_EVENT_PARALLEL_PRE_COMMIT)
+	{
+		hash_seq_init(&seq, write_entries);
+		while ((entry = hash_seq_search(&seq)) != NULL)
+		{
+			if (entry->ws != NULL)
+				pg_datalake_write_free(entry->ws);
+			MemoryContextDelete(entry->mcxt);
+		}
+		hash_destroy(write_entries);
+		write_entries = NULL;
+	}
+}
+
+/*
+ * Map a Postgres attribute to its Iceberg type name (doc 05 mapping);
+ * unsupported types are a clean CREATE-time-style rejection.
+ */
+static const char *
+iceberg_type_name(Form_pg_attribute attr)
+{
+	switch (attr->atttypid)
+	{
+		case BOOLOID:
+			return "boolean";
+		case INT2OID:
+		case INT4OID:
+			return "int";
+		case INT8OID:
+			return "long";
+		case FLOAT4OID:
+			return "float";
+		case FLOAT8OID:
+			return "double";
+		case TEXTOID:
+		case VARCHAROID:
+		case NAMEOID:
+		case BPCHAROID:
+			return "string";
+		case DATEOID:
+			return "date";
+		case TIMEOID:
+			return "time";
+		case TIMESTAMPOID:
+			return "timestamp";
+		case TIMESTAMPTZOID:
+			return "timestamptz";
+		case NUMERICOID:
+			{
+				int32		m = attr->atttypmod - VARHDRSZ;
+				int			precision = (m >> 16) & 0xffff;
+				int			scale = (((m) & 0x7ff) ^ 1024) - 1024;
+				static char buf[NAMEDATALEN];
+
+				if (scale < 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("lakehouse: negative-scale numeric is not supported on managed tables"),
+							 errdetail("Iceberg decimal requires scale >= 0.")));
+				snprintf(buf, sizeof(buf), "decimal(%d,%d)", precision, scale);
+				return buf;
+			}
+		case UUIDOID:
+			return "uuid";
+		case BYTEAOID:
+			return "binary";
+		default:
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("lakehouse: column \"%s\" has type %s, which is not supported on managed tables yet",
+							NameStr(attr->attname), format_type_be(attr->atttypid)),
+					 errdetail("Managed-table primitive coverage follows doc 05's mapping; nested types land with their own slices.")));
+			return "";			/* unreachable */
+	}
+}
+
+/* schema_json for pg_datalake_write_new, from the relation's tupdesc */
+static char *
+build_schema_json(TupleDesc tupdesc)
+{
+	StringInfoData buf;
+	bool		first = true;
+	int			i;
+
+	initStringInfo(&buf);
+	appendStringInfoString(&buf, "[");
+	for (i = 0; i < tupdesc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+
+		if (attr->attisdropped)
+			continue;
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		appendStringInfo(&buf, "{\"name\": ");
+		escape_json(&buf, NameStr(attr->attname));
+		appendStringInfo(&buf, ", \"type\": \"%s\"}", iceberg_type_name(attr));
+		first = false;
+	}
+	appendStringInfoChar(&buf, ']');
+	return buf.data;
+}
+
+/* one cell of the typed row-JSON (values the FFI parses, slice 27b-i) */
+static void
+append_cell_json(StringInfoData *buf, Form_pg_attribute attr, Datum v,
+				 bool isnull)
+{
+	if (isnull)
+	{
+		appendStringInfoString(buf, "null");
+		return;
+	}
+	switch (attr->atttypid)
+	{
+		case BOOLOID:
+			appendStringInfoString(buf, DatumGetBool(v) ? "true" : "false");
+			break;
+		case INT2OID:
+			appendStringInfo(buf, "%d", (int) DatumGetInt16(v));
+			break;
+		case INT4OID:
+			appendStringInfo(buf, "%d", DatumGetInt32(v));
+			break;
+		case INT8OID:
+			appendStringInfo(buf, "%lld", (long long) DatumGetInt64(v));
+			break;
+		case OIDOID:
+			appendStringInfo(buf, "%u", DatumGetObjectId(v));
+			break;
+		case FLOAT4OID:
+		case FLOAT8OID:
+			{
+				char	   *out = DatumGetCString(attr->atttypid == FLOAT4OID
+					? DirectFunctionCall1(float4out, v)
+					: DirectFunctionCall1(float8out, v));
+
+				if (strstr(out, "NaN") != NULL)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("lakehouse: NaN is not supported in managed-table floats yet")));
+				appendStringInfoString(buf, out);
+				break;
+			}
+		case TEXTOID:
+		case VARCHAROID:
+		case NAMEOID:
+		case BPCHAROID:
+			escape_json(buf, DatumGetCString(DirectFunctionCall1(textout, v)));
+			break;
+		case DATEOID:
+			/* PG date = days since 2000-01-01; Iceberg = days since epoch */
+			appendStringInfo(buf, "{\"d\": %d}",
+							 DatumGetInt32(v) +
+							 (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE));
+			break;
+		case TIMEOID:
+			/* micros since midnight — same epoch, no conversion */
+			appendStringInfo(buf, "{\"t\": %lld}", (long long) DatumGetInt64(v));
+			break;
+		case TIMESTAMPOID:
+		case TIMESTAMPTZOID:
+			/* PG micros since 2000-01-01 -> unix micros */
+			appendStringInfo(buf, "{\"ts\": %lld}",
+							 (long long) (DatumGetInt64(v) + 946684800000000LL));
+			break;
+		case NUMERICOID:
+			appendStringInfoString(buf, "{\"dec\": ");
+			escape_json(buf, DatumGetCString(DirectFunctionCall1(numeric_out, v)));
+			appendStringInfoChar(buf, '}');
+			break;
+		case UUIDOID:
+			appendStringInfoString(buf, "{\"u\": ");
+			escape_json(buf, DatumGetCString(DirectFunctionCall1(uuid_out, v)));
+			appendStringInfoChar(buf, '}');
+			break;
+		case BYTEAOID:
+			appendStringInfoString(buf, "{\"b\": ");
+			escape_json(buf, DatumGetCString(DirectFunctionCall1(byteaout, v)));
+			appendStringInfoChar(buf, '}');
+			break;
+		default:
+			/* build_schema_json rejected it before we ever got a row */
+			elog(ERROR, "lakehouse: unexpected column type in managed insert");
+	}
+}
+
+static LakehouseWriteEntry *
+get_write_entry(Relation rel)
+{
+	LakehouseWriteEntry *entry;
+	bool		found;
+	Oid			relid = RelationGetRelid(rel);
+
+	if (write_entries == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(LakehouseWriteEntry);
+		write_entries = hash_create("lakehouse managed write state", 8, &ctl,
+									HASH_ELEM | HASH_BLOBS);
+	}
+	entry = (LakehouseWriteEntry *) hash_search(write_entries, &relid,
+												HASH_ENTER, &found);
+	if (!found)
+	{
+		entry->ws = NULL;
+		entry->mcxt = AllocSetContextCreate(TopTransactionContext,
+											"lakehouse managed write",
+											ALLOCSET_DEFAULT_SIZES);
+		entry->staged_values = NULL;
+		entry->staged_isnull = NULL;
+		entry->staged_rows = 0;
+		entry->natts = 0;
+		entry->tupdesc = NULL;
+		memset(&entry->opts, 0, sizeof(entry->opts));
+		entry->have_identity =
+			ExtractManagedIdentity(relid, &entry->opts);
+		if (!entry->have_identity)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("managed table %s has no lakehouse identity",
+							RelationGetRelationName(rel)),
+					 errdetail("Managed DDL wiring arrives with the next slice; "
+							   "for now attach one explicitly."),
+					 errhint("SELECT lakehouse.attach_table('%s'::regclass, "
+							 "'namespace.table_name', endpoint => '...');",
+							 RelationGetRelationName(rel))));
+		entry->tupdesc = CreateTupleDescCopyConstr(RelationGetDescr(rel));
+		entry->natts = entry->tupdesc->natts;
+	}
+	return entry;
+}
+
 /* ---------------- scan state ---------------- */
 
 typedef struct LakehouseTableScanDescData
@@ -185,6 +502,10 @@ typedef struct LakehouseTableScanDescData
 	FmgrInfo   *in_funcs;
 	Oid		   *typioparams;
 	int		   *slot_index;
+	/* own-writes overlay: staged rows of THIS txn (entry == NULL when the
+	 * relation has no open write state) */
+	LakehouseWriteEntry *entry;
+	uint64		staged_pos;
 }			LakehouseTableScanDescData;
 typedef LakehouseTableScanDescData *LakehouseTableScanDesc;
 
@@ -290,6 +611,15 @@ lakehouse_scan_begin(Relation rel, Snapshot snapshot,
 						 RelationGetRelationName(rel))));
 
 	lakehouse_scan_common_setup(scan, rel, NULL);
+	if (write_entries != NULL)
+	{
+		bool		found;
+
+		scan->entry = (LakehouseWriteEntry *)
+			hash_search(write_entries, &rel->rd_id, HASH_FIND, &found);
+		if (!found)
+			scan->entry = NULL;
+	}
 	return (TableScanDesc) scan;
 }
 
@@ -339,6 +669,33 @@ lakehouse_scan_getnextslot(TableScanDesc bscan, ScanDirection direction,
 	int			i;
 
 	/* ScanDirection ignored: files iterate in stored order only */
+
+	/* own-writes overlay (doc 07 §2): after the snapshot's files, yield
+	 * the rows this transaction staged but has not committed yet */
+	if (scan->entry != NULL &&
+		scan->current_task >= scan->task_count)
+	{
+		LakehouseWriteEntry *entry = scan->entry;
+
+		while (scan->staged_pos < entry->staged_rows)
+		{
+			int			k;
+			Datum	   *row = entry->staged_values +
+				(size_t) scan->staged_pos * entry->natts;
+			bool	   *nulls = entry->staged_isnull +
+				(size_t) scan->staged_pos * entry->natts;
+
+			scan->staged_pos++;
+			ExecClearTuple(slot);
+			for (k = 0; k < tupdesc->natts; k++)
+			{
+				slot->tts_values[k] = row[k];
+				slot->tts_isnull[k] = nulls[k];
+			}
+			ExecStoreVirtualTuple(slot);
+			return true;
+		}
+	}
 
 	for (;;)
 	{
@@ -410,7 +767,93 @@ static void
 lakehouse_tuple_insert(Relation rel, TupleTableSlot *slot, CommandId cid,
 					   uint32 options, BulkInsertStateData *bistate)
 {
-	LAKEHOUSE_UNSUPPORTED("INSERT", "27");
+	LakehouseWriteEntry *entry = get_write_entry(rel);
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	StringInfoData row;
+	int			i;
+	char		errbuf[1024];
+
+	slot_getallattrs(slot);
+
+	/* first insert opens the FFI write session (loadTable + writer) */
+	if (entry->ws == NULL)
+	{
+		char	   *schema_json = build_schema_json(tupdesc);
+
+		errbuf[0] = '\0';
+		entry->ws = pg_datalake_write_new(entry->opts.endpoint,
+										  entry->opts.warehouse
+										  ? entry->opts.warehouse : "",
+										  entry->opts.token ? entry->opts.token : "",
+										  entry->opts.namespace,
+										  entry->opts.table,
+										  entry->opts.s3_endpoint,
+										  entry->opts.s3_access_key,
+										  entry->opts.s3_secret_key,
+										  schema_json,
+										  errbuf, sizeof(errbuf));
+		if (entry->ws == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_CONNECTION_EXCEPTION),
+					 errmsg("lakehouse: could not open write session: %s",
+							errbuf)));
+	}
+
+	/* tuple -> typed row JSON (datum arithmetic, no text formatting) */
+	initStringInfo(&row);
+	appendStringInfoChar(&row, '[');
+	for (i = 0; i < tupdesc->natts; i++)
+	{
+		if (i > 0)
+			appendStringInfoChar(&row, ',');
+		append_cell_json(&row, TupleDescAttr(tupdesc, i),
+						 slot->tts_values[i], slot->tts_isnull[i]);
+	}
+	appendStringInfoChar(&row, ']');
+
+	errbuf[0] = '\0';
+	if (!pg_datalake_write_push(entry->ws, row.data, errbuf, sizeof(errbuf)))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("lakehouse: could not stage row: %s", errbuf)));
+
+	/* own-writes overlay: copy the tuple into the txn-scoped entry */
+	{
+		int			j;
+		MemoryContext old = MemoryContextSwitchTo(entry->mcxt);
+
+		if (entry->staged_rows == 0)
+		{
+			entry->staged_values = (Datum *)
+				palloc(tupdesc->natts * sizeof(Datum) * 64);
+			entry->staged_isnull = (bool *)
+				palloc(tupdesc->natts * sizeof(bool) * 64);
+		}
+		else if (entry->staged_rows % 64 == 0)
+		{
+			entry->staged_values = (Datum *)
+				repalloc(entry->staged_values,
+						 tupdesc->natts * sizeof(Datum) *
+						 (entry->staged_rows + 64));
+			entry->staged_isnull = (bool *)
+				repalloc(entry->staged_isnull,
+						 tupdesc->natts * sizeof(bool) *
+						 (entry->staged_rows + 64));
+		}
+		for (j = 0; j < tupdesc->natts; j++)
+		{
+			entry->staged_values[(size_t) entry->staged_rows * tupdesc->natts + j] =
+				slot->tts_isnull[j]
+				? (Datum) 0
+				: datumCopy(slot->tts_values[j],
+							TupleDescAttr(tupdesc, j)->attbyval,
+							TupleDescAttr(tupdesc, j)->attlen);
+			entry->staged_isnull[(size_t) entry->staged_rows * tupdesc->natts + j] =
+				slot->tts_isnull[j];
+		}
+		entry->staged_rows++;
+		MemoryContextSwitchTo(old);
+	}
 }
 
 static void
@@ -419,7 +862,9 @@ lakehouse_tuple_insert_speculative(Relation rel, TupleTableSlot *slot,
 								   BulkInsertStateData *bistate,
 								   uint32 specToken)
 {
-	LAKEHOUSE_UNSUPPORTED("INSERT", "27");
+	/* speculative insert only comes from INSERT ... ON CONFLICT, which
+	 * needs upsert semantics — its slice */
+	LAKEHOUSE_UNSUPPORTED("INSERT ... ON CONFLICT", "29");
 }
 
 static void
@@ -779,6 +1224,12 @@ static const TableAmRoutine lakehouse_tableam_methods = {
 	.scan_set_tidrange = lakehouse_scan_set_tidrange,
 	.scan_getnextslot_tidrange = lakehouse_scan_getnextslot_tidrange,
 };
+
+void
+_PG_init(void)
+{
+	RegisterXactCallback(lakehouse_xact_callback, NULL);
+}
 
 PG_FUNCTION_INFO_V1(lakehouse_tableam_handler);
 

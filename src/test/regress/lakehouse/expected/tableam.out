@@ -79,16 +79,29 @@ EXCEPTION WHEN OTHERS THEN
         RAISE EXCEPTION 'unexpected SQLSTATE %', st;
     END IF;
 END $$;
--- writes are a clean not-supported error until the managed-write slices
+-- writes ARE live since 27b: staging requires identity (0A000), then a
+-- reachable catalog (08000 at session open, same fail-fast as scans)
 DO $$
 DECLARE
     st text;
 BEGIN
-    INSERT INTO lakehouse_mt VALUES (1, 'x');
-    RAISE EXCEPTION 'managed insert did not error';
+    INSERT INTO lakehouse_mt2 VALUES (1);   -- never attached
+    RAISE EXCEPTION 'unattached insert did not error';
 EXCEPTION WHEN OTHERS THEN
     GET STACKED DIAGNOSTICS st = RETURNED_SQLSTATE;
     IF st <> '0A000' THEN
+        RAISE EXCEPTION 'unexpected SQLSTATE %', st;
+    END IF;
+END $$;
+DO $$
+DECLARE
+    st text;
+BEGIN
+    INSERT INTO lakehouse_mt VALUES (1, 'x');   -- unreachable endpoint
+    RAISE EXCEPTION 'unreachable insert did not error';
+EXCEPTION WHEN OTHERS THEN
+    GET STACKED DIAGNOSTICS st = RETURNED_SQLSTATE;
+    IF st <> '08000' THEN
         RAISE EXCEPTION 'unexpected SQLSTATE %', st;
     END IF;
 END $$;

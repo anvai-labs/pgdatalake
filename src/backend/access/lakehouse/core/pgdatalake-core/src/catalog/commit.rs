@@ -137,13 +137,29 @@ struct CommitTableRequest<'a> {
     updates: &'a [TableUpdate],
 }
 
-/// Response of a successful commitTable.
+/// Tolerant map decoder: Lakekeeper sends explicit `"config": null` /
+/// `"metadata": null` in commitTable responses (v3-first in-band metadata);
+/// serde's `default` alone rejects explicit nulls.
+fn null_map_as_empty<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v: Option<BTreeMap<String, String>> = serde::Deserialize::deserialize(deserializer)?;
+    Ok(v.unwrap_or_default())
+}
+
+/// Response of a successful commitTable. The in-band `metadata` field of
+/// the v3-first model is tolerated and ignored (we fetch fresh metadata on
+/// the next open anyway).
 #[derive(Debug, Clone, Deserialize)]
 pub struct CommitTableResponse {
     #[serde(rename = "metadata-location")]
     pub metadata_location: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_map_as_empty")]
     pub config: BTreeMap<String, String>,
+    /// Present (possibly null) from v3-first servers; ignored.
+    #[serde(default)]
+    pub metadata: Option<serde::de::IgnoredAny>,
 }
 
 /// Wire shape of the REST spec `ErrorResponse` (error bodies).
@@ -212,7 +228,15 @@ impl RestCatalog {
         if !status.is_success() {
             return Err(RestError::Http(format!("POST {url} -> {status}")));
         }
-        resp.json().map_err(|e| RestError::Decode(e.to_string()))
+        // read as text first: decode failures surface the body prefix in
+        // the error instead of an opaque reqwest message
+        let text = resp.text().unwrap_or_default();
+        serde_json::from_str(&text).map_err(|e| {
+            RestError::Decode(format!(
+                "commitTable response: {e}; body starts: {:?}",
+                text.chars().take(200).collect::<String>()
+            ))
+        })
     }
 
     /// Commit with bounded re-plan retry (doc 07 §2 step 3). On each

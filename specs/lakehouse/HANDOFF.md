@@ -292,14 +292,37 @@
       {"u"}/{"b"} wrappers) so the C side sends datum arithmetic, not
       text formatting. Anchor: mock-catalog write->commit->capture
       commitTable body->merge snapshot->scan OUR OWN rows back (1,2).
-    - 27b-ii (C TableAM): tuple_insert accumulates CellValues into a
-      per-txn BatchWriter (RegisterXactCallback for pre-commit flush
-      per doc 07 §2 steps 1-5), own-writes overlay (scan yields staged
-      rows after file rows), abort = discard (nothing flushed
-      pre-commit -> nothing orphaned). CI has a LIVE fixture stack
-      (datalake-ci brings up SeaweedFS+Lakekeeper), so regress INSERT
-      can be end-to-end: INSERT visible-after-commit +
-      rollback-invisible against localhost fixtures.
+    - 27b-ii — DONE 2026-11-20 (tableam.c + ffi fixes, LIVE-VERIFIED):
+      tuple_insert accumulates typed row-JSON into the FFI write
+      session (backend-local hash keyed by relid; RegisterXactCallback:
+      PRE_COMMIT commits each session via pg_datalake_write_commit,
+      ABORT/COMMIT frees + destroys the hash), own-writes overlay
+      (scan yields staged datum copies after file rows — verified
+      live: staged_visible = 3 pre-commit), datum arithmetic for
+      date/time/ts (PG epoch 2000 -> unix epoch via JULIAN offsets),
+      numeric/uuid/bytea as canonical text, unsupported types rejected
+      at first insert. LIVE CYCLE: INSERT 3 rows (incl NULL) -> commit
+      -> fresh PG session reads 3 rows -> PYICEBERG reads
+      {1,2,3}/{alpha,beta,None} -> TRINO reads 1|alpha,2|beta,3|NULL.
+      THE SLICE-29 GATE (Trino reads a table we wrote) IS PROVEN LIVE
+      ahead of the ceremony. Offline regress anchors updated: INSERT
+      now stages (identity error 0A000 unattached; 08000 unreachable at
+      session open).
+      WIRE-CONVENTION GOTCHAS (all caught live by cross-engine reads,
+      recorded for doc 03): (1) manifest avro field-ids go ONLY on
+      record FIELDS — never on records/arrays; missing field-id on the
+      data_file FIELD made Trino+pyiceberg both fail ("Missing required
+      field: data_file"); (2) real LIST arrays need "element-id"
+      (partitions 508, split_offsets 133, equality_ids 136); (3) kv
+      metric arrays need "logicalType": "map" (pyiceberg's reader
+      requirement); (4) parquet footers MUST carry PARQUET:field_id
+      metadata (WriteColumn.field_id) — Trino/pyiceberg map parquet
+      columns by field id and read EMPTY columns without it; (5) S3
+      keys are bucket-relative in StorageIo (location path prefix must
+      be re-appended on writes); (6) Lakekeeper's commitTable response
+      carries in-band metadata + explicit-null config (tolerant decode).
+      Remote-CREATE of the Iceberg table is still manual (pyiceberg
+      helper) until managed DDL wires it (next slice).
   - slice 28 — UPDATE/DELETE as COW (rewrite affected files, reuse
     slice-20 delete reading for concurrent reads), TRUNCATE (empty
     snapshot commit); regress vs heap parity.

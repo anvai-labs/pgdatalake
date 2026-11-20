@@ -497,6 +497,10 @@ pub struct WriteSession {
     columns: Vec<crate::writer::WriteColumn>,
     writer: crate::writer::BatchWriter,
     io: crate::storage::StorageIo,
+    /// S3 keys are bucket-relative: the location's path prefix must ride
+    /// on every data-file put (write_snapshot handles its own metadata
+    /// keys; this covers the data files).
+    key_prefix: String,
     flushed: Vec<crate::snapshot_write::NewDataFile>,
     file_seq: usize,
     staged_rows: usize,
@@ -628,7 +632,11 @@ pub unsafe extern "C" fn pg_datalake_write_new(
     };
     let columns: Vec<crate::writer::WriteColumn> = cols
         .into_iter()
-        .map(|(name, ty)| crate::writer::WriteColumn { name, ty })
+        .map(|(name, ty)| crate::writer::WriteColumn {
+            field_id: state.field_ids.get(&name).copied(),
+            name,
+            ty,
+        })
         .collect();
     let writer = match crate::writer::BatchWriter::new(columns.clone()) {
         Ok(w) => w,
@@ -662,6 +670,10 @@ pub unsafe extern "C" fn pg_datalake_write_new(
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(1)
         });
+    let key_prefix = match crate::storage::parse_location(&state.location) {
+        Ok(crate::storage::Location::S3 { key, .. }) => key.trim_matches('/').to_string(),
+        _ => String::new(),
+    };
     let ws = Box::new(WriteSession {
         client,
         namespace: ns_levels,
@@ -670,6 +682,7 @@ pub unsafe extern "C" fn pg_datalake_write_new(
         columns,
         writer,
         io,
+        key_prefix,
         flushed: Vec::new(),
         file_seq: 0,
         staged_rows: 0,
@@ -739,7 +752,12 @@ pub unsafe extern "C" fn pg_datalake_write_flush(
     if ws.writer.num_rows() == 0 {
         return true;
     }
-    let key = match ws.writer.write_file(&ws.io, "data", ws.file_seq) {
+    let data_dir = if ws.key_prefix.is_empty() {
+        "data".to_string()
+    } else {
+        format!("{}/data", ws.key_prefix)
+    };
+    let key = match ws.writer.write_file(&ws.io, &data_dir, ws.file_seq) {
         Ok(k) => k,
         Err(e) => {
             unsafe { set_err(err_buf, err_len, &format!("write flush: {e}")) };
@@ -748,6 +766,14 @@ pub unsafe extern "C" fn pg_datalake_write_flush(
     };
     ws.file_seq += 1;
     let bytes = ws.io.get_bytes(&key).unwrap_or_default();
+    // the manifest stores the LOCATION URI; the put key may carry the S3
+    // bucket-root prefix, which the location already includes
+    let rel_key = if ws.key_prefix.is_empty() {
+        key.as_str()
+    } else {
+        key.strip_prefix(&format!("{}/", ws.key_prefix))
+            .unwrap_or(&key)
+    };
     // metric maps keyed by the TABLE's field ids
     let ids: Vec<i64> = ws
         .columns
@@ -755,7 +781,7 @@ pub unsafe extern "C" fn pg_datalake_write_flush(
         .filter_map(|c| ws.state.field_ids.get(&c.name).copied())
         .collect();
     let mut file = crate::snapshot_write::NewDataFile {
-        file_path: format!("{}/{key}", ws.state.location.trim_end_matches('/')),
+        file_path: format!("{}/{rel_key}", ws.state.location.trim_end_matches('/')),
         record_count: 0,
         file_size_in_bytes: bytes.len() as i64,
         ..Default::default()
