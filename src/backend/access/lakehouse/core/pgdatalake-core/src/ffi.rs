@@ -850,6 +850,117 @@ pub unsafe extern "C" fn pg_datalake_write_commit(
     }
 }
 
+/// Create the remote Iceberg table from a column list (managed CREATE,
+/// slice 27c). Namespace is created if missing. Returns 0 + err on
+/// failure; on success returns a heap CString with the server-assigned
+/// metadata-location (freed via pg_datalake_write_commit_result_free).
+///
+/// # Safety
+/// All CStrings must be valid NUL-terminated pointers.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_create_table(
+    endpoint: *const c_char,
+    warehouse: *const c_char,
+    token: *const c_char,
+    namespace: *const c_char,
+    table: *const c_char,
+    s3_endpoint: *const c_char,
+    s3_access_key: *const c_char,
+    s3_secret_key: *const c_char,
+    schema_json: *const c_char,
+    err_buf: *mut c_char,
+    err_len: usize,
+) -> *mut c_char {
+    let cstr = |p: *const c_char| -> String {
+        if p.is_null() {
+            String::new()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(p) }
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    let fail = |msg: String, err_buf: *mut c_char, err_len: usize| -> *mut c_char {
+        unsafe { set_err(err_buf, err_len, &msg) };
+        std::ptr::null_mut()
+    };
+    let (endpoint, warehouse, token, ns, table) = (
+        cstr(endpoint),
+        cstr(warehouse),
+        cstr(token),
+        cstr(namespace),
+        cstr(table),
+    );
+    let (s3_e, s3_ak, s3_sk) = (cstr(s3_endpoint), cstr(s3_access_key), cstr(s3_secret_key));
+    let schema_json = cstr(schema_json);
+    let cols: Vec<(String, crate::catalog::metadata::IcebergType)> =
+        match serde_json::from_str::<serde_json::Value>(&schema_json) {
+            Ok(serde_json::Value::Array(arr)) => {
+                let mut out = Vec::with_capacity(arr.len());
+                for c in arr {
+                    let (Some(name), Some(t)) = (c.get("name"), c.get("type")) else {
+                        return fail(
+                            "write path: schema entries need name+type".into(),
+                            err_buf,
+                            err_len,
+                        );
+                    };
+                    let (Some(name), Some(t)) = (name.as_str(), t.as_str()) else {
+                        return fail(
+                            "write path: schema entries need name+type strings".into(),
+                            err_buf,
+                            err_len,
+                        );
+                    };
+                    let ty: crate::catalog::metadata::IcebergType =
+                        match serde_json::from_str(&serde_json::json!(t).to_string()) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                return fail(
+                                    format!("write path: bad type {t:?}: {e}"),
+                                    err_buf,
+                                    err_len,
+                                )
+                            }
+                        };
+                    out.push((name.to_string(), ty));
+                }
+                out
+            }
+            _ => {
+                return fail("write path: schema_json is not an array".into(), err_buf, err_len);
+            }
+        };
+    let ns_levels: Vec<String> = ns
+        .split('.')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    let client = match crate::session::CatalogClient::new(
+        &endpoint,
+        &warehouse,
+        &token,
+        &crate::session::S3ClientOptions {
+            endpoint: (!s3_e.is_empty()).then(|| s3_e.clone()),
+            region: None,
+            access_key_id: (!s3_ak.is_empty()).then(|| s3_ak.clone()),
+            secret_access_key: (!s3_sk.is_empty()).then(|| s3_sk.clone()),
+            path_style: true,
+        },
+    ) {
+        Ok(c) => c,
+        Err(e) => return fail(format!("lakehouse create: {e}"), err_buf, err_len),
+    };
+    let ns_refs: Vec<&str> = ns_levels.iter().map(|s| s.as_str()).collect();
+    match client.create_table(&ns_refs, &table, &cols) {
+        Ok(loc) => match std::ffi::CString::new(loc) {
+            Ok(c) => c.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        },
+        Err(e) => fail(format!("lakehouse create: {e}"), err_buf, err_len),
+    }
+}
+
 /// Free a commit result string.
 ///
 /// # Safety

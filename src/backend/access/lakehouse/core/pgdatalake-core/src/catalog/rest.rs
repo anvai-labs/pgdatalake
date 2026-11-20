@@ -132,6 +132,84 @@ impl RestCatalog {
         Ok(wire)
     }
 
+    /// `POST /v1/{prefix}/namespaces` — createNamespace; 409 (already
+    /// exists) surfaces as Conflict so callers can upsert.
+    pub fn create_namespace(&self, namespace: &[&str]) -> Result<(), RestError> {
+        let prefix = self.prefix.lock().expect("prefix mutex poisoned").clone();
+        let ns_json = namespace
+            .iter()
+            .map(|c| format!("\"{}\"", c))
+            .collect::<Vec<_>>()
+            .join(",");
+        let url = format!(
+            "{}/v1{}/namespaces",
+            self.endpoint,
+            prefix.as_ref().map(|p| format!("/{p}")).unwrap_or_default()
+        );
+        let body = format!("{{\"namespace\": [{ns_json}]}}");
+        let resp = self
+            .inner
+            .post(&url)
+            .bearer_auth(self.tokens.token())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .map_err(|e| RestError::Http(e.to_string()))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::CONFLICT {
+            return Err(RestError::Conflict(format!("POST {url} -> {status}")));
+        }
+        if !status.is_success() {
+            return Err(RestError::Http(format!("POST {url} -> {status}")));
+        }
+        Ok(())
+    }
+
+    /// `POST /v1/{prefix}/namespaces/{ns}/tables` — createTable with the
+    /// schema (server assigns metadata location + uuid).
+    pub fn create_table(
+        &self,
+        namespace: &[&str],
+        table: &str,
+        schema: &super::metadata::Schema,
+    ) -> Result<super::types::LoadTableResult, RestError> {
+        let prefix = self.prefix.lock().expect("prefix mutex poisoned").clone();
+        let ns = namespace
+            .iter()
+            .map(|c| urlencoding::encode(c))
+            .collect::<Vec<_>>()
+            .join("%1F");
+        let url = format!(
+            "{}/v1{}/namespaces/{ns}/tables",
+            self.endpoint,
+            prefix.as_ref().map(|p| format!("/{p}")).unwrap_or_default()
+        );
+        let payload = serde_json::json!({
+            "name": table,
+            "schema": schema,
+            "properties": {},
+        });
+        let resp = self
+            .inner
+            .post(&url)
+            .bearer_auth(self.tokens.token())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(serde_json::to_vec(&payload).map_err(|e| RestError::Http(e.to_string()))?)
+            .send()
+            .map_err(|e| RestError::Http(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(RestError::Http(format!("POST {url} -> {status}")));
+        }
+        let text = resp.text().unwrap_or_default();
+        serde_json::from_str(&text).map_err(|e| {
+            RestError::Decode(format!(
+                "createTable response: {e}; body starts: {:?}",
+                text.chars().take(200).collect::<String>()
+            ))
+        })
+    }
+
     /// `GET /v1/config` — server capabilities and config defaults/overrides.
     ///
     /// `warehouse` is optional per the REST spec but some profiles (e.g.

@@ -321,8 +321,18 @@
       keys are bucket-relative in StorageIo (location path prefix must
       be re-appended on writes); (6) Lakekeeper's commitTable response
       carries in-band metadata + explicit-null config (tolerant decode).
-      Remote-CREATE of the Iceberg table is still manual (pyiceberg
-      helper) until managed DDL wires it (next slice).
+      27c — DONE 2026-11-20 (managed CREATE, live-verified): PURE-SQL
+      lifecycle now works end-to-end: CREATE TABLE ... USING lakehouse
+      -> attach_table -> lakehouse.create_remote(regclass) (schema from
+      the relation's tupdesc, namespace auto-created, 409 -> 'exists')
+      -> INSERT. Verified live across PG + pyiceberg ({7,8}/{seven,
+      None}) + Trino (7|seven, 8|NULL) on the freshly created table.
+      RestCatalog gained create_namespace/create_table (spec wire
+      shapes; tolerant decode). Remote CREATE went from manual pyiceberg
+      helper to SQL. STILL TODO in managed DDL: wire attach+create
+      INTO the CREATE statement itself (WITH-reloptions are heap-
+      dispatched by relkind in this tree, so the identity inputs need
+      either a reloptions core hook or the event-trigger route).
   - slice 28 — UPDATE/DELETE as COW (rewrite affected files, reuse
     slice-20 delete reading for concurrent reads), TRUNCATE (empty
     snapshot commit); regress vs heap parity.

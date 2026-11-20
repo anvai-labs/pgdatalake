@@ -104,3 +104,32 @@ WHERE relid = 'lakehouse_mt'::regclass;
 -- the companion catalog keeps referential sanity after DROP
 DROP TABLE lakehouse_mt;
 SELECT count(*) AS orphan_rows FROM lakehouse.managed_tables;
+
+-- managed CREATE (27c): create_remote requires an identity first
+DO $$
+DECLARE
+    st text;
+BEGIN
+    SELECT lakehouse.create_remote('lakehouse_mt2'::regclass);
+    RAISE EXCEPTION 'unattached create_remote did not error';
+EXCEPTION WHEN OTHERS THEN
+    GET STACKED DIAGNOSTICS st = RETURNED_SQLSTATE;
+    IF st <> '0A000' THEN
+        RAISE EXCEPTION 'unexpected SQLSTATE %', st;
+    END IF;
+END $$;
+
+-- non-managed relations are rejected
+DO $$
+DECLARE
+    st text;
+BEGIN
+    CREATE TABLE plain_heap (x int);
+    SELECT lakehouse.create_remote('plain_heap'::regclass);
+    RAISE EXCEPTION 'heap create_remote did not error';
+EXCEPTION WHEN OTHERS THEN
+    GET STACKED DIAGNOSTICS st = RETURNED_SQLSTATE;
+    IF st <> '42809' THEN
+        RAISE EXCEPTION 'unexpected SQLSTATE %', st;
+    END IF;
+END $$;

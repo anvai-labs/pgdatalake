@@ -34,6 +34,8 @@
 #include "nodes/miscnodes.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_am.h"
+#include "catalog/pg_am_d.h"
 #include "catalog/storage_xlog.h"
 #include "catalog/storage.h"
 #include "commands/vacuum.h"
@@ -1229,6 +1231,90 @@ void
 _PG_init(void)
 {
 	RegisterXactCallback(lakehouse_xact_callback, NULL);
+}
+
+/* pg_am oid of the lakehouse AM (resolved once per backend) */
+static Oid
+lakehouse_am_oid(void)
+{
+	static Oid	amoid = InvalidOid;
+
+	if (OidIsValid(amoid))
+		return amoid;
+	{
+		HeapTuple	tup = SearchSysCache1(AMNAME, CStringGetDatum("lakehouse"));
+
+		if (!HeapTupleIsValid(tup))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("access method \"lakehouse\" does not exist")));
+		amoid = ((Form_pg_am) GETSTRUCT(tup))->oid;
+		ReleaseSysCache(tup);
+	}
+	return amoid;
+}
+
+/*
+ * lakehouse.create_remote(regclass) -> text: create the remote Iceberg
+ * table for an attached managed relation (managed CREATE, slice 27c).
+ * The schema comes from the relation's own tupdesc — one definition, one
+ * catalog, one visibility. Idempotent: a 409 (table exists) reports
+ * 'exists' instead of erroring.
+ */
+PG_FUNCTION_INFO_V1(lakehouse_create_remote);
+
+Datum
+lakehouse_create_remote(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	Relation	rel;
+	LakehouseWriteEntry *entry;
+	char	   *schema_json;
+	char	   *loc;
+	char		errbuf[1024];
+
+	rel = table_open(relid, AccessShareLock);
+	if (rel->rd_rel->relkind != RELKIND_RELATION ||
+		rel->rd_rel->relam != lakehouse_am_oid())
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("%s is not a lakehouse managed table",
+						RelationGetRelationName(rel))));
+
+	/* reuse the entry machinery for identity resolution + schema build */
+	entry = get_write_entry(rel);
+	schema_json = build_schema_json(RelationGetDescr(rel));
+
+	errbuf[0] = '\0';
+	loc = pg_datalake_create_table(entry->opts.endpoint,
+								   entry->opts.warehouse ? entry->opts.warehouse : "",
+								   entry->opts.token ? entry->opts.token : "",
+								   entry->opts.namespace,
+								   entry->opts.table,
+								   entry->opts.s3_endpoint,
+								   entry->opts.s3_access_key,
+								   entry->opts.s3_secret_key,
+								   schema_json,
+								   errbuf, sizeof(errbuf));
+	table_close(rel, AccessShareLock);
+	if (loc == NULL)
+	{
+		bool		exists = strstr(errbuf, "409") != NULL ||
+			strstr(errbuf, "Conflict") != NULL ||
+			strstr(errbuf, "already exists") != NULL;
+
+		if (exists)
+			PG_RETURN_TEXT_P(cstring_to_text("exists"));
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_EXCEPTION),
+				 errmsg("lakehouse: could not create remote table: %s", errbuf)));
+	}
+	{
+		text	   *result = cstring_to_text(loc);
+
+		pg_datalake_write_commit_result_free(loc);
+		PG_RETURN_TEXT_P(result);
+	}
 }
 
 PG_FUNCTION_INFO_V1(lakehouse_tableam_handler);

@@ -96,3 +96,12 @@ CREATE EVENT TRIGGER lakehouse_drop_gc ON sql_drop
     EXECUTE FUNCTION lakehouse.managed_tables_drop_gc();
 
 CREATE ACCESS METHOD lakehouse TYPE TABLE HANDLER lakehouse.lakehouse_tableam_handler;
+
+-- Managed CREATE (slice 27c): create the remote Iceberg table for an
+-- attached managed relation, schema taken from the relation's own
+-- tupdesc. Flow: CREATE TABLE ... USING lakehouse -> attach_table ->
+-- create_remote -> INSERT.
+CREATE FUNCTION lakehouse.create_remote(target regclass)
+RETURNS text
+AS 'MODULE_PATHNAME', 'lakehouse_create_remote'
+LANGUAGE C VOLATILE;

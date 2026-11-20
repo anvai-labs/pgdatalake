@@ -223,6 +223,55 @@ impl CatalogClient {
         Ok((resp.metadata_location, written.snapshot))
     }
 
+    /// Create the remote Iceberg table (managed CREATE, slice 27c):
+    /// namespace created if missing, then createTable with a schema built
+    /// from the column list (field ids 1..n, all optional columns —
+    /// Postgres-side constraints are enforced locally). Returns the
+    /// metadata-location the server generated.
+    pub fn create_table(
+        &self,
+        namespace: &[&str],
+        table: &str,
+        columns: &[(String, crate::catalog::metadata::IcebergType)],
+    ) -> Result<String, crate::storage::StorageError> {
+        use crate::catalog::metadata::{Field, IcebergTypeMarker, Schema};
+        let cfg = self
+            .rest
+            .fetch_config(Some(&self.warehouse))
+            .map_err(|e| crate::storage::StorageError::Config(e.to_string()))?;
+        let _ = cfg;
+        // namespace upsert (REST: create + tolerate already-exists 409)
+        if let Err(e) = self.rest.create_namespace(namespace) {
+            match e {
+                crate::catalog::rest::RestError::Conflict(_) => {}
+                other => {
+                    return Err(crate::storage::StorageError::Config(other.to_string()))
+                }
+            }
+        }
+        let fields = columns
+            .iter()
+            .enumerate()
+            .map(|(i, (name, ty))| Field {
+                id: (i + 1) as i64,
+                name: name.clone(),
+                required: false,
+                r#type: ty.clone(),
+                doc: None,
+            })
+            .collect();
+        let schema = Schema {
+            struct_type: IcebergTypeMarker::Struct,
+            schema_id: 0,
+            fields,
+        };
+        let resp: super::catalog::types::LoadTableResult = self
+            .rest
+            .create_table(namespace, table, &schema)
+            .map_err(|e| crate::storage::StorageError::Config(e.to_string()))?;
+        Ok(resp.metadata_location)
+    }
+
     /// config -> loadTable -> metadata -> plan. Returns the plan plus the
     /// effective storage options (needed later to open task files).
     pub fn scan_table(
