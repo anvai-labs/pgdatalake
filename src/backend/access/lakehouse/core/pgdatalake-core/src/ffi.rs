@@ -844,6 +844,7 @@ pub unsafe extern "C" fn pg_datalake_create_table(
     schema_json: *const c_char,
     err_buf: *mut c_char,
     err_len: usize,
+    err_kind: *mut i32,
 ) -> *mut c_char {
     let cstr = |p: *const c_char| -> String {
         if p.is_null() {
@@ -854,6 +855,14 @@ pub unsafe extern "C" fn pg_datalake_create_table(
                 .into_owned()
         }
     };
+    // error KIND (13-review #6): the caller must never classify failures
+    // by searching the message for "409" — 0 = other, 1 = conflict.
+    let set_kind = |k: i32| {
+        if !err_kind.is_null() {
+            unsafe { *err_kind = k };
+        }
+    };
+    set_kind(0);
     let fail = |msg: String, err_buf: *mut c_char, err_len: usize| -> *mut c_char {
         unsafe { set_err(err_buf, err_len, &msg) };
         std::ptr::null_mut()
@@ -935,6 +944,10 @@ pub unsafe extern "C" fn pg_datalake_create_table(
             Ok(c) => c.into_raw(),
             Err(_) => std::ptr::null_mut(),
         },
+        Err(crate::storage::StorageError::Conflict(m)) => {
+            set_kind(1);
+            fail(format!("lakehouse create conflict: {m}"), err_buf, err_len)
+        }
         Err(e) => fail(format!("lakehouse create: {e}"), err_buf, err_len),
     }
 }

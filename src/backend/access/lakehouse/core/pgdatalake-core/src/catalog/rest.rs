@@ -12,16 +12,83 @@ use super::types::CatalogConfig;
 
 /// Source of the `Authorization: Bearer …` value for each request.
 pub trait TokenProvider: Send + Sync {
-    fn token(&self) -> String;
+    /// Resolve the bearer token for one request. Loud failure: a provider
+    /// that cannot produce a usable token errors the request instead of
+    /// degrading to an empty (or stale-expired) bearer (13-review #6).
+    fn token(&self) -> Result<String, RestError>;
 }
 
 /// Static bearer token (env-provided or pre-fetched); the trivial provider.
 pub struct StaticToken(pub String);
 
 impl TokenProvider for StaticToken {
-    fn token(&self) -> String {
-        self.0.clone()
+    fn token(&self) -> Result<String, RestError> {
+        Ok(self.0.clone())
     }
+}
+
+/// Mask anything credential-shaped in a URL before it lands in an error
+/// message (13-review #6): userinfo (`user:pass@`) and query VALUES are
+/// redacted; scheme/host/path stay for diagnosis.
+pub fn redact_url(url: &str) -> String {
+    let (base, query) = match url.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None => (url, None),
+    };
+    // userinfo: everything between "://" and the next "/"
+    let base = match base.split_once("://") {
+        Some((scheme, rest)) => match rest.split_once('/') {
+            Some((authority, path)) => {
+                let authority = match authority.split_once('@') {
+                    Some((_, host)) => host,
+                    None => authority,
+                };
+                format!("{scheme}://{authority}/{path}")
+            }
+            None => base.to_string(),
+        },
+        None => base.to_string(),
+    };
+    match query {
+        Some(q) => {
+            let redacted = q
+                .split('&')
+                .map(|kv| match kv.split_once('=') {
+                    Some((k, _)) => format!("{k}=***"),
+                    None => kv.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join("&");
+            format!("{base}?{redacted}")
+        }
+        None => base,
+    }
+}
+
+/// Same-origin redirect policy (13-review #6): each hop must keep the
+/// previous hop's scheme/host/port. A catalog that redirects off-origin
+/// fails the request instead of silently sending credentials elsewhere.
+fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let prev = attempt.previous().last().cloned();
+        let target = attempt.url().clone();
+        let same_origin = match &prev {
+            Some(p) => {
+                let (a, b) = (p.origin(), target.origin());
+                a == b && !a.ascii_serialization().is_empty()
+            }
+            None => true,
+        };
+        if same_origin {
+            attempt.follow()
+        } else {
+            attempt.error(format!(
+                "catalog redirect crosses origins: {} -> {} (refused)",
+                redact_url(prev.as_ref().map(|u| u.as_str()).unwrap_or_default()),
+                redact_url(target.as_str())
+            ))
+        }
+    })
 }
 
 /// HTTP client for one REST catalog endpoint.
@@ -79,6 +146,7 @@ impl RestCatalog {
             tokens,
             inner: reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(30))
+                .redirect(same_origin_redirect_policy())
                 .build()
                 .map_err(|e| RestError::Http(e.to_string()))?,
             prefix: std::sync::Mutex::new(None),
@@ -117,15 +185,25 @@ impl RestCatalog {
         let resp = self
             .inner
             .get(&url)
-            .bearer_auth(self.tokens.token())
+            .bearer_auth(
+                self.tokens
+                    .token()
+                    .map_err(|e| RestError::Http(format!("token provider: {e}")))?,
+            )
             .send()
             .map_err(|e| RestError::Http(e.to_string()))?;
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND {
-            return Err(RestError::NotFound(format!("GET {url} -> {status}")));
+            return Err(RestError::NotFound(format!(
+                "GET {} -> {status}",
+                redact_url(&url)
+            )));
         }
         if !status.is_success() {
-            return Err(RestError::Http(format!("GET {url} -> {status}")));
+            return Err(RestError::Http(format!(
+                "GET {} -> {status}",
+                redact_url(&url)
+            )));
         }
         let wire: super::types::LoadTableResult =
             resp.json().map_err(|e| RestError::Decode(e.to_string()))?;
@@ -150,17 +228,27 @@ impl RestCatalog {
         let resp = self
             .inner
             .post(&url)
-            .bearer_auth(self.tokens.token())
+            .bearer_auth(
+                self.tokens
+                    .token()
+                    .map_err(|e| RestError::Http(format!("token provider: {e}")))?,
+            )
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body)
             .send()
             .map_err(|e| RestError::Http(e.to_string()))?;
         let status = resp.status();
         if status == reqwest::StatusCode::CONFLICT {
-            return Err(RestError::Conflict(format!("POST {url} -> {status}")));
+            return Err(RestError::Conflict(format!(
+                "POST {} -> {status}",
+                redact_url(&url)
+            )));
         }
         if !status.is_success() {
-            return Err(RestError::Http(format!("POST {url} -> {status}")));
+            return Err(RestError::Http(format!(
+                "POST {} -> {status}",
+                redact_url(&url)
+            )));
         }
         Ok(())
     }
@@ -192,14 +280,30 @@ impl RestCatalog {
         let resp = self
             .inner
             .post(&url)
-            .bearer_auth(self.tokens.token())
+            .bearer_auth(
+                self.tokens
+                    .token()
+                    .map_err(|e| RestError::Http(format!("token provider: {e}")))?,
+            )
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(serde_json::to_vec(&payload).map_err(|e| RestError::Http(e.to_string()))?)
             .send()
             .map_err(|e| RestError::Http(e.to_string()))?;
         let status = resp.status();
+        // 409 (table already exists) surfaces as Conflict — typed, so the
+        // create_remote caller reacts by error KIND, never by searching
+        // messages for "409" (13-review #6)
+        if status == reqwest::StatusCode::CONFLICT {
+            return Err(RestError::Conflict(format!(
+                "POST {} -> {status}",
+                redact_url(&url)
+            )));
+        }
         if !status.is_success() {
-            return Err(RestError::Http(format!("POST {url} -> {status}")));
+            return Err(RestError::Http(format!(
+                "POST {} -> {status}",
+                redact_url(&url)
+            )));
         }
         let text = resp.text().unwrap_or_default();
         serde_json::from_str(&text).map_err(|e| {
@@ -223,12 +327,19 @@ impl RestCatalog {
         let resp = self
             .inner
             .get(&url)
-            .bearer_auth(self.tokens.token())
+            .bearer_auth(
+                self.tokens
+                    .token()
+                    .map_err(|e| RestError::Http(format!("token provider: {e}")))?,
+            )
             .send()
             .map_err(|e| RestError::Http(e.to_string()))?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(RestError::Http(format!("GET {url} -> {status}")));
+            return Err(RestError::Http(format!(
+                "GET {} -> {status}",
+                redact_url(&url)
+            )));
         }
         let wire: ConfigWire = resp.json().map_err(|e| RestError::Decode(e.to_string()))?;
         let cfg = CatalogConfig {
@@ -251,6 +362,63 @@ impl RestCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 13-review #6: credential-shaped URL parts never reach error
+    /// messages — userinfo is stripped, query VALUES masked, scheme/host/
+    /// path kept for diagnosis.
+    #[test]
+    fn redact_url_masks_userinfo_and_query_values() {
+        assert_eq!(
+            redact_url("https://user:secret@cat.example.com/v1/config"),
+            "https://cat.example.com/v1/config"
+        );
+        assert_eq!(
+            redact_url("http://cat.example.com/v1/config?warehouse=smoke&token=abc123"),
+            "http://cat.example.com/v1/config?warehouse=***&token=***"
+        );
+        // bare query keys and plain URLs pass through
+        assert_eq!(
+            redact_url("http://cat.example.com/v1/config?flag"),
+            "http://cat.example.com/v1/config?flag"
+        );
+        assert_eq!(
+            redact_url("https://cat.example.com/v1/namespaces/ns/tables/t"),
+            "https://cat.example.com/v1/namespaces/ns/tables/t"
+        );
+    }
+
+    /// 13-review #6: a catalog redirect that crosses origins fails the
+    /// request loudly instead of silently following (and sending the
+    /// bearer token) elsewhere; same-origin hops still follow.
+    #[test]
+    fn cross_origin_redirects_are_refused() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            // one request: 302 to a DIFFERENT origin (closed port)
+            let rq = server.recv().unwrap();
+            let resp = tiny_http::Response::empty(302);
+            rq.respond(
+                resp.with_header(
+                    tiny_http::Header::from_bytes(
+                        &b"Location"[..],
+                        &b"http://127.0.0.1:9/v1/config"[..],
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+        });
+        let client =
+            RestCatalog::new(&format!("http://{addr}"), Box::new(StaticToken("t".into()))).unwrap();
+        let err = client.fetch_config(None).unwrap_err();
+        handle.join().unwrap();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("crosses origins") || msg.contains("redirect"),
+            "cross-origin redirect must be refused loudly: {msg}"
+        );
+    }
 
     /// Mock of `GET /v1/config` on an in-process server (doc 10 §1: no
     /// network at unit-test time). Asserts the client hits the spec path and

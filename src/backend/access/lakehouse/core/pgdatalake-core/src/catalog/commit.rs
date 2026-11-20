@@ -206,10 +206,14 @@ impl RestCatalog {
         };
         let payload = serde_json::to_vec(&body)
             .map_err(|e| RestError::Http(format!("commitTable serialize: {e}")))?;
+        let token = self
+            .tokens
+            .token()
+            .map_err(|e| RestError::Http(format!("token provider: {e}")))?;
         let resp = self
             .inner
             .post(&url)
-            .bearer_auth(self.tokens.token())
+            .bearer_auth(token)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(payload)
             .send()
@@ -226,7 +230,10 @@ impl RestCatalog {
             return Err(RestError::Conflict(msg));
         }
         if !status.is_success() {
-            return Err(RestError::Http(format!("POST {url} -> {status}")));
+            return Err(RestError::Http(format!(
+                "POST {} -> {status}",
+                super::rest::redact_url(&url)
+            )));
         }
         // read as text first: decode failures surface the body prefix in
         // the error instead of an opaque reqwest message

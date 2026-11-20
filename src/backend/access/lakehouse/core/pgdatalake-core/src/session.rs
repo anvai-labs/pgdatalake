@@ -350,7 +350,12 @@ impl CatalogClient {
         let resp: super::catalog::types::LoadTableResult = self
             .rest
             .create_table(namespace, table, &schema)
-            .map_err(|e| crate::storage::StorageError::Config(e.to_string()))?;
+            .map_err(|e| match e {
+                crate::catalog::rest::RestError::Conflict(m) => {
+                    crate::storage::StorageError::Conflict(m)
+                }
+                other => crate::storage::StorageError::Config(other.to_string()),
+            })?;
         Ok(resp.metadata_location)
     }
 

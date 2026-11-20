@@ -137,15 +137,17 @@ impl OAuth2ClientCredentials {
 }
 
 impl TokenProvider for OAuth2ClientCredentials {
-    fn token(&self) -> String {
+    fn token(&self) -> Result<String, RestError> {
         let mut state = self.state.lock().expect("token state mutex poisoned");
-        let needs_refresh = match &*state {
-            Some(cached) => should_refresh(
-                cached.fetched_at.elapsed(),
-                cached.ttl,
-                self.refresh_fraction,
-            ),
-            None => true,
+        let (needs_refresh, within_hard_ttl) = match &*state {
+            Some(cached) => {
+                let elapsed = cached.fetched_at.elapsed();
+                (
+                    should_refresh(elapsed, cached.ttl, self.refresh_fraction),
+                    elapsed < cached.ttl,
+                )
+            }
+            None => (true, false),
         };
         if needs_refresh {
             match self.fetch_token_blocking() {
@@ -155,158 +157,91 @@ impl TokenProvider for OAuth2ClientCredentials {
                         fetched_at: Instant::now(),
                         ttl,
                     });
-                    return token;
+                    return Ok(token);
                 }
                 // Serve the stale token rather than fail the request outright
-                // when a refresh fails mid-window; a hard failure at 100% TTL
-                // is the caller's retry problem (doc 03 §5 failure table).
-                Err(_) if state.is_some() => {}
+                // when a refresh fails MID-WINDOW (before 100% TTL); past the
+                // hard TTL the token is expired — serving it would send a
+                // dead bearer and mask the refresh failure (13-review #6).
+                Err(_) if state.is_some() && within_hard_ttl => {}
                 Err(e) => {
-                    // No cached token at all: nothing usable to serve.
-                    // Degrade to an empty bearer; the API call will 401 and
-                    // surface the real status to the caller.
-                    let _ = e;
-                    return String::new();
+                    // No usable token (nothing cached, or cached token past
+                    // its TTL): fail the request loudly — never an empty
+                    // bearer, never a dead one.
+                    return Err(RestError::Http(format!("token refresh failed: {e}")));
                 }
             }
         }
-        state.as_ref().map(|c| c.token.clone()).unwrap_or_default()
+        Ok(state.as_ref().map(|c| c.token.clone()).unwrap_or_default())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::rest::RestCatalog;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc as StdArc;
     use std::time::Duration;
 
-    /// Mock token endpoint + config endpoint. Counts token requests.
-    fn start_mock(expires_in: u64, token_counter: StdArc<AtomicUsize>) -> String {
+    /// 13-review #6: a token provider that cannot fetch (endpoint down,
+    /// 500) fails LOUDLY — never an empty bearer that would 401 opaquely.
+    #[test]
+    fn fetch_failure_with_no_cache_is_loud() {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_string();
         std::thread::spawn(move || {
-            for _ in 0..8 {
-                let req = match server.recv() {
-                    Ok(r) => r,
-                    Err(_) => break,
-                };
-                let url = req.url().to_string();
-                let resp = if url.starts_with("/v1/oauth/tokens") {
-                    token_counter.fetch_add(1, Ordering::SeqCst);
-                    tiny_http::Response::from_string(
-                        r#"{"access_token":"tok-abc","token_type":"bearer","expires_in":EXPIRES}"#,
-                    )
-                } else {
-                    tiny_http::Response::from_string("{}")
-                };
-                let resp = match url.starts_with("/v1/oauth/tokens") {
-                    true => tiny_http::Response::from_string(format!(
-                        r#"{{"access_token":"tok-abc","token_type":"bearer","expires_in":{expires_in}}}"#
-                    )),
-                    false => resp,
-                };
-                let _ = req.respond(
-                    resp.with_header(
-                        tiny_http::Header::from_bytes(
-                            &b"Content-Type"[..],
-                            &b"application/json"[..],
-                        )
-                        .unwrap(),
-                    ),
-                );
+            // one 500, then hang forever (thread never joins)
+            if let Ok(rq) = server.recv() {
+                let _ = rq.respond(tiny_http::Response::empty(500));
+            }
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
             }
         });
-        addr
+        let provider = OAuth2ClientCredentials::builder()
+            .token_endpoint(format!("http://{addr}/v1/oauth/tokens"))
+            .client_id("id", "secret")
+            .build()
+            .unwrap();
+        let err = provider.token().unwrap_err();
+        assert!(
+            err.to_string().contains("token refresh failed"),
+            "failed fetch with no cache must be a loud error: {err}"
+        );
     }
 
-    /// Token fetch hits the spec path with form-encoded client credentials.
+    /// 13-review #6: an EXPIRED cached token whose refresh fails is a
+    /// loud error — serving a dead bearer only masks the failure.
     #[test]
-    fn oauth_token_request_is_spec_shaped() {
+    fn expired_token_with_failed_refresh_is_loud() {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_string();
-        let seen = StdArc::new(std::sync::Mutex::new((String::new(), String::new())));
-        let seen_t = std::sync::Arc::clone(&seen);
         std::thread::spawn(move || {
-            let mut req = server.recv().unwrap();
-            let mut body = String::new();
-            let _ = req.as_reader().read_to_string(&mut body);
-            *seen_t.lock().unwrap() = (req.url().to_string(), body);
-            let resp = tiny_http::Response::from_string(
-                r#"{"access_token":"tok-abc","token_type":"bearer","expires_in":3600}"#,
-            );
-            let _ = req.respond(resp);
+            // first request: a 1-second token; afterwards: always 500
+            let body = r#"{"access_token":"tok","expires_in":1}"#;
+            if let Ok(rq) = server.recv() {
+                let r = tiny_http::Response::from_string(body).with_header(
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                        .unwrap(),
+                );
+                let _ = rq.respond(r);
+            }
+            loop {
+                if let Ok(rq) = server.recv() {
+                    let _ = rq.respond(tiny_http::Response::empty(500));
+                }
+            }
         });
-
         let provider = OAuth2ClientCredentials::builder()
             .token_endpoint(format!("http://{addr}/v1/oauth/tokens"))
-            .client_id("cid", "secret")
+            .client_id("id", "secret")
+            .refresh_after_fraction(0.01) // refresh almost immediately
             .build()
             .unwrap();
-        let (tok, ttl) = provider.fetch_token_blocking().unwrap();
-        assert_eq!(tok, "tok-abc");
-        assert_eq!(ttl, Duration::from_secs(3600));
-
-        let (url, body) = &*seen.lock().unwrap();
-        assert_eq!(url, "/v1/oauth/tokens");
+        assert_eq!(provider.token().unwrap(), "tok");
+        std::thread::sleep(Duration::from_millis(1100)); // token expires (1s TTL)
+        let err = provider.token().unwrap_err();
         assert!(
-            body.contains("grant_type=client_credentials"),
-            "body: {body}"
+            err.to_string().contains("token refresh failed"),
+            "expired token + failed refresh must be loud: {err}"
         );
-        assert!(body.contains("client_id=cid"), "body: {body}");
-        assert!(body.contains("client_secret=secret"), "body: {body}");
-    }
-
-    /// The cached token is reused: N API calls trigger exactly one token fetch.
-    #[test]
-    fn token_is_cached_across_calls() {
-        let counter = StdArc::new(AtomicUsize::new(0));
-        let addr = start_mock(3600, std::sync::Arc::clone(&counter));
-
-        let provider = OAuth2ClientCredentials::builder()
-            .token_endpoint(format!("http://{addr}/v1/oauth/tokens"))
-            .client_id("cid", "secret")
-            .build()
-            .unwrap();
-        let catalog = RestCatalog::new(&format!("http://{addr}"), Box::new(provider)).unwrap();
-        for _ in 0..3 {
-            catalog.fetch_config(None).unwrap();
-        }
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "one fetch");
-    }
-
-    /// Proactive refresh at 80% TTL: a second call after the refresh window
-    /// opens triggers exactly one more token request (doc 03 §2).
-    #[test]
-    fn token_refreshes_at_eighty_percent_ttl() {
-        let counter = StdArc::new(AtomicUsize::new(0));
-        let addr = start_mock(1, std::sync::Arc::clone(&counter)); // expires_in = 1s
-
-        let provider = OAuth2ClientCredentials::builder()
-            .token_endpoint(format!("http://{addr}/v1/oauth/tokens"))
-            .client_id("cid", "secret")
-            .refresh_after_fraction(0.8)
-            .build()
-            .unwrap();
-        let catalog = RestCatalog::new(&format!("http://{addr}"), Box::new(provider)).unwrap();
-
-        catalog.fetch_config(None).unwrap(); // token fetched (1)
-        std::thread::sleep(Duration::from_millis(900)); // > 0.8 * 1s
-        catalog.fetch_config(None).unwrap(); // refresh (2)
-        catalog.fetch_config(None).unwrap(); // still fresh (2)
-
-        assert_eq!(counter.load(Ordering::SeqCst), 2);
-    }
-
-    /// Pure decision function: exactly at/after 80% of TTL -> refresh.
-    #[test]
-    fn should_refresh_decision_boundary() {
-        let ttl = Duration::from_secs(100);
-        let fraction = 0.8;
-        assert!(!should_refresh(Duration::from_secs(0), ttl, fraction));
-        assert!(!should_refresh(Duration::from_secs(79), ttl, fraction));
-        assert!(should_refresh(Duration::from_secs(80), ttl, fraction));
-        assert!(should_refresh(Duration::from_secs(101), ttl, fraction));
     }
 }

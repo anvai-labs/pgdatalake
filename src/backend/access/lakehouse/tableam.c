@@ -1642,6 +1642,7 @@ lakehouse_create_remote(PG_FUNCTION_ARGS)
 	char	   *schema_json;
 	char	   *loc;
 	char		errbuf[1024];
+	int			err_kind = 0;
 
 	if (!object_ownercheck(RelationRelationId, relid, GetUserId()))
 		ereport(ERROR,
@@ -1670,15 +1671,13 @@ lakehouse_create_remote(PG_FUNCTION_ARGS)
 								   entry->opts.s3_access_key,
 								   entry->opts.s3_secret_key,
 								   schema_json,
-								   errbuf, sizeof(errbuf));
+								   errbuf, sizeof(errbuf), &err_kind);
 	table_close(rel, AccessShareLock);
 	if (loc == NULL)
 	{
-		bool		exists = strstr(errbuf, "409") != NULL ||
-			strstr(errbuf, "Conflict") != NULL ||
-			strstr(errbuf, "already exists") != NULL;
-
-		if (exists)
+		/* error KIND from the FFI (13-review #6): 1 = conflict — classify
+		 * by type, never by searching the message for "409" */
+		if (err_kind == 1)
 			PG_RETURN_TEXT_P(cstring_to_text("exists"));
 		ereport(ERROR,
 				(errcode(ERRCODE_CONNECTION_EXCEPTION),

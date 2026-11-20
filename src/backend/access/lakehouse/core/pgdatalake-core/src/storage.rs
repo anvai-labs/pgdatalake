@@ -17,6 +17,10 @@ pub enum StorageError {
     Http(String),
     Decode(String),
     Config(String),
+    /// REST catalog 409 CommitFailedException-equivalent: a concurrent
+    /// writer won, or the object already exists. Distinct so callers react
+    /// by TYPE, never by searching error strings for "409" (13-review #6).
+    Conflict(String),
 }
 
 impl std::fmt::Display for StorageError {
@@ -26,6 +30,7 @@ impl std::fmt::Display for StorageError {
             StorageError::Http(m) => write!(f, "storage IO error: {m}"),
             StorageError::Decode(m) => write!(f, "storage decode error: {m}"),
             StorageError::Config(m) => write!(f, "storage config error: {m}"),
+            StorageError::Conflict(m) => write!(f, "storage conflict: {m}"),
         }
     }
 }
