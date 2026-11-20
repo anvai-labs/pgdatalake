@@ -702,3 +702,28 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     REMAINING overall: #7 parallel per-scan queues, #8 type-boundary
     statuses, #1 tail (two-writer concurrency, independent-reader
     verification); M2 #28 UPDATE/DELETE COW, #29 MERGE + ceremony.
+  - 13-implementation-review Blocker #7 — FIXED 2026-11-20 30c887d12ae
+    (live acceptance matrix; regress + cargo green): (a) PER-NODE
+    QUEUES: the process-global lakehouse_shared_state is gone — each
+    executor node carries LakehouseExecState.shared; hooks attach to
+    the node's own state; Shutdown clears only its own. (b) STABLE
+    TASK MAPPING: leader's Begin resolves the concrete snapshot
+    (per-execution = plancache-fresh boundary; refs/"current" resolve
+    ONCE there), InitializeDSM records it before workers launch, and
+    each worker RE-PINS its session to that id when its own
+    resolution differs (pg_datalake_scan_snapshot_id accessor added).
+    Concurrent commits can no longer make task index N mean different
+    files per process. (c) PARTIAL PATH gated on consider_parallel.
+    CAUGHT PRE-COMMIT by the acceptance matrix: Begin runs before the
+    DSM hooks in workers TOO (children init before the Gather parent —
+    the "InitializeWorker runs before Begin" assumption was wrong), so
+    the first per-node attempt left workers unshared and
+    leader-participation=off duplicated rows 4x; fixed by attaching in
+    the hooks + re-pinning. Live: serial == parallel(2 workers) ==
+    leader-off multisets across self-join / two distinct scans /
+    serial×parallel mix / correlated rescan; exactly-once verified.
+    Remaining #7 notes: catalog-advance barrier demo needs
+    injection-point test infrastructure (design is structurally
+    benign: worker detects id mismatch and re-pins). REMAINING
+    overall: #8 type-boundary statuses, #1 tail (two-writer
+    concurrency, independent-reader verification); M2 #28/#29.
