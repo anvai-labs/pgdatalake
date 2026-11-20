@@ -186,12 +186,19 @@ impl CatalogClient {
     /// parent/sequence/carried manifests from the fresh base, assembles
     /// a fresh snapshot with a collision-resistant id, and never replays
     /// stale requirements. Fatal assembly errors abort without retry.
+    /// `deleted` (M2 slice 28 COW): files this snapshot removes, emitted
+    /// as DELETED manifest entries (operation=overwrite). Every retry
+    /// attempt RE-VERIFIES each deleted path is still live in the fresh
+    /// base — a concurrent writer that rewrote the same file aborts the
+    /// commit (loud lost-update protection), never silently re-deletes
+    /// against a rewritten file.
     pub fn commit_append(
         &self,
         st: &TableWriteState,
         namespace: &[&str],
         table: &str,
         new_files: &[crate::snapshot_write::NewDataFile],
+        deleted: &[crate::snapshot_write::DeletedDataFile],
         retries: u32,
     ) -> Result<String, crate::storage::StorageError> {
         use crate::catalog::commit::{TableRequirement, TableUpdate};
@@ -245,6 +252,30 @@ impl CatalogClient {
                         None => Vec::new(),
                     };
 
+                    // slice 28: lost-update protection — every deleted
+                    // path must still be LIVE in the fresh base (plan_scan
+                    // applies the cross-manifest DELETED exclusion, so a
+                    // path another writer already removed is absent here)
+                    if !deleted.is_empty() {
+                        let plan = crate::scan::plan_scan(md, None, Some(&st.s3), None)
+                            .map_err(|e| {
+                                crate::catalog::rest::RestError::Http(e.to_string())
+                            })?;
+                        let live: std::collections::HashSet<&str> = plan
+                            .tasks
+                            .iter()
+                            .map(|t| t.entry.data_file.file_path.as_str())
+                            .collect();
+                        for d in deleted {
+                            if !live.contains(d.file_path.as_str()) {
+                                return Err(crate::catalog::rest::RestError::Http(format!(
+                                    "overwrite conflict: file {} is no longer live in the table's current snapshot (a concurrent writer removed or rewrote it); aborting to avoid a lost update",
+                                    d.file_path
+                                )));
+                            }
+                        }
+                    }
+
                     // collision-resistant positive id (entropy + time),
                     // NOT sequence-derived (two writers can share a seq)
                     let snapshot_id = {
@@ -271,6 +302,7 @@ impl CatalogClient {
                             schema_id: st.schema_id,
                             partition_spec_id: st.partition_spec_id,
                             carried_manifests: carried,
+                            deleted_files: deleted.to_vec(),
                         },
                     )
                     .map_err(|e| crate::catalog::rest::RestError::Http(e.to_string()))?;
@@ -488,5 +520,231 @@ mod tests {
         .unwrap();
         let err = client.scan_table(&["ns"], "t", None, None).unwrap_err();
         assert!(!err.to_string().is_empty());
+    }
+
+    // ---- slice 28: overwrite commits (COW UPDATE/DELETE) ----
+
+    /// Local-store fixture: one manifest (optionally holding one ADDED
+    /// data file of 3 rows) + a manifest-list, under `dir`. Returns the
+    /// table location and the data file's URI.
+    fn overwrite_fixture(dir: &std::path::Path, with_data_file: bool) -> (String, String) {
+        use crate::snapshot_write::{build_manifest_bytes, build_manifest_list_bytes, NewDataFile};
+        crate::storage::test_allow_local_stores();
+        let location = format!("file://{}", dir.display());
+        let data_path = format!("{location}/data/000-0.parquet");
+        let added: Vec<NewDataFile> = if with_data_file {
+            vec![NewDataFile {
+                file_path: data_path.clone(),
+                record_count: 3,
+                file_size_in_bytes: 4096,
+                ..Default::default()
+            }]
+        } else {
+            Vec::new()
+        };
+        let manifest_bytes = build_manifest_bytes(&added, &[], 42, 1).unwrap();
+        std::fs::create_dir_all(dir.join("metadata")).unwrap();
+        std::fs::write(dir.join("metadata").join("m0.avro"), &manifest_bytes).unwrap();
+        let list_bytes = build_manifest_list_bytes(&[crate::manifest::ManifestListEntry {
+            manifest_path: format!("{location}/metadata/m0.avro"),
+            manifest_length: manifest_bytes.len() as i64,
+            partition_spec_id: 0,
+            content: Some(0),
+            added_snapshot_id: 42,
+            added_files_count: Some(1),
+            existing_files_count: None,
+            deleted_files_count: None,
+            added_rows_count: Some(3),
+            existing_rows_count: None,
+            deleted_rows_count: None,
+            sequence_number: Some(1),
+            min_sequence_number: Some(1),
+        }])
+        .unwrap();
+        std::fs::write(dir.join("metadata").join("snap.avro"), list_bytes).unwrap();
+        (location, data_path)
+    }
+
+    fn overwrite_metadata_file(dir: &std::path::Path, location: &str) -> String {
+        let metadata_json = format!(
+            r#"{{
+                "format-version": 2,
+                "table-uuid": "1ca92afa-70b9-4d02-9ba6-7ee1a3ac0f5e",
+                "location": "{location}",
+                "last-sequence-number": 1,
+                "schemas": [{{"type": "struct", "schema-id": 0, "fields": [
+                    {{"id": 1, "name": "id", "required": true, "type": "long"}}]}}],
+                "current-schema-id": 0,
+                "snapshots": [{{"snapshot-id": 42, "timestamp-ms": 1712345678000,
+                                "manifest-list": "{location}/metadata/snap.avro",
+                                "summary": {{"operation": "append"}}}}],
+                "current-snapshot-id": 42
+            }}"#
+        );
+        let md_file = dir.join("metadata").join("00001-abc.metadata.json");
+        std::fs::write(&md_file, metadata_json).unwrap();
+        format!("file://{}", md_file.display())
+    }
+
+    /// commit_append with a deleted file emits an overwrite snapshot:
+    /// the commit request carries operation=overwrite and the deleted
+    /// path as a DELETED manifest entry, and the commit succeeds.
+    #[test]
+    fn commit_append_overwrite_emits_deleted_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let (location, data_path) = overwrite_fixture(dir.path(), true);
+        let md_loc = overwrite_metadata_file(dir.path(), &location);
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap(); // config
+            let _ = req.respond(tiny_http::Response::from_string(
+                r#"{"defaults": {}, "overrides": {}}"#,
+            ));
+            let resp_body = format!(
+                r#"{{"metadata-location": "{}", "config": {{}}}}"#,
+                md_loc
+            );
+            let req = server.recv().unwrap(); // loadTable (write_table_open)
+            let _ = req.respond(tiny_http::Response::from_string(resp_body.clone()));
+            let req = server.recv().unwrap(); // loadTable (commit_append)
+            let _ = req.respond(tiny_http::Response::from_string(resp_body));
+            let mut req = server.recv().unwrap(); // commit — CAPTURE the body
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            // the response parser opens metadata-location: keep it local+real
+            let next_loc = md_loc.replace("00001-abc", "00002-x");
+            let _ = req.respond(tiny_http::Response::from_string(format!(
+                r#"{{"metadata-location": "{}", "config": {{}}}}"#,
+                next_loc
+            )));
+            body
+        });
+
+        let client = CatalogClient::new(
+            &format!("http://{addr}"),
+            "wh",
+            "",
+            &S3ClientOptions::default(),
+        )
+        .unwrap();
+        let st = client
+            .write_table_open(
+                &["analytics"],
+                "events",
+                &[("id".into(), crate::catalog::metadata::IcebergType::Long)],
+            )
+            .unwrap();
+        let deleted = vec![crate::snapshot_write::DeletedDataFile {
+            file_path: data_path.clone(),
+            record_count: 3,
+            file_size_in_bytes: 4096,
+        }];
+        let new_loc = client
+            .commit_append(&st, &["analytics"], "events", &[], &deleted, 3)
+            .expect("overwrite commit");
+        assert!(new_loc.contains("00002-x.metadata.json"));
+
+        let body = handle.join().unwrap();
+        assert!(
+            body.contains(r#""operation":"overwrite""#)
+                || body.contains(r#""operation": "overwrite""#),
+            "commit body must say overwrite: {body}"
+        );
+        // the DELETED entry itself lives in the manifest avro the commit
+        // wrote; verify it parses back with the deleted path + counts
+        let snap_id: i64 = {
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            v["updates"][0]["snapshot"]["snapshot-id"]
+                .as_i64()
+                .unwrap()
+        };
+        let list_file = std::fs::read_dir(dir.path().join("metadata"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with(&format!("snap-{snap_id}-")))
+                    .unwrap_or(false)
+            })
+            .expect("commit's manifest-list written to the store");
+        let list =
+            crate::manifest::parse_manifest_list(&std::fs::read(&list_file).unwrap()).unwrap();
+        assert_eq!(list.len(), 2, "carried base manifest + new manifest");
+        let manifest_rel = list[1].manifest_path.trim_start_matches(&format!("{location}/"));
+        let entries =
+            crate::manifest::parse_manifest(&std::fs::read(dir.path().join(manifest_rel)).unwrap()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].status,
+            crate::manifest::ManifestEntryStatus::Deleted
+        );
+        assert_eq!(entries[0].data_file.file_path, data_path);
+        assert_eq!(entries[0].data_file.record_count, 3);
+        assert_eq!(entries[0].data_file.file_size_in_bytes, 4096);
+    }
+
+    /// Lost-update protection: if the deleted file is NOT live in the
+    /// fresh base (a concurrent writer removed/rewrote it), the commit
+    /// aborts BEFORE any commit request is sent.
+    #[test]
+    fn overwrite_aborts_when_deleted_file_not_live() {
+        let dir = tempfile::tempdir().unwrap();
+        // fixture WITHOUT the data file: the base's live set is empty
+        let (location, _data_path) = overwrite_fixture(dir.path(), false);
+        let md_loc = overwrite_metadata_file(dir.path(), &location);
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap(); // config
+            let _ = req.respond(tiny_http::Response::from_string(
+                r#"{"defaults": {}, "overrides": {}}"#,
+            ));
+            let resp_body = format!(
+                r#"{{"metadata-location": "{}", "config": {{}}}}"#,
+                md_loc
+            );
+            let req = server.recv().unwrap(); // loadTable (write_table_open)
+            let _ = req.respond(tiny_http::Response::from_string(resp_body.clone()));
+            let req = server.recv().unwrap(); // loadTable (commit_append)
+            let _ = req.respond(tiny_http::Response::from_string(resp_body));
+            // NO commit request may arrive
+            if let Ok(Some(extra)) = server.recv_timeout(std::time::Duration::from_secs(1)) {
+                panic!("commit must abort before any commit request; got {}", extra.url());
+            }
+        });
+
+        let client = CatalogClient::new(
+            &format!("http://{addr}"),
+            "wh",
+            "",
+            &S3ClientOptions::default(),
+        )
+        .unwrap();
+        let st = client
+            .write_table_open(
+                &["analytics"],
+                "events",
+                &[("id".into(), crate::catalog::metadata::IcebergType::Long)],
+            )
+            .unwrap();
+        let deleted = vec![crate::snapshot_write::DeletedDataFile {
+            file_path: format!("{location}/data/000-0.parquet"),
+            record_count: 3,
+            file_size_in_bytes: 4096,
+        }];
+        let err = client
+            .commit_append(&st, &["analytics"], "events", &[], &deleted, 3)
+            .expect_err("must abort");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no longer live") || msg.contains("conflict"),
+            "abort must name the conflict: {msg}"
+        );
+        handle.join().unwrap();
     }
 }

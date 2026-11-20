@@ -881,7 +881,7 @@ pub unsafe extern "C" fn pg_datalake_write_commit(
     let ns_refs: Vec<&str> = ws.namespace.iter().map(|s| s.as_str()).collect();
     let commit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ws.client
-            .commit_append(&ws.state, &ns_refs, &ws.table, &ws.flushed, retries)
+            .commit_append(&ws.state, &ns_refs, &ws.table, &ws.flushed, &[], retries)
     }));
     match commit {
         Ok(Ok(loc)) => {

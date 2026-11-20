@@ -102,6 +102,18 @@ pub struct NewDataFile {
 
 use apache_avro::types::Value as V;
 
+/// One existing data file the new snapshot REMOVES (COW overwrite, M2
+/// slice 28). Emitted as a DELETED manifest entry in the new snapshot's
+/// manifest — the file's bytes are never touched (time travel and
+/// concurrent readers of older snapshots stay valid; expiry is a later
+/// slice's job).
+#[derive(Debug, Clone)]
+pub struct DeletedDataFile {
+    pub file_path: String,
+    pub record_count: i64,
+    pub file_size_in_bytes: i64,
+}
+
 fn avro_long_map(schema: &AvroSchema, map: &BTreeMap<i64, i64>) -> V {
     // items record schema: {"key": int, "value": long}
     let items = match schema {
@@ -170,9 +182,11 @@ fn field_schema(schema: &AvroSchema, name: &str) -> Option<AvroSchema> {
         })
 }
 
-/// Serialize the ADDED entries of one manifest (v2 shape, unpartitioned).
+/// Serialize one manifest: ADDED entries for `files` plus DELETED entries
+/// for `deleted` (v2 shape, unpartitioned).
 pub fn build_manifest_bytes(
     files: &[NewDataFile],
+    deleted: &[DeletedDataFile],
     snapshot_id: i64,
     sequence: i64,
 ) -> Result<Vec<u8>, StorageError> {
@@ -237,6 +251,45 @@ pub fn build_manifest_bytes(
                 "file_sequence_number".into(),
                 V::Union(1, Box::new(V::Long(i as i64))),
             ),
+            ("data_file".into(), data_file),
+        ]);
+        writer
+            .append(entry)
+            .map_err(|e| StorageError::Config(format!("manifest append: {e}")))?;
+    }
+    // DELETED entries (slice 28): the removed file's identity travels in
+    // the data_file record so other engines' readers process the deletion;
+    // our own reader excludes by path across all manifests.
+    for f in deleted {
+        let data_file = V::Record(vec![
+            ("content".into(), V::Int(DataContent::Data as i32)),
+            ("file_path".into(), V::String(f.file_path.clone())),
+            ("file_format".into(), V::String("parquet".into())),
+            ("partition".into(), V::Union(1, Box::new(V::Record(vec![])))),
+            ("record_count".into(), V::Long(f.record_count)),
+            ("file_size_in_bytes".into(), V::Long(f.file_size_in_bytes)),
+            ("column_sizes".into(), V::Union(0, Box::new(V::Null))),
+            ("value_counts".into(), V::Union(0, Box::new(V::Null))),
+            ("null_value_counts".into(), V::Union(0, Box::new(V::Null))),
+            ("nan_value_counts".into(), V::Union(0, Box::new(V::Null))),
+            ("lower_bounds".into(), V::Union(0, Box::new(V::Null))),
+            ("upper_bounds".into(), V::Union(0, Box::new(V::Null))),
+            ("key_metadata".into(), V::Union(0, Box::new(V::Null))),
+            ("split_offsets".into(), V::Union(0, Box::new(V::Null))),
+            ("equality_ids".into(), V::Union(0, Box::new(V::Null))),
+            ("sort_order_id".into(), V::Union(0, Box::new(V::Null))),
+        ]);
+        let entry = V::Record(vec![
+            (
+                "status".into(),
+                V::Int(crate::manifest::ManifestEntryStatus::Deleted as i32),
+            ),
+            ("snapshot_id".into(), V::Long(snapshot_id)),
+            (
+                "sequence_number".into(),
+                V::Union(1, Box::new(V::Long(sequence))),
+            ),
+            ("file_sequence_number".into(), V::Union(0, Box::new(V::Null))),
             ("data_file".into(), data_file),
         ]);
         writer
@@ -315,6 +368,9 @@ pub struct SnapshotParams {
     /// everything the base contained (13-implementation-review blocker
     /// #1). Empty = first snapshot.
     pub carried_manifests: Vec<crate::manifest::ManifestListEntry>,
+    /// Files this snapshot removes (COW overwrite). Empty = plain append.
+    /// Non-empty flips the summary operation to "overwrite".
+    pub deleted_files: Vec<DeletedDataFile>,
 }
 
 /// Result of assembling a snapshot on the object store.
@@ -345,8 +401,9 @@ pub fn write_snapshot(
         schema_id,
         partition_spec_id,
         carried_manifests,
+        deleted_files,
     } = params;
-    if new_files.is_empty() {
+    if new_files.is_empty() && deleted_files.is_empty() {
         return Err(StorageError::Config(
             "write path: no data files in snapshot (empty commits are a no-op)".into(),
         ));
@@ -370,8 +427,9 @@ pub fn write_snapshot(
         }
     };
 
-    // manifest avro (the ADDED entries of this snapshot)
-    let manifest_bytes = build_manifest_bytes(new_files, snapshot_id, sequence)?;
+    // manifest avro (the ADDED entries + the DELETED entries of this
+    // snapshot)
+    let manifest_bytes = build_manifest_bytes(new_files, &deleted_files, snapshot_id, sequence)?;
     let manifest_key = keyed(format!(
         "metadata/{}-{}-m0.avro",
         snapshot_id,
@@ -394,10 +452,10 @@ pub fn write_snapshot(
         added_snapshot_id: snapshot_id,
         added_files_count: Some(new_files.len() as i64),
         existing_files_count: Some(0),
-        deleted_files_count: Some(0),
+        deleted_files_count: Some(deleted_files.len() as i64),
         added_rows_count: Some(new_files.iter().map(|f| f.record_count).sum()),
         existing_rows_count: Some(0),
-        deleted_rows_count: Some(0),
+        deleted_rows_count: Some(deleted_files.iter().map(|f| f.record_count).sum()),
         sequence_number: Some(sequence),
         min_sequence_number: Some(sequence),
     };
@@ -409,9 +467,28 @@ pub fn write_snapshot(
     let list_key = keyed(list_rel.clone());
     io.put_bytes(&list_key, list_bytes)?;
 
-    // summary per the spec's snapshot summary keys (writers may add more)
+    // summary per the spec's snapshot summary keys (writers may add more);
+    // any deletion flips the operation to overwrite (Iceberg convention:
+    // a snapshot that removes data files is an overwrite, not an append)
     let total_rows: i64 = new_files.iter().map(|f| f.record_count).sum();
     let total_bytes: i64 = new_files.iter().map(|f| f.file_size_in_bytes).sum();
+    let deleted_rows: i64 = deleted_files.iter().map(|f| f.record_count).sum();
+    let operation = if deleted_files.is_empty() {
+        "append"
+    } else {
+        "overwrite"
+    };
+    let mut summary = BTreeMap::from([
+        ("operation".to_string(), operation.to_string()),
+        ("added-data-files".to_string(), new_files.len().to_string()),
+        ("carried-manifests".to_string(), carried_len.to_string()),
+        ("added-records".to_string(), total_rows.to_string()),
+        ("added-files-size".to_string(), total_bytes.to_string()),
+    ]);
+    if !deleted_files.is_empty() {
+        summary.insert("deleted-data-files".to_string(), deleted_files.len().to_string());
+        summary.insert("deleted-records".to_string(), deleted_rows.to_string());
+    }
     let snapshot = Snapshot {
         snapshot_id,
         sequence_number: Some(sequence),
@@ -419,13 +496,7 @@ pub fn write_snapshot(
         parent_snapshot_id,
         timestamp_ms,
         manifest_list: format!("{loc}/{list_rel}"),
-        summary: BTreeMap::from([
-            ("operation".to_string(), "append".to_string()),
-            ("added-data-files".to_string(), new_files.len().to_string()),
-            ("carried-manifests".to_string(), carried_len.to_string()),
-            ("added-records".to_string(), total_rows.to_string()),
-            ("added-files-size".to_string(), total_bytes.to_string()),
-        ]),
+        summary,
         schema_id,
     };
     Ok(WrittenSnapshot {
@@ -515,6 +586,7 @@ mod tests {
                 schema_id: Some(0),
                 partition_spec_id: 0,
                 carried_manifests: Vec::new(),
+                deleted_files: Vec::new(),
             },
         )
         .expect("write_snapshot");
@@ -589,7 +661,7 @@ mod tests {
             lower_bounds: BTreeMap::from([(1, 1i64.to_le_bytes().to_vec())]),
             upper_bounds: BTreeMap::from([(1, 9i64.to_le_bytes().to_vec())]),
         }];
-        let bytes = build_manifest_bytes(&files, 42, 5).unwrap();
+        let bytes = build_manifest_bytes(&files, &[], 42, 5).unwrap();
 
         let entries = crate::manifest::parse_manifest(&bytes).unwrap();
         assert_eq!(entries.len(), 1);
@@ -624,6 +696,7 @@ mod tests {
                 file_size_in_bytes: 2048,
                 ..Default::default()
             }],
+            &[],
             42,
             5,
         )
@@ -733,6 +806,7 @@ mod carry_tests {
                 schema_id: Some(0),
                 partition_spec_id: 0,
                 carried_manifests: Vec::new(),
+                deleted_files: Vec::new(),
             },
         )
         .unwrap();
@@ -775,6 +849,7 @@ mod carry_tests {
                 schema_id: Some(0),
                 partition_spec_id: 0,
                 carried_manifests: carried,
+                deleted_files: Vec::new(),
             },
         )
         .unwrap();
@@ -843,5 +918,151 @@ mod carry_tests {
         assert_eq!(rows.value(0), crate::parquet::CellValue::Int64(1));
         assert!(!rows.next());
         let _ = written_b.written_keys;
+    }
+
+    /// COW overwrite (M2 slice 28): snapshot B DELETES A's data file and
+    /// ADDS a rewritten one. The written manifest carries a DELETED entry
+    /// for A's file (path + counts preserved), the manifest-list entry
+    /// reports the deletion counts, the summary says operation=overwrite,
+    /// and plan_scan over the merged metadata sees ONLY the rewrite —
+    /// read-your-writes through our own pipeline, A's rows gone.
+    #[test]
+    fn overwrite_snapshot_deletes_and_replaces() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
+        let location = format!("file://{}", dir.path().display());
+        let loc = parse_location(&location).unwrap();
+        let io = StorageIo::open(&loc, None).unwrap();
+
+        // A: one file, rows 1 and 2
+        let mut w = crate::writer::BatchWriter::new(vec![crate::writer::WriteColumn {
+            name: "id".into(),
+            ty: IcebergType::Long,
+            field_id: Some(1),
+        }])
+        .unwrap();
+        w.push(&[crate::parquet::CellValue::Int64(1)]).unwrap();
+        w.push(&[crate::parquet::CellValue::Int64(2)]).unwrap();
+        let wf_a = w.write_file(&io, "data", 0).unwrap();
+        let file_a_path = format!("{location}/{}", wf_a.key);
+        let written_a = write_snapshot(
+            &io,
+            &location,
+            &[NewDataFile {
+                file_path: file_a_path.clone(),
+                record_count: wf_a.record_count,
+                file_size_in_bytes: wf_a.file_size_in_bytes,
+                ..Default::default()
+            }],
+            SnapshotParams {
+                snapshot_id: 200,
+                timestamp_ms: 1,
+                parent_snapshot_id: None,
+                last_sequence_number: Some(0),
+                schema_id: Some(0),
+                partition_spec_id: 0,
+                carried_manifests: Vec::new(),
+                deleted_files: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        // B: rewrite file (row 2 only) + DELETE A's file
+        let mut w2 = crate::writer::BatchWriter::new(vec![crate::writer::WriteColumn {
+            name: "id".into(),
+            ty: IcebergType::Long,
+            field_id: Some(1),
+        }])
+        .unwrap();
+        w2.push(&[crate::parquet::CellValue::Int64(2)]).unwrap();
+        let wf_b = w2.write_file(&io, "data", 1).unwrap();
+        let file_b_path = format!("{location}/{}", wf_b.key);
+        let deleted = vec![crate::snapshot_write::DeletedDataFile {
+            file_path: file_a_path.clone(),
+            record_count: wf_a.record_count,
+            file_size_in_bytes: wf_a.file_size_in_bytes,
+        }];
+        let carried = {
+            let list_a_key = written_a
+                .snapshot
+                .manifest_list
+                .trim_start_matches(&format!("{location}/"))
+                .to_string();
+            crate::manifest::parse_manifest_list(&io.get_bytes(&list_a_key).unwrap()).unwrap()
+        };
+        let written_b = write_snapshot(
+            &io,
+            &location,
+            &[NewDataFile {
+                file_path: file_b_path.clone(),
+                record_count: wf_b.record_count,
+                file_size_in_bytes: wf_b.file_size_in_bytes,
+                ..Default::default()
+            }],
+            SnapshotParams {
+                snapshot_id: 201,
+                timestamp_ms: 2,
+                parent_snapshot_id: Some(200),
+                last_sequence_number: Some(1),
+                schema_id: Some(0),
+                partition_spec_id: 0,
+                carried_manifests: carried,
+                deleted_files: deleted,
+            },
+        )
+        .unwrap();
+
+        // summary: overwrite operation + deletion counts
+        assert_eq!(
+            written_b.snapshot.summary.get("operation").map(String::as_str),
+            Some("overwrite")
+        );
+        assert_eq!(
+            written_b.snapshot.summary.get("deleted-data-files").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            written_b.snapshot.summary.get("deleted-records").map(String::as_str),
+            Some("2")
+        );
+
+        // merged metadata: current view sees ONLY the rewrite
+        let mut md = one_col_metadata(&location);
+        for (sid, wsnap) in [(200i64, &written_a.snapshot), (201, &written_b.snapshot)] {
+            md.snapshots.push(wsnap.clone());
+            md.current_snapshot_id = Some(sid);
+            md.refs.insert(
+                "main".into(),
+                SnapshotRef {
+                    snapshot_id: sid,
+                    kind: "branch".into(),
+                    min_snapshots_to_keep: None,
+                    max_snapshot_age_ms: None,
+                },
+            );
+        }
+        let plan = crate::scan::plan_scan(&md, None, None, None).unwrap();
+        assert_eq!(plan.data_files, 1, "A deleted, only B's rewrite lives");
+        assert_eq!(plan.tasks[0].entry.data_file.file_path, file_b_path);
+        assert_eq!(plan.total_rows, 1);
+
+        // time travel to A still works (the DELETED entry lives in B's
+        // manifest; A's snapshot manifest-list doesn't reference it)
+        let plan_a = crate::scan::plan_scan(
+            &md,
+            Some(&crate::catalog::metadata::SnapshotSelector::Id { value: 200 }),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan_a.data_files, 1, "pinned A is untouched");
+        assert_eq!(plan_a.tasks[0].entry.data_file.file_path, file_a_path);
+
+        // read the rewrite back
+        let b_key = file_b_path.trim_start_matches(&format!("{location}/"));
+        let mut rows = crate::parquet::ParquetRows::open(&io, b_key, &["id"]).unwrap();
+        assert!(rows.next());
+        assert_eq!(rows.value(0), crate::parquet::CellValue::Int64(2));
+        assert!(!rows.next());
     }
 }
