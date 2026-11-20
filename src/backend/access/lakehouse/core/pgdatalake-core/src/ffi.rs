@@ -867,11 +867,11 @@ pub unsafe extern "C" fn pg_datalake_write_commit(
     err_buf: *mut c_char,
     err_len: usize,
 ) -> *mut c_char {
-    let Some(mut ws) = (unsafe { ws.as_mut() }) else {
+    let Some(ws) = (unsafe { ws.as_mut() }) else {
         unsafe { set_err(err_buf, err_len, "write commit: NULL session") };
         return std::ptr::null_mut();
     };
-    commit_internal(&mut ws, &[], retries, err_buf, err_len)
+    commit_internal(ws, &[], retries, err_buf, err_len)
 }
 
 /// Shared commit tail (append or overwrite): flush remainder, commit via
@@ -941,7 +941,7 @@ pub unsafe extern "C" fn pg_datalake_write_commit_overwrite(
     err_buf: *mut c_char,
     err_len: usize,
 ) -> *mut c_char {
-    let Some(mut ws) = (unsafe { ws.as_mut() }) else {
+    let Some(ws) = (unsafe { ws.as_mut() }) else {
         unsafe { set_err(err_buf, err_len, "overwrite commit: NULL session") };
         return std::ptr::null_mut();
     };
@@ -971,7 +971,7 @@ pub unsafe extern "C" fn pg_datalake_write_commit_overwrite(
             return std::ptr::null_mut();
         }
     };
-    unsafe { commit_internal(&mut ws, &deleted, retries, err_buf, err_len) }
+    unsafe { commit_internal(ws, &deleted, retries, err_buf, err_len) }
 }
 
 /// Open one data file BY PATH for a COW rewrite pass (slice 28): rows are

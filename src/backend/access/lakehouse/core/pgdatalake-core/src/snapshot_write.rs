@@ -447,7 +447,7 @@ pub fn rewrite_manifest_with_deletes(
             live += 1;
             continue;
         }
-        if deleted_paths.iter().any(|p| *p == e.data_file.file_path) {
+        if deleted_paths.contains(&e.data_file.file_path) {
             e.status = crate::manifest::ManifestEntryStatus::Deleted;
             deleted += 1;
         } else {
