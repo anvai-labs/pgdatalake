@@ -30,9 +30,22 @@ echo "PASS: setup + upstream regress + lakehouse regress (incl. time_travel)"
 cargo test --manifest-path src/backend/access/lakehouse/core/pgdatalake-core/Cargo.toml > /tmp/cr1-cargo.log 2>&1 || { echo "FAIL: cargo test"; tail -20 /tmp/cr1-cargo.log; exit 1; }
 echo "PASS: cargo tests"
 
-# 5. live read path: generate PyIceberg fixtures and read them through the FDW
-"${PYTHON_VENB:-build/venv}/bin/python" scripts/gen_fixtures.py || { echo "FAIL: gen_fixtures"; exit 1; }
-"${PYTHON_VENB:-build/venv}/bin/python" scripts/gen_conformance_fixtures.py || { echo "FAIL: gen_conformance_fixtures"; exit 1; }
+# 5. live read path: generate PyIceberg fixtures and read them through the FDW.
+# Fixture generation MUST run inside the compose network: lakekeeper serves a
+# per-table s3.endpoint (http://s3:9000) that beats client config in pyiceberg
+# (slice 20 gotcha). Uses the compose network + the pinned toolchain image with
+# the host venv mounted at its absolute path (venv python symlinks into it).
+run_py() {
+  script="$1"; shift
+  docker run --rm --network pgdatalake_default \
+    -v "${PYTHON_VENB:-build/venv}":"${PYTHON_VENB:-build/venv}" \
+    -v "${ANACONDA_DIR:-/home/vsingh/anaconda3}":"${ANACONDA_DIR:-/home/vsingh/anaconda3}" \
+    -v "$PWD":/work -e LK_URI=http://lakekeeper:8181/catalog \
+    --entrypoint "${PYTHON_VENB:-build/venv}/bin/python" \
+    anvai-wsl-runner:ubuntu24-20261008 "/work/$script" "$@"
+}
+run_py scripts/gen_fixtures.py --uri http://lakekeeper:8181/catalog || { echo "FAIL: gen_fixtures"; exit 1; }
+run_py scripts/gen_conformance_fixtures.py || { echo "FAIL: gen_conformance_fixtures"; exit 1; }
 echo "PASS: fixture generation"
 
 # 6. live SQL verification against a scratch cluster
