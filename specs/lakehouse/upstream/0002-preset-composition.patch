@@ -1,0 +1,185 @@
+From a5006eb8905f741cf1362e8b6b0a16d22405ef9e Mon Sep 17 00:00:00 2001
+From: VIJAY SINGH <singhvjd@gmail.com>
+Date: Thu, 19 Nov 2026 23:48:43 -0600
+Subject: [PATCH 2/2] =?UTF-8?q?reloptions:=20heap=5Freloptions=5Ffor=5Fam?=
+ =?UTF-8?q?=20=E2=80=94=20preset=20composition=20helper=20(v2.1)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Answers the 2020-thread 'preset option packages' direction with the
+smallest honest surface: AMs composing heap-standard options with their
+own keys call heap_reloptions_for_am(am_keys) instead of hand-stripping
+(what the test module previously demonstrated inline). Richer custom
+layouts remain the build_reloptions pattern (index-AM style).
+Test module now exercises the helper; suite green.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ doc/src/sgml/tableam.sgml                     |  7 ++-
+ src/backend/access/common/reloptions.c        | 56 +++++++++++++++++++
+ src/include/access/reloptions.h               |  3 +
+ .../tableam_reloptions/tableam_reloptions.c   | 43 +++-----------
+ 4 files changed, 72 insertions(+), 37 deletions(-)
+
+diff --git a/doc/src/sgml/tableam.sgml b/doc/src/sgml/tableam.sgml
+index 1dfb6a16d72..2ec5178ba25 100644
+--- a/doc/src/sgml/tableam.sgml
++++ b/doc/src/sgml/tableam.sgml
+@@ -180,7 +180,12 @@ my_tableam_handler(PG_FUNCTION_ARGS)
+   </para>
+ 
+   <para>
+-   See <filename>src/test/modules/tableam_reloptions</filename> for a
++   Access methods that want the heap-standard options (fillfactor,
++   autovacuum, ...) composed with their own keys can call
++   <function>heap_reloptions_for_am</function> with the list of keys
++   they own; the standard keys are parsed by the heap parser and the
++   AM's keys are reserved for its own processing. See
++   <filename>src/test/modules/tableam_reloptions</filename> for a
+    working example that delegates all other callbacks to the heap.
+   </para>
+  </sect1>
+diff --git a/src/backend/access/common/reloptions.c b/src/backend/access/common/reloptions.c
+index 6db70c41c66..46dae88c854 100644
+--- a/src/backend/access/common/reloptions.c
++++ b/src/backend/access/common/reloptions.c
+@@ -1591,6 +1591,62 @@ untransformRelOptions(Datum options)
+  * AM's options parser function in the case of a tuple corresponding to an
+  * index, or NULL otherwise.
+  */
++/*
++ * Compose the heap-standard option set with keys owned by a table AM:
++ * the AM's keys are stripped from the raw list and the remainder is
++ * parsed by heap_reloptions, so an access method gets the standard
++ * options (fillfactor, autovacuum, ...) plus clean ownership of its
++ * own without duplicating heap's option registry. AMs wanting a
++ * richer layout use build_reloptions with their own parse table
++ * instead (the index-AM pattern).
++ */
++bytea *
++heap_reloptions_for_am(Datum reloptions, bool validate,
++					   const char *const *am_keys, int namkeys)
++{
++	ArrayType  *array;
++	Datum	   *elems;
++	int			nelems;
++	Datum	   *keep;
++	int			nkeep = 0;
++	int			i;
++
++	if (DatumGetPointer(reloptions) == NULL)
++		return heap_reloptions(RELKIND_RELATION, reloptions, validate);
++
++	deconstruct_array_builtin(DatumGetArrayTypeP(reloptions), TEXTOID,
++							  &elems, NULL, &nelems);
++
++	keep = (Datum *) palloc(nelems * sizeof(Datum));
++	for (i = 0; i < nelems; i++)
++	{
++		char	   *raw = TextDatumGetCString(elems[i]);
++		char	   *eq = strchr(raw, '=');
++		bool		owned = false;
++		int			k;
++
++		if (eq != NULL)
++			*eq = '\0';
++		for (k = 0; k < namkeys; k++)
++		{
++			if (strcmp(raw, am_keys[k]) == 0)
++			{
++				owned = true;
++				break;
++			}
++		}
++		if (owned)
++			continue;
++		if (eq != NULL)
++			*eq = '=';
++		keep[nkeep++] = elems[i];
++	}
++
++	array = construct_array_builtin(keep, nkeep, TEXTOID);
++	return heap_reloptions(RELKIND_RELATION, PointerGetDatum(array),
++						   validate);
++}
++
+ /*
+  * Parse a table's reloptions through its table AM when the AM provides a
+  * reloptions callback, else heap_reloptions. relam may be
+diff --git a/src/include/access/reloptions.h b/src/include/access/reloptions.h
+index 23531a7ec9d..3c5a25adaff 100644
+--- a/src/include/access/reloptions.h
++++ b/src/include/access/reloptions.h
+@@ -252,6 +252,9 @@ extern struct StdRdOptions *merge_toast_reloptions(const struct StdRdOptions *to
+ extern bytea *heap_reloptions(char relkind, Datum reloptions, bool validate);
+ extern bytea *view_reloptions(Datum reloptions, bool validate);
+ extern bytea *partitioned_table_reloptions(Datum reloptions, bool validate);
++extern bytea *heap_reloptions_for_am(Datum reloptions, bool validate,
++									 const char *const *am_keys,
++									 int namkeys);
+ extern bytea *table_am_reloptions(char relkind, Datum reloptions,
+ 								  bool validate, Oid relam);
+ extern bytea *index_reloptions(amoptions_function amoptions, Datum reloptions,
+diff --git a/src/test/modules/tableam_reloptions/tableam_reloptions.c b/src/test/modules/tableam_reloptions/tableam_reloptions.c
+index d226b1c7abc..a2466f51708 100644
+--- a/src/test/modules/tableam_reloptions/tableam_reloptions.c
++++ b/src/test/modules/tableam_reloptions/tableam_reloptions.c
+@@ -30,47 +30,18 @@ PG_MODULE_MAGIC;
+ /* the one AM-specific option this AM accepts */
+ #define TEST_OPTION_KEY "test_option"
+ 
++static const char *const test_am_keys[] = {TEST_OPTION_KEY};
++
+ static bytea *
+ tableam_reloptions_test_reloptions(Datum reloptions, bool validate)
+ {
+-	ArrayType  *array;
+-	Datum	   *elems;
+-	int			nelems;
+-	Datum	   *keep;
+-	int			nkeep = 0;
+-	int			i;
+-
+-	/* no WITH (...) at all: defer to heap defaults */
+-	if (DatumGetPointer(reloptions) == NULL)
+-		return heap_reloptions(RELKIND_RELATION, reloptions, validate);
+-
+-	array = DatumGetArrayTypeP(reloptions);
+-	deconstruct_array(array, TEXTOID, -1, false, TYPALIGN_INT,
+-					 &elems, NULL, &nelems);
+-
+ 	/*
+-	 * Strip the keys this AM owns, then let heap validate the remainder.
+-	 * A production AM would instead build its own options struct here
+-	 * (the build_reloptions pattern index AMs use).
++	 * One line: heap-standard options composed with this AM's own key.
++	 * Unknown keys (neither heap's nor ours) still error at
++	 * validate time, inside heap_reloptions.
+ 	 */
+-	keep = (Datum *) palloc(nelems * sizeof(Datum));
+-	for (i = 0; i < nelems; i++)
+-	{
+-		char	   *raw = TextDatumGetCString(elems[i]);
+-		char	   *eq = strchr(raw, '=');
+-
+-		if (eq != NULL)
+-			*eq = '\0';
+-		if (strcmp(raw, TEST_OPTION_KEY) == 0)
+-			continue;			/* owned by this AM */
+-		if (eq != NULL)
+-			*eq = '=';
+-		keep[nkeep++] = elems[i];
+-	}
+-
+-	array = construct_array_builtin(keep, nkeep, TEXTOID);
+-	return heap_reloptions(RELKIND_RELATION, PointerGetDatum(array),
+-						   validate);
++	return heap_reloptions_for_am(reloptions, validate,
++								  test_am_keys, 1);
+ }
+ 
+ PG_FUNCTION_INFO_V1(tableam_reloptions_handler);
+-- 
+2.43.0
+

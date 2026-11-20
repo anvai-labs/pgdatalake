@@ -140,3 +140,23 @@ Citing the reviewer feedback on "Custom reloptions for table AM"
 Branch anvai-labs:table-am-reloptions carries v2; the format-patch in
 this directory is regenerated from it. EMAIL STILL HELD until the
 patch builds + tests green and the user approves.
+
+## v2.1 (2026-11-20) — preset gap closed in-patch
+
+0002 exports heap_reloptions_for_am(reloptions, validate, am_keys,
+namkeys): AMs composing heap-standard options (fillfactor, autovacuum,
+...) with their own keys make ONE call instead of hand-stripping; the
+test AM now exercises exactly that helper (test_option + fillfactor
+co-exist and round-trip through the relcache — suite green). Richer
+custom layouts stay on the build_reloptions pattern (index-AM style).
+
+TDD coverage now spans (all in-patch, upstream regress green locally):
+- ALTER TABLE SET re-parse through the callback (relcache round-trip)
+- ALTER TABLE SET ACCESS METHOD ownership transfer (old AM's keys
+  rejected under the new AM)
+- preset composition via heap_reloptions_for_am
+- unknown-key rejection at CREATE (AM keys and heap keys)
+- plain-heap rejection of AM keys (effective-AM dispatch)
+- CREATE acceptance + relkind wiring
+SGML documents both the callback contract and the preset helper.
+Branch anvai-labs:table-am-reloptions = the 2-patch series.
