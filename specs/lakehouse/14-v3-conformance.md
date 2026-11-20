@@ -65,10 +65,21 @@ pyiceberg 0.12's local scan planning does NOT yet apply DVs (our reader
 is the engine that does). Remaining refinement: bloom-filter acceleration
 (perf). Gate #2 lifted.
 
-**V2 — v3 fixture matrix (partially done).** The Java COW-less DV matrix
-is in place (see V1). Remaining: pyiceberg `format_version=3` COW tables
-through our pipeline, and a Trino read gate against our v3 fixtures. Gate
-#2 is already lifted.
+**V2 — v3 fixture matrix: DONE 2026-11-20.** Two independent v3 writers
+verified against our reader: (1) the Java reference implementation (V1
+fixture), (2) **Trino 484's own v3 DELETE** — Trino emits DVs for v3
+tables, its puffin container decodes with the same layout, and our
+end-to-end fixture test (`dv_trino_fixture_tests`) reads Trino's table
+applying its deletions (ids 3,5 gone). pyiceberg leg is CLOSED as
+impossible-and-moot: pyiceberg 0.12 cannot write v3 at all (upstream
+#1551) — and its local scan planning does not apply DVs anyway; its DV
+blob decoder remains the third independent verifier of the wire format.
+Notable wire facts from the Trino leg: Trino's manifests are COMPRESSED
+avro containers (path remapping requires decode/re-serialize); Trino
+validates the DV blob CRC over magic+data and reads the blob via the
+manifest's content-offset/content-size-in-snapshot fields (which our
+hand-rolled Java writer had to populate — pyiceberg's property-based
+lookup is the lenient variant).
 
 **V3 — DV write mode + v3 emission.** `lakehouse.write_mode =
 merge_on_read` emits DVs (Puffin blobs + manifest entries); the writer

@@ -2759,3 +2759,161 @@ mod dv_fixture_tests {
         );
     }
 }
+
+/// V2 gate (doc 14): the same pipeline against a table written by
+/// TRINO 484 (its v3 DELETE emits DVs). Trino's manifests are
+/// COMPRESSED avro containers — their embedded s3:// paths cannot be
+/// byte-patched, so the test re-serializes manifests via the crate's
+/// own readers/writers with paths remapped to a same-length local
+/// prefix; the (uncompressed) metadata JSON and puffin footer are
+/// byte-patched directly.
+#[cfg(test)]
+mod dv_trino_fixture_tests {
+    use crate::catalog::metadata::TableMetadata;
+    use crate::manifest::ManifestEntryStatus;
+    use crate::scan::{load_row_deletes, open_for, plan_scan};
+
+    fn remap(bytes: &[u8], from: &str, to: &str) -> Vec<u8> {
+        let text = String::from_utf8_lossy(bytes).replace(from, to);
+        text.into_bytes()
+    }
+
+    #[test]
+    fn trino_v3_dv_fixture_reads_with_deletions_applied() {
+        let src =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v3_dv_trino");
+        crate::storage::test_allow_local_stores();
+
+        let s3_prefix = "s3://warehouse/trino_v3-cdb345082a0747418ac2e79892c813dd";
+        let local_prefix = "/tmp/pdtl-trino-v3-fixture-00000000000000000000000000000";
+        assert_eq!(s3_prefix.len(), local_prefix.len(), "byte-for-byte rename");
+        let dst = std::path::Path::new(local_prefix);
+        let _ = std::fs::remove_dir_all(dst);
+
+        std::fs::create_dir_all(dst.join("metadata")).unwrap();
+        std::fs::create_dir_all(dst.join("data")).unwrap();
+
+        // metadata JSON: string remap (uncompressed)
+        for f in ["00002-01a1faef-257d-7771-8e08-77571d3a8d2metadata.json"] {
+            let out = remap(
+                &std::fs::read(src.join("metadata").join(f)).unwrap(),
+                s3_prefix,
+                local_prefix,
+            );
+            std::fs::write(dst.join("metadata").join(f), out).unwrap();
+        }
+
+        // manifest-lists (compressed avro): decode -> remap -> re-serialize
+        for f in [
+            "snap-6666542285715108362-1-ded03e45-7188-4151-8ac1-8cd818ce5d0b.avro",
+            "snap-7002360096778060333-1-c8f3429c-a643-49d5-bb73-b60412927f83.avro",
+            "snap-8135731491675097439-1-99eca9d5-4a25-4d10-8805-7d4a1f7aae3c.avro",
+        ] {
+            let entries = crate::manifest::parse_manifest_list(
+                &std::fs::read(src.join("metadata").join(f)).unwrap(),
+            )
+            .unwrap();
+            let mut remapped = entries.clone();
+            for e in &mut remapped {
+                e.manifest_path = e.manifest_path.replace(s3_prefix, local_prefix);
+            }
+            let bytes = crate::snapshot_write::build_manifest_list_bytes(&remapped).unwrap();
+            std::fs::write(dst.join("metadata").join(f), bytes).unwrap();
+        }
+
+        // manifests (compressed avro): decode -> remap data/DV paths ->
+        // re-serialize preserving statuses
+        for f in [
+            "99eca9d5-4a25-4d10-8805-7d4a1f7aae3c-m0.avro",
+            "c8f3429c-a643-49d5-bb73-b60412927f83-m0.avro",
+        ] {
+            let entries = crate::manifest::parse_manifest(
+                &std::fs::read(src.join("metadata").join(f)).unwrap(),
+            )
+            .unwrap();
+            let mut remapped = entries.clone();
+            for e in &mut remapped {
+                e.data_file.file_path = e.data_file.file_path.replace(s3_prefix, local_prefix);
+            }
+            let bytes = crate::snapshot_write::build_manifest_bytes_entries(&remapped).unwrap();
+            std::fs::write(dst.join("metadata").join(f), bytes).unwrap();
+        }
+
+        // parquet: no embedded paths
+        std::fs::copy(
+            src.join(
+                "data/20261120_214856_00025_ex4ny-07990454-7cad-4bd2-92a7-081369ce0042.parquet",
+            ),
+            dst.join(
+                "data/20261120_214856_00025_ex4ny-07990454-7cad-4bd2-92a7-081369ce0042.parquet",
+            ),
+        )
+        .unwrap();
+
+        // puffin: uncompressed footer JSON carries referenced-data-file —
+        // same-length byte patch
+        {
+            let mut bytes = std::fs::read(src.join(
+                "data/dv-20261120_214858_00026_ex4ny-9c4239f4-3360-4a90-8410-10f9ee652cde.puffin",
+            ))
+            .unwrap();
+            let mut i = 0;
+            let from = s3_prefix.as_bytes();
+            let to = local_prefix.as_bytes();
+            while i + from.len() <= bytes.len() {
+                if &bytes[i..i + from.len()] == from {
+                    bytes[i..i + to.len()].copy_from_slice(to);
+                    i += to.len();
+                } else {
+                    i += 1;
+                }
+            }
+            std::fs::write(
+                dst.join("data/dv-20261120_214858_00026_ex4ny-9c4239f4-3360-4a90-8410-10f9ee652cde.puffin"),
+                bytes,
+            )
+            .unwrap();
+        }
+
+        let md_path = dst.join("metadata/00002-01a1faef-257d-7771-8e08-77571d3a8d2metadata.json");
+        let md: TableMetadata =
+            serde_json::from_str(&std::fs::read_to_string(&md_path).expect("fixture metadata"))
+                .expect("parse");
+        assert_eq!(
+            md.format_version,
+            crate::catalog::metadata::FormatVersion::V3
+        );
+
+        let plan = plan_scan(&md, None, None, None).expect("plan_scan");
+        assert_eq!(plan.data_files, 1, "one data file");
+        assert_eq!(plan.delete_tasks.len(), 1, "one DV delete file");
+
+        let schema = md.current_schema().expect("schema");
+        let deletes = load_row_deletes(&plan, None, &schema).expect("load deletes");
+        let data_path = plan.tasks[0].entry.data_file.file_path.clone();
+        let row_deletes = deletes
+            .for_task(&data_path, plan.tasks[0].sequence_number, false)
+            .expect("for_task");
+        assert_eq!(
+            row_deletes.positions,
+            [2u64, 4u64]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+
+        let (io, key) = open_for(&data_path, None).expect("open data");
+        let mut rows =
+            crate::parquet::ParquetRows::open_with_deletes(&io, &key, &["id"], row_deletes)
+                .expect("open rows");
+        let mut ids = Vec::new();
+        while rows.next() {
+            match rows.value(0) {
+                crate::parquet::CellValue::Int64(v) => ids.push(v),
+                other => panic!("unexpected id cell: {other:?}"),
+            }
+        }
+        ids.sort();
+        assert_eq!(ids, vec![1, 2, 4], "Trino deleted ids 3,5 via DV");
+        let _ = ManifestEntryStatus::Added;
+    }
+}

@@ -853,3 +853,21 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     scan; the old gate test rewritten). E2E: Java fixture → plan →
     DV decode → {1,2,4,6}. 100 cargo tests green. V2 remainder:
     pyiceberg format_version=3 COW tables + Trino gate.
+  - V2 slice (doc 14) — DONE 2026-11-20: TRINO 484 writes v3 DVs (its
+    v3 DELETE) and OUR reader applies them (e2e fixture
+    tests/fixtures/v3_dv_trino, dv_trino_fixture_tests: Trino deleted
+    ids 3,5 -> we read {1,2,4}). pyiceberg leg closed: pyiceberg 0.12
+    CANNOT write v3 at all (upstream #1551) — Java + Trino are the two
+    real v3 writers, both verified. WIRE NOTES: Trino manifests are
+    COMPRESSED avro (byte-patching impossible — the test re-serializes
+    manifests via build_manifest_list_bytes/build_manifest_bytes_entries
+    with remapped paths); Trino validates DV CRC over magic+data and
+    locates the blob via the manifest's content-offset/
+    content-size-in-snapshot fields (populate BOTH in hand-rolled DV
+    writers; pyiceberg's property lookup is lenient); Trino table
+    registration via Lakekeeper register + its location must be a valid
+    s3:// sublocation (Java s3a:// rejected). Trino writes DVs on v3
+    DELETE — verified self-consistent, then decoded by us + pyiceberg.
+    Fixture gen: docker trino CLI (CREATE TABLE WITH format_version=3,
+    INSERT, DELETE). V3 (DV write mode) remains future; M3 slice 24
+    columnar reads is the next major slice.
