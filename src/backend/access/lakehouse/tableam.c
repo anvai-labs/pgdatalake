@@ -1046,7 +1046,28 @@ lakehouse_scan_getnextslot(TableScanDesc bscan, ScanDirection direction,
 								file, errbuf)));
 		}
 
-		if (pg_datalake_rows_next(scan->rows))
+		/* 13-review #8: explicit ROW/EOF/ERROR — a caught panic used to
+		 * look like EOF (silent truncation); errors abort the scan. */
+		{
+			char		next_err[1024];
+			int			nst;
+
+			next_err[0] = '\0';
+			nst = pg_datalake_rows_next(scan->rows, next_err, sizeof(next_err));
+			if (nst == 2)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_EXCEPTION),
+						 errmsg("lakehouse: row read failed in task %llu: %s",
+								(unsigned long long) scan->current_task,
+								next_err[0] != '\0' ? next_err : "unknown error")));
+			if (nst == 1)
+			{
+				pg_datalake_rows_close(scan->rows);
+				scan->rows = NULL;
+				scan->current_task++;
+				continue;
+			}
+		}
 		{
 			ExecClearTuple(slot);
 			for (i = 0; i < tupdesc->natts; i++)
@@ -1067,10 +1088,6 @@ lakehouse_scan_getnextslot(TableScanDesc bscan, ScanDirection direction,
 			ExecStoreVirtualTuple(slot);
 			return true;
 		}
-
-		pg_datalake_rows_close(scan->rows);
-		scan->rows = NULL;
-		scan->current_task++;
 	}
 }
 

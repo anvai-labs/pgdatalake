@@ -111,3 +111,28 @@ SELECT lakehouse.migrate_table('local_tbl', dest => 's3://wh/tbl',
 -- copies a heap table into a new managed Iceberg table in batches,
 -- resumable via pg_lakehouse.maintenance_log
 ```
+
+## Type-boundary hardening (2026-11-20, 13-review blocker #8a — read path)
+
+The C/Rust row boundary has an explicit ROW/EOF/ERROR status
+(`pg_datalake_rows_next`): a caught Rust panic used to return `false` —
+indistinguishable from EOF, silently truncating result sets. Errors
+abort the statement with ERRCODE_DATA_EXCEPTION and a bounded diagnostic
+naming the column and the problem. Cell-level rules:
+
+- Unsupported Arrow types **fail at open** (`is_supported_arrow_type`
+  validation over the full read set, equality-delete columns included) —
+  unknown types used to surface as SQL NULL per cell, fabricating empty
+  data. Nested types remain unsupported (loud) until the type-matrix
+  slice.
+- `LargeUtf8`/`LargeBinary` have their OWN arrow array types — the
+  shared small-offset downcast silently NULLed them; both decode now.
+- An interior NUL byte in a text value is an ERROR (it used to become an
+  EMPTY string).
+- Write-side exported functions (`write_push`, `write_flush`,
+  `write_commit`) carry the same catch_unwind boundary as scan-open.
+
+Remaining #8 write-path items (typmod, name-Datum, dropped-attribute
+row/schema mismatch, decimal scale reconciliation, whole-row validation
+before builder mutation, counted projection fields, bytea_output
+independence) are the 8b slice.

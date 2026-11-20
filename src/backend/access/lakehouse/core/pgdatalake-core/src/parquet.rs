@@ -220,6 +220,20 @@ impl ParquetRows {
             column_indices.push(idx);
         }
 
+        // 13-review #8: unsupported Arrow types must fail BEFORE rows are
+        // returned — the per-cell fallthrough maps unknown types to SQL
+        // NULL, which silently fabricates data. eq columns are validated
+        // too: an unmatchable key type would make deletes never apply.
+        for (i, name) in read_names.iter().enumerate() {
+            let ty = arrow_schema.field(column_indices[i]).data_type();
+            if !is_supported_arrow_type(ty) {
+                return Err(StorageError::Config(format!(
+                    "column {name:?} has unsupported type {ty} in this reader; \
+                     unsupported columns must not surface as NULL"
+                )));
+            }
+        }
+
         // eq columns resolve against the arrow schema independently (they
         // may be projected or internal)
         let mut eq_col_indices = Vec::with_capacity(deletes.equality.len());
@@ -386,6 +400,32 @@ impl ParquetRows {
     }
 }
 
+/// The Arrow types this reader converts WITHOUT loss or fabrication
+/// (13-review #8). Open-time validation rejects anything else loudly.
+fn is_supported_arrow_type(ty: &arrow::datatypes::DataType) -> bool {
+    use arrow::datatypes::DataType as DT;
+    match ty {
+        DT::Boolean
+        | DT::Int32
+        | DT::Int64
+        | DT::Date64
+        | DT::Date32
+        | DT::Time32(_)
+        | DT::Time64(_)
+        | DT::Timestamp(_, _)
+        | DT::Float32
+        | DT::Float64
+        | DT::Utf8
+        | DT::LargeUtf8
+        | DT::Binary
+        | DT::LargeBinary
+        | DT::Decimal128(_, _)
+        | DT::FixedSizeBinary(_) => true,
+        // nested types land with the type-matrix slice (doc 05)
+        _ => false,
+    }
+}
+
 fn cell_from_arrow(col: &dyn arrow::array::Array, row: usize) -> CellValue {
     use arrow::array::*;
     use arrow::datatypes::DataType as DT;
@@ -480,15 +520,36 @@ fn cell_from_arrow(col: &dyn arrow::array::Array, row: usize) -> CellValue {
             .downcast_ref::<Float64Array>()
             .map(|a| CellValue::Float64(a.value(row)))
             .unwrap_or(CellValue::Null),
-        DT::Utf8 | DT::LargeUtf8 => col
+        // LargeUtf8 has its OWN array type — downcasting it to StringArray
+        // failed silently and surfaced SQL NULL (13-review #8)
+        DT::Utf8 => col
             .as_any()
             .downcast_ref::<StringArray>()
             .map(|a| CellValue::Str(a.value(row).to_string()))
             .unwrap_or(CellValue::Null),
+        DT::LargeUtf8 => col
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .map(|a| CellValue::Str(a.value(row).to_string()))
+            .unwrap_or(CellValue::Null),
         // binary -> bytea hex text ('\x…', bytea_in-compatible; slice 21)
-        DT::Binary | DT::LargeBinary => col
+        DT::Binary => col
             .as_any()
             .downcast_ref::<BinaryArray>()
+            .map(|a| {
+                let b = a.value(row);
+                let mut hex = String::with_capacity(2 + b.len() * 2);
+                hex.push_str("\\x");
+                for x in b {
+                    hex.push_str(&format!("{x:02x}"));
+                }
+                CellValue::Str(hex)
+            })
+            .unwrap_or(CellValue::Null),
+        // LargeBinary likewise has its own array type (13-review #8)
+        DT::LargeBinary => col
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
             .map(|a| {
                 let b = a.value(row);
                 let mut hex = String::with_capacity(2 + b.len() * 2);

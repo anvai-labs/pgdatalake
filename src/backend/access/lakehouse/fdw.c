@@ -1050,7 +1050,34 @@ lakehouse_IterateForeignScan(ForeignScanState *node)
 								file, errbuf)));
 		}
 
-		if (pg_datalake_rows_next(state->rows))
+		/*
+		 * 13-review #8: explicit ROW/EOF/ERROR status — a caught panic
+		 * used to return false, INDISTINGUISHABLE FROM EOF (silent
+		 * result-set truncation). Errors abort the statement after the
+		 * rows already returned.
+		 */
+		{
+			char		next_err[1024];
+			int			nst;
+
+			next_err[0] = '\0';
+			nst = pg_datalake_rows_next(state->rows, next_err, sizeof(next_err));
+			if (nst == 2)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_EXCEPTION),
+						 errmsg("lakehouse: row read failed in task %llu after %llu rows: %s",
+								(unsigned long long) state->current_task,
+								(unsigned long long) state->current_task,
+								next_err[0] != '\0' ? next_err : "unknown error")));
+			if (nst == 1)
+			{
+				/* task exhausted: advance to the next one */
+				pg_datalake_rows_close(state->rows);
+				state->rows = NULL;
+				state->current_task++;
+				continue;
+			}
+		}
 		{
 			Datum	   *values = (Datum *) palloc(tupdesc->natts * sizeof(Datum));
 			bool	   *nulls = (bool *) palloc(tupdesc->natts * sizeof(bool));
@@ -1084,10 +1111,6 @@ lakehouse_IterateForeignScan(ForeignScanState *node)
 			return ExecStoreHeapTuple(tuple, slot, false);
 		}
 
-		/* task exhausted: advance to the next one */
-		pg_datalake_rows_close(state->rows);
-		state->rows = NULL;
-		state->current_task++;
 	}
 }
 

@@ -226,7 +226,7 @@ pub unsafe extern "C" fn pg_datalake_scan_task_file(
 /// `session` must be NULL or a live handle from `pg_datalake_scan_new`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_datalake_scan_snapshot_id(session: *mut ScanSession) -> i64 {
-    match (unsafe { session.as_ref() }) {
+    match unsafe { session.as_ref() } {
         Some(s) => s.plan.snapshot_id,
         None => 0,
     }
@@ -255,50 +255,58 @@ pub struct RowsHandle {
     column_names: Vec<CString>,
     current_row: Vec<CString>,
     current_null: Vec<bool>,
+    /// Diagnostic of the last ERROR status (13-review #8 ROW/EOF/ERROR).
+    last_err: Option<String>,
 }
 
 /// Render the current row into C strings; nulls become empty strings with
 /// the null flag set in parallel.
-fn render_row(rows: &mut crate::parquet::ParquetRows) -> (Vec<CString>, Vec<bool>) {
+/// Render one row; Err on any cell that cannot cross the C boundary
+/// (interior NUL bytes previously became EMPTY strings — 13-review #8).
+/// Uniform panic-to-message formatting for the C boundary (13-review #8).
+fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(x) = panic.downcast_ref::<&str>() {
+        (*x).to_string()
+    } else if let Some(x) = panic.downcast_ref::<String>() {
+        x.clone()
+    } else {
+        "pgdatalake-core panic".to_string()
+    }
+}
+
+fn render_row(rows: &mut crate::parquet::ParquetRows) -> Result<(Vec<CString>, Vec<bool>), String> {
     let mut vals = Vec::with_capacity(rows.column_names().len());
     let mut nulls = Vec::with_capacity(rows.column_names().len());
     for i in 0..rows.column_names().len() {
-        match rows.value(i) {
+        let c = match rows.value(i) {
             crate::parquet::CellValue::Null => {
                 vals.push(CString::new("").unwrap_or_default());
                 nulls.push(true);
+                continue;
             }
-            crate::parquet::CellValue::Bool(b) => {
-                vals.push(CString::new(if b { "t" } else { "f" }).unwrap_or_default());
-                nulls.push(false);
-            }
-            crate::parquet::CellValue::Int64(n) => {
-                vals.push(CString::new(n.to_string()).unwrap_or_default());
-                nulls.push(false);
-            }
+            crate::parquet::CellValue::Bool(b) => if b { "t" } else { "f" }.to_string(),
+            crate::parquet::CellValue::Int64(n) => n.to_string(),
             crate::parquet::CellValue::TimestampMicros(us) => {
-                vals.push(
-                    CString::new(crate::parquet::format_timestamp_micros(us)).unwrap_or_default(),
-                );
-                nulls.push(false);
+                crate::parquet::format_timestamp_micros(us)
             }
-            crate::parquet::CellValue::Float64(f) => {
-                vals.push(CString::new(f.to_string()).unwrap_or_default());
-                nulls.push(false);
-            }
-            crate::parquet::CellValue::Str(s) => {
-                vals.push(CString::new(s).unwrap_or_default());
-                nulls.push(false);
-            }
+            crate::parquet::CellValue::Float64(f) => f.to_string(),
+            crate::parquet::CellValue::Str(s) => s,
             crate::parquet::CellValue::Bytes(b) => {
                 // text form: hex — typed binary Datum conversion is the FDW's job
-                let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
-                vals.push(CString::new(hex).unwrap_or_default());
-                nulls.push(false);
+                b.iter().map(|x| format!("{x:02x}")).collect()
             }
-        }
+        };
+        let cstr = CString::new(c).map_err(|_| {
+            format!(
+                "column {:?} value contains an interior NUL byte and cannot be \
+                 returned as text",
+                rows.column_names().get(i).cloned().unwrap_or_default()
+            )
+        })?;
+        vals.push(cstr);
+        nulls.push(false);
     }
-    (vals, nulls)
+    Ok((vals, nulls))
 }
 
 /// Open a projected row iterator over task `task_idx` of `session`.
@@ -378,6 +386,7 @@ pub unsafe extern "C" fn pg_datalake_rows_open(
             column_names,
             current_row: Vec::new(),
             current_null: Vec::new(),
+            last_err: None,
         })
     });
     let handle = result.unwrap_or_else(|panic| {
@@ -404,21 +413,52 @@ pub unsafe extern "C" fn pg_datalake_rows_open(
 /// # Safety
 /// `rows` must be a live handle from pg_datalake_rows_open.
 #[no_mangle]
-pub unsafe extern "C" fn pg_datalake_rows_next(rows: *mut RowsHandle) -> bool {
+pub unsafe extern "C" fn pg_datalake_rows_next(
+    rows: *mut RowsHandle,
+    err_buf: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    /// Explicit advance status (13-review #8): a caught panic used to
+    /// return `false` — INDISTINGUISHABLE FROM EOF, silently truncating
+    /// result sets.
+    pub const ROW: i32 = 0;
+    pub const EOF: i32 = 1;
+    pub const ERROR: i32 = 2;
     let Some(h) = rows.as_mut() else {
-        return false;
+        unsafe { set_err(err_buf, err_len, "NULL rows handle") };
+        return ERROR;
     };
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if h.rows.next() {
-            let (vals, nulls) = render_row(&mut h.rows);
-            h.current_row = vals;
-            h.current_null = nulls;
-            true
+            render_row(&mut h.rows).map(|(vals, nulls)| {
+                h.current_row = vals;
+                h.current_null = nulls;
+                ROW
+            })
         } else {
-            false
+            Ok(EOF)
         }
-    }))
-    .unwrap_or(false)
+    }));
+    match outcome {
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => {
+            h.last_err = Some(e.clone());
+            unsafe { set_err(err_buf, err_len, &e) };
+            ERROR
+        }
+        Err(panic) => {
+            let m = if let Some(x) = panic.downcast_ref::<&str>() {
+                format!("pgdatalake-core panic: {x}")
+            } else if let Some(x) = panic.downcast_ref::<String>() {
+                format!("pgdatalake-core panic: {x}")
+            } else {
+                "pgdatalake-core panic".to_string()
+            };
+            h.last_err = Some(m.clone());
+            unsafe { set_err(err_buf, err_len, &m) };
+            ERROR
+        }
+    }
 }
 
 /// Column count of the projection.
@@ -723,13 +763,20 @@ pub unsafe extern "C" fn pg_datalake_write_push(
             return false;
         }
     };
-    match ws.writer.push(&cells) {
-        Ok(()) => {
+    // 13-review #8: consistent panic boundary — a Rust-side panic must
+    // surface as a loud error, never unwind into C.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ws.writer.push(&cells))) {
+        Ok(Ok(())) => {
             ws.staged_rows += 1;
             true
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             unsafe { set_err(err_buf, err_len, &e.to_string()) };
+            false
+        }
+        Err(panic) => {
+            let m = panic_message(&panic);
+            unsafe { set_err(err_buf, err_len, &format!("write push: {m}")) };
             false
         }
     }
@@ -759,10 +806,17 @@ pub unsafe extern "C" fn pg_datalake_write_flush(
     } else {
         format!("{}/data", ws.key_prefix)
     };
-    let wf = match ws.writer.write_file(&ws.io, &data_dir, ws.file_seq) {
-        Ok(w) => w,
-        Err(e) => {
+    let wf = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ws.writer.write_file(&ws.io, &data_dir, ws.file_seq)
+    })) {
+        Ok(Ok(w)) => w,
+        Ok(Err(e)) => {
             unsafe { set_err(err_buf, err_len, &format!("write flush: {e}")) };
+            return false;
+        }
+        Err(panic) => {
+            let m = panic_message(&panic);
+            unsafe { set_err(err_buf, err_len, &format!("write flush: {m}")) };
             return false;
         }
     };
@@ -821,19 +875,25 @@ pub unsafe extern "C" fn pg_datalake_write_commit(
         return std::ptr::null_mut();
     }
     let ns_refs: Vec<&str> = ws.namespace.iter().map(|s| s.as_str()).collect();
-    match ws
-        .client
-        .commit_append(&ws.state, &ns_refs, &ws.table, &ws.flushed, retries)
-    {
-        Ok(loc) => {
+    let commit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ws.client
+            .commit_append(&ws.state, &ns_refs, &ws.table, &ws.flushed, retries)
+    }));
+    match commit {
+        Ok(Ok(loc)) => {
             ws.flushed.clear();
             match std::ffi::CString::new(loc) {
                 Ok(c) => c.into_raw(),
                 Err(_) => std::ptr::null_mut(),
             }
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             unsafe { set_err(err_buf, err_len, &format!("lakehouse commit: {e}")) };
+            std::ptr::null_mut()
+        }
+        Err(panic) => {
+            let m = panic_message(&panic);
+            unsafe { set_err(err_buf, err_len, &format!("lakehouse commit: {m}")) };
             std::ptr::null_mut()
         }
     }
@@ -1381,7 +1441,9 @@ mod tests {
                 CStr::from_ptr(err.as_ptr()).to_string_lossy()
             });
             let mut ids = Vec::new();
-            while unsafe { pg_datalake_rows_next(rows) } {
+            let mut next_err = [0i8; 1024];
+            while unsafe { pg_datalake_rows_next(rows, next_err.as_mut_ptr() as *mut _, 1024) } == 0
+            {
                 let n = unsafe { pg_datalake_rows_column_count(rows) };
                 assert_eq!(n, 1);
                 let v = unsafe { pg_datalake_rows_col_text(rows, 0) };
@@ -1712,7 +1774,9 @@ mod tests {
             };
             assert!(!rows.is_null(), "rows_open: {}", errmsg(&err));
             let mut ids = Vec::new();
-            while unsafe { pg_datalake_rows_next(rows) } {
+            let mut next_err = [0i8; 1024];
+            while unsafe { pg_datalake_rows_next(rows, next_err.as_mut_ptr() as *mut _, 1024) } == 0
+            {
                 let v = unsafe { pg_datalake_rows_col_text(rows, 0) };
                 ids.push(unsafe { CStr::from_ptr(v) }.to_string_lossy().into_owned());
             }
@@ -1720,5 +1784,165 @@ mod tests {
             assert_eq!(ids, vec!["1", "2"], "WROTE 1,2; READ 1,2");
         }
         unsafe { pg_datalake_scan_free(session) };
+    }
+
+    /// 13-review #8: unsupported Arrow types fail AT OPEN with a loud
+    /// message — they used to surface as SQL NULL per cell (fabricated
+    /// empty data).
+    #[test]
+    fn unsupported_arrow_type_is_loud_at_open() {
+        use arrow::array::{ArrayRef, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "nested",
+                DataType::Struct(vec![Field::new("x", DataType::Int64, true)].into()),
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                arrow::array::new_null_array(
+                    &DataType::Struct(vec![Field::new("x", DataType::Int64, true)].into()),
+                    1,
+                ),
+            ],
+        )
+        .unwrap();
+        let f = std::fs::File::create(dir.path().join("nested.parquet")).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let io = crate::storage::StorageIo::open(
+            &crate::storage::parse_location(&format!("file://{}", dir.path().display())).unwrap(),
+            None,
+        )
+        .unwrap();
+        let err = crate::parquet::ParquetRows::open(&io, "nested.parquet", &["id", "nested"])
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsupported type"),
+            "unsupported type must be a loud open error: {msg}"
+        );
+    }
+
+    /// 13-review #8: an interior NUL in a text value is an ERROR status —
+    /// it used to become an EMPTY string silently.
+    #[test]
+    fn interior_nul_is_error_status() {
+        use arrow::array::{ArrayRef, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use std::ffi::CStr;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "s",
+            DataType::Utf8,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec![Some("a\0b")])) as ArrayRef],
+        )
+        .unwrap();
+        let f = std::fs::File::create(dir.path().join("nul.parquet")).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let io = crate::storage::StorageIo::open(
+            &crate::storage::parse_location(&format!("file://{}", dir.path().display())).unwrap(),
+            None,
+        )
+        .unwrap();
+        let rows = crate::parquet::ParquetRows::open(&io, "nul.parquet", &["s"]).expect("open ok");
+        let h = Box::into_raw(Box::new(RowsHandle {
+            rows,
+            column_names: vec![CString::new("s").unwrap()],
+            current_row: Vec::new(),
+            current_null: Vec::new(),
+            last_err: None,
+        }));
+        let mut err = [0i8; 1024];
+        let st = unsafe { pg_datalake_rows_next(h, err.as_mut_ptr() as *mut _, 1024) };
+        assert_eq!(st, 2, "NUL value must be ERROR status, got {st}");
+        let msg = unsafe { CStr::from_ptr(err.as_ptr()) }.to_string_lossy();
+        assert!(
+            msg.contains("NUL"),
+            "diagnostic must name the problem: {msg}"
+        );
+        unsafe { drop(Box::from_raw(h)) };
+    }
+
+    /// 13-review #8: LargeUtf8 columns decode — downcasting them to
+    /// StringArray silently produced SQL NULL.
+    #[test]
+    fn large_utf8_decodes() {
+        use arrow::array::{ArrayRef, LargeStringArray};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use std::ffi::CStr;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "s",
+            DataType::LargeUtf8,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(LargeStringArray::from(vec![Some("big")])) as ArrayRef],
+        )
+        .unwrap();
+        let f = std::fs::File::create(dir.path().join("large.parquet")).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let io = crate::storage::StorageIo::open(
+            &crate::storage::parse_location(&format!("file://{}", dir.path().display())).unwrap(),
+            None,
+        )
+        .unwrap();
+        let rows = crate::parquet::ParquetRows::open(&io, "large.parquet", &["s"])
+            .expect("LargeUtf8 must open");
+        let h = Box::into_raw(Box::new(RowsHandle {
+            rows,
+            column_names: vec![CString::new("s").unwrap()],
+            current_row: Vec::new(),
+            current_null: Vec::new(),
+            last_err: None,
+        }));
+        let mut err = [0i8; 1024];
+        assert_eq!(
+            unsafe { pg_datalake_rows_next(h, err.as_mut_ptr() as *mut _, 1024) },
+            0,
+            "row status"
+        );
+        let v = unsafe { pg_datalake_rows_col_text(h, 0) };
+        assert_eq!(
+            unsafe { CStr::from_ptr(v) }.to_string_lossy(),
+            "big",
+            "LargeUtf8 value must decode, not NULL"
+        );
+        unsafe { drop(Box::from_raw(h)) };
     }
 }
