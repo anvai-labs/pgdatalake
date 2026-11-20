@@ -1,0 +1,615 @@
+//! Iceberg metadata WRITERS (M2 slice 27a): manifest avro, manifest-list
+//! avro, and snapshot assembly — the bridge between slice 24 (parquet data
+//! files) and slice 25 (commitTable client). Per doc 07 §2 step 1-2: flush
+//! staged batches, build the snapshot (AddSnapshot + SetSnapshotRef
+//! updates ride to the catalog; the client never rewrites metadata.json).
+//!
+//! Write schemas are the spec-shaped manifest structures with explicit
+//! `field-id` annotations (matching pyiceberg/Trino id assignments) —
+//! other engines' readers map manifest fields by field-id, so missing
+//! annotations would break the slice-29 "Trino reads a table we wrote"
+//! gate even though OUR reader parses by name from the embedded schema.
+
+use std::collections::BTreeMap;
+
+use apache_avro::{Schema as AvroSchema, Writer};
+use uuid::Uuid;
+
+use crate::catalog::metadata::Snapshot;
+use crate::manifest::DataContent;
+use crate::storage::{StorageError, StorageIo};
+
+/// The manifest WRITE schema: same shape as the read-side reference
+/// (manifest.rs) but with `field-id` annotations per the Iceberg spec /
+/// pyiceberg id assignments. Field ORDER matters for avro and matches the
+/// read-side constant.
+pub const MANIFEST_ENTRY_WRITE_SCHEMA_V2: &str = r#"{
+    "type": "record",
+    "name": "manifest_entry",
+    "fields": [
+        {"name": "status", "type": "int", "field-id": 0},
+        {"name": "snapshot_id", "type": "long", "field-id": 1},
+        {"name": "sequence_number", "type": ["null", "long"], "field-id": 3},
+        {"name": "file_sequence_number", "type": ["null", "long"], "field-id": 4},
+        {"name": "data_file", "type": {
+            "type": "record", "name": "data_file", "field-id": 2,
+            "fields": [
+                {"name": "content", "type": "int", "field-id": 134},
+                {"name": "file_path", "type": "string", "field-id": 100},
+                {"name": "file_format", "type": "string", "field-id": 101},
+                {"name": "partition", "type": ["null", {"type": "record", "name": "r_part", "field-id": 102, "fields": []}], "field-id": 102},
+                {"name": "record_count", "type": "long", "field-id": 103},
+                {"name": "file_size_in_bytes", "type": "long", "field-id": 104},
+                {"name": "column_sizes", "type": ["null", {"type": "array", "field-id": 108, "items": {"type": "record", "name": "kv_long", "field-id": 117, "fields": [{"name": "key", "type": "int", "field-id": 117}, {"name": "value", "type": "long", "field-id": 118}]}}], "field-id": 108},
+                {"name": "value_counts", "type": ["null", {"type": "array", "field-id": 109, "items": {"type": "record", "name": "kv_long_v2", "field-id": 119, "fields": [{"name": "key", "type": "int", "field-id": 119}, {"name": "value", "type": "long", "field-id": 120}]}}], "field-id": 109},
+                {"name": "null_value_counts", "type": ["null", {"type": "array", "field-id": 110, "items": {"type": "record", "name": "kv_long_v3", "field-id": 121, "fields": [{"name": "key", "type": "int", "field-id": 121}, {"name": "value", "type": "long", "field-id": 122}]}}], "field-id": 110},
+                {"name": "nan_value_counts", "type": ["null", {"type": "array", "field-id": 137, "items": {"type": "record", "name": "kv_long_v4", "field-id": 138, "fields": [{"name": "key", "type": "int", "field-id": 138}, {"name": "value", "type": "long", "field-id": 139}]}}], "field-id": 137},
+                {"name": "lower_bounds", "type": ["null", {"type": "array", "field-id": 125, "items": {"type": "record", "name": "kv_bytes_v1", "field-id": 126, "fields": [{"name": "key", "type": "int", "field-id": 126}, {"name": "value", "type": "bytes", "field-id": 127}]}}], "field-id": 125},
+                {"name": "upper_bounds", "type": ["null", {"type": "array", "field-id": 128, "items": {"type": "record", "name": "kv_bytes_v2", "field-id": 129, "fields": [{"name": "key", "type": "int", "field-id": 129}, {"name": "value", "type": "bytes", "field-id": 130}]}}], "field-id": 128},
+                {"name": "key_metadata", "type": ["null", "bytes"], "field-id": 131},
+                {"name": "split_offsets", "type": ["null", {"type": "array", "field-id": 132, "items": "int"}], "field-id": 132},
+                {"name": "equality_ids", "type": ["null", {"type": "array", "field-id": 135, "items": "int"}], "field-id": 135},
+                {"name": "sort_order_id", "type": ["null", "int"], "field-id": 140}
+            ]
+        }}
+    ]
+}"#;
+
+/// The manifest-list WRITE schema (v2: adds content/sequence fields over
+/// v1). Field-ids per pyiceberg's MANIFEST_LIST_FILE_SCHEMAS[2].
+pub const MANIFEST_LIST_WRITE_SCHEMA_V2: &str = r#"{
+    "type": "record",
+    "name": "manifest_file",
+    "fields": [
+        {"name": "manifest_path", "type": "string", "field-id": 500},
+        {"name": "manifest_length", "type": "long", "field-id": 501},
+        {"name": "partition_spec_id", "type": "int", "field-id": 502},
+        {"name": "content", "type": "int", "field-id": 517},
+        {"name": "sequence_number", "type": "long", "field-id": 515},
+        {"name": "min_sequence_number", "type": "long", "field-id": 516},
+        {"name": "added_snapshot_id", "type": "long", "field-id": 503},
+        {"name": "added_files_count", "type": "int", "field-id": 504},
+        {"name": "existing_files_count", "type": "int", "field-id": 505},
+        {"name": "deleted_files_count", "type": "int", "field-id": 506},
+        {"name": "added_rows_count", "type": "long", "field-id": 512},
+        {"name": "existing_rows_count", "type": "long", "field-id": 513},
+        {"name": "deleted_rows_count", "type": "long", "field-id": 514},
+        {"name": "partitions", "type": ["null", {"type": "array", "field-id": 508, "items": {"type": "record", "name": "r_partsum", "field-id": 509, "fields": [
+            {"name": "contains_null", "type": "boolean", "field-id": 509},
+            {"name": "contains_nan", "type": ["null", "boolean"], "field-id": 518},
+            {"name": "lower_bound", "type": ["null", "bytes"], "field-id": 510},
+            {"name": "upper_bound", "type": ["null", "bytes"], "field-id": 511}
+        ]}}], "field-id": 507},
+        {"name": "key_metadata", "type": ["null", "bytes"], "field-id": 519}
+    ]
+}"#;
+
+/// One new data file to include in the snapshot (metrics computed at
+/// flush time by the write path). Metric maps may be empty — spec-legal,
+/// just no pruning/statistics from them yet.
+#[derive(Debug, Clone, Default)]
+pub struct NewDataFile {
+    /// Full URI used in manifests (what reads resolve via open_for).
+    pub file_path: String,
+    pub record_count: i64,
+    pub file_size_in_bytes: i64,
+    pub column_sizes: BTreeMap<i64, i64>,
+    pub value_counts: BTreeMap<i64, i64>,
+    pub null_value_counts: BTreeMap<i64, i64>,
+    pub lower_bounds: BTreeMap<i64, Vec<u8>>,
+    pub upper_bounds: BTreeMap<i64, Vec<u8>>,
+}
+
+use apache_avro::types::Value as V;
+
+fn avro_long_map(schema: &AvroSchema, map: &BTreeMap<i64, i64>) -> V {
+    // items record schema: {"key": int, "value": long}
+    let items = match schema {
+        AvroSchema::Array(a) => (*a.items).clone(),
+        other => other.clone(),
+    };
+    V::Array(
+        map.iter()
+            .map(|(k, v)| {
+                V::Record(vec![
+                    ("key".into(), V::Int(*k as i32)),
+                    ("value".into(), V::Long(*v)),
+                ])
+                .resolve(&items)
+                .unwrap_or_else(|_| {
+                    V::Record(vec![
+                        ("key".into(), V::Int(*k as i32)),
+                        ("value".into(), V::Long(*v)),
+                    ])
+                })
+            })
+            .collect(),
+    )
+}
+
+fn avro_bytes_map(schema: &AvroSchema, map: &BTreeMap<i64, Vec<u8>>) -> V {
+    let items = match schema {
+        AvroSchema::Array(a) => (*a.items).clone(),
+        other => other.clone(),
+    };
+    V::Array(
+        map.iter()
+            .map(|(k, v)| {
+                V::Record(vec![
+                    ("key".into(), V::Int(*k as i32)),
+                    ("value".into(), V::Bytes(v.clone())),
+                ])
+                .resolve(&items)
+                .unwrap_or_else(|_| {
+                    V::Record(vec![
+                        ("key".into(), V::Int(*k as i32)),
+                        ("value".into(), V::Bytes(v.clone())),
+                    ])
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Field schema of `name` inside the data_file record, unwrapping unions.
+fn field_schema(schema: &AvroSchema, name: &str) -> Option<AvroSchema> {
+    let AvroSchema::Record(r) = schema else {
+        return None;
+    };
+    let df = r.fields.iter().find(|f| f.name == "data_file")?;
+    let AvroSchema::Record(df_rec) = &df.schema else {
+        return None;
+    };
+    df_rec
+        .fields
+        .iter()
+        .find(|f| f.name == name)
+        .map(|f| match &f.schema {
+            AvroSchema::Union(u) => u.variants()[1].clone(),
+            other => other.clone(),
+        })
+}
+
+/// Serialize the ADDED entries of one manifest (v2 shape, unpartitioned).
+pub fn build_manifest_bytes(
+    files: &[NewDataFile],
+    snapshot_id: i64,
+    sequence: i64,
+) -> Result<Vec<u8>, StorageError> {
+    let schema = AvroSchema::parse_str(MANIFEST_ENTRY_WRITE_SCHEMA_V2)
+        .map_err(|e| StorageError::Config(format!("manifest write schema: {e}")))?;
+    let col_sizes = field_schema(&schema, "column_sizes")
+        .ok_or_else(|| StorageError::Config("manifest write schema: no column_sizes".into()))?;
+    let lower = field_schema(&schema, "lower_bounds")
+        .ok_or_else(|| StorageError::Config("manifest write schema: no lower_bounds".into()))?;
+
+    let mut writer = Writer::new(&schema, Vec::new());
+    for (i, f) in files.iter().enumerate() {
+        let data_file = V::Record(vec![
+            ("content".into(), V::Int(DataContent::Data as i32)),
+            ("file_path".into(), V::String(f.file_path.clone())),
+            ("file_format".into(), V::String("parquet".into())),
+            // unpartitioned (skeleton 27a); per-table partition structs
+            // arrive with partitioned managed tables
+            ("partition".into(), V::Union(1, Box::new(V::Record(vec![])))),
+            ("record_count".into(), V::Long(f.record_count)),
+            ("file_size_in_bytes".into(), V::Long(f.file_size_in_bytes)),
+            (
+                "column_sizes".into(),
+                V::Union(1, Box::new(avro_long_map(&col_sizes, &f.column_sizes))),
+            ),
+            (
+                "value_counts".into(),
+                V::Union(1, Box::new(avro_long_map(&col_sizes, &f.value_counts))),
+            ),
+            (
+                "null_value_counts".into(),
+                V::Union(1, Box::new(avro_long_map(&col_sizes, &f.null_value_counts))),
+            ),
+            (
+                "nan_value_counts".into(),
+                V::Union(1, Box::new(avro_long_map(&col_sizes, &BTreeMap::new()))),
+            ),
+            (
+                "lower_bounds".into(),
+                V::Union(1, Box::new(avro_bytes_map(&lower, &f.lower_bounds))),
+            ),
+            (
+                "upper_bounds".into(),
+                V::Union(1, Box::new(avro_bytes_map(&lower, &f.upper_bounds))),
+            ),
+            ("key_metadata".into(), V::Union(0, Box::new(V::Null))),
+            ("split_offsets".into(), V::Union(0, Box::new(V::Null))),
+            ("equality_ids".into(), V::Union(0, Box::new(V::Null))),
+            ("sort_order_id".into(), V::Union(0, Box::new(V::Null))),
+        ]);
+        let entry = V::Record(vec![
+            (
+                "status".into(),
+                V::Int(crate::manifest::ManifestEntryStatus::Added as i32),
+            ),
+            ("snapshot_id".into(), V::Long(snapshot_id)),
+            (
+                "sequence_number".into(),
+                V::Union(1, Box::new(V::Long(sequence))),
+            ),
+            (
+                "file_sequence_number".into(),
+                V::Union(1, Box::new(V::Long(i as i64))),
+            ),
+            ("data_file".into(), data_file),
+        ]);
+        writer
+            .append(entry)
+            .map_err(|e| StorageError::Config(format!("manifest append: {e}")))?;
+    }
+    writer
+        .into_inner()
+        .map_err(|e| StorageError::Config(format!("manifest close: {e}")))
+}
+
+/// Serialize a manifest-list (v2 shape). Content/count fields take the
+/// ADDS of this snapshot (existing/deleted are 0; a compaction commit
+/// builder will populate them for EXISTING entries in M4).
+pub fn build_manifest_list_bytes(
+    entries: &[crate::manifest::ManifestListEntry],
+) -> Result<Vec<u8>, StorageError> {
+    let schema = AvroSchema::parse_str(MANIFEST_LIST_WRITE_SCHEMA_V2)
+        .map_err(|e| StorageError::Config(format!("manifest-list write schema: {e}")))?;
+    let mut writer = Writer::new(&schema, Vec::new());
+    for e in entries {
+        let row = V::Record(vec![
+            ("manifest_path".into(), V::String(e.manifest_path.clone())),
+            ("manifest_length".into(), V::Long(e.manifest_length)),
+            ("partition_spec_id".into(), V::Int(e.partition_spec_id)),
+            // 0 = DATA manifests only in appends (delete manifests arrive
+            // with the COW slice)
+            ("content".into(), V::Int(0)),
+            (
+                "sequence_number".into(),
+                V::Long(e.sequence_number.unwrap_or(0)),
+            ),
+            (
+                "min_sequence_number".into(),
+                V::Long(e.min_sequence_number.unwrap_or(0)),
+            ),
+            ("added_snapshot_id".into(), V::Long(e.added_snapshot_id)),
+            (
+                "added_files_count".into(),
+                V::Int(e.added_files_count.unwrap_or(0) as i32),
+            ),
+            ("existing_files_count".into(), V::Int(0)),
+            ("deleted_files_count".into(), V::Int(0)),
+            (
+                "added_rows_count".into(),
+                V::Long(e.added_rows_count.unwrap_or(0)),
+            ),
+            ("existing_rows_count".into(), V::Long(0)),
+            ("deleted_rows_count".into(), V::Long(0)),
+            // unpartitioned: null partition summary
+            ("partitions".into(), V::Union(0, Box::new(V::Null))),
+            ("key_metadata".into(), V::Union(0, Box::new(V::Null))),
+        ]);
+        writer
+            .append(row)
+            .map_err(|e| StorageError::Config(format!("manifest-list append: {e}")))?;
+    }
+    writer
+        .into_inner()
+        .map_err(|e| StorageError::Config(format!("manifest-list close: {e}")))
+}
+
+/// Identity/lineage parameters of the snapshot being assembled.
+#[derive(Debug, Clone)]
+pub struct SnapshotParams {
+    pub snapshot_id: i64,
+    pub timestamp_ms: i64,
+    /// The base we planned against (doc 07 §2) — None for a first snapshot.
+    pub parent_snapshot_id: Option<i64>,
+    pub last_sequence_number: Option<i64>,
+    pub schema_id: Option<i64>,
+    pub partition_spec_id: i32,
+}
+
+/// Result of assembling a snapshot on the object store.
+pub struct WrittenSnapshot {
+    /// The AddSnapshot payload (manifest_list points at the written avro).
+    pub snapshot: Snapshot,
+    /// Object keys written (manifest + manifest-list) — surfaced so the
+    /// caller can audit/clean on abort.
+    pub written_keys: Vec<String>,
+}
+
+/// Assemble and WRITE a snapshot for `new_files`: manifest avro +
+/// manifest-list avro under `<location>/metadata/`, plus the Snapshot
+/// struct for the AddSnapshot update. `parent_snapshot_id` is the base we
+/// planned against (doc 07 §2); `sequence` = base.last_sequence + 1.
+///
+pub fn write_snapshot(
+    io: &StorageIo,
+    location: &str,
+    new_files: &[NewDataFile],
+    params: SnapshotParams,
+) -> Result<WrittenSnapshot, StorageError> {
+    let SnapshotParams {
+        snapshot_id,
+        timestamp_ms,
+        parent_snapshot_id,
+        last_sequence_number,
+        schema_id,
+        partition_spec_id,
+    } = params;
+    if new_files.is_empty() {
+        return Err(StorageError::Config(
+            "write path: no data files in snapshot (empty commits are a no-op)".into(),
+        ));
+    }
+    let sequence = last_sequence_number.unwrap_or(0) + 1;
+    let loc = location.trim_end_matches('/').to_string();
+
+    // manifest avro (the ADDED entries of this snapshot)
+    let manifest_bytes = build_manifest_bytes(new_files, snapshot_id, sequence)?;
+    let manifest_key = format!("metadata/{}-{}-m0.avro", snapshot_id, Uuid::new_v4());
+    io.put_bytes(&manifest_key, manifest_bytes.clone())?;
+    let manifest_path = format!("{loc}/{manifest_key}");
+
+    // manifest-list avro (single DATA manifest for appends)
+    let list_entry = crate::manifest::ManifestListEntry {
+        manifest_path,
+        manifest_length: manifest_bytes.len() as i64,
+        partition_spec_id,
+        added_snapshot_id: snapshot_id,
+        added_files_count: Some(new_files.len() as i64),
+        existing_files_count: Some(0),
+        deleted_files_count: Some(0),
+        added_rows_count: Some(new_files.iter().map(|f| f.record_count).sum()),
+        existing_rows_count: Some(0),
+        deleted_rows_count: Some(0),
+        sequence_number: Some(sequence),
+        min_sequence_number: Some(sequence),
+    };
+    let list_bytes = build_manifest_list_bytes(&[list_entry])?;
+    let list_key = format!("metadata/snap-{}-0-{}.avro", snapshot_id, Uuid::new_v4());
+    io.put_bytes(&list_key, list_bytes)?;
+
+    // summary per the spec's snapshot summary keys (writers may add more)
+    let total_rows: i64 = new_files.iter().map(|f| f.record_count).sum();
+    let total_bytes: i64 = new_files.iter().map(|f| f.file_size_in_bytes).sum();
+    let snapshot = Snapshot {
+        snapshot_id,
+        sequence_number: Some(sequence),
+        first_row_id: None,
+        parent_snapshot_id,
+        timestamp_ms,
+        manifest_list: format!("{loc}/{list_key}"),
+        summary: BTreeMap::from([
+            ("operation".to_string(), "append".to_string()),
+            ("added-data-files".to_string(), new_files.len().to_string()),
+            ("added-records".to_string(), total_rows.to_string()),
+            ("added-files-size".to_string(), total_bytes.to_string()),
+        ]),
+        schema_id,
+    };
+    Ok(WrittenSnapshot {
+        snapshot,
+        written_keys: vec![manifest_key, list_key],
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::metadata::{
+        FormatVersion, IcebergType, IcebergTypeMarker, Schema, SnapshotRef, TableMetadata,
+    };
+    use crate::storage::parse_location;
+    use std::collections::BTreeMap;
+
+    fn base_metadata(location: &str) -> TableMetadata {
+        TableMetadata {
+            format_version: FormatVersion::V2,
+            table_uuid: Uuid::nil(),
+            location: location.to_string(),
+            last_sequence_number: Some(3),
+            schemas: vec![Schema {
+                struct_type: IcebergTypeMarker::Struct,
+                schema_id: 0,
+                fields: vec![crate::catalog::metadata::Field {
+                    id: 1,
+                    name: "id".into(),
+                    required: false,
+                    r#type: IcebergType::Long,
+                    doc: None,
+                }],
+            }],
+            current_schema_id: 0,
+            snapshots: vec![],
+            current_snapshot_id: None,
+            properties: BTreeMap::new(),
+            partition_specs: vec![],
+            default_partition_spec_id: Some(0),
+            refs: BTreeMap::new(),
+        }
+    }
+
+    /// TDD anchor (M2 slice 27a): BatchWriter data files -> snapshot
+    /// assembly (manifest + manifest-list avro on the store) -> merged
+    /// metadata -> OUR OWN plan_scan reads the rows back. The full write
+    /// pipeline proven without a catalog.
+    #[test]
+    fn write_snapshot_end_to_end_readback() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = format!("file://{}", dir.path().display());
+        let loc = parse_location(&location).unwrap();
+        let io = StorageIo::open(&loc, None).unwrap();
+
+        let md = base_metadata(&location);
+
+        // 1. data files (slice 24 writer)
+        let mut w = crate::writer::BatchWriter::new(vec![crate::writer::WriteColumn {
+            name: "id".into(),
+            ty: IcebergType::Long,
+        }])
+        .unwrap();
+        w.push(&[crate::parquet::CellValue::Int64(1)]).unwrap();
+        w.push(&[crate::parquet::CellValue::Int64(2)]).unwrap();
+        let key = w.write_file(&io, "data", 0).unwrap();
+        let bytes = io.get_bytes(&key).unwrap();
+        let new_files = vec![NewDataFile {
+            file_path: format!("{location}/{key}"),
+            record_count: 2,
+            file_size_in_bytes: bytes.len() as i64,
+            ..Default::default()
+        }];
+
+        // 2. snapshot assembly (this module)
+        let snap_id = 900;
+        let written = write_snapshot(
+            &io,
+            &location,
+            &new_files,
+            SnapshotParams {
+                snapshot_id: snap_id,
+                timestamp_ms: 1_700_000_000_000,
+                parent_snapshot_id: None,
+                last_sequence_number: md.last_sequence_number,
+                schema_id: Some(0),
+                partition_spec_id: 0,
+            },
+        )
+        .expect("write_snapshot");
+        assert_eq!(written.snapshot.snapshot_id, snap_id);
+        assert_eq!(
+            written.snapshot.parent_snapshot_id, None,
+            "first snapshot has no parent"
+        );
+        assert_eq!(
+            written
+                .snapshot
+                .summary
+                .get("operation")
+                .map(String::as_str),
+            Some("append")
+        );
+        assert_eq!(written.snapshot.sequence_number, Some(4), "base seq + 1");
+        assert_eq!(written.written_keys.len(), 2, "manifest + manifest-list");
+
+        // both avro files exist on the store
+        for k in &written.written_keys {
+            assert!(!io.get_bytes(k).unwrap().is_empty(), "{k} non-empty");
+        }
+
+        // 3. merge into metadata (what the commit update produces
+        // remotely; locally we simulate the post-commit state)
+        let mut md2 = md;
+        md2.snapshots.push(written.snapshot.clone());
+        md2.current_snapshot_id = Some(snap_id);
+        md2.refs.insert(
+            "main".to_string(),
+            SnapshotRef {
+                snapshot_id: snap_id,
+                kind: "branch".into(),
+                min_snapshots_to_keep: None,
+                max_snapshot_age_ms: None,
+            },
+        );
+
+        // 4. read back through OUR scan pipeline
+        let plan = crate::scan::plan_scan(&md2, None, None, None).expect("plan_scan");
+        assert_eq!(plan.snapshot_id, snap_id);
+        assert_eq!(plan.data_files, 1);
+        assert_eq!(plan.total_rows, 2);
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(
+            plan.tasks[0].entry.data_file.file_path,
+            new_files[0].file_path
+        );
+
+        let (rio, rkey) =
+            crate::scan::open_for(&plan.tasks[0].entry.data_file.file_path, None).unwrap();
+        let mut rows = crate::parquet::ParquetRows::open(&rio, &rkey, &["id"]).unwrap();
+        assert!(rows.next());
+        assert_eq!(rows.value(0), crate::parquet::CellValue::Int64(1));
+        assert!(rows.next());
+        assert_eq!(rows.value(0), crate::parquet::CellValue::Int64(2));
+        assert!(!rows.next());
+    }
+
+    /// The written manifest parses back through OUR reader with the
+    /// expected ADDED entry + metrics (embedded-schema round trip).
+    #[test]
+    fn written_manifest_parses_back() {
+        let files = vec![NewDataFile {
+            file_path: "file://w/t/data/5-0.parquet".into(),
+            record_count: 7,
+            file_size_in_bytes: 4096,
+            column_sizes: BTreeMap::from([(1, 64)]),
+            value_counts: BTreeMap::from([(1, 7)]),
+            null_value_counts: BTreeMap::from([(1, 2)]),
+            lower_bounds: BTreeMap::from([(1, 1i64.to_le_bytes().to_vec())]),
+            upper_bounds: BTreeMap::from([(1, 9i64.to_le_bytes().to_vec())]),
+        }];
+        let bytes = build_manifest_bytes(&files, 42, 5).unwrap();
+
+        let entries = crate::manifest::parse_manifest(&bytes).unwrap();
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e.status, crate::manifest::ManifestEntryStatus::Added);
+        assert_eq!(e.snapshot_id, 42);
+        assert_eq!(e.sequence_number, Some(5));
+        assert_eq!(e.file_sequence_number, Some(0));
+        assert_eq!(e.data_file.content, DataContent::Data);
+        assert_eq!(e.data_file.file_path, files[0].file_path);
+        assert_eq!(e.data_file.record_count, 7);
+        assert_eq!(e.data_file.column_sizes.get(&1), Some(&64));
+        assert_eq!(e.data_file.value_counts.get(&1), Some(&7));
+        assert_eq!(e.data_file.null_value_counts.get(&1), Some(&2));
+        assert_eq!(
+            e.data_file.lower_bounds.get(&1),
+            Some(&1i64.to_le_bytes().to_vec())
+        );
+        assert_eq!(
+            e.data_file.upper_bounds.get(&1),
+            Some(&9i64.to_le_bytes().to_vec())
+        );
+    }
+
+    /// The written manifest-list parses back through OUR reader.
+    #[test]
+    fn written_manifest_list_parses_back() {
+        let manifest_bytes = build_manifest_bytes(
+            &[NewDataFile {
+                file_path: "file://w/t/data/1-0.parquet".into(),
+                record_count: 3,
+                file_size_in_bytes: 2048,
+                ..Default::default()
+            }],
+            42,
+            5,
+        )
+        .unwrap();
+        let bytes = build_manifest_list_bytes(&[crate::manifest::ManifestListEntry {
+            manifest_path: "file://w/t/metadata/m0.avro".into(),
+            manifest_length: manifest_bytes.len() as i64,
+            partition_spec_id: 0,
+            added_snapshot_id: 42,
+            added_files_count: Some(1),
+            existing_files_count: None,
+            deleted_files_count: None,
+            added_rows_count: Some(3),
+            existing_rows_count: None,
+            deleted_rows_count: None,
+            sequence_number: Some(5),
+            min_sequence_number: Some(5),
+        }])
+        .unwrap();
+
+        let list = crate::manifest::parse_manifest_list(&bytes).unwrap();
+        assert_eq!(list.len(), 1);
+        let e = &list[0];
+        assert_eq!(e.manifest_path, "file://w/t/metadata/m0.avro");
+        assert_eq!(e.manifest_length, manifest_bytes.len() as i64);
+        assert_eq!(e.partition_spec_id, 0);
+        assert_eq!(e.added_snapshot_id, 42);
+    }
+}

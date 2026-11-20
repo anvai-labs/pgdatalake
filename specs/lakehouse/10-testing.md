@@ -98,6 +98,30 @@ codec matrix, "Trino reads a table we wrote" (M2).)*
 Regressions > 10% on two consecutive runs block merge; `perf/` directory holds
 the harness (`make perf-lakehouse`).
 
+### 5.1 Cross-engine reference numbers (proximaDB, 2026-11-20)
+
+Same fixture as our TPC-DS gate (SeaweedFS, SF=10, store_sales 73-file
+bin-packed layout; row counts verified against duckdb goldens; fresh
+server + wiped catalog per route, warmup + 3 measured runs, median,
+release builds, same machine). Delivered by the proximaDB session
+(proximadb-e4); recorded here as the shared-fixture reference point
+(M1 numbers are our release-build FDW runs):
+
+| query | proximaDB native (pgwire) | DuckDB wrapper (pgwire) | stock DataFusion 55 (ListingTable) | postgres FDW (M1 gate) |
+|---|---|---|---|---|
+| q1 | 1.759s | 2.412s | 0.139s | 1.2s |
+| q2 | 0.788s | 1.472s | 0.194s | 18.0s |
+| q3 | 0.471s | 1.171s | 0.117s | >12min unfinished |
+
+Reading: proximaDB native beats the FDW everywhere except q1; q3 goes
+from >720s-unfinished to 0.47s — consistent with our retro finding #1
+(row-by-row transport is THE bottleneck; columnar batch reads fix it).
+The stock-DataFusion baseline pays NO per-query table open while
+proximaDB re-pays LIST+HEAD+footers each query (q1 1.76s vs 0.139s) —
+the open-cache/remote-parameterization work recorded in retro #3 is
+the shared lever. proximaDB's side: TD-OLAP-4, branch
+feat/external-table-df-exec.
+
 ## 6. Developer loop
 
 ```bash

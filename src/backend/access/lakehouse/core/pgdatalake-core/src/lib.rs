@@ -18,5 +18,6 @@ pub mod manifest;
 pub mod parquet;
 pub mod scan;
 pub mod session;
+pub mod snapshot_write;
 pub mod storage;
 pub mod writer;
