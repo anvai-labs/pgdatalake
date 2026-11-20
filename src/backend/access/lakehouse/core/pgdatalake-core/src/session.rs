@@ -414,6 +414,20 @@ impl CatalogClient {
         let s3 = self.s3_client.merged(&cfg);
         let (io, key) = crate::scan::open_for(&lt.metadata_location, Some(&s3))?;
         let md = fetch_metadata(&io, &key)?;
+        // v3 conformance gate (doc 14): v3 metadata PARSES (the model
+        // carries FormatVersion::V3 + first_row_id) but v3 SEMANTICS are
+        // not yet covered — deletion vectors (Puffin DV blobs), row
+        // lineage, default values. A table whose rows we cannot prove
+        // correct must error loudly, never return plausible results
+        // (13-review: "identify v3 deletion vectors before returning
+        // rows"). Lift this gate when the DV-read slice lands.
+        if md.format_version == crate::catalog::metadata::FormatVersion::V3 {
+            return Err(crate::storage::StorageError::Config(format!(
+                "table {table} is format-version 3: v3 tables are not yet \
+                 supported for reads (deletion vectors, row lineage) — \
+                 tracked in specs/lakehouse/14-v3-conformance.md"
+            )));
+        }
         let plan = crate::scan::plan_scan(&md, selector, Some(&s3), predicate)?;
         let schema = md.current_schema().cloned().ok_or_else(|| {
             crate::storage::StorageError::Config("scan: table has no current schema".to_string())
@@ -505,6 +519,64 @@ mod tests {
             .expect("scan");
         assert_eq!(plan.snapshot_id, 42);
         assert_eq!(plan.tasks.len(), 0, "fresh table: empty manifest list");
+    }
+
+    /// v3 conformance gate (doc 14): reads of format-version 3 tables are
+    /// REJECTED loudly until DV application + v3 semantics are covered —
+    /// a v3 table whose rows we cannot prove correct must never return
+    /// plausible-looking results (13-review "identify v3 deletion vectors
+    /// before returning rows").
+    #[test]
+    fn v3_tables_are_rejected_loudly_on_read() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
+        std::fs::create_dir_all(dir.path().join("metadata")).unwrap();
+        let location = format!("file://{}", dir.path().display());
+        let metadata_json = format!(
+            r#"{{
+                "format-version": 3,
+                "table-uuid": "1ca92afa-70b9-4d02-9ba6-7ee1a3ac0f5e",
+                "location": "{location}",
+                "last-sequence-number": 1,
+                "schemas": [{{"type": "struct", "schema-id": 0, "fields": [
+                    {{"id": 1, "name": "id", "required": true, "type": "long"}}]}}],
+                "current-schema-id": 0,
+                "snapshots": []
+            }}"#
+        );
+        let md_file = dir.path().join("metadata").join("00001.metadata.json");
+        std::fs::write(&md_file, metadata_json).unwrap();
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let md_path = md_file.clone();
+        std::thread::spawn(move || {
+            let req = server.recv().unwrap(); // config
+            let _ = req.respond(tiny_http::Response::from_string(
+                r#"{"defaults": {}, "overrides": {}}"#,
+            ));
+            let req = server.recv().unwrap(); // loadTable
+            let _ = req.respond(tiny_http::Response::from_string(format!(
+                r#"{{"metadata-location": "file://{}", "config": {{}}}}"#,
+                md_path.display()
+            )));
+        });
+
+        let client = CatalogClient::new(
+            &format!("http://{addr}"),
+            "wh",
+            "",
+            &S3ClientOptions::default(),
+        )
+        .unwrap();
+        let err = client
+            .scan_table(&["analytics"], "t", None, None)
+            .expect_err("v3 read must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("format-version 3") || msg.contains("v3"),
+            "rejection must name the version: {msg}"
+        );
     }
 
     /// Unreachable catalogs error with the endpoint in the message (the C

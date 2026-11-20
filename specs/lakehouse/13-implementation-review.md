@@ -133,3 +133,13 @@ Define explicit ROW/EOF/ERROR status with owned, bounded diagnostics. Use field 
 **CI and handoff.** The workflow starts fixtures, but the registered SQL FDW regression deliberately uses an unreachable server. The conformance and performance Make targets currently exit with a placeholder error. Wire a deterministic fixture-backed positive read and a two-append independent read into the CI path. Include the allowed fork parser/reloptions files and fixture scripts in push filters. Pin fixture images/tool versions, bind local-only fixtures to loopback, surface setup failures and run against an isolated cluster. Use explicit build/install paths and locked Rust dependencies. The current check target invokes `meson install` from the test directory without selecting the build directory. Add an assertion-enabled C build and an instrumented memory-safety run. Retain the inexpensive Rust and SQL suites as the first tier. [Workflow](../../.github/workflows/datalake-ci.yml) · [Make targets](../../src/test/lakehouse/Makefile) · [Fixture stack](../../src/test/lakehouse/docker-compose.yml) · [Build wrapper](../../src/backend/access/lakehouse/rust_build.py)
 
 For each implementation package, record the reviewed commit, failing regression on its parent, passing result after the change, compatibility impact on existing tables, and the spec sections amended. At the first re-review, demonstrate immutable historical reads across a second append and exact FDW results on the same snapshot with optimization enabled and disabled.
+
+---
+
+*(2026-11-20 v3 pass — item "Identify unsupported file formats, v3 deletion
+vectors and required features before returning rows": ADDRESSED at the gate
+level. `scan_table` rejects format-version 3 loudly before any row is
+returned (doc 14 §3 V0, TDD `v3_tables_are_rejected_loudly_on_read`), and a
+manifest entry with an unknown `content` value (v3 DV = 3) fails the
+manifest decode loudly (pre-existing, verified). Full DV application is
+slice V1 in specs/lakehouse/14-v3-conformance.md.)*

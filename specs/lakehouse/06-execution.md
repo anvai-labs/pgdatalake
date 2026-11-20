@@ -98,7 +98,12 @@ load at scan planning (eager; small relative to data) into
   under an eq-delete snapshot errors loudly (partition-scoped application
   is a later slice; silently applying across partitions could over-delete).
 - **v3 deletion vectors**: later slice (Puffin DV blobs; read half of the
-  gate matrix).
+  gate matrix) — slices V1/V3 in specs/lakehouse/14-v3-conformance.md.
+  *(2026-11-20 v3 pass: until they land, v3 tables are REJECTED loudly at
+  scan time — scan_table's format-version gate, doc 14 §3 V0 — and a
+  manifest entry with an unknown `content` value (e.g. a DV entry) fails
+  the manifest decode loudly. The read-correctness rule "never misread"
+  applies: unimplemented delete constructs error, they never approximate.)*
 
 *(13-review #5 amendment, 2026-11-20 — delete-specific pruning and
 manifest inheritance.)* Predicate pruning is content-aware:

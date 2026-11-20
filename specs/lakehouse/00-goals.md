@@ -39,7 +39,11 @@
    MinIO is the default dev/test target.
 6. **Upstream-forkable.** The delta against upstream postgres stays as small,
    reviewable, and rebase-friendly as possible (see [RULES.md](RULES.md)).
-7. **Strict Iceberg conformance.** Target the current Iceberg **v3** table spec +
+7. **Strict Iceberg conformance.** Target the current Iceberg **v3** table spec
+   *(operational definition, feature tiers, and the v2→v3 table-migration
+   plan: specs/lakehouse/14-v3-conformance.md — reads of v3 tables are
+   gated loudly until DV coverage lands; managed writes are COW-first,
+   v3-legal)* +
    REST catalog spec; implement v2 fallback (position/equality deletes) read-only,
    and v1 read-only.
 

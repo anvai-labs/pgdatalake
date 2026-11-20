@@ -27,6 +27,11 @@ rejected at DDL with a suggestion.
 | `map<K,V>` | `jsonb` (v1) / `lakehouse.map<K,V>` (v2 domain type) | explicit cast required | see §3 |
 | `struct<F1 T1,…>` | composite type (managed: auto `CREATE TYPE …_row`; external: `lakehouse.struct` pseudo) | composite type | field names preserved |
 | `variant` (v3) | `jsonb` (read) / write via `lakehouse.variant_unshredded` cast (v2) | deferred | fast-follow |
+| `geometry`/`geography` (v3) | — | **not parsed** (schema decode errors loudly) | out of scope unless a partner workload demands it — doc 14 §2 #12 |
+
+*(2026-11-20 v3 pass: the conformance tier of every row above, plus the
+unknown/geometry entries, is defined in specs/lakehouse/14-v3-conformance.md
+— that doc is the authority for v3 feature status and migration.)*
 
 Integer width policy: PG `smallint` has no Iceberg counterpart — maps to `int`
 (widening, safe on read; on write, value range checked, overflow → error).

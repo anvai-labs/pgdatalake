@@ -52,7 +52,7 @@ Options (all optional):
 | `table` | fully-qualified Iceberg table name | required |
 | `branch` / `tag` | pin reads/writes to a ref | catalog default ref |
 | `snapshot_id` | pin reads to a snapshot (read-only) | latest |
-| `format_version` | max accepted metadata version | v3 |
+| `format_version` | max accepted metadata version | v3 *(status: the writer emits v2 and v3 reads are gated loudly — doc 14 §3 slices V1–V3 lift this; the option is honored at `create_remote` in slice V3)* |
 | `readonly` | forbid DML at FDW level | false |
 | `scan_tasks_per_worker` | parallel scan granularity | 8 |
 

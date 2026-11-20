@@ -26,7 +26,8 @@ fixture* swapped. Revisit if Iceberg workloads hit SeaweedFS-specific gaps
 - **Iceberg spec conformance**: port the official `iceberg-python`/`iceberg-go`
   integration test corpus: table lifecycle, all type round-trips, all partition
   transforms, schema evolution sequences, snapshot expiry, v2 position/equality
-  delete application, v3 deletion vectors. Run the *same fixtures* written by
+  delete application, v3 deletion vectors (slice V1/V2 in doc 14;
+  pyiceberg `format_version=3` fixtures — it defaults to 2). Run the *same fixtures* written by
   PyIcepire/Spark and read by us, and vice versa (write by us, read by PyIceberg).
 - **REST catalog conformance**: the REST spec's official conformance suite
   (namespacing, config resolution order, commit requirements, token refresh).

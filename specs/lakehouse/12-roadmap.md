@@ -67,7 +67,11 @@ another's gate. Rough sizing assumes 1–2 engineers + this agent.
   restores pruning (files examined→tasks ratio ≥ 10×) and byte reduction.
 
 ## M5 — The seamless layer (ongoing)
-- Deletion vectors as managed write mode (merge-on-read), bloom-filtered DV reads
+- Deletion vectors as managed write mode (merge-on-read), bloom-filtered DV
+  reads *(v3 conformance slices V1–V5: specs/lakehouse/14-v3-conformance.md
+  — V0 loud gates landed 2026-11-20; V1 DV-read is the next read-correctness
+  item; v2→v3 table migration rides slice V3 with the reader-first
+  precondition)*
 - `metadata_only` plans (count/min/max from Parquet stats), metadata cache tuning
 - variant type read/write, `lakehouse.map`/`struct` domain types (doc 05 v2)
 - Logical decoding from commit journal; `lakehouse.migrate_table` GA
