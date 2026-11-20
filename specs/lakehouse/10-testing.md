@@ -116,10 +116,15 @@ release builds, same machine). Delivered by the proximaDB session
 Reading: proximaDB native beats the FDW everywhere except q1; q3 goes
 from >720s-unfinished to 0.47s — consistent with our retro finding #1
 (row-by-row transport is THE bottleneck; columnar batch reads fix it).
-The stock-DataFusion baseline pays NO per-query table open while
-proximaDB re-pays LIST+HEAD+footers each query (q1 1.76s vs 0.139s) —
-the open-cache/remote-parameterization work recorded in retro #3 is
-the shared lever. proximaDB's side: TD-OLAP-4, branch
+Addendum from proximadb-e4 (measured, head-on): the per-query open
+overhead (pgwire + LIST + 73 HEADs + footers) is only ~0.17s on the
+native route — NOT the main native-vs-stock-DF gap driver (q1: 1.759
+vs 0.139s leaves ~1.6s in the scan/compute operators). The real
+proximaDB optimization target is the scan path itself (bloom semi-join
+gate, io-trace wrapper, StatsTrust::Untrusted disabling footer elision
+for external locations). Our analogous lever stays retro #3
+(remote parameterization / hash-subplan conversion for correlated
+subplans). proximaDB's side: TD-OLAP-4, branch
 feat/external-table-df-exec.
 
 ## 6. Developer loop
