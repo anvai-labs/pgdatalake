@@ -940,3 +940,7 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     "kB .. kB" format. NEXT: P1 writer rollover (consumes
     lakehouse.target_file_size via a new FFI flush threshold), or P0
     read-path integration (cache into fetch_metadata/manifests).
+  - HANDOFF REPAIR 2026-11-21: the P1 commit briefly landed directly on
+    lakehouse-dev (branch-discipline slip, RULES §1a B3) as a merge
+    object; repaired by cherry-pick -m 1 onto cf5631-port + clippy fix
+    (manual_checked_ops on the rollover avg). 112 cargo green.
