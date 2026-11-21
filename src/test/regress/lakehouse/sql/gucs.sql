@@ -35,12 +35,10 @@ RESET lakehouse.cache_max_bytes;
 -- invalid enum value rejected loudly
 SET lakehouse.write_mode = 'bogus';
 
--- invalid numeric rejected loudly
+-- invalid numeric rejected loudly (min 32MB, max 4GB — kB bounds)
 SET lakehouse.target_file_size = '0';
-
--- hard ceiling: 10GB (10485760 kB) on both size knobs (spec 15 P2)
-SET lakehouse.target_file_size = '11GB';
-SET lakehouse.cache_max_bytes = '11GB';
-SET lakehouse.target_file_size = '10GB';
+SET lakehouse.target_file_size = '31MB';
+SET lakehouse.cache_max_bytes = '5GB';
+SET lakehouse.target_file_size = '4GB';
 SHOW lakehouse.target_file_size;
 RESET lakehouse.target_file_size;
