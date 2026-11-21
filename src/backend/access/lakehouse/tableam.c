@@ -264,16 +264,49 @@ typedef struct LakehouseTombFile
 	int64		file_size_in_bytes;
 }			LakehouseTombFile;
 
+/*
+ * LakehouseWriteEntry — per-transaction per-relation write state.
+ *
+ * ⚠️ HASH-KEY ALIASING (do not re-break — this cost us a multi-day debug):
+ *
+ * dynahash does NOT store the key beside the user struct. The hash element
+ * layout is [header][key][data], and hash_search returns a pointer to the
+ * KEY (ELEMENTKEY), cast to the entry type — the ENTIRE struct overlays the
+ * stored key bytes. Consequence: any member of this struct that lands at
+ * offset 0 (within keysize = sizeof(Oid) bytes) IS the stored key; writing
+ * it from init code silently REWRITES the key, and every later hash_search
+ * with the same key MISSES.
+ *
+ * That exact bug shipped here: `int write_mode` sat first, and its !found
+ * init (`entry->write_mode = ...`) trampled the key, so HASH_ENTER minted
+ * a DUPLICATE ENTRY PER ROW (probe showed found=0 three times, hash
+ * growing 1→2→3, same relid, same table). A 3-row staged INSERT captured
+ * three single-row delta segments instead of one 3-row segment, and COW
+ * mode silently opened one remote write session per row instead of one
+ * per transaction. It survived every other hypothesis (xact-callback
+ * registration, seq-search iteration, teardown) because nothing was
+ * "losing" the entry — the table was full of keys that no longer matched.
+ *
+ * RULES for this struct (and any other HASH_ELEM entry struct here):
+ * 1. The hash key field comes FIRST and is owned by dynahash — hash_search
+ *    copies it in; init code must never write it (re-writing the same
+ *    value is harmless but forbidden by convention; a different value
+ *    corrupts the table).
+ * 2. Adding a member is safe only if the key stays first. NEVER reorder
+ *    without re-checking that no member aliases [0, keysize).
+ * 3. Debugging symptom to recognize instantly: HASH_ENTER reports
+ *    found=false repeatedly for an identical key on the same HTAB, and
+ *    hash_get_num_entries climbs with duplicates. That is key aliasing,
+ *    not a teardown/registration/iteration bug.
+ *
+ * (LakehouseScanRegistryEntry below follows the same idiom correctly.)
+ */
 typedef struct LakehouseWriteEntry
 {
 	/*
-	 * HASH KEY — MUST be first. dynahash stores the key AT the pointer
-	 * hash_search returns (ELEMENTKEY aliasing): any struct member placed
-	 * before/over the keysize window rewrites the stored key, so every
-	 * subsequent lookup of the same relid MISSES and HASH_ENTER creates a
-	 * duplicate entry per row (the per-row staged-capture regression:
-	 * write_mode sat at offset 0 and its init wrote over the key). The
-	 * field is written by hash_search itself; init code must not touch it.
+	 * HASH KEY — MUST be first (see the block comment above for why, and
+	 * for the aliasing failure mode). Written by hash_search itself;
+	 * init code must not touch it.
 	 */
 	Oid			relid;
 	int			write_mode;	/* resolved: reloption wins over GUC (R2) */
@@ -319,6 +352,12 @@ typedef struct LakehouseTableScanDescData LakehouseTableScanDescData;
 
 typedef struct LakehouseScanRegistryEntry
 {
+	/*
+	 * HASH KEY — first member, per the dynahash key-aliasing idiom (see
+	 * the full warning above LakehouseWriteEntry, where a non-key member
+	 * at offset 0 once corrupted lookups). dynahash copies the key in;
+	 * never write this field from init code.
+	 */
 	Oid			relid;
 	LakehouseTableScanDescData *scan;
 	SubTransactionId subid;
@@ -1147,6 +1186,12 @@ get_write_entry(Relation rel)
 	{
 		HASHCTL		ctl;
 
+		/*
+		 * HASH_ELEM entry structs overlay the key (see the hash-key
+		 * aliasing warning above LakehouseWriteEntry): keysize bytes at
+		 * offset 0 of LakehouseWriteEntry ARE the stored key. relid is
+		 * deliberately the struct's first member — keep it that way.
+		 */
 		ctl.keysize = sizeof(Oid);
 		ctl.entrysize = sizeof(LakehouseWriteEntry);
 		write_entries = hash_create("lakehouse managed write state", 8, &ctl,
@@ -1156,9 +1201,11 @@ get_write_entry(Relation rel)
 												HASH_ENTER, &found);
 	if (!found)
 	{
-		/* entry->relid is the hash key — dynahash already copied it in;
-		 * rewriting it here would be harmless (same value) but the field
-		 * is documented as hash-owned, so leave it alone */
+		/*
+		 * Init a freshly minted entry. dynahash has ALREADY copied the
+		 * key into entry->relid — do not (re)write it here; see the
+		 * hash-key aliasing warning on the struct.
+		 */
 		entry->ws = NULL;
 		entry->mcxt = AllocSetContextCreate(TopTransactionContext,
 											"lakehouse managed write",
