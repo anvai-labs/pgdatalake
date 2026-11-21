@@ -1082,3 +1082,22 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     and committed. ALL probes removed. Suite red on PR #9
     (tableam + staged_insert): LOCAL repro = DROP/CREATE/attach/SET
     staged/INSERT 3 rows on vg-m3.
+  - ⚠️ REGRESSION NARROWED (PR #9 still open): two REAL bugs FIXED and
+    verified (tableam passes again): (1) the decode walk now bounds by
+    blob length — legacy 4-key blobs + NUM_RELOPTS 5 read garbage past
+    the last NUL and errored loudly, aborting EVERY statement touching
+    the table (the CI 22023 + the 8-ABORT bursts); (2) entry->relid
+    assignment. REMAINING (repro: fresh staged table, single 3-row
+    INSERT txn): the capture STILL fires once PER ROW — get_write_entry
+    re-creates the write_entries hash entry per tuple_insert (!found
+    per row, same txid — probed), yielding 3 single-row segments
+    instead of 1 three-row segment. NOT the xact-callback registration
+    (idempotent, tried), NOT the teardown (probe silent mid-insert),
+    NOT the seq-search iteration (two-phase collect-then-capture
+    restructure in place, didn't change the count). NEXT: probe
+    hash_search HASH_ENTER/HASH_REMOVE on write_entries directly
+    (who deletes the entry between rows of one txn), and diff
+    get_write_entry's call path per row. All probes currently REMOVED.
+    Also commit 5ded905e: the P3 phase-2 two-phase PRE_COMMIT
+    restructure (collect during seq iteration, capture after it
+    completes) — correct pattern regardless.
