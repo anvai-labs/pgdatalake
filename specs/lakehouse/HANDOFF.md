@@ -1119,3 +1119,28 @@ fixture table + count(*) exactness + EXPLAIN shows no foreign-scan
 transport) → P0b3 row-group-deferred iteration (q3 canary) → P0b2
 page-index pruning → §5.2 marketed comparison once clean protocol
 completes.
+
+## REFACTOR QUEUE (2026-11-21): fdw.c/tableam.c decomposition
+
+Language rule reaffirmed: C++ is NOT allowed in backend code (upstream
+law: no C++ runtime, ereport longjmp vs stack objects, toolchain
+assumptions). The sanctioned non-C escape hatch is pgdatalake-core
+(Rust behind cbindgen C ABI) — complex logic goes there; C stays a
+thin adapter. C-side "design patterns" already in use and correct:
+FdwRoutine vtables (interface), exec-state context structs, fdw_private
+plan<->executor messaging, batch_fill adapters. What is missing is
+module boundaries, not patterns.
+
+Planned split (AFTER #20 lands — fdw.c is in flight there; standalone
+zero-behavior-change PR, validated by regress suite + live elision/
+publish checks):
+- lakehouse_fdw.h: shared exec-state structs, options, fdw_private
+  conventions, cross-file decls
+- fdw.c: handler/validator/options/registration only
+- fdw_plan.c: relsize/paths/GetForeignPlan/GetForeignUpperPaths +
+  elision detection + predicate->JSON translation (~700 lines)
+- fdw_exec.c: Begin/Iterate/ReScan/End/Explain + elided-count dispatch
+  (enum-driven two-mode scan state, replacing the boolean branches)
+Then the same treatment for tableam.c (seams: DDL callbacks / DML /
+scan / tombstone-COW / publisher). Threshold going forward: > ~1500
+lines or > 3 responsibilities -> split.
