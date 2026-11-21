@@ -246,6 +246,7 @@ impl StorageIo {
 
     /// GET one object as bytes; 404s map to `StorageError::NotFound`.
     pub fn get_bytes(&self, key: &str) -> Result<Vec<u8>, StorageError> {
+        use object_store::ObjectStoreExt;
         let path = Self::full_path(key);
         match runtime().block_on(self.store.get(&path)) {
             Ok(res) => {
@@ -270,11 +271,7 @@ impl StorageIo {
         use object_store::{GetOptions, GetRange};
         let path = Self::full_path(key);
         let opts = GetOptions {
-            range: Some(GetRange::Bounded({
-                let o = offset as usize;
-                let l = len as usize;
-                o..o.saturating_add(l)
-            })),
+            range: Some(GetRange::Bounded(offset..offset.saturating_add(len))),
             ..Default::default()
         };
         match runtime().block_on(self.store.get_opts(&path, opts)) {
@@ -296,9 +293,12 @@ impl StorageIo {
     #[allow(dead_code)]
     pub fn put_bytes(&self, key: &str, data: Vec<u8>) -> Result<(), StorageError> {
         let path = Self::full_path(key);
-        runtime()
-            .block_on(self.store.put(&path, PutPayload::from_bytes(data.into())))
-            .map_err(|e| StorageError::Http(e.to_string()))?;
+        {
+            use object_store::ObjectStoreExt;
+            runtime()
+                .block_on(self.store.put(&path, PutPayload::from_bytes(data.into())))
+                .map_err(|e| StorageError::Http(e.to_string()))?;
+        }
         Ok(())
     }
 }

@@ -66,6 +66,18 @@ jobs:
           cargo clippy --all-targets -- -D warnings
           cargo test --release
 
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: cargo audit (dependency advisories fail the build)
+        working-directory: src/backend/access/lakehouse/core
+        # --deny vulnerabilities: RUSTSEC vulns fail the build; "unmaintained"
+        # transitive notices (chrono, humantime) stay warnings until an
+        # upstream fix lands to depend on
+        run: cargo audit --deny vulnerabilities
+
       - name: Bring up docker fixtures (SeaweedFS S3, Lakekeeper, Azurite, fake-gcs)
         run: make lakehouse-up
 
