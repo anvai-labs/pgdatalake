@@ -198,6 +198,23 @@ pub unsafe extern "C" fn pg_datalake_scan_task_count(session: *mut ScanSession) 
     }
 }
 
+/// True when the pinned snapshot carries ANY delete work (v2 position/
+/// equality delete files, or v3 deletion vectors — puffin routing is
+/// the authoritative signal). P0b4 slice A's COUNT elision MUST decline
+/// when this is true: a data file with an attached DV still carries its
+/// pre-delete `record_count`, so the manifest sum would overcount. The
+/// plain scan applies deletes via `load_row_deletes` and stays exact.
+///
+/// # Safety
+/// `session` must be NULL or a live handle from `pg_datalake_scan_new`.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_scan_has_deletes(session: *mut ScanSession) -> bool {
+    match unsafe { session.as_ref() } {
+        Some(s) => !s.plan.delete_tasks.is_empty(),
+        None => false,
+    }
+}
+
 /// File path of task `idx` (stable for the session's lifetime); NULL when
 /// out of range or session NULL.
 ///
@@ -2117,6 +2134,12 @@ mod tests {
         let f = unsafe { CStr::from_ptr(file) };
         assert!(f.to_string_lossy().ends_with("a.parquet"));
         assert_eq!(unsafe { pg_datalake_scan_task_rows(session, 0) }, 77);
+        // P0b4: delete files are routed OUT of tasks — has_deletes must
+        // reflect their presence so the count elision can decline.
+        assert!(
+            unsafe { pg_datalake_scan_has_deletes(session) },
+            "fixture carries 1 pos-delete + 1 eq-delete file"
+        );
         assert_eq!(unsafe { pg_datalake_scan_task_rows(session, 99) }, 0);
 
         // slice 20: rows_open applies the position deletes — the delete

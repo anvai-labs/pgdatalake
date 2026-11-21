@@ -636,26 +636,52 @@ lakehouse_GetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 										selector[0] != '\0' ? selector : NULL);
 		if (session == NULL)
 			return;
+
+		/*
+		 * DV/DELETE GUARD (spec 15 §6.6): a data file with an attached
+		 * deletion vector or delete file still carries its PRE-DELETE
+		 * record_count in the manifest — the sum would OVERCOUNT MoR
+		 * tables. The plain scan applies deletes via load_row_deletes and
+		 * stays exact, so decline: elision (slice A) is only for snapshots
+		 * with NO delete work (append-only / COW-rewritten).
+		 */
+		if (pg_datalake_scan_has_deletes(session))
+		{
+			pg_datalake_scan_free(session);
+			return;
+		}
 		n = pg_datalake_scan_task_count(session);
 		total = 0;
 		for (uint64 i = 0; i < n; i++)
 			total += (int64) pg_datalake_scan_task_rows(session, i);
 		pg_datalake_scan_free(session);
 
+		/*
+		 * byVal must be TRUE for INT8: a false byval makes plan copies memcpy
+		 * from the datum VALUE interpreted as a pointer
+		 */
 		count_const = makeConst(INT8OID, -1, InvalidOid, sizeof(int64),
-								Int64GetDatum(total), false, false);
+								Int64GetDatum(total), false, true);
 		target = create_empty_pathtarget();
 		add_new_column_to_pathtarget(target, (Expr *) count_const);
+
+		/*
+		 * the expected sum rides in fdw_private: Begin re-verifies it against
+		 * the CURRENT snapshot so a reused plan (prepared statement) cannot
+		 * serve a stale count under READ COMMITTED
+		 */
 		path = create_foreignscan_path(root, output_rel, target,
 									   1 /* rows */ , 0,
 									   0.0 /* startup */ ,
 									   10.0 /* total: a manifest read */ ,
 									   NIL, NULL, NULL,
 									   NIL /* fdw_restrictinfo */ ,
-									   list_make3(makeString("count_elision"),
+									   list_make4(makeString("count_elision"),
 												  makeString(selector),
 												  makeString(psprintf("%u",
-																	  rte->relid))));
+																	  rte->relid)),
+												  makeString(psprintf("%lld",
+																	  (long long) total))));
 	}
 	add_path(output_rel, &path->path);
 }
@@ -1063,7 +1089,7 @@ lakehouse_GetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 		char	   *selector;
 		char	   *ftid;
 
-		Assert(list_length(best_path->fdw_private) == 3);
+		Assert(list_length(best_path->fdw_private) == 4);
 		marker = strVal(linitial(best_path->fdw_private));
 		Assert(strcmp(marker, "count_elision") == 0);
 		selector = strVal(lsecond(best_path->fdw_private));
@@ -1072,12 +1098,14 @@ lakehouse_GetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 		/*
 		 * tlist already carries the plan-time count Const (the path
 		 * pathtarget it was created with) — no Aggref, no Var,
-		 * executor-safe.
+		 * executor-safe. The expected sum rides along so Begin can re-verify
+		 * against the current snapshot (MVCC revalidation).
 		 */
 		return make_foreignscan(tlist, NIL, 0, NIL,
-								list_make3(makeString(pstrdup(marker)),
+								list_make4(makeString(pstrdup(marker)),
 										   makeString(pstrdup(selector)),
-										   makeString(pstrdup(ftid))),
+										   makeString(pstrdup(ftid)),
+										   makeString(pstrdup(strVal(lfourth(best_path->fdw_private))))),
 								NIL, NIL, NULL);
 	}
 
@@ -1164,17 +1192,53 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 		ForeignScan *fscan = (ForeignScan *) node->ss.ps.plan;
 
 		if (fscan != NULL && fscan->fdw_private != NIL &&
-			list_length(fscan->fdw_private) == 3 &&
+			list_length(fscan->fdw_private) == 4 &&
 			strcmp(strVal(linitial(fscan->fdw_private)),
 				   "count_elision") == 0)
 		{
+			char	   *sel = strVal(lsecond(fscan->fdw_private));
+			char	   *ftid_s = strVal(lthird(fscan->fdw_private));
+			char	   *want_s = strVal(lfourth(fscan->fdw_private));
+			Oid			ftid = (Oid) strtoul(ftid_s, NULL, 10);
+			LakehouseOptions eopts;
+			ScanSession *session;
+			uint64		n;
+			int64		now_total;
+
 			/*
-			 * the count itself is a plan-time Const in the targetlist — no
-			 * session, no I/O at execution time
+			 * MVCC REVALIDATION (spec 15 §6.6): the count Const was computed
+			 * at PLAN time. A prepared statement may execute a plan built
+			 * against an OLDER snapshot; under READ COMMITTED the answer must
+			 * reflect the CURRENT snapshot. Recompute (cached manifests,
+			 * cheap); on drift, error with retry semantics — the next
+			 * execution replans fresh (the same AssertRefSnapshotId
+			 * philosophy as row scans).
 			 */
+			ExtractOptions(ftid, &eopts);
 			state = (LakehouseExecState *) palloc0(sizeof(LakehouseExecState));
 			state->elided_count = true;
 			state->count_done = false;
+			session = lakehouse_OpenSession(&eopts,
+											sel[0] != '\0' ? sel : NULL);
+			if (session == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_CONNECTION_EXCEPTION),
+						 errmsg("lakehouse: elision revalidation could not "
+								"open the scan session")));
+			n = pg_datalake_scan_task_count(session);
+			now_total = 0;
+			for (uint64 i = 0; i < n; i++)
+				now_total += (int64) pg_datalake_scan_task_rows(session, i);
+			pg_datalake_scan_free(session);
+			if ((long long) now_total != strtoll(want_s, NULL, 10))
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("lakehouse: table %u advanced since this "
+								"statement was planned (%lld rows now, "
+								"%s planned)",
+								ftid, (long long) now_total, want_s),
+						 errhint("Re-execute the statement: the retry uses a "
+								 "fresh plan and snapshot.")));
 			node->fdw_state = state;
 			return;
 		}
