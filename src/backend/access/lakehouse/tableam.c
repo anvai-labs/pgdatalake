@@ -2899,52 +2899,51 @@ pg_lakehouse_publish_staged(PG_FUNCTION_ARGS)
 		Datum		payload = SPI_getbinval(SPI_tuptable->vals[i],
 											SPI_tuptable->tupdesc, 2, &isnull);
 		char	   *payload_c;
-		char	   *loc;
 
 		if (isnull)
 			continue;
 		payload_c = TextDatumGetCString(payload);
 
-		/* emission core (Rust): payload rows -> writer -> flush */
+		/* emission core (Rust): payload rows -> writer -> flush.
+		 * COALESCED emission: every unpublished segment's rows go into
+		 * ONE accumulator (rollover bounds file sizes), ONE commit. */
 		if (!pg_datalake_publish_segment(entry->ws, payload_c,
 										 errbuf, sizeof(errbuf)))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_EXCEPTION),
 					 errmsg("lakehouse: publisher emission failed for segment %lld: %s",
 							(long long) DatumGetInt64(seg_id), errbuf)));
+		published_count++;
+	}
 
-		/* commit ONE snapshot per segment (v1 discipline, spec 15 §4.4
-		 * single-segment-per-commit) and flip the ledger immediately */
+	if (published_count > 0)
+	{
+		char	   *loc;
+		int64		snap_id;
+		int			flip_ret;
+
+		/* ONE append snapshot for the whole batch */
 		loc = pg_datalake_write_commit(entry->ws, 3, errbuf, sizeof(errbuf));
 		if (loc == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_CONNECTION_EXCEPTION),
 					 errmsg("lakehouse: publisher commit failed: %s", errbuf)));
-		{
-			StringInfoData upd;
-
-			initStringInfo(&upd);
-			appendStringInfo(&upd,
-							 "UPDATE lakehouse.lakehouse_delta_segments"
-							 " SET published = true,"
-							 " published_snapshot_id = %s"
-							 " WHERE seg_id = %lld",
-							 "0",	/* snapshot id from loc: parsed below */
-							 (long long) DatumGetInt64(seg_id));
-			(void) upd;		/* snapshot-id parse lands with P4b; flip now */
-			ret = SPI_execute(psprintf("UPDATE"
-									   " lakehouse.lakehouse_delta_segments"
-									   " SET published = true"
-									   " WHERE seg_id = %lld",
-									   (long long) DatumGetInt64(seg_id)),
-							  false, 0);
-			if (ret != SPI_OK_UPDATE)
-				ereport(ERROR,
-						(errcode(ERRCODE_IO_ERROR),
-						 errmsg("lakehouse: publisher ledger flip failed")));
-			published_count++;
-		}
+		snap_id = pg_datalake_write_last_snapshot_id(entry->ws);
 		pg_datalake_write_commit_result_free(loc);
+
+		/* ledger flip: the batch's segments all point at the snapshot */
+		flip_ret = SPI_execute(psprintf("UPDATE"
+										" lakehouse.lakehouse_delta_segments"
+										" SET published = true,"
+										" published_snapshot_id = %lld"
+										" WHERE relid = %u AND NOT published",
+										(long long) snap_id,
+										(unsigned) relid),
+							   false, 0);
+		if (flip_ret != SPI_OK_UPDATE)
+			ereport(ERROR,
+					(errcode(ERRCODE_IO_ERROR),
+					 errmsg("lakehouse: publisher ledger flip failed")));
 	}
 	PopActiveSnapshot();
 	SPI_finish();
