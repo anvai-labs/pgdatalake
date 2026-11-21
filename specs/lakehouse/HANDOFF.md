@@ -1053,3 +1053,13 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     the prior snapshot). Suspect carried-manifests handling in the
     fresh-session commit path. Also cleanup: relid=0 delta rows from
     the broken window.
+  - RETRACTION 2026-11-21: the "publisher append REPLACES the previous
+    snapshot" bug recorded earlier today DOES NOT EXIST. Manifest-level
+    inspection (pyiceberg, wm_stick snapshot chain) shows every append
+    correctly CARRIES all prior files forward (each snapshot = prior
+    files + its own added file). The "lost rows" were victims of the
+    pre-guard silent drop (unresolved entry write_mode on the
+    attach-row identity path — fixed in R2 with the loud never-misread
+    guard); the 6-vs-11 discrepancy came from repeated manual test
+    attempts, not snapshot replacement. The publisher's append path is
+    correct as-is; carried-manifests handling needs NO change.
