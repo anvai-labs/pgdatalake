@@ -57,6 +57,15 @@ gitGraph
 | B5 | Promotion = merge, never rebase, across branch tiers. Rebase is only for a feature branch onto `lakehouse-dev` before ITS OWN merge. |
 | B6 | Upstream sync (`git fetch upstream && git merge upstream/master` into `main`) is blocked while `datalake-ci` is red on `lakehouse-dev`. |
 
+**GitHub enforcement (2026-11-21):** branch protection is set via the API
+on `lakehouse-dev` and `main` — direct pushes are REJECTED; all landings go
+through PRs with **squash or rebase (fast-forward-style) merge** allowed and
+merge commits disabled (`allow_merge_commit: false`). 0 required approvals
+(single-dev repo — the PR is the audit trail and the CI trigger, not a review
+gate); force pushes and deletions denied. Docs-only PRs skip CI by path
+filter, so required-status-check enforcement is deliberately OFF until the
+CI strategy gains a docs-only sentinel check (doc 10 §1a).
+
 **CI validity rule (closes the incident):** the ONLY signal that counts is the
 `datalake-ci` workflow, verified as
 `gh run list --workflow datalake-ci`. Upstream's `CI for PostgreSQL` runs are
