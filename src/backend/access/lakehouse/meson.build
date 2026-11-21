@@ -62,7 +62,8 @@ lakehouse = shared_module('lakehouse',
 )
 
 install_data(
-  ['lakehouse.control', 'lakehouse--1.0.sql'],
+  ['lakehouse.control', 'lakehouse--1.0.sql',
+   'lakehouse--1.1.sql', 'lakehouse--1.0--1.1.sql'],
   install_dir: dir_data_extension,
 )
 
@@ -75,7 +76,7 @@ tests += {
   'sd': meson.project_source_root() / 'src/test/regress/lakehouse',
   'bd': meson.current_build_dir(),
   'regress': {
-    'sql': ['version', 'scan_files', 'fdw', 'fdw_auth', 'time_travel', 'tableam', 'gucs'],
+    'sql': ['version', 'scan_files', 'fdw', 'fdw_auth', 'time_travel', 'tableam', 'gucs', 'delta_table'],
     'test_kwargs': {'timeout': 120},
     'deps': [lakehouse],
   },
