@@ -1226,14 +1226,24 @@ get_write_entry(Relation rel)
 		/* WITH-options identity wins; attach row still supplies the
 		 * credentials (they never live in reloptions — doc 09) */
 		entry->have_identity = decode_lakehouse_reloptions(rel, &entry->opts);
-		/* R2: WITH (write_mode=...) sticks over the session GUC —
-		 * resolved on EVERY identity path (attach row included), not
-		 * just the WITH-options one */
+		/*
+		 * R2: a TABLE-LEVEL write_mode sticks over the session GUC —
+		 * resolved on EVERY reloption path, NOT just the ones that also
+		 * carry identity keys. decode_lakehouse_reloptions returns "has
+		 * identity" (opts->table != NULL), which is the WRONG gate: a
+		 * blob holding write_mode alone (CREATE-time write_mode without
+		 * identity — legal per the validator; ALTER TABLE SET is its
+		 * post-create form) was silently ignored and the session GUC
+		 * won. Discriminate on wm_opts.write_mode instead. decode skips
+		 * its memset on the early-return paths (no rd_options, foreign
+		 * layout), so zero the struct here first.
+		 */
 		{
 			LakehouseOptions wm_opts;
-			bool			has_wm = decode_lakehouse_reloptions(rel, &wm_opts);
 
-			entry->write_mode = (has_wm && wm_opts.write_mode != 0)
+			memset(&wm_opts, 0, sizeof(wm_opts));
+			decode_lakehouse_reloptions(rel, &wm_opts);
+			entry->write_mode = (wm_opts.write_mode != 0)
 				? wm_opts.write_mode
 				: lakehouse_write_mode;
 		}
@@ -1593,11 +1603,18 @@ lakehouse_scan_common_setup(LakehouseTableScanDesc scan, Relation rel,
 	/* R2 staged bypass: a table-level WITH (write_mode='staged') makes
 	 * this a delta-only scan — no remote session, zero tasks. Decoded
 	 * into a LOCAL: opts here carries the server-derived endpoint/
-	 * warehouse that OpenSession needs (decode memsets its target). */
+	 * warehouse that OpenSession needs. Same gate as the write path:
+	 * discriminate on wm_opts.write_mode alone (see get_write_entry) —
+	 * keying on decode's "has identity" return silently ignored a
+	 * write_mode-only blob. decode skips its memset on early returns,
+	 * so zero the struct here first. */
 	{
 		LakehouseOptions wm_opts;
-		bool			has_wm = decode_lakehouse_reloptions(rel, &wm_opts);
-		int				wm = (has_wm && wm_opts.write_mode != 0)
+		int				wm;
+
+		memset(&wm_opts, 0, sizeof(wm_opts));
+		decode_lakehouse_reloptions(rel, &wm_opts);
+		wm = (wm_opts.write_mode != 0)
 			? wm_opts.write_mode
 			: lakehouse_write_mode;
 
