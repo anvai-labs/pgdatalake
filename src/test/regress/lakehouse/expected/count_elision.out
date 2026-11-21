@@ -34,13 +34,11 @@ INSERT INTO cnt_elide SELECT g, 'e-'||g FROM generate_series(1, 5) g;
 -- Result (no scan node at all — the answer is a plan-time Const), and
 -- the count is exact
 EXPLAIN (VERBOSE, COSTS OFF) SELECT count(*) FROM cnt_elide;
-             QUERY PLAN             
-------------------------------------
- Aggregate
-   Output: count(*)
-   ->  Seq Scan on public.cnt_elide
-         Output: id, name
-(4 rows)
+      QUERY PLAN       
+-----------------------
+ Result
+   Output: '5'::bigint
+(2 rows)
 
 SELECT count(*) AS exact FROM cnt_elide;
  exact 
