@@ -264,9 +264,52 @@ typedef struct LakehouseTombFile
 	int64		file_size_in_bytes;
 }			LakehouseTombFile;
 
+/*
+ * LakehouseWriteEntry — per-transaction per-relation write state.
+ *
+ * ⚠️ HASH-KEY ALIASING (do not re-break — this cost us a multi-day debug):
+ *
+ * dynahash does NOT store the key beside the user struct. The hash element
+ * layout is [header][key][data], and hash_search returns a pointer to the
+ * KEY (ELEMENTKEY), cast to the entry type — the ENTIRE struct overlays the
+ * stored key bytes. Consequence: any member of this struct that lands at
+ * offset 0 (within keysize = sizeof(Oid) bytes) IS the stored key; writing
+ * it from init code silently REWRITES the key, and every later hash_search
+ * with the same key MISSES.
+ *
+ * That exact bug shipped here: `int write_mode` sat first, and its !found
+ * init (`entry->write_mode = ...`) trampled the key, so HASH_ENTER minted
+ * a DUPLICATE ENTRY PER ROW (probe showed found=0 three times, hash
+ * growing 1→2→3, same relid, same table). A 3-row staged INSERT captured
+ * three single-row delta segments instead of one 3-row segment, and COW
+ * mode silently opened one remote write session per row instead of one
+ * per transaction. It survived every other hypothesis (xact-callback
+ * registration, seq-search iteration, teardown) because nothing was
+ * "losing" the entry — the table was full of keys that no longer matched.
+ *
+ * RULES for this struct (and any other HASH_ELEM entry struct here):
+ * 1. The hash key field comes FIRST and is owned by dynahash — hash_search
+ *    copies it in; init code must never write it (re-writing the same
+ *    value is harmless but forbidden by convention; a different value
+ *    corrupts the table).
+ * 2. Adding a member is safe only if the key stays first. NEVER reorder
+ *    without re-checking that no member aliases [0, keysize).
+ * 3. Debugging symptom to recognize instantly: HASH_ENTER reports
+ *    found=false repeatedly for an identical key on the same HTAB, and
+ *    hash_get_num_entries climbs with duplicates. That is key aliasing,
+ *    not a teardown/registration/iteration bug.
+ *
+ * (LakehouseScanRegistryEntry below follows the same idiom correctly.)
+ */
 typedef struct LakehouseWriteEntry
 {
+	/*
+	 * HASH KEY — MUST be first (see the block comment above for why, and
+	 * for the aliasing failure mode). Written by hash_search itself;
+	 * init code must not touch it.
+	 */
 	Oid			relid;
+	int			write_mode;	/* resolved: reloption wins over GUC (R2) */
 	WriteSession *ws;			/* FFI write session; NULL until 1st insert */
 	MemoryContext mcxt;			/* all entry allocations live here */
 	/* own-writes overlay: staged tuples, copied datum-wise into mcxt */
@@ -309,6 +352,12 @@ typedef struct LakehouseTableScanDescData LakehouseTableScanDescData;
 
 typedef struct LakehouseScanRegistryEntry
 {
+	/*
+	 * HASH KEY — first member, per the dynahash key-aliasing idiom (see
+	 * the full warning above LakehouseWriteEntry, where a non-key member
+	 * at offset 0 once corrupted lookups). dynahash copies the key in;
+	 * never write this field from init code.
+	 */
 	Oid			relid;
 	LakehouseTableScanDescData *scan;
 	SubTransactionId subid;
@@ -328,6 +377,8 @@ extern char	   *lakehouse_publish_database;
 
 #define LAKEHOUSE_WRITE_MODE_COW		1
 #define LAKEHOUSE_WRITE_MODE_STAGED		2
+
+static bool xact_callbacks_registered = false;
 
 static void staged_capture_segment(LakehouseWriteEntry *entry);
 
@@ -375,20 +426,42 @@ lakehouse_xact_callback(XactEvent event, void *arg)
 		 * callback then frees the sessions) — no partial commit ever
 		 * exists remotely (Iceberg's core guarantee).
 		 */
-		hash_seq_init(&seq, write_entries);
-		while ((entry = hash_seq_search(&seq)) != NULL)
+		/* P3 regression fix: hash_seq_search is INVALIDATED by work
+		 * done mid-iteration (the capture's SPI runs hash operations);
+		 * the old inline capture re-yielded the same entry per row.
+		 * Phase 1: iterate + collect. Phase 2 (seq finished): capture. */
 		{
-			/* staged mode (D1-rev): the delta row IS the commit —
-			 * durability from the heap+WAL machinery, no remote I/O */
-			if (lakehouse_write_mode == LAKEHOUSE_WRITE_MODE_STAGED &&
-				entry->staged_rows > 0)
+			LakehouseWriteEntry *staged_list[64];
+			int			n_staged = 0;
+
+			hash_seq_init(&seq, write_entries);
+			while ((entry = hash_seq_search(&seq)) != NULL)
 			{
-				staged_capture_segment(entry);
-				continue;
-			}
-			if (entry->ws == NULL || (entry->staged_rows == 0 &&
-									  entry->n_tomb_files == 0))
-				continue;
+				/* staged mode (D1-rev): the delta row IS the commit —
+				 * durability from the heap+WAL machinery, no remote I/O */
+				if (entry->write_mode == LAKEHOUSE_WRITE_MODE_STAGED &&
+					entry->staged_rows > 0)
+				{
+					if (n_staged < 64)
+						staged_list[n_staged++] = entry;
+					continue;
+				}
+				/* NEVER-MISREAD GUARD (R2): staged rows with no capture
+				 * path = silent row loss. */
+				if (entry->staged_rows > 0 &&
+					(entry->write_mode != LAKEHOUSE_WRITE_MODE_COW ||
+					 entry->ws == NULL))
+					ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("lakehouse: %d staged rows cannot be committed"
+									" (write mode %d, no remote session)",
+									entry->staged_rows, entry->write_mode),
+							 errdetail("This is a lakehouse bug, not an operator"
+									   " error — the rows would be silently"
+									   " lost.")));
+				if (entry->ws == NULL || (entry->staged_rows == 0 &&
+										  entry->n_tomb_files == 0))
+					continue;
 			{
 				char		errbuf[1024];
 				char	   *loc;
@@ -572,6 +645,19 @@ lakehouse_xact_callback(XactEvent event, void *arg)
 				pg_datalake_write_commit_result_free(loc);
 			}
 		}
+
+		/* P3 phase 2: capture the staged entries COLLECTED during the
+		 * seq iteration (the capture's own SPI runs hash operations and
+		 * re-yielded the same entry per row — the live-proven per-row
+		 * capture bug). The seq search has COMPLETED here, so SPI is
+		 * safe. COW entries were handled inline above. */
+		{
+			int			ci;
+
+			for (ci = 0; ci < n_staged; ci++)
+				staged_capture_segment(staged_list[ci]);
+		}
+		}	/* staged_list collection scope */
 	}
 
 	/* teardown: free FFI sessions + the hash. PRE_COMMIT's commit errors
@@ -589,7 +675,7 @@ lakehouse_xact_callback(XactEvent event, void *arg)
 				pg_datalake_write_free(entry->ws);
 			MemoryContextDelete(entry->mcxt);
 		}
-		hash_destroy(write_entries);
+			hash_destroy(write_entries);
 		write_entries = NULL;
 	}
 }
@@ -865,9 +951,9 @@ typedef struct LakehouseRelOptions
 }			LakehouseRelOptions;
 
 static const char *lakehouse_relopt_keys[] = {
-	"table", "endpoint", "warehouse", "s3_endpoint",
+	"table", "endpoint", "warehouse", "s3_endpoint", "write_mode",
 };
-#define LAKEHOUSE_NUM_RELOPTS 4
+#define LAKEHOUSE_NUM_RELOPTS 5
 
 /* credentials (token, s3_access_key, s3_secret_key) are deliberately NOT
  * table options: they live in the attach row / secure settings (doc 09)
@@ -926,12 +1012,16 @@ lakehouse_relation_reloptions(Datum reloptions, bool validate)
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("lakehouse: unrecognized option \"%s\"", key),
 						 errhint("Known options: table, endpoint, warehouse, "
-								 "s3_endpoint (credentials come from the attach "
-								 "row or secure settings, never table options).")));
+								 "s3_endpoint, write_mode (credentials come "
+								 "from the attach row or secure settings, "
+								 "never table options).")));
 		}
 	}
 
-	if (values[0] == NULL)
+	/* write_mode alone is legal (R2: mode can be set at CREATE, identity
+	 * attached later via lakehouse.attach_table) */
+	if ((values[1] != NULL || values[2] != NULL || values[3] != NULL) &&
+		values[0] == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("lakehouse: the \"table\" option is required"),
@@ -1014,13 +1104,21 @@ decode_lakehouse_reloptions(Relation rel, LakehouseOptions *opts)
 
 	memset(opts, 0, sizeof(*opts));
 	p = ro->blob;
-	for (i = 0; i < LAKEHOUSE_NUM_RELOPTS; i++)
 	{
-		char	  **field = NULL;
-		char	   *start = p;
+		/* bound the walk by the BLOB LENGTH: legacy blobs hold fewer
+		 * keys than LAKEHOUSE_NUM_RELOPTS, and reading past the last
+		 * NUL hit garbage bytes that (a) errored loudly as an invalid
+		 * write_mode and (b) aborted every statement touching the
+		 * table (CI regression, R2) */
+		char	   *blob_end = ro->blob + ro->blob_len;
 
-		while (*p != '\0')
-			p++;
+		for (i = 0; i < LAKEHOUSE_NUM_RELOPTS && p < blob_end; i++)
+		{
+			char	  **field = NULL;
+			char	   *start = p;
+
+			while (*p != '\0')
+				p++;
 		switch (i)
 		{
 			case 0:
@@ -1035,10 +1133,28 @@ decode_lakehouse_reloptions(Relation rel, LakehouseOptions *opts)
 			case 3:
 				field = &opts->s3_endpoint;
 				break;
+			case 4:				/* write_mode: int, not a char* field */
+				if (p > start)
+				{
+					/* empty slot = unset (blobs written before R2 or
+					 * CREATEs without the option) — only a NON-empty
+					 * unrecognized value is a loud error */
+					if (strcmp(start, "staged") == 0)
+						opts->write_mode = LAKEHOUSE_WRITE_MODE_STAGED;
+					else if (strcmp(start, "cow") == 0)
+						opts->write_mode = LAKEHOUSE_WRITE_MODE_COW;
+					else
+						ereport(ERROR,
+								(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+								 errmsg("invalid write_mode \"%s\" (cow|staged)",
+										start)));
+				}
+				break;
 		}
-		if (p > start)
-			*field = pnstrdup(start, p - start);
-		p++;					/* skip the NUL */
+			if (p > start && i != 4)
+				*field = pnstrdup(start, p - start);
+			p++;				/* skip the NUL */
+		}
 	}
 
 	/* split identity into namespace.table (doc 03 §3) */
@@ -1070,6 +1186,12 @@ get_write_entry(Relation rel)
 	{
 		HASHCTL		ctl;
 
+		/*
+		 * HASH_ELEM entry structs overlay the key (see the hash-key
+		 * aliasing warning above LakehouseWriteEntry): keysize bytes at
+		 * offset 0 of LakehouseWriteEntry ARE the stored key. relid is
+		 * deliberately the struct's first member — keep it that way.
+		 */
 		ctl.keysize = sizeof(Oid);
 		ctl.entrysize = sizeof(LakehouseWriteEntry);
 		write_entries = hash_create("lakehouse managed write state", 8, &ctl,
@@ -1079,6 +1201,11 @@ get_write_entry(Relation rel)
 												HASH_ENTER, &found);
 	if (!found)
 	{
+		/*
+		 * Init a freshly minted entry. dynahash has ALREADY copied the
+		 * key into entry->relid — do not (re)write it here; see the
+		 * hash-key aliasing warning on the struct.
+		 */
 		entry->ws = NULL;
 		entry->mcxt = AllocSetContextCreate(TopTransactionContext,
 											"lakehouse managed write",
@@ -1099,6 +1226,17 @@ get_write_entry(Relation rel)
 		/* WITH-options identity wins; attach row still supplies the
 		 * credentials (they never live in reloptions — doc 09) */
 		entry->have_identity = decode_lakehouse_reloptions(rel, &entry->opts);
+		/* R2: WITH (write_mode=...) sticks over the session GUC —
+		 * resolved on EVERY identity path (attach row included), not
+		 * just the WITH-options one */
+		{
+			LakehouseOptions wm_opts;
+			bool			has_wm = decode_lakehouse_reloptions(rel, &wm_opts);
+
+			entry->write_mode = (has_wm && wm_opts.write_mode != 0)
+				? wm_opts.write_mode
+				: lakehouse_write_mode;
+		}
 		if (!ExtractManagedIdentity(relid, &entry->opts))
 			entry->have_identity = entry->have_identity;
 		else if (!entry->have_identity)
@@ -1452,14 +1590,23 @@ lakehouse_scan_common_setup(LakehouseTableScanDesc scan, Relation rel,
 	}
 	scan->projection_csv = proj.data;
 
-	/* staged mode (P3, D2): the scan source is the delta table — no
-	 * remote session; zero tasks means the file loop never runs and the
-	 * delta serve path (below) is the whole scan */
-	if (lakehouse_write_mode == LAKEHOUSE_WRITE_MODE_STAGED)
+	/* R2 staged bypass: a table-level WITH (write_mode='staged') makes
+	 * this a delta-only scan — no remote session, zero tasks. Decoded
+	 * into a LOCAL: opts here carries the server-derived endpoint/
+	 * warehouse that OpenSession needs (decode memsets its target). */
 	{
-		scan->session = NULL;
-		scan->task_count = 0;
-		return;
+		LakehouseOptions wm_opts;
+		bool			has_wm = decode_lakehouse_reloptions(rel, &wm_opts);
+		int				wm = (has_wm && wm_opts.write_mode != 0)
+			? wm_opts.write_mode
+			: lakehouse_write_mode;
+
+		if (wm == LAKEHOUSE_WRITE_MODE_STAGED)
+		{
+			scan->session = NULL;
+			scan->task_count = 0;
+			return;
+		}
 	}
 	scan->session = lakehouse_OpenSession(&scan->opts, rte_selector);
 	scan->task_count = pg_datalake_scan_task_count(scan->session);
@@ -1628,12 +1775,13 @@ lakehouse_scan_getnextslot(TableScanDesc bscan, ScanDirection direction,
 
 				/* staged mode: committed unpublished delta segments
 				 * next (MVCC visibility via the SPI snapshot) */
-				if (lakehouse_write_mode == LAKEHOUSE_WRITE_MODE_STAGED)
+				if (lakehouse_write_mode == LAKEHOUSE_WRITE_MODE_STAGED ||
+					scan->opts.write_mode == LAKEHOUSE_WRITE_MODE_STAGED)
 				{
-					if (!scan->delta_loaded)
-						load_delta_segments(scan, tupdesc);
 					char		delta_err[1024];
 
+					if (!scan->delta_loaded)
+						load_delta_segments(scan, tupdesc);
 					while (scan->delta_pos < scan->n_delta)
 					{
 						DeltaRowsHandle *h = scan->delta_rows[scan->delta_pos];
@@ -2065,7 +2213,6 @@ staged_capture_segment(LakehouseWriteEntry *entry)
 	int			i;
 	int			k;
 	bool		first_row = true;
-	Oid			save_uid;
 	int			ret;
 	TupleDesc	tupdesc = entry->tupdesc;
 
@@ -2137,12 +2284,12 @@ lakehouse_tuple_insert(Relation rel, TupleTableSlot *slot, CommandId cid,
 
 	slot_getallattrs(slot);
 	/* staged mode (spec 15 D2): durability is the delta table — no
-	 * remote session is opened, ever, on the insert path */
-	if (lakehouse_write_mode != LAKEHOUSE_WRITE_MODE_STAGED)
+	 * remote session is opened, ever, on the insert path. R2: a
+	 * table-level WITH (write_mode='staged') sticks over the session
+	 * GUC. */
+	if (entry->write_mode != LAKEHOUSE_WRITE_MODE_STAGED)
 		open_write_session(entry, RelationGetDescr(rel));
 	stage_slot(entry, slot, RelationGetDescr(rel));
-	elog(LOG, "lakehouse staged row at subid %u",
-		 GetCurrentSubTransactionId());
 }
 
 static void
@@ -2630,11 +2777,7 @@ lakehouse_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	LakehouseWriteEntry *entry;
 
 	if (event != SUBXACT_EVENT_ABORT_SUB || write_entries == NULL)
-	{
-		elog(LOG, "lakehouse subxact event %d subid %u", (int) event, mySubid);
 		return;
-	}
-	elog(LOG, "lakehouse ABORT_SUB subid %u", mySubid);
 	hash_seq_init(&seq, write_entries);
 	while ((entry = hash_seq_search(&seq)) != NULL)
 	{
@@ -2835,7 +2978,12 @@ lakehouse_publisher_main(Datum main_arg)
 							  " WHERE NOT published", true, 0);
 			if (ret == SPI_OK_SELECT && SPI_processed > 0)
 			{
-				MemoryContext sc = MemoryContextSwitchTo(TopTransactionContext);
+				/* TopMemoryContext: the array must SURVIVE the discovery
+				 * transaction's commit — allocating in the txn context
+				 * freed it before the per-table publish loop read it
+				 * (use-after-free: garbage relids, worker SEGV — the
+				 * same context-lifetime class as the M2 entry bug) */
+				MemoryContext sc = MemoryContextSwitchTo(TopMemoryContext);
 
 				relids = (Oid *) palloc(sizeof(Oid) * SPI_processed);
 				for (int i = 0; i < SPI_processed; i++)
@@ -3005,8 +3153,15 @@ _PG_init(void)
 		lakehouse_publisher_enabled)
 		register_publisher_worker();
 
-	RegisterXactCallback(lakehouse_xact_callback, NULL);
-	RegisterSubXactCallback(lakehouse_subxact_callback, NULL);
+	/* idempotent: the library can load more than once per backend
+	 * (extension script + AM handoff); duplicate registrations ran the
+	 * staged capture once PER registration per commit */
+	if (!xact_callbacks_registered)
+	{
+		RegisterXactCallback(lakehouse_xact_callback, NULL);
+		RegisterSubXactCallback(lakehouse_subxact_callback, NULL);
+		xact_callbacks_registered = true;
+	}
 }
 
 /* pg_am oid of the lakehouse AM (resolved once per backend) */

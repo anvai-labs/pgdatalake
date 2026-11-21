@@ -1032,3 +1032,59 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     pyiceberg reads exactly 10 rows (no duplicates). Offline
     acceptance: publisher.sql (10th test) asserts the worker runs via
     start_publisher. Suite 10/10, 114 cargo.
+  - R2 slice — MOSTLY DONE 2026-11-21 (write_mode table option + guard,
+    live): WITH (write_mode='staged') sticks per table over the session
+    GUC (resolved on every identity path); validator accepts write_mode
+    alone at CREATE (identity attach later); scans/captures/flip all
+    honor the table mode. NEW NEVER-MISREAD GUARD: staged rows with no
+    capture path (mode unresolved + no session) now ereport LOUDLY —
+    the first wm_stick insert vanished silently through exactly that
+    hole (entry mode unresolved on the attach-row identity path; fixed:
+    resolved on EVERY path via a local decode). EDITORIAL INCIDENT:
+    a non-unique sed/replace duplicated ~3000 lines of tableam.c
+    (caught by the compile; truncated at the true handler end and the
+    scan bypass re-applied as a SINGLE pre-OpenSession block — decode
+    into a LOCAL, never into scan->opts (memset clobbers the
+    server-derived endpoint: "builder error")). OPEN BUG (next session
+    first item): the publisher's append REPLACES the previous snapshot
+    instead of extending it — fresh write session per cycle isn't
+    carrying the base snapshot's manifests (wm_stick: published 5, then
+    published 6 -> remote shows only 6/75; prior rows recoverable via
+    the prior snapshot). Suspect carried-manifests handling in the
+    fresh-session commit path. Also cleanup: relid=0 delta rows from
+    the broken window.
+  - RETRACTION 2026-11-21: the "publisher append REPLACES the previous
+    snapshot" bug recorded earlier today DOES NOT EXIST. Manifest-level
+    inspection (pyiceberg, wm_stick snapshot chain) shows every append
+    correctly CARRIES all prior files forward (each snapshot = prior
+    files + its own added file). The "lost rows" were victims of the
+    pre-guard silent drop (unresolved entry write_mode on the
+    attach-row identity path — fixed in R2 with the loud never-misread
+    guard); the 6-vs-11 discrepancy came from repeated manual test
+    attempts, not snapshot replacement. The publisher's append path is
+    correct as-is; carried-manifests handling needs NO change.
+  - ✅ PER-ROW CAPTURE REGRESSION FIXED (commit 42f2174b23e, PR #9
+    should go green). ROOT CAUSE: dynahash hash-key aliasing. hash_search
+    returns a pointer to the KEY BYTES (ELEMENTKEY) — the entry struct
+    overlays them. LakehouseWriteEntry declared `int write_mode` at
+    offset 0 (inside the 4-byte keysize window), so its !found init
+    (`entry->write_mode = ...`) rewrote the stored key: every later
+    HASH_ENTER for the same relid MISSED and minted a duplicate entry —
+    one per row, each with 1 staged row, each captured as its own
+    segment. Probes proved it directly: `found 0` three times, hash
+    growing 1→2→3, same relid, same hashp. COW multi-row had the same
+    bug latently (one write session per row). Fix: `Oid relid` is the
+    FIRST member (canonical dynahash idiom, matching
+    LakehouseScanRegistryEntry); init code never touches the key
+    field. Also removed: redundant entry->relid init, unused save_uid,
+    C90 mixed-declaration warning in the delta-serve path. Verified:
+    probe log found=0 once then found=1 per row, ONE entry rows=3, ONE
+    capture; lakehouse suite 10/10 green, upstream regress suite green.
+    LESSON (generalizes): any struct used as a dynahash HASH_ELEM entry
+    must declare the key first and treat it as hash-owned — a member
+    landing inside [0, keysize) silently corrupts lookups.
+  - (history) The two suspects previously eliminated — xact-callback
+    registration and seq-search iteration — were never the cause; the
+    earlier "capture 3× with staged_rows=1" observation was the alias
+    entries. The two-phase PRE_COMMIT restructure (commit 5ded905e) is
+    still the correct pattern and stays.

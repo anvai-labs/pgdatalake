@@ -1,0 +1,82 @@
+# PROGRESS.md — visual tracker (update at every slice/milestone landing)
+
+*(Living tracker, 2026-11-21. Percentages are working estimates anchored
+on the ROADMAP (12-roadmap.md), spec 15 §7 prerequisite chain, doc 14
+slices, and the 13-review blocker ledger. Update protocol: append a
+HANDOFF entry AND touch this file in the same commit when a slice or
+milestone lands.)*
+
+## 1. Milestone completion
+
+```mermaid
+pie showData
+    title Milestone-weighted overall progress (~77%)
+    "M0 Foundation — 100%" : 100
+    "M1 Read path — 100%" : 100
+    "M2 Managed writes — 100%" : 100
+    "M3 Semantics & parity — 65%" : 65
+    "M4 Maintenance — 20%" : 20
+```
+
+| Milestone | Progress | Remaining |
+|---|---|---|
+| **M0** Foundation | 100% ✅ | — |
+| **M1** Read path (REST, FDW, S3, types, time travel) | 100% ✅ | — |
+| **M2** Managed writes (TableAM, COW DML, MERGE, ceremony) | 100% ✅ | — |
+| **M3** Semantics & cloud parity | ~65% 🔶 | MVCC models · ADLS/GCS IO + auth · branches/tags SQL · logical-repl decision |
+| **M4** Maintenance & hardening | ~20% 🔶 | compaction/expire/orphan/ANALYZE + optimize exec (designed, doc 08) |
+| **M5** Seamless layer | ongoing | engine integrations |
+
+## 2. Current milestone (M3) detail
+
+```mermaid
+flowchart LR
+    subgraph done["✅ done"]
+        TT["time travel"]
+        PERF["perf: batch ABI 3.2x\nwriter bounds, pruning"]
+        STG["staged writes:\ndelta table + publisher\nbgworker, crash-tested"]
+        CACHE["block cache +\nranged reads"]
+    end
+    subgraph todo["❌ remaining"]
+        MVCC["mvcc models\nRR/SERIALIZABLE"]
+        CLOUD["ADLS/GCS IO\n+ auth chains"]
+        BR["branches/tags\nrollback SQL"]
+        LR["logical repl\ndecision"]
+    end
+    done --> todo
+```
+
+## 3. Track-by-track
+
+| Track | Progress | Detail |
+|---|---|---|
+| Staged writes (spec 15 R2) | 85% ✅ | P0–P4c + R2 core all landed (PRs #5/#6/#9); left: polish + coalesce edge cases |
+| v3 conformance (doc 14) | 50% 🔶 | V0/V1/V2 ✅ — V3 (DV write) V4 (lineage) V5 (defaults) remain |
+| 13-review blockers | ~80% ✅ | #1 #5 #6 #7 #8 done; #2/#3 partial (writer-side), #4 partial (identity partitions) |
+| CI/CD (doc 10 §1a) | ~75% ✅ | all-branch datalake-ci ✅ docs-sentinel ✅ · sanitizer/coverage jobs ❌ |
+| Perf (13-review E) | ~60% 🔶 | batch ABI ✅ bounds ✅ · P0b lazy ranged reader ❌ planning-IO 🔶 |
+
+## 4. Recently landed (reverse-chronological, evidence in HANDOFF)
+
+| Date | Slice | PR |
+|---|---|---|
+| 2026-11-21 | Hash-key aliasing fix: per-row staged-capture regression ROOT-CAUSED | #9 |
+| 2026-11-21 | R2: CREATE-time write_mode + never-misread guard | #9 |
+| 2026-11-21 | P4c publisher bgworker (hands-off, live) | #6 |
+| 2026-11-21 | P3/P4 core: delta table, staged INSERT, coalesced publisher, crash test | #5 |
+| 2026-11-21 | P3 foundation: delta-segments store as PG table | #4 |
+| 2026-11-21 | P2 GUCs (32MB/4GB/128MB) · P0 caches · P1 rollover | #3/#2 |
+| 2026-11-21 | M3-R2 writer min/max bounds (pruning live) | PR #5-lineage |
+| 2026-11-21 | M3-R1 typed batch ABI (3.2×) + corruption fix | PR #5-lineage |
+| 2026-11-21 | Specs 15/§1a/01-diagrams; RULES §1a; branch protection; repo rename | #1/#8 |
+
+## 5. Next queue
+
+1. **Publisher append-extend verification** — RETRACTED as a bug (manifest
+   inspection shows correct carry); only needs a regression test pinning
+   the two-batch publish case
+2. **P0b** — lazy ranged parquet reader (zero-GET EXPLAIN, 13-review perf #1)
+3. **M3 close-out** — MVCC models → ADLS/GCS IO + auth → branches/tags →
+   logical-repl decision (gate: 4-store CI matrix + isolation tests)
+4. **M4** — compaction/expire/orphan/ANALYZE on the P4c worker skeleton;
+   optimize exec tiers (design: doc 08)
