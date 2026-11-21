@@ -7,7 +7,12 @@
 # re-run standalone: src/test/lakehouse/fixtures/smoke.sh
 set -eu
 
-NET=$(docker compose -f "$(dirname "$0")/../docker-compose.yml" -p pgdatalake ls --format json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["Network"])' 2>/dev/null || echo pgdatalake_default)
+# Makefile pins the compose project (-p pgdatalake), so the network name is
+# deterministic; the label query handles custom COMPOSE_PROJECT_NAME setups.
+# (docker compose ls --format json emits no "Network" key — the old
+# auto-detection here was dead code that always fell back.)
+NET=$(docker network ls --filter label=com.docker.compose.project=pgdatalake --format '{{.Name}}' 2>/dev/null | head -1)
+NET=${NET:-pgdatalake_default}
 
 RCLONE_ENV="-e RCLONE_CONFIG_S3_TYPE=s3 -e RCLONE_CONFIG_S3_PROVIDER=Other
  -e RCLONE_CONFIG_S3_ACCESS_KEY_ID=lakehouse-test
