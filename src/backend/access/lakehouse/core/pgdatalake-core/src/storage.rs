@@ -171,12 +171,16 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 }
 
 /// An open handle to one object-store location.
+///
+/// Cheap to CLONE (the store is behind an Arc): P0b's `RangedReader` owns
+/// a clone because parquet's `ChunkReader` consumers require 'static.
+#[derive(Clone)]
 pub struct StorageIo {
     /// Cache namespace (spec 15 §6.2): endpoint+bucket for S3-family
     /// stores, local-root for file stores — paths are only unique within
     /// a warehouse, so every cached key is scoped by this.
     pub scope_id: String,
-    store: Box<dyn ObjectStore>,
+    store: std::sync::Arc<dyn ObjectStore>,
 }
 
 impl StorageIo {
@@ -237,7 +241,10 @@ impl StorageIo {
             ),
             Location::Http { url } => format!("http:{url}"),
         };
-        Ok(Self { scope_id, store })
+        Ok(Self {
+            scope_id,
+            store: std::sync::Arc::from(store),
+        })
     }
 
     fn full_path(key: &str) -> object_store::path::Path {
@@ -260,6 +267,24 @@ impl StorageIo {
             }
             Err(e) => Err(StorageError::Http(e.to_string())),
         }
+    }
+
+    /// Object length via HEAD (P0b): the parquet `ChunkReader` needs the
+    /// file size to seek the footer. One stat per open — cheap, and NOT
+    /// cached (a stat is metadata, not the immutable-bytes the §6.2 law
+    /// is about).
+    pub fn stat_len(&self, key: &str) -> Result<u64, StorageError> {
+        use object_store::ObjectStoreExt;
+        let path = Self::full_path(key);
+        let meta = runtime()
+            .block_on(self.store.head(&path))
+            .map_err(|e| match e {
+                object_store::Error::NotFound { path, source } => {
+                    StorageError::NotFound(format!("{path}: {source}"))
+                }
+                e => StorageError::Http(e.to_string()),
+            })?;
+        Ok(meta.size)
     }
 
     /// Ranged GET of `[offset, offset+len)` bytes (slice P0, spec 15
