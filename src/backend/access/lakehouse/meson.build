@@ -39,6 +39,8 @@ lakehouse_sources = files(
   'lakehouse_core.c',
   'tableam.c',
   'fdw.c',
+  'fdw_plan.c',
+  'fdw_exec.c',
   'batch_fill.c',
 )
 
