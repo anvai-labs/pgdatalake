@@ -327,7 +327,11 @@ fn render_row(rows: &mut crate::parquet::ParquetRows) -> Result<(Vec<CString>, V
             crate::parquet::CellValue::Float64(f) => f.to_string(),
             crate::parquet::CellValue::Str(s) => s,
             crate::parquet::CellValue::Bytes(b) => {
-                // text form: hex — typed binary Datum conversion is the FDW's job
+                // text form: bytea-hex (\x…, byteaout-compatible) — typed
+                // binary Datum conversion is the FDW's job. Deliberate
+                // behavior change vs the old bare-hex render here: the
+                // per-row path now matches the batch and delta paths (all
+                // three share hex_escape_bytes).
                 crate::parquet::hex_escape_bytes(&b)
             }
         };

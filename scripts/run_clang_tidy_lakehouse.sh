@@ -5,10 +5,12 @@
 # Requires a configured meson build dir (default: ../build relative to repo
 # root) for generated headers (pg_config.h, cbindgen's pg_datalake_core.h).
 #
-# The meson compile_commands.json is gcc-flavored: gcc-only flags (-fpch-deps,
-# -MD/-MF/-MQ/-o) and gcc-specific include paths are stripped and the missing
-# build-dir includes are prepended, then clang-tidy runs with the repo's
-# curated profile in src/backend/access/lakehouse/.clang-tidy.
+# It does NOT read meson's compile_commands.json (gcc-flavored: -fpch-deps
+# and friends are clang-incompatible); instead it hardcodes the same
+# -D/-I flag set meson uses for lakehouse, plus the two build-dir include
+# paths meson adds for generated headers (pg_config.h, cbindgen's
+# pg_datalake_core.h). Headers are linted via their .c includes — add
+# files to the list below when a new lakehouse source lands.
 set -eu
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
@@ -17,9 +19,7 @@ dir=src/backend/access/lakehouse
 
 files="
 $dir/batch_fill.c
-$dir/batch_fill.h
 $dir/fdw.c
-$dir/lakehouse.h
 $dir/lakehouse_core.c
 $dir/tableam.c
 "
@@ -27,9 +27,6 @@ $dir/tableam.c
 cd "$build"
 status=0
 for f in $files; do
-	case $f in
-		*.h) continue ;;	# linted via their .c includes
-	esac
 	echo "== clang-tidy $f"
 	clang-tidy "$repo/$f" -- \
 		-D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 \
