@@ -29,7 +29,7 @@ pub struct ScanPlan {
     /// Delete files (v2 position/equality deletes) surviving in the
     /// snapshot — never data tasks; the row readers apply them (slice 20).
     pub delete_tasks: Vec<ScanTask>,
-    /// Sum of record_count over surviving DATA files (delete files add rows
+    /// Sum of `record_count` over surviving DATA files (delete files add rows
     /// at read time; the row-count story is completed by the delete slice).
     pub total_rows: i64,
     /// Number of surviving DATA files.
@@ -135,14 +135,14 @@ fn decode_bound(bytes: &[u8], ty: &crate::catalog::metadata::IcebergType) -> Opt
     let le_i32 = |b: &[u8]| -> Option<i64> {
         b.try_into()
             .ok()
-            .map(|a: [u8; 4]| i32::from_le_bytes(a) as i64)
+            .map(|a: [u8; 4]| i64::from(i32::from_le_bytes(a)))
     };
     Some(match ty {
         IT::Int => BoundVal::Int(le_i32(bytes)?),
         IT::Long | IT::Timestamp | IT::Timestamptz => BoundVal::Int(le_i64(bytes)?),
         IT::Float => {
             let b: [u8; 4] = bytes.try_into().ok()?;
-            BoundVal::Num(f32::from_le_bytes(b) as f64)
+            BoundVal::Num(f64::from(f32::from_le_bytes(b)))
         }
         IT::Double => {
             let b: [u8; 8] = bytes.try_into().ok()?;
@@ -167,6 +167,12 @@ fn coerce_value(
             // exact only when integral and in i64 range; anything else is
             // incomparable against an i64 bound (conservative keep)
             let i = n.as_i64()?;
+            // Exact equality is the point: reject non-integral bounds.
+            #[expect(
+                clippy::float_cmp,
+                clippy::cast_precision_loss,
+                reason = "intentional exactness test: keep the bound only if the f64 round-trips to i64"
+            )]
             if n.as_f64()? != i as f64 {
                 return None;
             }
@@ -184,6 +190,8 @@ fn cmp_bound<'a>(bound: Option<&'a BoundVal>, other: &'a BoundVal) -> Option<std
         // integer-vs-float compares exactly only inside f64's integer
         // continuum (|v| <= 2^53); beyond that -> incomparable, keep
         (BoundVal::Int(a), BoundVal::Num(b)) | (BoundVal::Num(b), BoundVal::Int(a)) => {
+            // Guarded above: inside f64's integer continuum the cast is lossless.
+            #[expect(clippy::cast_precision_loss, reason = "|a| <= 2^53 checked")]
             if a.abs() <= 9_007_199_254_740_992 {
                 (*a as f64).partial_cmp(b)
             } else {
@@ -232,17 +240,16 @@ fn bounds_keep(
         .upper_bounds
         .get(&f.id)
         .and_then(|b| decode_bound(b, &f.r#type));
-    let value = match pred {
-        ScanPredicate::Eq { value, .. }
-        | ScanPredicate::Lt { value, .. }
-        | ScanPredicate::Le { value, .. }
-        | ScanPredicate::Gt { value, .. }
-        | ScanPredicate::Ge { value, .. } => value,
-        _ => unreachable!(),
+    let (ScanPredicate::Eq { value, .. }
+    | ScanPredicate::Lt { value, .. }
+    | ScanPredicate::Le { value, .. }
+    | ScanPredicate::Gt { value, .. }
+    | ScanPredicate::Ge { value, .. }) = pred
+    else {
+        unreachable!("bounds_keep is only called for ordered comparison predicates")
     };
-    let value = match coerce_value(value, &f.r#type) {
-        Some(v) => v,
-        None => return true,
+    let Some(value) = coerce_value(value, &f.r#type) else {
+        return true;
     };
     match pred {
         ScanPredicate::Eq { .. } => !matches!(
@@ -254,27 +261,21 @@ fn bounds_keep(
         ),
         ScanPredicate::Lt { .. } => match lower {
             None => true,
-            Some(ref b) => cmp_bound(Some(b), &value)
-                .map(|o| o == std::cmp::Ordering::Less)
-                .unwrap_or(true),
+            Some(ref b) => cmp_bound(Some(b), &value).is_none_or(|o| o == std::cmp::Ordering::Less),
         },
         ScanPredicate::Le { .. } => match lower {
             None => true,
-            Some(ref b) => cmp_bound(Some(b), &value)
-                .map(|o| o != std::cmp::Ordering::Greater)
-                .unwrap_or(true),
+            Some(ref b) => cmp_bound(Some(b), &value) != Some(std::cmp::Ordering::Greater),
         },
         ScanPredicate::Gt { .. } => match upper {
             None => true,
-            Some(ref b) => cmp_bound(Some(b), &value)
-                .map(|o| o == std::cmp::Ordering::Greater)
-                .unwrap_or(true),
+            Some(ref b) => {
+                cmp_bound(Some(b), &value).is_none_or(|o| o == std::cmp::Ordering::Greater)
+            }
         },
         ScanPredicate::Ge { .. } => match upper {
             None => true,
-            Some(ref b) => cmp_bound(Some(b), &value)
-                .map(|o| o != std::cmp::Ordering::Less)
-                .unwrap_or(true),
+            Some(ref b) => cmp_bound(Some(b), &value) != Some(std::cmp::Ordering::Less),
         },
         ScanPredicate::And(_) => unreachable!("handled above"),
     }
@@ -403,7 +404,7 @@ pub(crate) fn ensure_within_table_root(
 }
 
 /// Plan a scan of the given table metadata. `selector = None` selects the
-/// current snapshot; a selector that resolves to nothing is a NotFound
+/// current snapshot; a selector that resolves to nothing is a `NotFound`
 /// (doc 02 §2 pin semantics — `FOR … AS OF`, slice 19). `s3` carries
 /// connection options for locations that need them (file:// local fixtures
 /// pass None).
@@ -566,7 +567,7 @@ pub fn plan_scan(
 }
 
 /// Load the snapshot's v2 delete files (slice 20, doc 07): position-delete
-/// parquet has the (file_path, pos) schema — positions map per data file;
+/// parquet has the (`file_path`, pos) schema — positions map per data file;
 /// equality-delete parquet has one column per eq field — every row is a
 /// delete tuple carrying the delete file's sequence number. M1 loads
 /// eagerly at scan planning (delete files are small relative to data).
@@ -662,7 +663,7 @@ pub fn load_row_deletes(
                         Some(ids) if !ids.is_empty() => ids
                             .iter()
                             .map(|id| {
-                                let name = id_to_name.get(&(*id as i64)).ok_or_else(|| {
+                                let name = id_to_name.get(&i64::from(*id)).ok_or_else(|| {
                                     StorageError::Decode(format!(
                                         "equality delete file {}: equality_id {} is not in the table schema",
                                         t.entry.data_file.file_path, id
@@ -725,7 +726,7 @@ mod tests {
     }
 
     /// 13-review #6: fixture data paths must live under the (test) table
-    /// root — remap the historical file:///table/data/ prefix onto the
+    /// root — remap the historical <file:///table/data>/ prefix onto the
     /// tempdir so the table-root scope gate sees in-root paths.
     fn scope_data_path(dir: &std::path::Path, p: &str) -> String {
         if let Some(rest) = p.strip_prefix("file:///table/data/") {
@@ -1084,7 +1085,7 @@ mod tests {
             .iter()
             .map(|t| t.entry.data_file.file_path.as_str())
             .collect();
-        paths.sort();
+        paths.sort_unstable();
         assert_eq!(
             paths,
             [
@@ -1185,7 +1186,7 @@ mod tests {
         assert_eq!(plan.total_rows, 0);
     }
 
-    /// Pinning an unknown snapshot id errors (doc 02 §2 snapshot_id pin).
+    /// Pinning an unknown snapshot id errors (doc 02 §2 `snapshot_id` pin).
     #[test]
     fn unknown_snapshot_pin_errors() {
         let metadata_json = r#"{
@@ -1209,7 +1210,7 @@ mod tests {
     /// TDD anchor (M1 slice 19): FOR TIMESTAMP/TAG AS OF selectors pin the
     /// plan to the right snapshot's tasks — a timestamp selects the latest
     /// snapshot at or before it, a tag resolves through the refs map, and a
-    /// selector that matches no snapshot is a NotFound error.
+    /// selector that matches no snapshot is a `NotFound` error.
     #[test]
     fn time_travel_selectors_pin_plan_to_snapshot() {
         let dir = tempfile::tempdir().unwrap();
@@ -1920,11 +1921,9 @@ mod tests {
                 null_value_counts: BTreeMap::new(),
                 nan_value_counts: BTreeMap::new(),
                 lower_bounds: lower
-                    .map(|v| BTreeMap::from([(1i64, v.to_le_bytes().to_vec())]))
-                    .unwrap_or_default(),
+                    .map_or_default(|v| BTreeMap::from([(1i64, v.to_le_bytes().to_vec())])),
                 upper_bounds: upper
-                    .map(|v| BTreeMap::from([(1i64, v.to_le_bytes().to_vec())]))
-                    .unwrap_or_default(),
+                    .map_or_default(|v| BTreeMap::from([(1i64, v.to_le_bytes().to_vec())])),
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,
@@ -1996,7 +1995,7 @@ mod tests {
     }
 
     /// TDD anchor (M1 slice 15): the C/FDW side serializes translated
-    /// quals as JSON; predicate_from_json is the deserialization contract:
+    /// quals as JSON; `predicate_from_json` is the deserialization contract:
     /// {"op":"eq|lt|le|gt|ge","field":...,"value":...} and
     /// {"and":[...]} — everything else is a hard error (the C side keeps
     /// untranslated quals local).
@@ -2042,7 +2041,7 @@ mod tests {
         .is_err());
     }
 
-    /// Integration: a JSON predicate arriving through plan_scan prunes the
+    /// Integration: a JSON predicate arriving through `plan_scan` prunes the
     /// same way a constructed one does (the FFI seam's end-to-end contract).
     #[test]
     fn json_predicate_prunes_through_plan_scan() {
@@ -2066,11 +2065,9 @@ mod tests {
                 null_value_counts: BTreeMap::new(),
                 nan_value_counts: BTreeMap::new(),
                 lower_bounds: lower
-                    .map(|v| BTreeMap::from([(1i64, v.to_le_bytes().to_vec())]))
-                    .unwrap_or_default(),
+                    .map_or_default(|v| BTreeMap::from([(1i64, v.to_le_bytes().to_vec())])),
                 upper_bounds: upper
-                    .map(|v| BTreeMap::from([(1i64, v.to_le_bytes().to_vec())]))
-                    .unwrap_or_default(),
+                    .map_or_default(|v| BTreeMap::from([(1i64, v.to_le_bytes().to_vec())])),
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,
@@ -2225,7 +2222,7 @@ mod tests {
     /// table's own location root — a compromised catalog or manifest must
     /// not direct reads at arbitrary buckets or local paths. Every hop
     /// (manifest list, manifests, data/delete files) is checked with a
-    /// segment-aware prefix (no s3://t/ab vs s3://t/a confusion); a
+    /// segment-aware prefix (no <s3://t/ab> vs <s3://t/a> confusion); a
     /// violation is a loud decode error, never a best-effort read.
     #[test]
     fn paths_outside_table_root_are_loud() {
@@ -2310,6 +2307,7 @@ mod tests {
 mod prune_i64_tests {
     use super::*;
     use crate::catalog::metadata::{Field, IcebergType, IcebergTypeMarker, Schema};
+    use std::collections::BTreeMap;
 
     fn md() -> crate::catalog::metadata::TableMetadata {
         use crate::catalog::metadata::{FormatVersion, TableMetadata};
@@ -2332,10 +2330,10 @@ mod prune_i64_tests {
             current_schema_id: 0,
             snapshots: vec![],
             current_snapshot_id: None,
-            properties: Default::default(),
+            properties: BTreeMap::default(),
             partition_specs: vec![],
             default_partition_spec_id: Some(0),
-            refs: Default::default(),
+            refs: BTreeMap::default(),
         }
     }
 
@@ -2347,10 +2345,10 @@ mod prune_i64_tests {
             partition: None,
             record_count: 1,
             file_size_in_bytes: 100,
-            column_sizes: Default::default(),
-            value_counts: Default::default(),
-            null_value_counts: Default::default(),
-            nan_value_counts: Default::default(),
+            column_sizes: BTreeMap::default(),
+            value_counts: BTreeMap::default(),
+            null_value_counts: BTreeMap::default(),
+            nan_value_counts: BTreeMap::default(),
             lower_bounds: [(1, lower.to_le_bytes().to_vec())].into(),
             upper_bounds: [(1, upper.to_le_bytes().to_vec())].into(),
             key_metadata: None,
@@ -2408,7 +2406,7 @@ mod prune_i64_tests {
         let df = data_file(9_007_199_254_740_992, ABOVE_2POW53);
         let pred = ScanPredicate::Gt {
             field: "id".into(),
-            value: serde_json::json!(9.007199254740993e15),
+            value: serde_json::json!(9_007_199_254_740_993.0),
         };
         assert!(bounds_keep(&df, md.current_schema().unwrap(), &pred));
     }
@@ -2421,11 +2419,12 @@ mod eq_delete_binding_tests {
     use crate::parquet::CellValue;
     use apache_avro::types::{Record, Value};
     use apache_avro::{Schema as AvroSchema, Writer};
+    use std::collections::BTreeMap;
 
     /// ACCEPTANCE (13-review blocker #5): an equality delete file with an
     /// EXTRA non-key column still matches rows — the key columns come
-    /// from the manifest's equality_ids via the TABLE schema, not from
-    /// "every column in the delete file". An unresolvable equality_id is
+    /// from the manifest's `equality_ids` via the TABLE schema, not from
+    /// "every column in the delete file". An unresolvable `equality_id` is
     /// a loud error (never a silently partial key).
     #[test]
     fn equality_delete_binds_to_equality_ids() {
@@ -2520,14 +2519,14 @@ mod eq_delete_binding_tests {
                 parent_snapshot_id: None,
                 timestamp_ms: 1,
                 manifest_list: format!("{location}/mn-list.avro"),
-                summary: Default::default(),
+                summary: BTreeMap::default(),
                 schema_id: Some(0),
             }],
             current_snapshot_id: Some(42),
-            properties: Default::default(),
+            properties: BTreeMap::default(),
             partition_specs: vec![],
             default_partition_spec_id: Some(0),
-            refs: Default::default(),
+            refs: BTreeMap::default(),
         };
 
         // manifest: data + equality delete (content 2, equality_ids [1])
@@ -2718,17 +2717,17 @@ mod dv_fixture_tests {
         let src_dir =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v3_dv_table");
         crate::storage::test_allow_local_stores();
-        let _dir = std::path::Path::new("/tmp/v3fixture/table");
+        let dir = std::path::Path::new("/tmp/v3fixture/table");
         for sub in ["metadata", "data"] {
-            let _ = std::fs::remove_dir_all(_dir.join(sub));
-            std::fs::create_dir_all(_dir.join(sub)).expect("create fixture layout");
+            let _ = std::fs::remove_dir_all(dir.join(sub));
+            std::fs::create_dir_all(dir.join(sub)).expect("create fixture layout");
             for entry in std::fs::read_dir(src_dir.join(sub)).expect("fixture subdirs") {
                 let entry = entry.expect("fixture entry");
-                std::fs::copy(entry.path(), _dir.join(sub).join(entry.file_name()))
+                std::fs::copy(entry.path(), dir.join(sub).join(entry.file_name()))
                     .expect("copy fixture file");
             }
         }
-        let md_path = _dir.join("metadata").join("v3.metadata.json");
+        let md_path = dir.join("metadata").join("v3.metadata.json");
         let md_text = std::fs::read_to_string(&md_path).expect("fixture metadata");
         let md: TableMetadata = serde_json::from_str(&md_text).expect("parse fixture metadata");
         assert_eq!(
@@ -2766,7 +2765,7 @@ mod dv_fixture_tests {
                 other => panic!("unexpected id cell: {other:?}"),
             }
         }
-        ids.sort();
+        ids.sort_unstable();
         assert_eq!(
             ids,
             vec![1, 2, 4, 6],
@@ -2928,7 +2927,7 @@ mod dv_trino_fixture_tests {
                 other => panic!("unexpected id cell: {other:?}"),
             }
         }
-        ids.sort();
+        ids.sort_unstable();
         assert_eq!(ids, vec![1, 2, 4], "Trino deleted ids 3,5 via DV");
         let _ = ManifestEntryStatus::Added;
     }

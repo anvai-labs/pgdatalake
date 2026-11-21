@@ -3,7 +3,7 @@
 //! half of the managed-write path: the M2 commit protocol (slice 25) turns
 //! the returned file list into an Iceberg snapshot commit.
 //!
-//! Types mirror the read side (`CellValue`) so the TableAM insert path
+//! Types mirror the read side (`CellValue`) so the `TableAM` insert path
 //! (slice 27) can feed rows without a second representation. Canonical TEXT
 //! forms (dates, times, decimals, uuids) are the same ones the reader
 //! produces — round-trip stability by construction.
@@ -150,7 +150,7 @@ fn column_bounds(
     }
 }
 
-/// Identity + metrics of one written data file (from write_file).
+/// Identity + metrics of one written data file (from `write_file`).
 #[derive(Debug, Clone)]
 pub struct WrittenFile {
     pub key: String,
@@ -237,9 +237,10 @@ fn parse_date_days(s: &str) -> Option<i32> {
     Some(days_from_civil(y, m, d) as i32)
 }
 
-/// Howard Hinnant's civil_from_days: canonical `YYYY-MM-DD` text from
-/// days since epoch — the write-side inverse of parse_date_days (used by
+/// Howard Hinnant's `civil_from_days`: canonical `YYYY-MM-DD` text from
+/// days since epoch — the write-side inverse of `parse_date_days` (used by
 /// the row-JSON parser for typed {"d": days} date cells).
+#[must_use]
 pub fn format_date_days(days: i64) -> String {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -254,7 +255,8 @@ pub fn format_date_days(days: i64) -> String {
 }
 
 /// Canonical `HH:MM:SS.ffffff` from microseconds since midnight (the
-/// write-side inverse of parse_time_us).
+/// write-side inverse of `parse_time_us`).
+#[must_use]
 pub fn format_time_us(us: i64) -> String {
     let secs = us.div_euclid(1_000_000);
     let frac = us.rem_euclid(1_000_000);
@@ -267,13 +269,14 @@ pub fn format_time_us(us: i64) -> String {
     )
 }
 
-/// Howard Hinnant's days_from_civil (inverse of civil_from_days).
+/// Howard Hinnant's `days_from_civil` (inverse of `civil_from_days`).
+#[must_use]
 pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = (y - era * 400) as u64; // [0, 399]
-    let mp = if m > 2 { m - 3 } else { m + 9 } as u64; // [3, 14]
-    let doy = (153 * mp + 2) / 5 + d as u64 - 1; // [0, 365]
+    let mp = u64::from(if m > 2 { m - 3 } else { m + 9 }); // [3, 14]
+    let doy = (153 * mp + 2) / 5 + u64::from(d) - 1; // [0, 365]
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
     era * 146_097 + doe as i64 - 719_468
 }
@@ -318,7 +321,7 @@ fn parse_decimal_parts(s: &str) -> Option<(i128, u32)> {
     let mut unscaled: i128 = int_part.parse().ok()?;
     for c in frac_part.chars() {
         unscaled = unscaled.checked_mul(10)?;
-        unscaled = unscaled.checked_add(c.to_digit(10)? as i128)?;
+        unscaled = unscaled.checked_add(i128::from(c.to_digit(10)?))?;
     }
     Some((sign * unscaled, frac_part.len() as u32))
 }
@@ -382,6 +385,7 @@ impl BatchWriter {
         })
     }
 
+    #[must_use]
     pub fn num_rows(&self) -> usize {
         self.rows
     }
@@ -405,40 +409,45 @@ impl BatchWriter {
         for (i, v) in row.iter().enumerate() {
             use IcebergType as IT;
             match (&self.builders[i], v) {
-                (Builder::Bool(_), CellValue::Bool(_)) | (Builder::Bool(_), CellValue::Null) => {}
                 (Builder::Int32(_), CellValue::Int64(x)) => {
-                    if !(*x >= i32::MIN as i64 && *x <= i32::MAX as i64) {
+                    if i32::try_from(*x).is_err() {
                         return Err(StorageError::Config(format!(
                             "write path: column {} value {:?} overflows int32",
                             self.columns[i].name, v
                         )));
                     }
                 }
-                (Builder::Int32(_), CellValue::Null)
+                (
+                    Builder::Bool(_)
+                    | Builder::Int32(_)
+                    | Builder::Int64(_)
+                    | Builder::Float32(_)
+                    | Builder::Float64(_)
+                    | Builder::Str(_)
+                    | Builder::Binary(_)
+                    | Builder::TsUs(_)
+                    | Builder::Date32(_)
+                    | Builder::Time64Us(_)
+                    | Builder::Decimal(_)
+                    | Builder::Uuid(_),
+                    CellValue::Null,
+                )
+                | (Builder::Bool(_), CellValue::Bool(_))
                 | (Builder::Int64(_), CellValue::Int64(_))
-                | (Builder::Int64(_), CellValue::Null)
-                | (Builder::Float32(_), CellValue::Float64(_))
-                | (Builder::Float32(_), CellValue::Null)
-                | (Builder::Float64(_), CellValue::Float64(_))
-                | (Builder::Float64(_), CellValue::Null)
+                | (Builder::Float32(_) | Builder::Float64(_), CellValue::Float64(_))
                 | (Builder::Str(_), CellValue::Str(_))
-                | (Builder::Str(_), CellValue::Null)
                 | (Builder::Binary(_), CellValue::Bytes(_))
-                | (Builder::Binary(_), CellValue::Null)
-                | (Builder::TsUs(_), CellValue::TimestampMicros(_))
-                | (Builder::TsUs(_), CellValue::Null) => {}
+                | (Builder::TsUs(_), CellValue::TimestampMicros(_)) => {}
                 (Builder::Date32(_), CellValue::Str(x)) => {
                     parse_date_days(x).ok_or_else(|| {
                         StorageError::Config(format!("write path: bad date text {x:?}"))
                     })?;
                 }
-                (Builder::Date32(_), CellValue::Null) => {}
                 (Builder::Time64Us(_), CellValue::Str(x)) => {
                     parse_time_us(x).ok_or_else(|| {
                         StorageError::Config(format!("write path: bad time text {x:?}"))
                     })?;
                 }
-                (Builder::Time64Us(_), CellValue::Null) => {}
                 (Builder::Decimal(_), CellValue::Str(x)) => {
                     let (unscaled, text_scale) = parse_decimal_parts(x).ok_or_else(|| {
                         StorageError::Config(format!("write path: bad decimal text {x:?}"))
@@ -449,9 +458,8 @@ impl BatchWriter {
                     };
                     if text_scale > scale {
                         return Err(StorageError::Config(format!(
-                            "write path: decimal {x:?} has {} fractional digits, \
-                             column scale is {scale} (losing digits is not allowed)",
-                            text_scale
+                            "write path: decimal {x:?} has {text_scale} fractional digits, \
+                             column scale is {scale} (losing digits is not allowed)"
                         )));
                     }
                     let rescaled = unscaled
@@ -468,13 +476,11 @@ impl BatchWriter {
                         )));
                     }
                 }
-                (Builder::Decimal(_), CellValue::Null) => {}
                 (Builder::Uuid(_), CellValue::Str(x)) => {
                     hex_uuid_bytes(x).ok_or_else(|| {
                         StorageError::Config(format!("write path: bad uuid text {x:?}"))
                     })?;
                 }
-                (Builder::Uuid(_), CellValue::Null) => {}
                 (b, v) => {
                     return Err(StorageError::Config(format!(
                         "write path: column {} got mismatched value {v:?} (builder {b:?})",
@@ -488,10 +494,8 @@ impl BatchWriter {
             match (&mut self.builders[i], v) {
                 (Builder::Bool(b), CellValue::Bool(x)) => b.append_value(*x),
                 (Builder::Bool(b), CellValue::Null) => b.append_null(),
-                (Builder::Int32(b), CellValue::Int64(x))
-                    if *x >= i32::MIN as i64 && *x <= i32::MAX as i64 =>
-                {
-                    b.append_value(*x as i32)
+                (Builder::Int32(b), CellValue::Int64(x)) if i32::try_from(*x).is_ok() => {
+                    b.append_value(*x as i32);
                 }
                 (Builder::Int32(b), CellValue::Null) => b.append_null(),
                 (Builder::Int64(b), CellValue::Int64(x)) => b.append_value(*x),
@@ -508,14 +512,14 @@ impl BatchWriter {
                     let days = parse_date_days(x).ok_or_else(|| {
                         StorageError::Config(format!("write path: bad date text {x:?}"))
                     })?;
-                    b.append_value(days)
+                    b.append_value(days);
                 }
                 (Builder::Date32(b), CellValue::Null) => b.append_null(),
                 (Builder::Time64Us(b), CellValue::Str(x)) => {
                     let us = parse_time_us(x).ok_or_else(|| {
                         StorageError::Config(format!("write path: bad time text {x:?}"))
                     })?;
-                    b.append_value(us)
+                    b.append_value(us);
                 }
                 (Builder::Time64Us(b), CellValue::Null) => b.append_null(),
                 (Builder::TsUs(b), CellValue::TimestampMicros(x)) => b.append_value(*x),
@@ -529,7 +533,7 @@ impl BatchWriter {
                         IcebergType::Decimal { scale, .. } => *scale,
                         other => unreachable!("non-decimal column {other:?}"),
                     };
-                    b.append_value(unscaled * 10i128.pow(scale - text_scale))
+                    b.append_value(unscaled * 10i128.pow(scale - text_scale));
                 }
                 (Builder::Decimal(b), CellValue::Null) => b.append_null(),
                 (Builder::Uuid(b), CellValue::Str(x)) => {
@@ -537,7 +541,7 @@ impl BatchWriter {
                         StorageError::Config(format!("write path: bad uuid text {x:?}"))
                     })?;
                     b.append_value(&bytes)
-                        .map_err(|e| StorageError::Config(format!("write path: uuid: {e}")))?
+                        .map_err(|e| StorageError::Config(format!("write path: uuid: {e}")))?;
                 }
                 (Builder::Uuid(b), CellValue::Null) => {
                     b.append_null();
@@ -555,9 +559,9 @@ impl BatchWriter {
     }
 
     /// Drain accumulated rows into one parquet byte buffer.
-    /// flush_bytes + per-column manifest stats (M3-R2): value/null
+    /// `flush_bytes` + per-column manifest stats (M3-R2): value/null
     /// counts and spec-serialized bounds from the finished arrays;
-    /// column_sizes from the parquet footer (compressed bytes per
+    /// `column_sizes` from the parquet footer (compressed bytes per
     /// column chunk, summed over row groups).
     pub fn flush_bytes_with_stats(&mut self) -> Result<(Vec<u8>, ColumnStats), StorageError> {
         let mut fields = Vec::with_capacity(self.columns.len());
@@ -595,7 +599,7 @@ impl BatchWriter {
         self.rows = 0;
 
         // ---- M3-R2 stats (keyed by FIELD ID; columns without one are skipped) ----
-        let mut stats: ColumnStats = Default::default();
+        let mut stats = ColumnStats::default();
         for (i, c) in self.columns.iter().enumerate() {
             let Some(id) = c.field_id else { continue };
             let arr = &arrays[i];
@@ -683,6 +687,7 @@ pub fn parse_row_json(
     columns: &[WriteColumn],
     row: &serde_json::Value,
 ) -> Result<Vec<CellValue>, StorageError> {
+    use IcebergType as IT;
     let arr = row
         .as_array()
         .ok_or_else(|| StorageError::Config("write path: row is not a JSON array".into()))?;
@@ -693,7 +698,6 @@ pub fn parse_row_json(
             columns.len()
         )));
     }
-    use IcebergType as IT;
     let mut out = Vec::with_capacity(arr.len());
     for (col, cell) in columns.iter().zip(arr) {
         let cv = match (&col.ty, cell) {
@@ -701,24 +705,24 @@ pub fn parse_row_json(
             (IT::Boolean, serde_json::Value::Bool(b)) => CellValue::Bool(*b),
             (IT::Int | IT::Long, serde_json::Value::Number(n)) => CellValue::Int64(
                 n.as_i64()
-                    .ok_or_else(|| StorageError::Config(format!("write path: bad int {}", n)))?,
+                    .ok_or_else(|| StorageError::Config(format!("write path: bad int {n}")))?,
             ),
             (IT::Float | IT::Double, serde_json::Value::Number(n)) => CellValue::Float64(
                 n.as_f64()
-                    .ok_or_else(|| StorageError::Config(format!("write path: bad float {}", n)))?,
+                    .ok_or_else(|| StorageError::Config(format!("write path: bad float {n}")))?,
             ),
             (IT::String, serde_json::Value::String(v)) => CellValue::Str(v.clone()),
             (IT::Date, serde_json::Value::Object(o)) if o.contains_key("d") => {
                 let days = o
                     .get("d")
-                    .and_then(|v| v.as_i64())
+                    .and_then(serde_json::Value::as_i64)
                     .ok_or_else(|| StorageError::Config("write path: bad date cell".into()))?;
                 CellValue::Str(format_date_days(days))
             }
             (IT::Time, serde_json::Value::Object(o)) if o.contains_key("t") => {
                 let us = o
                     .get("t")
-                    .and_then(|v| v.as_i64())
+                    .and_then(serde_json::Value::as_i64)
                     .ok_or_else(|| StorageError::Config("write path: bad time cell".into()))?;
                 CellValue::Str(format_time_us(us))
             }
@@ -727,7 +731,7 @@ pub fn parse_row_json(
             {
                 let micros = o
                     .get("ts")
-                    .and_then(|v| v.as_i64())
+                    .and_then(serde_json::Value::as_i64)
                     .ok_or_else(|| StorageError::Config("write path: bad timestamp cell".into()))?;
                 CellValue::TimestampMicros(micros)
             }
@@ -895,7 +899,8 @@ mod tests {
     /// #[ignore]d — timing is machine-relative; run explicitly:
     ///   cargo test -p pgdatalake-core --lib -- --ignored bench --nocapture
     #[test]
-    #[ignore]
+    #[ignore = "manual throughput benchmark; run explicitly"]
+    #[expect(clippy::cast_precision_loss, reason = "test-only metrics formatting")]
     fn bench_write_push_json_throughput() {
         let cols = vec![
             WriteColumn {
@@ -1114,7 +1119,7 @@ mod tests {
         assert!(!rows.next());
     }
 
-    /// Row-JSON cells map to canonical CellValues per column type (27b).
+    /// Row-JSON cells map to canonical `CellValues` per column type (27b).
     #[test]
     fn parse_row_json_typed_cells() {
         use serde_json::json;
@@ -1168,7 +1173,7 @@ mod tests {
         assert_eq!(row[0], CellValue::Int64(5));
         assert_eq!(row[1], CellValue::Str("hi".into()));
         assert_eq!(row[2], CellValue::Str("2024-10-04".into()));
-        assert_eq!(row[3], CellValue::TimestampMicros(1700000000000000));
+        assert_eq!(row[3], CellValue::TimestampMicros(1_700_000_000_000_000));
         assert_eq!(row[4], CellValue::Str("12.34".into()));
         assert_eq!(
             row[5],
@@ -1191,8 +1196,8 @@ mod tests {
         .is_err());
     }
 
-    /// Date formatter round-trips through parse_date_days (Hinnant
-    /// civil_from_days / days_from_civil are inverses).
+    /// Date formatter round-trips through `parse_date_days` (Hinnant
+    /// `civil_from_days` / `days_from_civil` are inverses).
     #[test]
     fn format_date_roundtrips() {
         for (y, m, d) in [(1970, 1, 1), (2024, 10, 4), (2000, 2, 29), (1969, 12, 31)] {
@@ -1227,7 +1232,7 @@ mod tests {
         assert_eq!(seen, 1000);
     }
 
-    /// M3-R2 (13-review: pruning inert on our tables): write_file must
+    /// M3-R2 (13-review: pruning inert on our tables): `write_file` must
     /// collect per-column stats — value/null counts, min/max bounds
     /// serialized per the Iceberg single-value table (LE ints/floats,
     /// UTF-8 strings) keyed by FIELD ID — so the manifest entries carry

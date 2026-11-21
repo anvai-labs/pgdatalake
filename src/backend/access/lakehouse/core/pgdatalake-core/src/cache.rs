@@ -37,6 +37,7 @@ struct CacheInner {
 impl BlockCache {
     /// Cache with the given byte capacity (LRU eviction). No invalidation
     /// API exists — by design (immutable-path law, spec 15 §6.2).
+    #[must_use]
     pub fn new(max_bytes: u64) -> Self {
         BlockCache {
             inner: Mutex::new(CacheInner {
@@ -158,8 +159,8 @@ impl BlockCache {
 use std::sync::OnceLock;
 
 /// The per-backend global cache (spec 15 §2a C1: per-backend LRU at the
-/// I/O layer; capacity fixed by the first `global_init` — _PG_init does
-/// it from lakehouse.cache_max_bytes before any scan can run).
+/// I/O layer; capacity fixed by the first `global_init` — _`PG_init` does
+/// it from `lakehouse.cache_max_bytes` before any scan can run).
 static GLOBAL: OnceLock<BlockCache> = OnceLock::new();
 
 pub fn global_init(max_bytes: u64) {
@@ -197,7 +198,7 @@ mod tests {
     }
 
     /// Byte-identity: cached ranged reads return EXACTLY the same bytes
-    /// as slicing get_bytes — the whole point of the cache.
+    /// as slicing `get_bytes` — the whole point of the cache.
     #[test]
     fn cached_range_is_byte_identical() {
         let (_dir, io) = fixture();
@@ -253,7 +254,7 @@ mod tests {
     /// it; D evicts the LRU-est survivor.
     #[test]
     fn eviction_respects_cap_and_lru() {
-        let (_dir, io) = fixture();
+        let (dir, io) = fixture();
         io.put_bytes("data/k1.bin", vec![0u8; 1000]).unwrap();
         io.put_bytes("data/k2.bin", vec![1u8; 1000]).unwrap();
         io.put_bytes("data/k3.bin", vec![2u8; 1000]).unwrap();
@@ -266,7 +267,7 @@ mod tests {
                                                                     // k3 inserted: cap forces one eviction = k2. k1 survives (touched).
                                                                     // delete everything: only cached entries can still be read
         for k in ["k1", "k2", "k3"] {
-            std::fs::remove_file(_dir.path().join(format!("data/{k}.bin"))).unwrap();
+            std::fs::remove_file(dir.path().join(format!("data/{k}.bin"))).unwrap();
         }
         assert!(
             cache.get_range(&io, "s", "data/k1.bin", 0, 1000).is_ok(),
@@ -282,7 +283,7 @@ mod tests {
         );
     }
 
-    /// Whole-object path: byte-identity with get_bytes + hit/no-IO law.
+    /// Whole-object path: byte-identity with `get_bytes` + hit/no-IO law.
     #[test]
     fn whole_object_cache_is_identical_and_hits() {
         let (dir, io) = fixture();

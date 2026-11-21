@@ -183,8 +183,8 @@ impl RestCatalog {
         &self,
         namespace: &[&str],
         table: &str,
-        requirements: Vec<TableRequirement>,
-        updates: Vec<TableUpdate>,
+        requirements: &[TableRequirement],
+        updates: &[TableUpdate],
     ) -> Result<CommitTableResponse, RestError> {
         let prefix = self.prefix.lock().expect("prefix mutex poisoned").clone();
         let ns = namespace
@@ -197,12 +197,12 @@ impl RestCatalog {
         let url = format!(
             "{}/v1{}/namespaces/{ns}/tables/{}",
             self.endpoint,
-            prefix.as_ref().map(|p| format!("/{p}")).unwrap_or_default(),
+            prefix.as_ref().map_or_default(|p| format!("/{p}")),
             urlencoding::encode(table),
         );
         let body = CommitTableRequest {
-            requirements: &requirements,
-            updates: &updates,
+            requirements,
+            updates,
         };
         let payload = serde_json::to_vec(&body)
             .map_err(|e| RestError::Http(format!("commitTable serialize: {e}")))?;
@@ -267,7 +267,7 @@ impl RestCatalog {
         loop {
             let loaded = self.load_table(namespace, table)?;
             let (requirements, updates) = plan(&loaded)?;
-            match self.commit_table(namespace, table, requirements, updates) {
+            match self.commit_table(namespace, table, &requirements, &updates) {
                 Ok(resp) => return Ok(resp),
                 Err(e @ RestError::Conflict(_)) if attempt < max_retries => {
                     let _ = e;
@@ -342,7 +342,7 @@ mod tests {
         }
     }
 
-    /// The plan closure doc 07 §2 prescribes: AssertTableUUID +
+    /// The plan closure doc 07 §2 prescribes: `AssertTableUUID` +
     /// AssertRefSnapshotId(main, loaded base) + add-snapshot + set main ref.
     fn append_plan(loaded: &LoadTableResult) -> (Vec<TableRequirement>, Vec<TableUpdate>) {
         let md = loaded.metadata.as_ref().unwrap();
@@ -460,7 +460,7 @@ mod tests {
         let (requirements, updates) = append_plan(&load_result(100));
         let resp = mock
             .catalog()
-            .commit_table(&["analytics"], "events", requirements, updates)
+            .commit_table(&["analytics"], "events", &requirements, &updates)
             .expect("commit_table");
 
         mock.join();
@@ -496,7 +496,7 @@ mod tests {
         );
     }
 
-    /// 409 + CommitFailedException classifies as Conflict (retryable),
+    /// 409 + `CommitFailedException` classifies as Conflict (retryable),
     /// carrying the server's requirement message for the ERROR report.
     #[test]
     fn commit_table_409_is_conflict() {
@@ -504,7 +504,7 @@ mod tests {
         let (requirements, updates) = append_plan(&load_result(100));
         let err = mock
             .catalog()
-            .commit_table(&["analytics"], "events", requirements, updates)
+            .commit_table(&["analytics"], "events", &requirements, &updates)
             .unwrap_err();
         mock.join();
         match err {
@@ -526,7 +526,7 @@ mod tests {
         let (requirements, updates) = append_plan(&load_result(100));
         let err = mock
             .catalog()
-            .commit_table(&["analytics"], "events", requirements, updates)
+            .commit_table(&["analytics"], "events", &requirements, &updates)
             .unwrap_err();
         mock.join();
         assert!(matches!(err, RestError::Http(_)), "{err}");
@@ -623,7 +623,7 @@ mod tests {
         assert_eq!(mock.requests().len(), 6, "3 reload+commit attempts");
     }
 
-    /// `AssertRefSnapshotId` with snapshot_id=None serializes an explicit
+    /// `AssertRefSnapshotId` with `snapshot_id=None` serializes an explicit
     /// null (pyiceberg contract: some servers require the key present) —
     /// the "ref must not exist" create-time assertion.
     #[test]

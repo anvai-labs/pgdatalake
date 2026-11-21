@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::storage::StorageError;
 
 /// Iceberg manifest-list Avro schema, v2 shape (spec § manifest-list).
-/// Same reader handles v1 files: v1-only field names (added_rows_count vs
-/// added_rows etc.) differ — see parse note below.
+/// Same reader handles v1 files: v1-only field names (`added_rows_count` vs
+/// `added_rows` etc.) differ — see parse note below.
 pub const MANIFEST_LIST_SCHEMA_V2: &str = r#"{
     "type": "record",
     "name": "manifest_file",
@@ -86,7 +86,7 @@ fn entry_from_value(v: &apache_avro::types::Value) -> Result<ManifestListEntry, 
             let as_i64 = |v: &apache_avro::types::Value| -> Result<Option<i64>, StorageError> {
                 match v {
                     apache_avro::types::Value::Long(n) => Ok(Some(*n)),
-                    apache_avro::types::Value::Int(n) => Ok(Some(*n as i64)),
+                    apache_avro::types::Value::Int(n) => Ok(Some(i64::from(*n))),
                     apache_avro::types::Value::Null => Ok(None),
                     other => Err(StorageError::Decode(format!("{k}: {other:?}"))),
                 }
@@ -95,7 +95,7 @@ fn entry_from_value(v: &apache_avro::types::Value) -> Result<ManifestListEntry, 
                 Some((_, apache_avro::types::Value::Union(_, inner))) => as_i64(inner),
                 plain => {
                     let default_null = apache_avro::types::Value::Null;
-                    let v = plain.map(|(_, v)| v).unwrap_or(&default_null);
+                    let v = plain.map_or(&default_null, |(_, v)| v);
                     as_i64(v)
                 }
             }
@@ -240,7 +240,7 @@ pub struct DataFile {
     pub file_path: String,
     pub file_format: String,
     /// Per-table partition values; kept opaque until partition-spec-aware
-    /// pruning (slice with partition_specs, doc 06 §2).
+    /// pruning (slice with `partition_specs`, doc 06 §2).
     pub partition: Option<serde_json::Value>,
     pub record_count: i64,
     pub file_size_in_bytes: i64,
@@ -358,7 +358,7 @@ fn manifest_entry_from_value(
     let snapshot_id = match find("snapshot_id") {
         Some((_, V::Union(_, inner))) => match inner.as_ref() {
             V::Long(n) => *n,
-            V::Int(n) => *n as i64,
+            V::Int(n) => i64::from(*n),
             V::Null => added_snapshot_fallback.ok_or_else(|| {
                 StorageError::Decode(
                     "snapshot_id is null and manifest container metadata has no added-snapshot-id to inherit"
@@ -368,7 +368,7 @@ fn manifest_entry_from_value(
             other => return Err(StorageError::Decode(format!("snapshot_id: {other:?}"))),
         },
         Some((_, V::Long(n))) => *n,
-        Some((_, V::Int(n))) => *n as i64,
+        Some((_, V::Int(n))) => i64::from(*n),
         Some((_, V::Null)) => added_snapshot_fallback.ok_or_else(|| {
             StorageError::Decode(
                 "snapshot_id is null and manifest container metadata has no added-snapshot-id to inherit"
@@ -379,8 +379,7 @@ fn manifest_entry_from_value(
     };
     let opt_long = |k: &str| -> Result<Option<i64>, StorageError> {
         match find(k) {
-            None => Ok(None),
-            Some((_, V::Null)) => Ok(None),
+            None | Some((_, V::Null)) => Ok(None),
             Some((_, V::Union(_, inner))) => match inner.as_ref() {
                 V::Long(n) => Ok(Some(*n)),
                 V::Null => Ok(None),
@@ -390,13 +389,10 @@ fn manifest_entry_from_value(
             Some((k2, o)) => Err(StorageError::Decode(format!("{k2}: {o:?}"))),
         }
     };
-    let data_file_val = match find("data_file") {
-        Some((_, d)) => d,
-        None => {
-            return Err(StorageError::Decode(
-                "manifest entry missing data_file".into(),
-            ))
-        }
+    let Some((_, data_file_val)) = find("data_file") else {
+        return Err(StorageError::Decode(
+            "manifest entry missing data_file".into(),
+        ));
     };
     let V::Record(df_fields) = data_file_val else {
         return Err(StorageError::Decode("data_file is not a record".into()));
@@ -441,7 +437,7 @@ fn manifest_entry_from_value(
                     let (Some((_, V::Int(fid))), Some((_, V::Long(n)))) = (key, value) else {
                         return Err(StorageError::Decode(format!("{k} kv: {kv:?}")));
                     };
-                    m.insert(*fid as i64, *n);
+                    m.insert(i64::from(*fid), *n);
                 }
             }
             V::Map(pairs) => {
@@ -479,7 +475,7 @@ fn manifest_entry_from_value(
                     let (Some((_, V::Int(fid))), Some((_, V::Bytes(b)))) = (key, value) else {
                         return Err(StorageError::Decode(format!("{k} kv: {kv:?}")));
                     };
-                    m.insert(*fid as i64, b.clone());
+                    m.insert(i64::from(*fid), b.clone());
                 }
             }
             V::Map(pairs) => {
@@ -614,11 +610,12 @@ fn avro_to_json(v: &apache_avro::types::Value) -> Option<serde_json::Value> {
             serde_json::Value::Object(m)
         }
         V::Union(_, inner) => return avro_to_json(inner),
-        V::Date(d) => serde_json::json!(d),
-        V::TimestampMicros(t) => serde_json::json!(t),
-        V::TimestampMillis(t) => serde_json::json!(t),
-        V::TimeMicros(t) => serde_json::json!(t),
-        V::TimeMillis(t) => serde_json::json!(t),
+        // Date/TimeMillis are avro i32, the rest i64 — same JSON number
+        // either way
+        V::Date(d) | V::TimeMillis(d) => serde_json::json!(i64::from(*d)),
+        V::TimestampMicros(d) | V::TimestampMillis(d) | V::TimeMicros(d) => {
+            serde_json::json!(d)
+        }
         _ => return None,
     })
 }
@@ -628,7 +625,7 @@ mod tests {
     use super::*;
 
     /// TDD anchor (M1 slice 5): an Avro file written with the Iceberg
-    /// manifest-list schema parses into ManifestListEntry records. The
+    /// manifest-list schema parses into `ManifestListEntry` records. The
     /// fixture is written with the same schema the spec mandates (v2 shape:
     /// sequence numbers present).
     #[test]
@@ -641,7 +638,7 @@ mod tests {
         record.put("manifest_path", "s3://warehouse/analytics/events/mn1.avro");
         record.put("manifest_length", 8221i64);
         record.put("partition_spec_id", 0i32);
-        record.put("added_snapshot_id", 3051729675574597005i64);
+        record.put("added_snapshot_id", 3_051_729_675_574_597_005i64);
         record.put("added_files_count", Some(3i64));
         record.put("existing_files_count", Some(1i64));
         record.put("deleted_files_count", Some(0i64));
@@ -659,13 +656,13 @@ mod tests {
         assert_eq!(e.manifest_path, "s3://warehouse/analytics/events/mn1.avro");
         assert_eq!(e.manifest_length, 8221);
         assert_eq!(e.partition_spec_id, 0);
-        assert_eq!(e.added_snapshot_id, 3051729675574597005);
+        assert_eq!(e.added_snapshot_id, 3_051_729_675_574_597_005);
         assert_eq!(e.added_files_count, Some(3));
         assert_eq!(e.added_rows_count, Some(100));
     }
 
     /// TDD anchor (M1 slice 6): a manifest Avro (embedded writer schema,
-    /// per-table partition struct) parses into ManifestEntry records with
+    /// per-table partition struct) parses into `ManifestEntry` records with
     /// data-file stats — the inputs to scan planning (doc 06 §2).
     #[test]
     fn parses_manifest_avro_entries() {
@@ -703,7 +700,7 @@ mod tests {
 
         let mut entry = Record::new(&schema).unwrap();
         entry.put("status", Value::Int(1)); // ADDED
-        entry.put("snapshot_id", Value::Long(3051729675574597005));
+        entry.put("snapshot_id", Value::Long(3_051_729_675_574_597_005));
         entry.put(
             "sequence_number",
             Value::Union(1, Box::new(Value::Long(34))),
@@ -725,7 +722,7 @@ mod tests {
                 Value::Union(1, Box::new(Value::Record(vec![]))),
             ),
             ("record_count".into(), Value::Long(100)),
-            ("file_size_in_bytes".into(), Value::Long(5242880)),
+            ("file_size_in_bytes".into(), Value::Long(5_242_880)),
             (
                 "column_sizes".into(),
                 Value::Union(1, Box::new(map(&[("1", 1024), ("2", 2048)]))),
@@ -776,7 +773,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         let e = &entries[0];
         assert_eq!(e.status, ManifestEntryStatus::Added);
-        assert_eq!(e.snapshot_id, 3051729675574597005);
+        assert_eq!(e.snapshot_id, 3_051_729_675_574_597_005);
         assert_eq!(e.sequence_number, Some(34));
         assert_eq!(e.data_file.content, DataContent::Data);
         assert_eq!(
@@ -784,13 +781,13 @@ mod tests {
             "s3://warehouse/analytics/events/data/00001.parquet"
         );
         assert_eq!(e.data_file.record_count, 100);
-        assert_eq!(e.data_file.file_size_in_bytes, 5242880);
+        assert_eq!(e.data_file.file_size_in_bytes, 5_242_880);
         assert_eq!(e.data_file.column_sizes.get(&1), Some(&1024));
         assert_eq!(e.data_file.null_value_counts.get(&2), Some(&3));
         assert_eq!(e.data_file.split_offsets, Some(vec![4]));
     }
 
-    /// 13-review #5: manifest entries written with a NULL snapshot_id are
+    /// 13-review #5: manifest entries written with a NULL `snapshot_id` are
     /// valid when the enclosing manifest supplies `added-snapshot-id` in
     /// its Avro container metadata (older writers omit the entry-level
     /// ID). The reader must inherit it; a null with NO metadata to
@@ -966,7 +963,7 @@ mod tests {
         );
     }
 
-    /// Interop regression (slice 12): PyIceberg 0.12 writes manifest-list
+    /// Interop regression (slice 12): `PyIceberg` 0.12 writes manifest-list
     /// counts as Avro INT in some versions; the reader must accept both
     /// INT and LONG per Avro promotion rules (spec says long, real writers
     /// vary — be liberal in what you accept for counts).

@@ -1,7 +1,7 @@
 //! Iceberg metadata WRITERS (M2 slice 27a): manifest avro, manifest-list
 //! avro, and snapshot assembly — the bridge between slice 24 (parquet data
 //! files) and slice 25 (commitTable client). Per doc 07 §2 step 1-2: flush
-//! staged batches, build the snapshot (AddSnapshot + SetSnapshotRef
+//! staged batches, build the snapshot (`AddSnapshot` + `SetSnapshotRef`
 //! updates ride to the catalog; the client never rewrites metadata.json).
 //!
 //! Write schemas are the spec-shaped manifest structures with explicit
@@ -56,7 +56,7 @@ pub const MANIFEST_ENTRY_WRITE_SCHEMA_V2: &str = r#"{
 }"#;
 
 /// The manifest-list WRITE schema (v2: adds content/sequence fields over
-/// v1). Field-ids per pyiceberg's MANIFEST_LIST_FILE_SCHEMAS[2].
+/// v1). Field-ids per pyiceberg's `MANIFEST_LIST_FILE_SCHEMAS`[2].
 pub const MANIFEST_LIST_WRITE_SCHEMA_V2: &str = r#"{
     "type": "record",
     "name": "manifest_file",
@@ -89,7 +89,7 @@ pub const MANIFEST_LIST_WRITE_SCHEMA_V2: &str = r#"{
 /// just no pruning/statistics from them yet.
 #[derive(Debug, Clone, Default)]
 pub struct NewDataFile {
-    /// Full URI used in manifests (what reads resolve via open_for).
+    /// Full URI used in manifests (what reads resolve via `open_for`).
     pub file_path: String,
     pub record_count: i64,
     pub file_size_in_bytes: i64,
@@ -163,7 +163,7 @@ fn avro_bytes_map(schema: &AvroSchema, map: &BTreeMap<i64, Vec<u8>>) -> V {
     )
 }
 
-/// Field schema of `name` inside the data_file record, unwrapping unions.
+/// Field schema of `name` inside the `data_file` record, unwrapping unions.
 fn field_schema(schema: &AvroSchema, name: &str) -> Option<AvroSchema> {
     let AvroSchema::Record(r) = schema else {
         return None;
@@ -305,7 +305,7 @@ pub fn build_manifest_bytes(
 }
 
 /// Serialize fully-parsed manifest entries (status + per-entry identity +
-/// full data_file record) — the manifest-REWRITE path of overwrite
+/// full `data_file` record) — the manifest-REWRITE path of overwrite
 /// commits. Unpartitioned only: a partitioned entry cannot be re-emitted
 /// without the partition spec's field-id mapping, and the managed write
 /// gate rejects partitioned tables.
@@ -322,12 +322,11 @@ pub fn build_manifest_bytes_entries(
     let mut writer = Writer::new(&schema, Vec::new());
     for e in entries {
         let df = &e.data_file;
-        if df.partition.as_ref().map(|p| match p {
+        if df.partition.as_ref().is_some_and(|p| match p {
             serde_json::Value::Object(o) => !o.is_empty(),
             serde_json::Value::Null => false,
             _ => true,
-        }) == Some(true)
-        {
+        }) {
             return Err(StorageError::Config(format!(
                 "manifest rewrite: partitioned entry {} cannot be re-emitted                  (managed writes cover unpartitioned tables)",
                 df.file_path
@@ -378,7 +377,7 @@ pub fn build_manifest_bytes_entries(
                 match &df.split_offsets {
                     Some(v) => V::Union(
                         1,
-                        Box::new(V::Array(v.iter().map(|x| V::Long(*x as i64)).collect())),
+                        Box::new(V::Array(v.iter().map(|x| V::Long(i64::from(*x))).collect())),
                     ),
                     None => V::Union(0, Box::new(V::Null)),
                 },
@@ -432,7 +431,7 @@ pub fn build_manifest_bytes_entries(
 /// Manifest REWRITE for overwrite commits (M2 slice 28): flip every entry
 /// whose path is in `deleted_paths` to DELETED (identity preserved) and
 /// survivors to EXISTING. Returns the new manifest bytes plus
-/// (live_entries, deleted_entries) counts. Entries whose content is not
+/// (`live_entries`, `deleted_entries`) counts. Entries whose content is not
 /// DATA are never rewritten (delete files have no COW semantics).
 pub fn rewrite_manifest_with_deletes(
     bytes: &[u8],
@@ -545,7 +544,7 @@ pub struct SnapshotParams {
 
 /// Result of assembling a snapshot on the object store.
 pub struct WrittenSnapshot {
-    /// The AddSnapshot payload (manifest_list points at the written avro).
+    /// The `AddSnapshot` payload (`manifest_list` points at the written avro).
     pub snapshot: Snapshot,
     /// Object keys written (manifest + manifest-list) — surfaced so the
     /// caller can audit/clean on abort.
@@ -554,8 +553,8 @@ pub struct WrittenSnapshot {
 
 /// Assemble and WRITE a snapshot for `new_files`: manifest avro +
 /// manifest-list avro under `<location>/metadata/`, plus the Snapshot
-/// struct for the AddSnapshot update. `parent_snapshot_id` is the base we
-/// planned against (doc 07 §2); `sequence` = base.last_sequence + 1.
+/// struct for the `AddSnapshot` update. `parent_snapshot_id` is the base we
+/// planned against (doc 07 §2); `sequence` = `base.last_sequence` + 1.
 ///
 pub fn write_snapshot(
     io: &StorageIo,
@@ -611,7 +610,7 @@ pub fn write_snapshot(
         let loc_prefix = format!("{loc}/");
         let del_paths: Vec<String> = deleted_files.iter().map(|d| d.file_path.clone()).collect();
         let mut rewritten = Vec::with_capacity(carried.len());
-        for mle in carried.into_iter() {
+        for mle in carried {
             let rel = mle.manifest_path.strip_prefix(&loc_prefix).ok_or_else(|| {
                 StorageError::Config(format!(
                     "overwrite commit: carried manifest {} is outside the table location",
@@ -788,9 +787,9 @@ mod tests {
         }
     }
 
-    /// TDD anchor (M2 slice 27a): BatchWriter data files -> snapshot
+    /// TDD anchor (M2 slice 27a): `BatchWriter` data files -> snapshot
     /// assembly (manifest + manifest-list avro on the store) -> merged
-    /// metadata -> OUR OWN plan_scan reads the rows back. The full write
+    /// metadata -> OUR OWN `plan_scan` reads the rows back. The full write
     /// pipeline proven without a catalog.
     #[test]
     fn write_snapshot_end_to_end_readback() {
@@ -1170,10 +1169,10 @@ mod carry_tests {
     /// Manifest rewrite interop (M2 slice 28): carried manifests with
     /// overwritten files are REWRITTEN with the entries flipped to DELETED
     /// (the Java/Trino convention — pyiceberg 0.12 plans with
-    /// discard_deleted semantics and never applies cross-manifest
+    /// `discard_deleted` semantics and never applies cross-manifest
     /// deletions, so a separate DELETED-only manifest would resurrect the
-    /// file for independent readers). Per-entry identity (snapshot_id,
-    /// sequence, file_sequence_number, metrics) is preserved; survivors
+    /// file for independent readers). Per-entry identity (`snapshot_id`,
+    /// sequence, `file_sequence_number`, metrics) is preserved; survivors
     /// flip to EXISTING.
     #[test]
     fn rewrite_manifest_flips_deleted_entries() {
@@ -1232,7 +1231,7 @@ mod carry_tests {
     /// ADDS a rewritten one. The written manifest carries a DELETED entry
     /// for A's file (path + counts preserved), the manifest-list entry
     /// reports the deletion counts, the summary says operation=overwrite,
-    /// and plan_scan over the merged metadata sees ONLY the rewrite —
+    /// and `plan_scan` over the merged metadata sees ONLY the rewrite —
     /// read-your-writes through our own pipeline, A's rows gone.
     #[test]
     fn overwrite_snapshot_deletes_and_replaces() {

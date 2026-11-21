@@ -26,6 +26,7 @@ pub enum CellValue {
 
 /// Format micros-since-epoch UTC as `YYYY-MM-DD HH:MM:SS.ffffff+00`
 /// (proleptic Gregorian civil-from-days, no external deps).
+#[must_use]
 pub fn format_timestamp_micros(micros: i64) -> String {
     let secs = micros.div_euclid(1_000_000);
     let sub = micros.rem_euclid(1_000_000);
@@ -42,19 +43,34 @@ pub fn format_timestamp_micros(micros: i64) -> String {
 }
 
 /// Format days-since-1970 as `YYYY-MM-DD` (identical bytes to
-/// cell_from_arrow's Date32 branch — the batch fallback renders through
+/// `cell_from_arrow`'s Date32 branch — the batch fallback renders through
 /// this and the input function, exactly as the per-row path did).
+#[must_use]
 pub fn format_date32(days: i32) -> String {
-    let (y, m, d) = civil_from_days(days as i64);
+    let (y, m, d) = civil_from_days(i64::from(days));
     format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// Format an f64 exactly as the per-row renderer does (shortest repr).
+#[must_use]
 pub fn format_f64(v: f64) -> String {
     v.to_string()
 }
 
-/// Howard Hinnant's civil_from_days algorithm (days since 1970-01-01).
+/// Postgres `bytea` hex text form (`\x` followed by two hex digits per byte),
+/// matching `byteaout` so the per-row renderer and the batch text path agree.
+#[must_use]
+pub fn hex_escape_bytes(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(2 + bytes.len() * 2);
+    hex.push_str("\\x");
+    for x in bytes {
+        let _ = write!(hex, "{x:02x}");
+    }
+    hex
+}
+
+/// Howard Hinnant's `civil_from_days` algorithm (days since 1970-01-01).
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
@@ -129,7 +145,7 @@ impl LoadedDeletes {
         let positions = self
             .positions_by_file
             .get(file_path)
-            .map(|by_seq| {
+            .map_or_default(|by_seq| {
                 let mut out = std::collections::BTreeSet::new();
                 // v2 applicability: delete seq N applies to data files
                 // with sequence <= N
@@ -139,8 +155,7 @@ impl LoadedDeletes {
                     }
                 }
                 out
-            })
-            .unwrap_or_default();
+            });
         Ok(RowDeletes {
             positions,
             equality: self
@@ -212,7 +227,7 @@ pub struct BatchView {
     /// total rows in the arrow batch (live + dead)
     pub rows: usize,
     /// ascending positions of surviving rows WITHIN THE BATCH (buffer
-    /// indexes — the file-absolute position of live_idx[k] is
+    /// indexes — the file-absolute position of `live_idx`[k] is
     /// `start_abs + live_idx[k]`)
     pub live_idx: Vec<u32>,
     /// file-absolute position of batch row 0 (position deletes are
@@ -230,7 +245,7 @@ pub struct ParquetRows {
     row: usize,
     column_names: Vec<String>,
     column_indices: Vec<usize>,
-    /// width of the caller's projection (column_indices may exceed it —
+    /// width of the caller's projection (`column_indices` may exceed it —
     /// eq-delete internal columns ride beyond this mark)
     projection_len: usize,
     num_rows_in_current: usize,
@@ -277,7 +292,10 @@ impl ParquetRows {
 
         // internal read set: projection first, then any equality-delete
         // columns not already projected
-        let mut read_names: Vec<String> = projection.iter().map(|s| s.to_string()).collect();
+        let mut read_names: Vec<String> = projection
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
         for eq in &deletes.equality {
             for c in &eq.columns {
                 if !read_names.contains(c) {
@@ -347,7 +365,10 @@ impl ParquetRows {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| StorageError::Decode(format!("parquet read: {e}")))?;
 
-        let column_names = projection.iter().map(|s| s.to_string()).collect();
+        let column_names = projection
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
         Ok(Self {
             num_rows_in_current: 0,
             batches: batches.into_iter(),
@@ -394,14 +415,15 @@ impl ParquetRows {
         })
     }
 
+    #[must_use]
     pub fn column_names(&self) -> &[String] {
         &self.column_names
     }
 
     /// Advance to the next row across batch boundaries; false when done.
     /// After a `true` return, `row` points at the current row (first call
-    /// after open() selects row 0). Named `next` deliberately: the FFI and
-    /// FDW drive it imperatively; implementing std::iter::Iterator would
+    /// after `open()` selects row 0). Named `next` deliberately: the FFI and
+    /// FDW drive it imperatively; implementing `std::iter::Iterator` would
     /// borrow-split `value()` against the mutable cursor.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> bool {
@@ -444,6 +466,7 @@ impl ParquetRows {
     /// Same check, for an arbitrary row of `current` (the batch path
     /// computes the whole live list up front — M3-R1).
     fn row_deleted_at(&self, row: usize) -> bool {
+        use arrow::array::Array as _;
         let abs = self.batch_start_abs + row as u64;
         if self.deletes.positions.contains(&abs) {
             return true;
@@ -454,7 +477,6 @@ impl ParquetRows {
                 let batch = self.current.as_ref().expect("current row");
                 let arr_idx = self.eq_col_indices[eq_idx][c_i];
                 let col = batch.column(arr_idx);
-                use arrow::array::Array as _;
                 let got = if col.is_null(row) {
                     CellValue::Null
                 } else {
@@ -474,12 +496,16 @@ impl ParquetRows {
 
     /// Materialize the next arrow batch with live rows as a typed view
     /// (M3-R1, 13-review perf #3): one pass per column instead of one
-    /// CString per cell. Skips batches whose every row is dead. The views
+    /// `CString` per cell. Skips batches whose every row is dead. The views
     /// borrow `current`'s buffers — valid until the following
     /// `next_batch`/`next` call or drop. Deletes/DVs are already applied
     /// via `live_idx`; the C consumer never sees dead rows.
     pub fn next_batch(&mut self) -> Result<Option<BatchView>, StorageError> {
         use arrow::array::Array as _;
+        use arrow::array::{
+            TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+            TimestampSecondArray,
+        };
         use arrow::datatypes::DataType as DT;
         loop {
             let Some(batch) = self.batches.next() else {
@@ -511,7 +537,7 @@ impl ParquetRows {
                 let col = batch.column(arr_idx);
                 let mut nulls = Vec::with_capacity(self.num_rows_in_current);
                 for r in 0..self.num_rows_in_current {
-                    nulls.push(col.is_null(r) as u8);
+                    nulls.push(u8::from(col.is_null(r)));
                 }
                 let mut view = BatchColumnView {
                     kind: BatchKind::Rendered,
@@ -530,18 +556,19 @@ impl ParquetRows {
                             .downcast_ref::<arrow::array::BooleanArray>()
                             .expect("boolean array");
                         for r in 0..self.num_rows_in_current {
-                            view.bools.push(a.value(r) as u8);
+                            view.bools.push(u8::from(a.value(r)));
                         }
                     }
                     DT::Int32 | DT::Int64 | DT::Date64 => {
                         view.kind = BatchKind::Int64;
                         for r in 0..self.num_rows_in_current {
                             let v = match col.data_type() {
-                                DT::Int32 => col
-                                    .as_any()
-                                    .downcast_ref::<arrow::array::Int32Array>()
-                                    .expect("int32 array")
-                                    .value(r) as i64,
+                                DT::Int32 => i64::from(
+                                    col.as_any()
+                                        .downcast_ref::<arrow::array::Int32Array>()
+                                        .expect("int32 array")
+                                        .value(r),
+                                ),
                                 _ => col
                                     .as_any()
                                     .downcast_ref::<arrow::array::Int64Array>()
@@ -555,11 +582,12 @@ impl ParquetRows {
                         view.kind = BatchKind::Float64;
                         for r in 0..self.num_rows_in_current {
                             let v = match col.data_type() {
-                                DT::Float32 => col
-                                    .as_any()
-                                    .downcast_ref::<arrow::array::Float32Array>()
-                                    .expect("float32 array")
-                                    .value(r) as f64,
+                                DT::Float32 => f64::from(
+                                    col.as_any()
+                                        .downcast_ref::<arrow::array::Float32Array>()
+                                        .expect("float32 array")
+                                        .value(r),
+                                ),
                                 _ => col
                                     .as_any()
                                     .downcast_ref::<arrow::array::Float64Array>()
@@ -573,10 +601,6 @@ impl ParquetRows {
                         view.kind = BatchKind::TimestampUs;
                         // exactly cell_from_arrow's per-unit rules (doc 05 §4);
                         // temporal arrays are their own primitive types
-                        use arrow::array::{
-                            TimestampMicrosecondArray, TimestampMillisecondArray,
-                            TimestampNanosecondArray, TimestampSecondArray,
-                        };
                         {
                             let scaled: Vec<i64> = match unit {
                                 arrow::datatypes::TimeUnit::Second => {
@@ -618,7 +642,7 @@ impl ParquetRows {
                             .downcast_ref::<arrow::array::Date32Array>()
                             .expect("date32 array");
                         for r in 0..self.num_rows_in_current {
-                            view.i64s.push(a.value(r) as i64);
+                            view.i64s.push(i64::from(a.value(r)));
                         }
                     }
                     DT::Utf8 | DT::LargeUtf8 => {
@@ -724,8 +748,10 @@ impl ParquetRows {
     }
 
     /// Cell `col_idx` of the current row. Out-of-range column or a call
-    /// before next() returns Null (the FDW drives next() first).
+    /// before `next()` returns Null (the FDW drives `next()` first).
+    #[must_use]
     pub fn value(&self, col_idx: usize) -> CellValue {
+        use arrow::array::Array as _;
         let Some(batch) = &self.current else {
             return CellValue::Null;
         };
@@ -736,7 +762,6 @@ impl ParquetRows {
             return CellValue::Null;
         }
         let col = batch.column(*arr_idx);
-        use arrow::array::Array as _;
         if col.is_null(self.row) {
             return CellValue::Null;
         }
@@ -772,7 +797,13 @@ fn is_supported_arrow_type(ty: &arrow::datatypes::DataType) -> bool {
 }
 
 fn cell_from_arrow(col: &dyn arrow::array::Array, row: usize) -> CellValue {
-    use arrow::array::*;
+    use arrow::array::{
+        BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
+        Float32Array, Float64Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
+        Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray,
+    };
     use arrow::datatypes::DataType as DT;
     let down = |a: &dyn arrow::array::Array| {
         a.as_any()
@@ -783,51 +814,50 @@ fn cell_from_arrow(col: &dyn arrow::array::Array, row: usize) -> CellValue {
         DT::Boolean => col
             .as_any()
             .downcast_ref::<BooleanArray>()
-            .map(|a| CellValue::Bool(a.value(row)))
-            .unwrap_or(CellValue::Null),
-        DT::Int32 => down(col)
-            .map(|v| CellValue::Int64(v as i64))
-            .unwrap_or(CellValue::Null),
+            .map_or(CellValue::Null, |a| CellValue::Bool(a.value(row))),
+        DT::Int32 => down(col).map_or(CellValue::Null, |v| CellValue::Int64(i64::from(v))),
         DT::Int64 | DT::Date64 => col
             .as_any()
             .downcast_ref::<Int64Array>()
-            .map(|a| CellValue::Int64(a.value(row)))
-            .unwrap_or(CellValue::Null),
+            .map_or(CellValue::Null, |a| CellValue::Int64(a.value(row))),
         // temporal arrays are their own primitive types (timestamp columns
         // caught live with PyIceberg-written fixtures, slice 12)
         // date/time -> PostgreSQL-input-compatible TEXT (slice 21)
         DT::Date32 => col
             .as_any()
             .downcast_ref::<Date32Array>()
-            .map(|a| {
-                let (y, m, d) = civil_from_days(a.value(row) as i64);
+            .map_or(CellValue::Null, |a| {
+                let (y, m, d) = civil_from_days(i64::from(a.value(row)));
                 CellValue::Str(format!("{y:04}-{m:02}-{d:02}"))
-            })
-            .unwrap_or(CellValue::Null),
+            }),
         DT::Time32(unit) => match unit {
             arrow::datatypes::TimeUnit::Second => col
                 .as_any()
                 .downcast_ref::<Time32SecondArray>()
-                .map(|a| CellValue::Str(format_time(a.value(row) as i64, 6)))
-                .unwrap_or(CellValue::Null),
+                .map_or(CellValue::Null, |a| {
+                    CellValue::Str(format_time(i64::from(a.value(row)), 6))
+                }),
             arrow::datatypes::TimeUnit::Millisecond => col
                 .as_any()
                 .downcast_ref::<Time32MillisecondArray>()
-                .map(|a| CellValue::Str(format_time(a.value(row) as i64 * 1_000, 3)))
-                .unwrap_or(CellValue::Null),
+                .map_or(CellValue::Null, |a| {
+                    CellValue::Str(format_time(i64::from(a.value(row)) * 1_000, 3))
+                }),
             _ => CellValue::Null,
         },
         DT::Time64(unit) => match *unit {
             arrow::datatypes::TimeUnit::Microsecond => col
                 .as_any()
                 .downcast_ref::<Time64MicrosecondArray>()
-                .map(|a| CellValue::Str(format_time(a.value(row), 6)))
-                .unwrap_or(CellValue::Null),
+                .map_or(CellValue::Null, |a| {
+                    CellValue::Str(format_time(a.value(row), 6))
+                }),
             arrow::datatypes::TimeUnit::Nanosecond => col
                 .as_any()
                 .downcast_ref::<Time64NanosecondArray>()
-                .map(|a| CellValue::Str(format_time(a.value(row) / 1_000, 6)))
-                .unwrap_or(CellValue::Null),
+                .map_or(CellValue::Null, |a| {
+                    CellValue::Str(format_time(a.value(row) / 1_000, 6))
+                }),
             // Time64 cannot hold second/millisecond precision; kept
             // unreachable for enum exhaustiveness
             _ => CellValue::Null,
@@ -836,82 +866,78 @@ fn cell_from_arrow(col: &dyn arrow::array::Array, row: usize) -> CellValue {
             arrow::datatypes::TimeUnit::Second => col
                 .as_any()
                 .downcast_ref::<TimestampSecondArray>()
-                .map(|a| CellValue::TimestampMicros(a.value(row) * 1_000_000))
-                .unwrap_or(CellValue::Null),
+                .map_or(CellValue::Null, |a| {
+                    CellValue::TimestampMicros(a.value(row) * 1_000_000)
+                }),
             arrow::datatypes::TimeUnit::Millisecond => col
                 .as_any()
                 .downcast_ref::<TimestampMillisecondArray>()
-                .map(|a| CellValue::TimestampMicros(a.value(row) * 1_000))
-                .unwrap_or(CellValue::Null),
+                .map_or(CellValue::Null, |a| {
+                    CellValue::TimestampMicros(a.value(row) * 1_000)
+                }),
             arrow::datatypes::TimeUnit::Microsecond => col
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
-                .map(|a| CellValue::TimestampMicros(a.value(row)))
-                .unwrap_or(CellValue::Null),
+                .map_or(CellValue::Null, |a| {
+                    CellValue::TimestampMicros(a.value(row))
+                }),
             // nanosecond sources truncate to micros (doc 05 §4)
             arrow::datatypes::TimeUnit::Nanosecond => col
                 .as_any()
                 .downcast_ref::<TimestampNanosecondArray>()
-                .map(|a| CellValue::TimestampMicros(a.value(row) / 1_000))
-                .unwrap_or(CellValue::Null),
+                .map_or(CellValue::Null, |a| {
+                    CellValue::TimestampMicros(a.value(row) / 1_000)
+                }),
         },
         DT::Float32 => col
             .as_any()
             .downcast_ref::<Float32Array>()
-            .map(|a| CellValue::Float64(a.value(row) as f64))
-            .unwrap_or(CellValue::Null),
+            .map_or(CellValue::Null, |a| {
+                CellValue::Float64(f64::from(a.value(row)))
+            }),
         DT::Float64 => col
             .as_any()
             .downcast_ref::<Float64Array>()
-            .map(|a| CellValue::Float64(a.value(row)))
-            .unwrap_or(CellValue::Null),
+            .map_or(CellValue::Null, |a| CellValue::Float64(a.value(row))),
         // LargeUtf8 has its OWN array type — downcasting it to StringArray
         // failed silently and surfaced SQL NULL (13-review #8)
         DT::Utf8 => col
             .as_any()
             .downcast_ref::<StringArray>()
-            .map(|a| CellValue::Str(a.value(row).to_string()))
-            .unwrap_or(CellValue::Null),
+            .map_or(CellValue::Null, |a| {
+                CellValue::Str(a.value(row).to_string())
+            }),
         DT::LargeUtf8 => col
             .as_any()
             .downcast_ref::<LargeStringArray>()
-            .map(|a| CellValue::Str(a.value(row).to_string()))
-            .unwrap_or(CellValue::Null),
+            .map_or(CellValue::Null, |a| {
+                CellValue::Str(a.value(row).to_string())
+            }),
         // binary -> bytea hex text ('\x…', bytea_in-compatible; slice 21)
         DT::Binary => col
             .as_any()
             .downcast_ref::<BinaryArray>()
-            .map(|a| {
+            .map_or(CellValue::Null, |a| {
                 let b = a.value(row);
-                let mut hex = String::with_capacity(2 + b.len() * 2);
-                hex.push_str("\\x");
-                for x in b {
-                    hex.push_str(&format!("{x:02x}"));
-                }
-                CellValue::Str(hex)
-            })
-            .unwrap_or(CellValue::Null),
+                CellValue::Str(crate::parquet::hex_escape_bytes(b))
+            }),
         // LargeBinary likewise has its own array type (13-review #8)
-        DT::LargeBinary => col
-            .as_any()
-            .downcast_ref::<LargeBinaryArray>()
-            .map(|a| {
-                let b = a.value(row);
-                let mut hex = String::with_capacity(2 + b.len() * 2);
-                hex.push_str("\\x");
-                for x in b {
-                    hex.push_str(&format!("{x:02x}"));
-                }
-                CellValue::Str(hex)
-            })
-            .unwrap_or(CellValue::Null),
+        DT::LargeBinary => {
+            col.as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .map_or(CellValue::Null, |a| {
+                    let b = a.value(row);
+                    CellValue::Str(crate::parquet::hex_escape_bytes(b))
+                })
+        }
         // decimal -> canonical unscaled/scale TEXT (numeric_in-compatible;
         // slice 21 conformance gate)
         DT::Decimal128(_, scale) => col
             .as_any()
             .downcast_ref::<Decimal128Array>()
-            .map(|a| CellValue::Str(format_decimal128(a.value(row), *scale)))
-            .unwrap_or(CellValue::Null),
+            .map_or(CellValue::Null, |a| {
+                CellValue::Str(format_decimal128(a.value(row), *scale))
+            }),
         // 16-byte fixed binary is the parquet shape of Iceberg `uuid`
         // (canonical hyphenated text for uuid_in; `fixed(16)` columns are
         // rare and render the same — noted in HANDOFF). Other sizes are
@@ -919,13 +945,13 @@ fn cell_from_arrow(col: &dyn arrow::array::Array, row: usize) -> CellValue {
         DT::FixedSizeBinary(16) => col
             .as_any()
             .downcast_ref::<FixedSizeBinaryArray>()
-            .map(|a| CellValue::Str(format_uuid16(a.value(row))))
-            .unwrap_or(CellValue::Null),
+            .map_or(CellValue::Null, |a| {
+                CellValue::Str(format_uuid16(a.value(row)))
+            }),
         DT::FixedSizeBinary(_) => col
             .as_any()
             .downcast_ref::<FixedSizeBinaryArray>()
-            .map(|a| CellValue::Bytes(a.value(row).to_vec()))
-            .unwrap_or(CellValue::Null),
+            .map_or(CellValue::Null, |a| CellValue::Bytes(a.value(row).to_vec())),
         // nested types land with the type-matrix slice (doc 05)
         _ => CellValue::Null,
     }
@@ -959,7 +985,7 @@ fn format_time(us: i64, fwidth: usize) -> String {
     let mi = (us / 60_000_000) % 60;
     let s = (us / 1_000_000) % 60;
     let f = us % 1_000_000;
-    format!("{h:02}:{mi:02}:{s:02}.{:0fwidth$}", f, fwidth = fwidth)
+    format!("{h:02}:{mi:02}:{s:02}.{f:0fwidth$}")
 }
 
 /// Canonical lowercase hyphenated UUID from 16 big-endian bytes.
@@ -1121,13 +1147,13 @@ mod tests {
         writer.close().unwrap();
         ids.to_vec()
             .iter()
-            .map(|i| i.to_string())
+            .map(std::string::ToString::to_string)
             .collect::<Vec<_>>()
             .join(",")
     }
 
     /// TDD anchor (M1 slice 20): position deletes skip exact absolute row
-    /// positions (v2 (file_path, pos) delete files).
+    /// positions (v2 (`file_path`, pos) delete files).
     #[test]
     fn position_deletes_skip_rows() {
         let dir = tempfile::tempdir().unwrap();
@@ -1385,8 +1411,8 @@ mod pos_delete_applicability_tests {
     }
 
     /// Empty-projection scans must still apply position deletes: the old
-    /// open_all branch in rows_open silently counted deleted rows. This
-    /// exercises open_with_deletes with an empty projection: next()
+    /// `open_all` branch in `rows_open` silently counted deleted rows. This
+    /// exercises `open_with_deletes` with an empty projection: `next()`
     /// skips deleted absolute rows even though no columns are read.
     #[test]
     fn empty_projection_still_applies_positions() {

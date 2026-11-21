@@ -109,10 +109,13 @@ impl<'de> Deserialize<'de> for IcebergType {
 }
 
 /// The canonical type name each variant parses back from (mirror of
-/// parse_parameterized) — used by Serialize so commits write the exact
+/// `parse_parameterized`) — used by Serialize so commits write the exact
 /// wire form other engines read.
 fn type_to_value(t: &IcebergType) -> serde_json::Value {
-    use IcebergType::*;
+    use IcebergType::{
+        Binary, Boolean, Date, Decimal, Double, Fixed, Float, Int, List, Long, Map, String, Struct,
+        Time, Timestamp, TimestampNanos, Timestamptz, TimestamptzNanos, Unknown, Uuid, Variant,
+    };
     match t {
         Boolean => "boolean".into(),
         Int => "int".into(),
@@ -159,7 +162,10 @@ impl serde::Serialize for IcebergType {
 /// All type names that appear as plain strings: simple primitives plus the
 /// parameterized `fixed[n]` and `decimal(p,s)`.
 fn parse_parameterized(s: &str) -> Option<IcebergType> {
-    use IcebergType::*;
+    use IcebergType::{
+        Binary, Boolean, Date, Decimal, Double, Fixed, Float, Int, Long, String, Time, Timestamp,
+        TimestampNanos, Timestamptz, TimestamptzNanos, Unknown, Uuid, Variant,
+    };
     Some(match s {
         "boolean" => Boolean,
         "int" => Int,
@@ -196,7 +202,7 @@ fn parse_parameterized(s: &str) -> Option<IcebergType> {
 }
 
 fn parse_type(v: &serde_json::Value) -> Option<IcebergType> {
-    use IcebergType::*;
+    use IcebergType::{List, Map, Struct};
     match v {
         serde_json::Value::String(s) => parse_parameterized(s),
         serde_json::Value::Object(o) => match o.get("type")?.as_str()? {
@@ -212,7 +218,7 @@ fn parse_type(v: &serde_json::Value) -> Option<IcebergType> {
                 element_id: o.get("element-id")?.as_i64()?,
                 element_required: o
                     .get("element-required")
-                    .and_then(|v| v.as_bool())
+                    .and_then(serde_json::Value::as_bool)
                     .unwrap_or(true),
                 element: Box::new(parse_type(o.get("element")?)?),
             })),
@@ -222,7 +228,7 @@ fn parse_type(v: &serde_json::Value) -> Option<IcebergType> {
                 value_id: o.get("value-id")?.as_i64()?,
                 value_required: o
                     .get("value-required")
-                    .and_then(|v| v.as_bool())
+                    .and_then(serde_json::Value::as_bool)
                     .unwrap_or(true),
                 value: Box::new(parse_type(o.get("value").or_else(|| o.get("values"))?)?),
             })),
@@ -276,7 +282,7 @@ pub struct PartitionField {
 }
 
 /// A partition spec: an ordered list of partition fields. The ORDER of the
-/// fields defines the layout of data_file.partition values in manifests —
+/// fields defines the layout of `data_file.partition` values in manifests —
 /// pruning resolves positionally against this list (slice 8).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -380,25 +386,30 @@ pub struct TableMetadata {
 impl TableMetadata {
     /// The schema `current-schema-id` points at, or None (stale/hand-made
     /// metadata must not panic — doc 03 §5).
+    #[must_use]
     pub fn current_schema(&self) -> Option<&Schema> {
         self.schema_by_id(self.current_schema_id)
     }
 
+    #[must_use]
     pub fn schema_by_id(&self, id: i64) -> Option<&Schema> {
         self.schemas.iter().find(|s| s.schema_id == id)
     }
 
     /// The current snapshot, if the table has one (empty tables have none).
+    #[must_use]
     pub fn current_snapshot(&self) -> Option<&Snapshot> {
         let id = self.current_snapshot_id?;
         self.snapshot(id)
     }
 
+    #[must_use]
     pub fn snapshot(&self, id: i64) -> Option<&Snapshot> {
         self.snapshots.iter().find(|s| s.snapshot_id == id)
     }
 
     /// The partition spec with the given id, or None (doc 03 §5: no panics).
+    #[must_use]
     pub fn partition_spec(&self, id: i32) -> Option<&PartitionSpec> {
         self.partition_specs.iter().find(|s| s.spec_id == id)
     }
@@ -407,7 +418,8 @@ impl TableMetadata {
     /// picks the latest snapshot at or before it (the snapshot that was
     /// current at that time); a ref resolves through the refs map; an id is
     /// an exact lookup. None = selector matches no snapshot (the caller
-    /// maps this to NotFound — no panics across the FFI).
+    /// maps this to `NotFound` — no panics across the FFI).
+    #[must_use]
     pub fn resolve_snapshot(&self, selector: &SnapshotSelector) -> Option<&Snapshot> {
         match selector {
             SnapshotSelector::Id { value } => self.snapshot(*value),
@@ -493,7 +505,7 @@ mod tests {
             }
         );
         assert_eq!(schema.fields[6].doc.as_deref(), Some("origin host"));
-        assert_eq!(md.current_snapshot_id, Some(3051729675574597005));
+        assert_eq!(md.current_snapshot_id, Some(3_051_729_675_574_597_005));
         let cur = md.current_snapshot().unwrap();
         assert_eq!(
             cur.summary.get("operation").map(String::as_str),
@@ -723,8 +735,8 @@ mod tests {
     /// resolution — an id picks the exact snapshot; a timestamp picks the
     /// latest snapshot at or before that time (Iceberg "snapshot current at
     /// timestamp" semantics); a ref resolves through the refs map. Unknown
-    /// ids/refs and too-early timestamps yield None (plan_scan maps them to
-    /// NotFound — doc 03 §5).
+    /// ids/refs and too-early timestamps yield None (`plan_scan` maps them to
+    /// `NotFound` — doc 03 §5).
     #[test]
     fn resolves_time_travel_selectors() {
         let json = r#"{
