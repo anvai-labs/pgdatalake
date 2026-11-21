@@ -43,10 +43,14 @@ PDI_NET=${PDI_NET:-pgdatalake_default}
 [ -d "$PDI_VENV" ] || { echo "FAIL: PDI_VENV=$PDI_VENV does not exist (create the pyiceberg venv or point PDI_VENV at it)"; exit 1; }
 PDI_SITE=$(ls -d "$PDI_VENV"/lib/python3.*/site-packages 2>/dev/null | head -1)
 [ -n "$PDI_SITE" ] || { echo "FAIL: no lib/python3.*/site-packages under PDI_VENV=$PDI_VENV"; exit 1; }
+# PYTHONPATH must be the CONTAINER path — the venv mounts at /venv, so the
+# container sees /venv/lib/<py-minor>/site-packages, NOT the host path
+# (a host PDI_SITE silently imports nothing: ModuleNotFoundError pyarrow)
+PDI_PY_MINOR=$(basename "$(dirname "$PDI_SITE")")
 PDI() {
     docker run --rm -i --network "$PDI_NET" \
         -v "$PDI_VENV":/venv \
-        -e PYTHONPATH="$PDI_SITE" \
+        -e PYTHONPATH="/venv/lib/$PDI_PY_MINOR/site-packages" \
         python:3.12-slim python3 -
 }
 
@@ -67,8 +71,10 @@ echo "== staged-publish acceptance: $REMTBL =="
 # in-container hostnames: lakekeeper:8181 / s3:9000 (docker-internal)
 PDI <<PYEOF
 import pyarrow as pa
-from pyiceberg.exceptions import (NamespaceAlreadyExistsError,
-                                  TableAlreadyExistsError)
+from pyiceberg.exceptions import (NoSuchNamespaceError, NoSuchTableError,
+                                  NamespaceAlreadyExistsError)
+from pyiceberg.schema import Schema
+from pyiceberg.types import LongType, NestedField, StringType
 $CAT_PY
 try:
     cat.create_namespace("$NS")
@@ -76,7 +82,7 @@ except NamespaceAlreadyExistsError:
     pass
 try:
     cat.drop_table("$REMTBL")
-except TableAlreadyExistsError:
+except (NoSuchTableError, NoSuchNamespaceError):
     pass
 schema = Schema(NestedField(1, "id", LongType(), required=False),
                 NestedField(2, "val", StringType(), required=False))
@@ -164,8 +170,12 @@ PYEOF
 
 psql_run -q -c "DROP TABLE pub_$TBL CASCADE"
 PDI <<PYEOF
+from pyiceberg.exceptions import NoSuchTableError
 $CAT_PY
-cat.drop_table("$REMTBL")
+try:
+    cat.drop_table("$REMTBL")
+except NoSuchTableError:
+    print("cleanup: remote table already gone")
 PYEOF
 
 echo "staged-publish acceptance: ALL CHECKS PASSED"
