@@ -200,11 +200,12 @@ impl CatalogClient {
         new_files: &[crate::snapshot_write::NewDataFile],
         deleted: &[crate::snapshot_write::DeletedDataFile],
         retries: u32,
-    ) -> Result<String, crate::storage::StorageError> {
+    ) -> Result<(String, i64), crate::storage::StorageError> {
         use crate::catalog::commit::{TableRequirement, TableUpdate};
         let loc = crate::storage::parse_location(&st.location)?;
         let io = crate::storage::StorageIo::open(&loc, Some(&st.s3))?;
 
+        let mut last_generated_snapshot_id = 0i64;
         let resp = self
             .rest
             .commit_with_retry(
@@ -306,6 +307,7 @@ impl CatalogClient {
                         },
                     )
                     .map_err(|e| crate::catalog::rest::RestError::Http(e.to_string()))?;
+                    last_generated_snapshot_id = snapshot_id;
 
                     let updates = vec![
                         TableUpdate::AddSnapshot {
@@ -336,7 +338,7 @@ impl CatalogClient {
                 std::time::Duration::from_millis(50),
             )
             .map_err(|e| crate::storage::StorageError::Config(e.to_string()))?;
-        Ok(resp.metadata_location)
+        Ok((resp.metadata_location, last_generated_snapshot_id))
     }
 
     /// Create the remote Iceberg table (managed CREATE, slice 27c):
@@ -695,7 +697,7 @@ mod tests {
             record_count: 3,
             file_size_in_bytes: 4096,
         }];
-        let new_loc = client
+        let (new_loc, _snap) = client
             .commit_append(&st, &["analytics"], "events", &[], &deleted, 3)
             .expect("overwrite commit");
         assert!(new_loc.contains("00002-x.metadata.json"));

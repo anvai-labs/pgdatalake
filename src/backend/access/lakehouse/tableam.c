@@ -50,6 +50,7 @@
 #include "utils/lsyscache.h"
 #include "access/reloptions.h"
 #include "utils/guc.h"
+#include "executor/spi.h"
 #include "utils/rel.h"
 #include "utils/builtins.h"
 #include "utils/fmgrprotos.h"
@@ -310,6 +311,17 @@ typedef struct LakehouseScanRegistryEntry
 
 static HTAB *scan_registry = NULL;
 
+/* lakehouse GUCs (defined + registered in _PG_init, spec 15 P2) */
+extern int		lakehouse_write_mode;	/* enum: 1 = cow, 2 = staged */
+extern int		lakehouse_target_file_size;
+extern int		lakehouse_publish_max_lag;
+extern int		lakehouse_cache_max_bytes;
+#define LAKEHOUSE_WRITE_MODE_COW		1
+#define LAKEHOUSE_WRITE_MODE_STAGED		2
+
+static void staged_capture_segment(LakehouseWriteEntry *entry);
+
+
 static HTAB *write_entries = NULL;
 
 static void append_cell_json(StringInfoData *buf, Form_pg_attribute attr,
@@ -356,6 +368,14 @@ lakehouse_xact_callback(XactEvent event, void *arg)
 		hash_seq_init(&seq, write_entries);
 		while ((entry = hash_seq_search(&seq)) != NULL)
 		{
+			/* staged mode (D1-rev): the delta row IS the commit —
+			 * durability from the heap+WAL machinery, no remote I/O */
+			if (lakehouse_write_mode == LAKEHOUSE_WRITE_MODE_STAGED &&
+				entry->staged_rows > 0)
+			{
+				staged_capture_segment(entry);
+				continue;
+			}
 			if (entry->ws == NULL || (entry->staged_rows == 0 &&
 									  entry->n_tomb_files == 0))
 				continue;
@@ -1362,8 +1382,16 @@ typedef struct LakehouseTableScanDescData
 	bool		batch_valid;
 	uint64		batch_cursor;
 	LakehouseBatchMap *maps;	/* per visible attribute */
+	/* staged-delta read side (P3 core, D1-rev): committed unpublished
+	 * segments of this table, loaded once per scan via SPI */
+	DeltaRowsHandle **delta_rows;
+	int			n_delta;
+	int			delta_pos;
+	bool		delta_loaded;
 }			LakehouseTableScanDescData;
 typedef LakehouseTableScanDescData *LakehouseTableScanDesc;
+
+static void load_delta_segments(LakehouseTableScanDesc scan, TupleDesc tupdesc);
 
 static void
 lakehouse_scan_common_setup(LakehouseTableScanDesc scan, Relation rel,
@@ -1414,6 +1442,15 @@ lakehouse_scan_common_setup(LakehouseTableScanDesc scan, Relation rel,
 	}
 	scan->projection_csv = proj.data;
 
+	/* staged mode (P3, D2): the scan source is the delta table — no
+	 * remote session; zero tasks means the file loop never runs and the
+	 * delta serve path (below) is the whole scan */
+	if (lakehouse_write_mode == LAKEHOUSE_WRITE_MODE_STAGED)
+	{
+		scan->session = NULL;
+		scan->task_count = 0;
+		return;
+	}
 	scan->session = lakehouse_OpenSession(&scan->opts, rte_selector);
 	scan->task_count = pg_datalake_scan_task_count(scan->session);
 	scan->rows = NULL;
@@ -1577,6 +1614,50 @@ lakehouse_scan_getnextslot(TableScanDesc bscan, ScanDirection direction,
 					}
 					ExecStoreVirtualTuple(slot);
 					return true;
+				}
+
+				/* staged mode: committed unpublished delta segments
+				 * next (MVCC visibility via the SPI snapshot) */
+				if (lakehouse_write_mode == LAKEHOUSE_WRITE_MODE_STAGED)
+				{
+					if (!scan->delta_loaded)
+						load_delta_segments(scan, tupdesc);
+					char		delta_err[1024];
+
+					while (scan->delta_pos < scan->n_delta)
+					{
+						DeltaRowsHandle *h = scan->delta_rows[scan->delta_pos];
+
+						if (pg_datalake_delta_rows_next(h, delta_err,
+														sizeof(delta_err)) == 0)
+						{
+							int			k2;
+
+							ExecClearTuple(slot);
+							ItemPointerSetInvalid(&slot->tts_tid);
+							for (k2 = 0; k2 < tupdesc->natts; k2++)
+							{
+								int			pcol = scan->slot_index[k2];
+
+								if (pcol < 0 ||
+									pg_datalake_delta_rows_col_null(h, pcol))
+								{
+									slot->tts_values[k2] = PointerGetDatum(NULL);
+									slot->tts_isnull[k2] = true;
+									continue;
+								}
+								slot->tts_values[k2] =
+									InputFunctionCall(&scan->in_funcs[k2],
+										pg_datalake_delta_rows_col_text(h, pcol),
+										scan->typioparams[k2],
+										TupleDescAttr(tupdesc, k2)->atttypmod);
+								slot->tts_isnull[k2] = false;
+							}
+							ExecStoreVirtualTuple(slot);
+							return true;
+						}
+						scan->delta_pos++;
+					}
 				}
 				return false;
 			}
@@ -1744,11 +1825,6 @@ lakehouse_scan_getnextslot(TableScanDesc bscan, ScanDirection direction,
 						   what))); \
 	} while (0)
 
-/* lakehouse GUCs (defined + registered in _PG_init, spec 15 P2) */
-extern int		lakehouse_write_mode;
-extern int		lakehouse_target_file_size;
-extern int		lakehouse_publish_max_lag;
-extern int		lakehouse_cache_max_bytes;
 
 /* Open the FFI write session lazily (first insert or first tombstone):
  * validates identity/credentials early, fail-fast per doc 03 §5. */
@@ -1785,6 +1861,74 @@ open_write_session(LakehouseWriteEntry *entry, TupleDesc tupdesc)
 				(errcode(ERRCODE_IO_ERROR),
 				 errmsg("lakehouse: could not set target file size: %s",
 						errbuf)));
+}
+
+/*
+ * load_delta_segments (P3 core): one SPI pass over this table's
+ * committed unpublished delta rows, opened as DeltaRowsHandles. SPI
+ * inside the running executor uses the active (statement) snapshot, so
+ * visibility is exactly MVCC — rows staged by OTHER backends that have
+ * committed appear; our own txn's are served by the overlay (and are
+ * not yet committed, hence invisible here — no duplicates).
+ */
+static void
+load_delta_segments(LakehouseTableScanDesc scan, TupleDesc tupdesc)
+{
+	MemoryContext old = CurrentMemoryContext;
+	Oid			relid = RelationGetRelid(scan->rs_base.rs_rd);
+	char	   *schema_json = build_schema_json(tupdesc);
+	int			ret;
+	int			i;
+
+	scan->delta_loaded = true;
+	scan->delta_rows = NULL;
+	scan->n_delta = 0;
+	scan->delta_pos = 0;
+
+	SPI_connect();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	{
+		StringInfoData sql;
+
+		initStringInfo(&sql);
+		appendStringInfo(&sql,
+						 "SELECT payload FROM lakehouse.lakehouse_delta_segments"
+						 " WHERE relid = %u AND NOT published ORDER BY seg_id",
+						 (unsigned) relid);
+		ret = SPI_execute(sql.data, true, 0);
+	}
+	if (ret == SPI_OK_SELECT)
+	{
+		MemoryContext sc = MemoryContextSwitchTo(old);
+
+		scan->n_delta = SPI_processed;
+		scan->delta_rows = (DeltaRowsHandle **)
+			palloc0(sizeof(DeltaRowsHandle *) * (SPI_processed ? SPI_processed : 1));
+		for (i = 0; i < SPI_processed; i++)
+		{
+			bool		isnull;
+			Datum		d = SPI_getbinval(SPI_tuptable->vals[i],
+										  SPI_tuptable->tupdesc, 1, &isnull);
+			char	   *payload;
+
+			if (isnull)
+				continue;
+			payload = TextDatumGetCString(d);
+			MemoryContextSwitchTo(old);
+			scan->delta_rows[scan->delta_pos] =
+				pg_datalake_delta_rows_open(payload, schema_json,
+											NULL, 0);
+			MemoryContextSwitchTo(sc);
+			if (scan->delta_rows[scan->delta_pos] != NULL)
+				scan->delta_pos++;
+		}
+		/* every handle serves from pos 0 */
+		scan->delta_pos = 0;
+		MemoryContextSwitchTo(sc);
+	}
+	PopActiveSnapshot();
+	SPI_finish();
+	MemoryContextSwitchTo(old);
 }
 
 /* Own-writes overlay: copy the tuple into the txn-scoped entry. Rows are
@@ -1896,6 +2040,85 @@ capture_tombstone(Relation rel, ItemPointer tid)
 	}
 }
 
+/*
+ * staged_capture_segment (P3 core, D1-rev): serialize this entry's
+ * staged rows as ONE JSON payload (array of the write path's typed
+ * row-JSON) and INSERT it into lakehouse.lakehouse_delta_segments via
+ * SPI — durability from the transaction's own WAL record. The tombstone
+ * rewrite/remote paths are untouched (D2: staged mode is INSERT-only).
+ */
+static void
+staged_capture_segment(LakehouseWriteEntry *entry)
+{
+	StringInfoData payload;
+	StringInfoData row;
+	int			i;
+	int			k;
+	bool		first_row = true;
+	Oid			save_uid;
+	int			ret;
+	TupleDesc	tupdesc = entry->tupdesc;
+
+	initStringInfo(&payload);
+	appendStringInfoChar(&payload, '[');
+	for (i = 0; i < entry->staged_rows; i++)
+	{
+		bool		first_col = true;
+
+		if (!first_row)
+			appendStringInfoChar(&payload, ',');
+		initStringInfo(&row);
+		appendStringInfoChar(&row, '[');
+		for (k = 0; k < tupdesc->natts; k++)
+		{
+			/* dropped attributes are omitted — cell count matches the
+			 * schema column count (13-review #8b) */
+			if (TupleDescAttr(tupdesc, k)->attisdropped)
+				continue;
+			if (!first_col)
+				appendStringInfoChar(&row, ',');
+			append_cell_json(&row,
+							 TupleDescAttr(tupdesc, k),
+							 entry->staged_values[(size_t) i * entry->natts + k],
+							 entry->staged_isnull[(size_t) i * entry->natts + k]);
+			first_col = false;
+		}
+		appendStringInfoChar(&row, ']');
+		appendBinaryStringInfo(&payload, row.data, row.len);
+		pfree(row.data);
+		first_row = false;
+	}
+	appendStringInfoChar(&payload, ']');
+
+	/*
+	 * INSERT inside the committing transaction: WAL-fsync at commit
+	 * makes the delta durable BEFORE the COMMIT ack (D1-rev's point).
+	 * Parameterized payload (no literal injection surface).
+	 */
+	SPI_connect();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	{
+		Oid			argtypes[1] = {TEXTOID};
+		Datum		values[1];
+		char		nulls[2] = {' ', '\0'};
+
+		values[0] = CStringGetTextDatum(payload.data);
+		ret = SPI_execute_with_args(psprintf("INSERT INTO"
+											 " lakehouse.lakehouse_delta_segments"
+											 " (relid, payload) VALUES (%u, $1::bytea)",
+											 (unsigned) entry->relid),
+									1, argtypes, values, nulls, false, 0);
+	}
+	PopActiveSnapshot();
+	SPI_finish();
+	if (ret != SPI_OK_INSERT)
+		ereport(ERROR,
+				(errcode(ERRCODE_IO_ERROR),
+				 errmsg("lakehouse: staged delta capture failed (relid %u)",
+						(unsigned) entry->relid)));
+	pfree(payload.data);
+}
+
 static void
 lakehouse_tuple_insert(Relation rel, TupleTableSlot *slot, CommandId cid,
 					   uint32 options, BulkInsertStateData *bistate)
@@ -1903,7 +2126,10 @@ lakehouse_tuple_insert(Relation rel, TupleTableSlot *slot, CommandId cid,
 	LakehouseWriteEntry *entry = get_write_entry(rel);
 
 	slot_getallattrs(slot);
-	open_write_session(entry, RelationGetDescr(rel));
+	/* staged mode (spec 15 D2): durability is the delta table — no
+	 * remote session is opened, ever, on the insert path */
+	if (lakehouse_write_mode != LAKEHOUSE_WRITE_MODE_STAGED)
+		open_write_session(entry, RelationGetDescr(rel));
 	stage_slot(entry, slot, RelationGetDescr(rel));
 	elog(LOG, "lakehouse staged row at subid %u",
 		 GetCurrentSubTransactionId());
@@ -2617,6 +2843,114 @@ lakehouse_create_remote(PG_FUNCTION_ARGS)
 		pg_datalake_write_commit_result_free(loc);
 		PG_RETURN_TEXT_P(result);
 	}
+}
+
+
+/*
+ * pg_lakehouse_publish_staged (P4, spec 15 §4): emit every unpublished
+ * delta segment of `relid` — ONE write session, publish_segment per
+ * row-payload, ONE append commit, then the ledger flip (the segment
+ * row's own columns). Returns the number of segments published.
+ */
+PG_FUNCTION_INFO_V1(pg_lakehouse_publish_staged);
+
+Datum
+pg_lakehouse_publish_staged(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	Relation	rel;
+	LakehouseWriteEntry *entry = NULL;
+	int			published_count = 0;
+	int			ret;
+	MemoryContext cb_ctx = CurrentMemoryContext;
+	char		errbuf[1024];
+
+	rel = table_open(relid, AccessShareLock);
+	entry = get_write_entry(rel);
+	open_write_session(entry, RelationGetDescr(rel));
+	if (entry->ws == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_IO_ERROR),
+				 errmsg("lakehouse: publisher could not open a write session")));
+
+	SPI_connect();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	{
+		StringInfoData sql;
+
+		initStringInfo(&sql);
+		appendStringInfo(&sql,
+						 "SELECT seg_id, payload FROM"
+						 " lakehouse.lakehouse_delta_segments"
+						 " WHERE relid = %u AND NOT published"
+						 " ORDER BY seg_id", (unsigned) relid);
+		ret = SPI_execute(sql.data, false, 0);
+	}
+	if (ret != SPI_OK_SELECT)
+		ereport(ERROR,
+				(errcode(ERRCODE_IO_ERROR),
+				 errmsg("lakehouse: publisher could not read delta segments")));
+
+	for (int i = 0; i < SPI_processed; i++)
+	{
+		bool		isnull;
+		Datum		seg_id = SPI_getbinval(SPI_tuptable->vals[i],
+										   SPI_tuptable->tupdesc, 1, &isnull);
+		Datum		payload = SPI_getbinval(SPI_tuptable->vals[i],
+											SPI_tuptable->tupdesc, 2, &isnull);
+		char	   *payload_c;
+
+		if (isnull)
+			continue;
+		payload_c = TextDatumGetCString(payload);
+
+		/* emission core (Rust): payload rows -> writer -> flush.
+		 * COALESCED emission: every unpublished segment's rows go into
+		 * ONE accumulator (rollover bounds file sizes), ONE commit. */
+		if (!pg_datalake_publish_segment(entry->ws, payload_c,
+										 errbuf, sizeof(errbuf)))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_EXCEPTION),
+					 errmsg("lakehouse: publisher emission failed for segment %lld: %s",
+							(long long) DatumGetInt64(seg_id), errbuf)));
+		published_count++;
+	}
+
+	if (published_count > 0)
+	{
+		char	   *loc;
+		int64		snap_id;
+		int			flip_ret;
+
+		/* ONE append snapshot for the whole batch */
+		loc = pg_datalake_write_commit(entry->ws, 3, errbuf, sizeof(errbuf));
+		if (loc == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_CONNECTION_EXCEPTION),
+					 errmsg("lakehouse: publisher commit failed: %s", errbuf)));
+		snap_id = pg_datalake_write_last_snapshot_id(entry->ws);
+		pg_datalake_write_commit_result_free(loc);
+
+		/* ledger flip: the batch's segments all point at the snapshot */
+		flip_ret = SPI_execute(psprintf("UPDATE"
+										" lakehouse.lakehouse_delta_segments"
+										" SET published = true,"
+										" published_snapshot_id = %lld"
+										" WHERE relid = %u AND NOT published",
+										(long long) snap_id,
+										(unsigned) relid),
+							   false, 0);
+		if (flip_ret != SPI_OK_UPDATE)
+			ereport(ERROR,
+					(errcode(ERRCODE_IO_ERROR),
+					 errmsg("lakehouse: publisher ledger flip failed")));
+	}
+	PopActiveSnapshot();
+	SPI_finish();
+	table_close(rel, AccessShareLock);
+	MemoryContextSwitchTo(cb_ctx);
+
+	PG_RETURN_INT32(published_count);
 }
 
 PG_FUNCTION_INFO_V1(lakehouse_tableam_handler);

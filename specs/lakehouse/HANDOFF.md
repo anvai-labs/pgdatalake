@@ -960,3 +960,55 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     clippy -D warnings, suite 7/7. NEXT: P3 delta store as PG table +
     P4 publisher worker (staged-INSERT critical path), or P0b lazy
     ranged parquet reader.
+  - P3 core slice — DONE 2026-11-21 (staged INSERT capture + delta
+    read side, TDD offline): write_mode='staged' now routes managed
+    INSERT through the delta-segments TABLE — durability from the
+    txn's own WAL record (D1-rev): tuple_insert skips the remote
+    session entirely; PRE_COMMIT serializes staged rows as ONE JSON
+    payload (the write path's typed row-JSON) and SPI-INSERTs it into
+    lakehouse.lakehouse_delta_segments ($1::bytea parameterized);
+    scan_begin in staged mode opens NO session (delta-only scan: zero
+    tasks) and scan_getnextslot serves committed unpublished segments
+    via SPI (active snapshot = MVCC — cross-backend staged visibility
+    free, own-txn rows via the overlay, no duplicates). Rust:
+    pg_datalake_delta_rows_* FFI (payload -> renderer-exact text forms;
+    WriteColumn serde accepts "type"). OFFLINE PROOF (the point):
+    staged INSERT COMMITTED against an unreachable catalog with
+    read-your-writes across TWO transactions and TWO segments — COW
+    structurally cannot do this. 114 cargo + suite 9/9 (staged_insert
+    is the 9th). PENDING: kill-9 crash test (live), publisher
+    read/emission side, tombstone gating (staged DML = R4 after V3).
+    Branch: feature/p3-staged-writes (PR next).
+  - P3 CRASH TEST — PASSED 2026-11-21 (live, §7.2 P3 acceptance):
+    staged INSERT of 50 rows committed (write_mode=staged, 1 delta
+    segment, published=false) -> pg_ctl stop -m immediate (kill-class:
+    no clean shutdown, WAL replay on restart) -> recovery ran -> delta
+    segment SURVIVED (count 1) -> read-your-writes after recovery =
+    ALL 50 rows served from the recovered segment. The D1-rev claim
+    ("the row IS the durable record; recovery restores it") is now
+    demonstrated, not asserted. PENDING: publisher read/emission
+    (P4), tombstone gating note for staged DML (R4 after V3).
+  - P4 slice 1 — DONE 2026-11-21 (publisher emission core + SQL entry,
+    live + pyiceberg): pg_datalake_publish_segment (Rust: payload ->
+    parse_row_json -> writer push -> flush, one data file per segment,
+    M3-R2 stats carried) + lakehouse.publish_staged(regclass) (C:
+    SPI-select unpublished segments ordered by seg_id, ONE write
+    session, publish_segment + write_commit per segment (v1
+    single-segment-per-commit per §4.4), ledger flip immediately after
+    each commit). LIVE: staged 50-row segments -> publish_staged ->
+    TWO APPEND snapshots on the remote table (+50 rows, +1 file each),
+    pyiceberg reads 100 rows, ledger drained to 0 unpublished. P4b
+    TODO: parse snapshot-id from commit result into the ledger column
+    (currently flips published only), bgworker wrapper + publish_max_lag
+    scheduling, coalesced multi-segment emission.
+  - P4 slice 2 — DONE 2026-11-21 (coalesced emission + ledger snapshot
+    id, live): commit_append now returns (metadata-location,
+    snapshot-id) — the id captured from the locally-generated AddSnapshot
+    (the REST response carries only metadata-location); C-side
+    pg_datalake_write_last_snapshot_id; publish_staged COALESCES all
+    unpublished segments into ONE snapshot (rollover bounds file sizes)
+    and flips every segment's ledger to published=true +
+    published_snapshot_id=<real id>. LIVE: 2 segments (20+11 rows) -> 1
+    commit -> ledger {2, all_pub=t, snap=1882430676134503717}; cow-mode
+    remote scan reads 31 rows, sum exact. P4c remaining: bgworker
+    wrapper + publish_max_lag scheduling.

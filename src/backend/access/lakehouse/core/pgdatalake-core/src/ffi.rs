@@ -772,6 +772,8 @@ pub struct WriteSession {
     target_file_size_bytes: i64,
     /// measured bytes/row from the last flush — the rollover estimate
     last_avg_row_bytes: usize,
+    /// snapshot id of the LAST successful commit (P4 ledger)
+    last_snapshot_id: i64,
 }
 
 /// Open a write session. `schema_json` is `[{"name": ..., "type":
@@ -935,6 +937,7 @@ pub unsafe extern "C" fn pg_datalake_write_new(
         staged_rows: 0,
         target_file_size_bytes: 0,
         last_avg_row_bytes: 64,
+        last_snapshot_id: 0,
     });
     Box::into_raw(ws)
 }
@@ -1021,6 +1024,271 @@ pub unsafe extern "C" fn pg_datalake_write_flush(
             unsafe { set_err(err_buf, err_len, &format!("write flush: {e}")) };
             false
         }
+    }
+}
+
+/// Delta-segment payload reader (P3 core, spec 15 §3.3 D1-rev): the
+/// payload is ONE JSON document — an array of row arrays in the write
+/// path's typed row-JSON (bare numbers, quoted strings, null). Cells are
+/// rendered to the EXACT text forms the per-row renderer produces, so
+/// the C consumer feeds them to the same input functions with identical
+/// results.
+pub struct DeltaRowsHandle {
+    rows: Vec<Vec<(CString, bool)>>, // row -> col -> (text, isnull)
+    row_pos: usize,
+    column_names: Vec<CString>,
+}
+
+/// CellValue -> text, byte-identical to render_row's match.
+fn cell_text(v: &crate::parquet::CellValue) -> String {
+    use crate::parquet::CellValue::*;
+    match v {
+        Null => String::new(),
+        Bool(b) => {
+            if *b {
+                "t".into()
+            } else {
+                "f".into()
+            }
+        }
+        Int64(n) => n.to_string(),
+        TimestampMicros(us) => crate::parquet::format_timestamp_micros(*us),
+        Float64(f) => f.to_string(),
+        Str(s) => s.clone(),
+        Bytes(b) => {
+            let mut hex = String::with_capacity(2 + b.len() * 2);
+            hex.push_str("\\x");
+            for x in b {
+                hex.push_str(&format!("{x:02x}"));
+            }
+            hex
+        }
+    }
+}
+
+/// Open a delta payload (JSON array of row arrays). Column names/types
+/// ride in the same schema JSON the write path uses.
+/// # Safety
+/// Both C strings must be valid NUL-terminated pointers; the returned
+/// handle is freed exactly once with pg_datalake_delta_rows_close.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_delta_rows_open(
+    payload_json: *const c_char,
+    schema_json: *const c_char,
+    err_buf: *mut c_char,
+    err_len: usize,
+) -> *mut DeltaRowsHandle {
+    let outcome = std::panic::catch_unwind(|| -> Result<Box<DeltaRowsHandle>, String> {
+        let payload = unsafe { CStr::from_ptr(payload_json) }.to_string_lossy();
+        let schema = unsafe { CStr::from_ptr(schema_json) }.to_string_lossy();
+        let cols: Vec<crate::writer::WriteColumn> =
+            serde_json::from_str(&schema).map_err(|e| format!("delta rows: schema json: {e}"))?;
+        let doc: serde_json::Value =
+            serde_json::from_str(&payload).map_err(|e| format!("delta rows: payload json: {e}"))?;
+        let rows_json = doc
+            .as_array()
+            .ok_or_else(|| "delta rows: payload is not a JSON array".to_string())?;
+        let mut out = Vec::with_capacity(rows_json.len());
+        for (ri, rj) in rows_json.iter().enumerate() {
+            let cells = crate::writer::parse_row_json(&cols, rj)
+                .map_err(|e| format!("delta rows: row {ri}: {e}"))?;
+            if cells.len() != cols.len() {
+                return Err(format!(
+                    "delta rows: row {ri}: {} cells for {} columns",
+                    cells.len(),
+                    cols.len()
+                ));
+            }
+            let mut row = Vec::with_capacity(cols.len());
+            for c in &cells {
+                if matches!(c, crate::parquet::CellValue::Null) {
+                    row.push((CString::new("").unwrap(), true));
+                } else {
+                    row.push((
+                        CString::new(cell_text(c))
+                            .map_err(|_| format!("delta rows: row {ri}: interior NUL in cell"))?,
+                        false,
+                    ));
+                }
+            }
+            out.push(row);
+        }
+        let column_names = cols
+            .iter()
+            .map(|c| CString::new(c.name.as_str()).unwrap_or_default())
+            .collect();
+        Ok(Box::new(DeltaRowsHandle {
+            rows: out,
+            row_pos: 0,
+            column_names,
+        }))
+    });
+    match outcome {
+        Ok(Ok(h)) => Box::into_raw(h),
+        Ok(Err(e)) => {
+            unsafe { set_err(err_buf, err_len, &e) };
+            std::ptr::null_mut()
+        }
+        Err(panic) => {
+            let m = panic_message(&panic);
+            unsafe { set_err(err_buf, err_len, &m) };
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// # Safety
+/// `h` must be a live handle from pg_datalake_delta_rows_open.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_delta_rows_close(h: *mut DeltaRowsHandle) {
+    if !h.is_null() {
+        drop(unsafe { Box::from_raw(h) });
+    }
+}
+
+/// # Safety
+/// `h` must be a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_delta_rows_column_count(h: *mut DeltaRowsHandle) -> u64 {
+    match unsafe { h.as_ref() } {
+        Some(d) => d.column_names.len() as u64,
+        None => 0,
+    }
+}
+
+/// Advance: 0 = row, 1 = EOF, 2 = error (13-review #8 tri-state).
+///
+/// # Safety
+/// `h` must be a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_delta_rows_next(
+    h: *mut DeltaRowsHandle,
+    err_buf: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    match unsafe { h.as_mut() } {
+        Some(d) => {
+            if d.row_pos < d.rows.len() {
+                d.row_pos += 1;
+                0
+            } else {
+                1
+            }
+        }
+        None => {
+            unsafe { set_err(err_buf, err_len, "delta rows: NULL handle") };
+            2
+        }
+    }
+}
+
+/// # Safety
+/// `h` must be a live handle; call after a 0 from next().
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_delta_rows_col_null(
+    h: *mut DeltaRowsHandle,
+    idx: u64,
+) -> bool {
+    unsafe { h.as_ref() }
+        .and_then(|d| d.rows.get(d.row_pos.saturating_sub(1)))
+        .and_then(|r| r.get(idx as usize))
+        .map(|(_, isnull)| *isnull)
+        .unwrap_or(true)
+}
+
+/// # Safety
+/// `h` must be a live handle; call after a 0 from next().
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_delta_rows_col_text(
+    h: *mut DeltaRowsHandle,
+    idx: u64,
+) -> *const c_char {
+    unsafe { h.as_ref() }
+        .and_then(|d| d.rows.get(d.row_pos.saturating_sub(1)))
+        .and_then(|r| r.get(idx as usize))
+        .map(|(t, _)| t.as_ptr())
+        .unwrap_or(std::ptr::null())
+}
+
+/// Publisher emission core (P4, spec 15 §4): push ONE delta segment's
+/// rows (payload = the typed row-JSON document) through the write
+/// session's accumulator and flush it as a data file. The C publisher
+/// calls this per unpublished segment on ONE write session, then
+/// pg_datalake_write_commit once — one snapshot, size-bounded files
+/// (rollover active), the M3-R2 stats carried. Idempotency note (spec
+/// 15 §4.4): the caller flips the segment's ledger columns only after
+/// the commit result returns; the crash window between commitTable and
+/// the ledger UPDATE is documented for the v1 single-segment-per-commit
+/// discipline.
+///
+/// # Safety
+/// `ws` from pg_datalake_write_new; `payload_json` a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_publish_segment(
+    ws: *mut WriteSession,
+    payload_json: *const c_char,
+    err_buf: *mut c_char,
+    err_len: usize,
+) -> bool {
+    let Some(ws) = (unsafe { ws.as_mut() }) else {
+        unsafe { set_err(err_buf, err_len, "publish segment: NULL session") };
+        return false;
+    };
+    let payload = unsafe { CStr::from_ptr(payload_json) }.to_string_lossy();
+    let doc: serde_json::Value = match serde_json::from_str(&payload) {
+        Ok(v) => v,
+        Err(e) => {
+            unsafe { set_err(err_buf, err_len, &format!("publish segment: payload: {e}")) };
+            return false;
+        }
+    };
+    let rows = match doc.as_array() {
+        Some(r) => r.clone(),
+        None => {
+            unsafe { set_err(err_buf, err_len, "publish segment: payload is not an array") };
+            return false;
+        }
+    };
+    for (ri, rj) in rows.iter().enumerate() {
+        let cells = match crate::writer::parse_row_json(&ws.columns, rj) {
+            Ok(c) => c,
+            Err(e) => {
+                unsafe { set_err(err_buf, err_len, &format!("publish segment: row {ri}: {e}")) };
+                return false;
+            }
+        };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ws.writer.push(&cells))) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                unsafe { set_err(err_buf, err_len, &format!("publish segment: row {ri}: {e}")) };
+                return false;
+            }
+            Err(panic) => {
+                let m = panic_message(&panic);
+                unsafe { set_err(err_buf, err_len, &format!("publish segment: {m}")) };
+                return false;
+            }
+        }
+    }
+    match flush_writer_buffer(ws) {
+        Ok(()) => true,
+        Err(e) => {
+            unsafe { set_err(err_buf, err_len, &format!("publish segment: flush: {e}")) };
+            false
+        }
+    }
+}
+
+/// Snapshot id of the LAST successful commit on this session (P4
+/// ledger flip). 0 when no commit has happened.
+///
+/// # Safety
+/// `ws` must be a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_write_last_snapshot_id(ws: *mut WriteSession) -> i64 {
+    match unsafe { ws.as_ref() } {
+        Some(w) => w.last_snapshot_id,
+        None => 0,
     }
 }
 
@@ -1173,7 +1441,8 @@ unsafe fn commit_internal(
         )
     }));
     match commit {
-        Ok(Ok(loc)) => {
+        Ok(Ok((loc, snap_id))) => {
+            ws.last_snapshot_id = snap_id;
             ws.flushed.clear();
             match std::ffi::CString::new(loc) {
                 Ok(c) => c.into_raw(),
@@ -3732,5 +4001,54 @@ mod tests {
             1,
             "second scan plans from cache despite deletion"
         );
+    }
+
+    /// P3 core: delta payload round-trip — rows written in the typed
+    /// row-JSON come back as the per-row renderer's exact text forms,
+    /// nulls flagged, tri-state next.
+    #[test]
+    fn delta_rows_roundtrip() {
+        crate::storage::test_allow_local_stores();
+        let payload = CString::new(r#"[[1,"a"],[2,null],[3,"c"]]"#).unwrap();
+        let schema =
+            CString::new(r#"[{"name":"id","type":"long"},{"name":"name","type":"string"}]"#)
+                .unwrap();
+        let mut err = [0 as c_char; 1024];
+        let h = unsafe {
+            pg_datalake_delta_rows_open(
+                payload.as_ptr(),
+                schema.as_ptr(),
+                err.as_mut_ptr(),
+                err.len(),
+            )
+        };
+        assert!(!h.is_null(), "open: {}", unsafe {
+            CStr::from_ptr(err.as_ptr()).to_string_lossy()
+        });
+        assert_eq!(unsafe { pg_datalake_delta_rows_column_count(h) }, 2);
+        for (id, name) in [("1", "a"), ("2", ""), ("3", "c")] {
+            assert_eq!(
+                unsafe { pg_datalake_delta_rows_next(h, err.as_mut_ptr() as *mut _, 1024) },
+                0
+            );
+            let got_id = unsafe { CStr::from_ptr(pg_datalake_delta_rows_col_text(h, 0)) }
+                .to_string_lossy()
+                .into_owned();
+            let name_null = unsafe { pg_datalake_delta_rows_col_null(h, 1) };
+            assert_eq!(got_id, id);
+            assert_eq!(name_null, name.is_empty() && id == "2", "{id}/{name}");
+            if !name_null {
+                let got = unsafe { CStr::from_ptr(pg_datalake_delta_rows_col_text(h, 1)) }
+                    .to_string_lossy()
+                    .into_owned();
+                assert_eq!(got, name);
+            }
+        }
+        assert_eq!(
+            unsafe { pg_datalake_delta_rows_next(h, err.as_mut_ptr() as *mut _, 1024) },
+            1,
+            "EOF"
+        );
+        unsafe { pg_datalake_delta_rows_close(h) };
     }
 }
