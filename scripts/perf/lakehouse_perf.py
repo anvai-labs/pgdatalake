@@ -65,6 +65,7 @@ from pyiceberg.types import LongType, NestedField, StringType
 random.seed(7)
 cat = load_catalog("smoke", type="rest", uri=%r, warehouse="smoke",
                    **{"s3.endpoint": %r,
+                      "s3.addressing-style": "path",
                       "s3.access-key-id": "lakehouse-test",
                       "s3.secret-access-key": "lakehouse-test-password"})
 try:
@@ -127,6 +128,7 @@ from pyiceberg.catalog import load_catalog
 cat = load_catalog("smoke", type="rest", uri={args.catalog_uri!r},
                    warehouse="smoke",
                    **{{"s3.endpoint": {args.s3_endpoint!r},
+                       "s3.addressing-style": "path",
                       "s3.access-key-id": "lakehouse-test",
                       "s3.secret-access-key": "lakehouse-test-password"}})
 try:
