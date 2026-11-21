@@ -1,0 +1,42 @@
+-- P0b4 slice C (spec 15 §6.6): COUNT(*) elision for MANAGED tables.
+-- The planner hook replaces a trivial count(*) over a managed lakehouse
+-- table with the ledger row_count sum (exact for the pinned snapshot;
+-- DV-free snapshots only — delete work forces the normal scan).
+-- This test runs OFFLINE on purpose: the elided plan never touches the
+-- catalog (the ledger lives in Postgres), so an unreachable endpoint
+-- proves the answer comes from the ledger, not a scan.
+CREATE EXTENSION IF NOT EXISTS lakehouse;
+SELECT lakehouse.version();
+
+SET lakehouse.write_mode = 'staged';
+CREATE TABLE cnt_elide (id bigint, name text) USING lakehouse;
+DO $$ BEGIN CREATE FOREIGN DATA WRAPPER ce_wrapper
+    HANDLER lakehouse.lakehouse_fdw_handler;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN CREATE SERVER ce_srv FOREIGN DATA WRAPPER ce_wrapper
+    OPTIONS (endpoint 'http://127.0.0.1:9', warehouse 'wh',
+             s3_endpoint 'http://s3:9000');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+CREATE USER MAPPING IF NOT EXISTS FOR CURRENT_USER SERVER ce_srv;
+SELECT lakehouse.attach_table('cnt_elide'::regclass, 'analytics.cnt_elide', 'ce_srv');
+
+INSERT INTO cnt_elide SELECT g, 'e-'||g FROM generate_series(1, 5) g;
+
+-- the elided plan must NOT open a scan session: EXPLAIN shows a bare
+-- Result (no scan node at all — the answer is a plan-time Const), and
+-- the count is exact
+EXPLAIN (VERBOSE, COSTS OFF) SELECT count(*) FROM cnt_elide;
+SELECT count(*) AS exact FROM cnt_elide;
+
+-- savepoint rollback removes staged rows: elision must reflect pruning
+BEGIN;
+INSERT INTO cnt_elide VALUES (100, 'x');
+SAVEPOINT s1;
+INSERT INTO cnt_elide VALUES (200, 'y');
+ROLLBACK TO s1;
+COMMIT;
+SELECT count(*) AS after_savepoint_prune FROM cnt_elide;
+
+-- negative control: a WHERE clause forces the normal scan path
+-- (dead endpoint -> loud failure; elision must NOT fire)
+SELECT count(*) AS filtered FROM cnt_elide WHERE id = 1;
