@@ -1744,6 +1744,12 @@ lakehouse_scan_getnextslot(TableScanDesc bscan, ScanDirection direction,
 						   what))); \
 	} while (0)
 
+/* lakehouse GUCs (defined + registered in _PG_init, spec 15 P2) */
+extern int		lakehouse_write_mode;
+extern int		lakehouse_target_file_size;
+extern int		lakehouse_publish_max_lag;
+extern int		lakehouse_cache_max_bytes;
+
 /* Open the FFI write session lazily (first insert or first tombstone):
  * validates identity/credentials early, fail-fast per doc 03 §5. */
 static void
@@ -1769,6 +1775,15 @@ open_write_session(LakehouseWriteEntry *entry, TupleDesc tupdesc)
 		ereport(ERROR,
 				(errcode(ERRCODE_CONNECTION_EXCEPTION),
 				 errmsg("lakehouse: could not open write session: %s",
+						errbuf)));
+	if (!pg_datalake_write_set_target_file_size(
+			entry->ws,
+			(int64) lakehouse_target_file_size * 1024,
+			errbuf,
+			sizeof(errbuf)))
+		ereport(ERROR,
+				(errcode(ERRCODE_IO_ERROR),
+				 errmsg("lakehouse: could not set target file size: %s",
 						errbuf)));
 }
 
@@ -2476,7 +2491,7 @@ _PG_init(void)
 							"Target size of one written data file; the writer rolls files at this threshold.",
 							NULL,
 							&lakehouse_target_file_size,
-							128 * 1024, 128 * 1024, PG_INT32_MAX,
+							128 * 1024, 128, PG_INT32_MAX,
 							PGC_USERSET,
 							GUC_UNIT_KB,
 							NULL, NULL, NULL);
