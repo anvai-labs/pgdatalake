@@ -85,6 +85,61 @@ sequenceDiagram
     Note over I: other engines (Trino/Spark)<br/>see rows ONLY here
 ```
 
+## 2a. Seam conformance: build on Postgres, or justify the delta (2026-11-20)
+
+*(Review question: is every capability here built on a battle-tested
+Postgres subsystem, or are we inventing a parallel one? All facilities
+cited below were verified present in this tree.)*
+
+| Capability | Postgres subsystem we ride on | Verdict |
+|---|---|---|
+| delta durability | **plain catalog tables**: a committed transaction's INSERT of its delta segment is WAL-fsynced at COMMIT by the machinery that has logged every row since 1987; crash recovery, physical replication, basebackup, checksums — all inherited, zero new code | ✅ PG-native (see D1-rev) |
+| crash visibility of staged rows | PG recovery restores the delta table like any table | ✅ |
+| publish idempotency ledger (§4.4) | the delta row itself carries `published` + `published_snapshot_id` columns — a ledger file is unnecessary; UPDATE visibility via MVCC | ✅ PG-native |
+| publisher / compactor processes | **dynamic background workers** (`postmaster/bgworker.h`, `WaitLatch` sleep/wake) — the autovacuum model: launcher + workers, `cost_limit`-style I/O throttling borrowed from `autovacuum_vac_cost_delay` | ✅ PG-native |
+| shared coordination (work queue, leases) | shared hash + `dsa`/`shm_toc` primitives bgworkers already use | ✅ PG-native |
+| temp/spill files | `BufFileCreateFileSet` / `FileSet` (`storage/buffile.h`) — never hand-rolled file management | ✅ PG-native |
+| read caching (in-process) | per-backend LRU in the Rust core (P0, landed) | ⚠ justified delta — see C1 |
+| read caching (shared disk, v2) | `SharedFileSet` + `dsa` for cross-backend coordination | ✅ PG-native (v2 plan) |
+| WAL alternative channels | logical decoding messages (`replication/logical.h`): evaluated, **rejected** for delta durability — see D1-rev rationale | recorded |
+
+**D1-rev (supersedes D1, 2026-11-20 — per RULES §7): the delta store is a
+Postgres TABLE, not custom WAL records and not segment files.**
+
+- Original D1: custom rmgr (`RegisterCustomRmgr`, verified at
+  `rmgr.c:107`) logging delta records, replayed at startup into a
+  hand-managed segment store under `pg_lakehouse/delta/`.
+- What broke in review: EVERYTHING the rmgr bought is what a plain
+  INSERT inside the committing transaction already provides —
+  WAL-fsync-at-commit ordering, crash replay (the row IS the durable
+  record; recovery restores it), physical-standby inheritance. The
+  custom route then adds three hand-rolled subsystems PG already owns:
+  replay (redo callbacks), segment fsync/enumeration, and a ledger
+  file — each a correctness surface the delta-as-table design deletes.
+- The rmgr route is RETAINED as a recorded alternative for one
+  scenario only: if measured delta-INSERT overhead (buffer-manager +
+  TOAST traffic) materially regresses bulk staged loads, a rmgr writing
+  pre-serialized batch payloads (one record per flush, not per row)
+  becomes the escalation — with the crash tests of §7.2 P3 as the
+  identical acceptance bar either way.
+- Logical decoding was evaluated as the other "PG WAL" channel and
+  rejected: its delivery semantics are consumer-driven (slot retention,
+  lost on slot drop), it requires `wal_level=logical` WAL amplification,
+  and — decisively — it does not participate in crash RECOVERY (the
+  delta would be decodable-but-not-replayed exactly when G2 needs it).
+
+**C1 (justified delta — the read cache is not a parallel buffer pool).**
+Postgres's buffer manager is a page-cache for relations going through
+smgr; lakehouse bytes come from object stores over HTTP(S) via
+`object_store`, in file formats with no page structure. Routing them
+through shared_buffers would mean fake relations + smgr games — a
+fragile inversion of the seam. The cache therefore lives in the layer
+that performs the I/O: per-backend LRU in the Rust core (landed, P0),
+promoted to a shared disk cache on `SharedFileSet` + `dsa` (both
+verified in-tree) only when measurement shows multi-backend locality
+matters. The OS page cache already covers local-FS (`file://`) reads —
+our cache earns its keep specifically on network object-store reads.
+
 ## 3. A — the staged-delta layer
 
 ### 3.1 Representation
@@ -103,7 +158,9 @@ re-reads never re-parse text.
 
 ### 3.2 Durability: a custom WAL resource manager (the load-bearing decision)
 
-**Decision D1.** Delta records go through **Postgres WAL via a custom
+**Decision D1** *(SUPERSEDED by D1-rev, §2a — the delta store is a
+Postgres table; the rmgr route below is the recorded alternative kept
+for the measured-escalation scenario only)*. Delta records go through **Postgres WAL via a custom
 resource manager (RM_LAKEHOUSE_ID)**, not a bespoke sidecar log.
 
 - A commit that staged N rows / T tombstones emits one delta WAL record
@@ -141,31 +198,17 @@ commit" and is gated on it: §7.3/R2 requires it be opt-in per table
 (`lakehouse.write_mode = 'staged'`, default remains 'cow') until the
 whole doc is implemented and lived with.
 
-### 3.3 Delta store
+### 3.3 Delta store (D1-rev: a Postgres table)
 
-On-disk location: per-table directory under the instance's data
-directory (`pg_lakehouse/delta/<relid>/segment-<uuid>`), managed like
-PG's own durable state (fsync'd, included in basebackup). Segment = the
-delta produced by one or more commits, flushed by the publisher (§4).
-Committed-but-unpublished segments are enumerated at startup from a
-small fsync'd index (rebuilt from WAL replay, which is authoritative).
-
-Retention: a segment dies only when the publisher has durably recorded
-its Iceberg commit result (the published-snapshot-id ledger, §4.3).
-Publish is idempotent and at-least-once at this layer; §4.4 makes
-duplicate publish harmless.
-
-**Segment lifecycle:**
-
-```mermaid
-stateDiagram-v2
-    [*] --> in_txn: DML staging (memory)
-    in_txn --> committed: COMMIT (WAL-fsynced)
-    committed --> published: publisher commitTable + ledger write
-    published --> deleted: safe to remove (ledger proof)
-    in_txn --> [*]: txn abort (pruned, nothing durable)
-    committed --> committed: crash -> WAL replay reconstructs
-```
+One catalog table, `lakehouse_delta_segments`, stores committed-but-
+unpublished segments: one row per flush (relid, typed-batch payload as
+bytea — the same accumulator representation, never re-encoded —
+`staged_at`, `published`, `published_snapshot_id`). Durability,
+recovery, replication, and basebackup are inherited from the heap/WAL
+machinery; the "ledger" of §4.3 is the row's own columns. Retention: a
+row is deletable only after `published` is set (and is deleted by the
+publisher, letting autovacuum reclaim). Large payloads ride TOAST —
+battle-tested chunking we do not re-implement.
 
 ### 3.4 Read-your-writes through the delta
 
@@ -228,26 +271,27 @@ SeaweedFS/S3 intermittently-flaky PUT behavior (observed since M2)
 is absorbed by bounded retry inside the publisher, off the transaction
 path.
 
-### 4.3 The published-snapshot ledger
+### 4.3 The published-snapshot ledger (in-row: `published`, `published_snapshot_id`)
 
 After a successful commitTable, the publisher records
-`(segment-id → published snapshot-id)` in an fsync'd ledger file (same
-durability class as the delta index). Startup treats "in ledger" as
-"safe to delete segment". Crash windows:
+`(segment → published snapshot-id)` IN THE SEGMENT'S DELTA ROW
+(D1-rev: the ledger is columns, not a file — same crash durability as
+the delta itself). "Published" is the only state under which a segment
+may be deleted. Crash windows:
 
 | Crash | State | Recovery |
 |---|---|---|
 | before PUTs complete | segment unpublished, nothing remote | replay delta; publish later |
 | after PUTs, before commitTable | orphan objects, no snapshot | publisher retries commitTable with fresh plan; orphan PUTs are unreferenced (doc 08's orphan rule: provable-unreachability or age-based GC, never eager) |
-| after commitTable, before ledger write | snapshot exists, ledger stale | publish attempt re-runs; §4.4 makes the retry a no-op or an additive re-publish (duplicate rows impossible: segments carry deterministic row provenance — see §4.4) |
+| after commitTable, before the delta row's published-columns UPDATE | snapshot exists, ledger columns stale | publish attempt re-runs; §4.4 makes the retry a no-op or an additive re-publish (duplicate rows impossible: segments carry deterministic row provenance — see §4.4) |
 
 ### 4.4 Idempotency law
 
 Publish of a segment must be **idempotent-or-additive**, never
 duplicating rows. Mechanism: each segment's rows are emitted as one
 data file whose manifest entry carries the segment-id in a summary
-key; before emitting, the publisher checks the table's published-ledger
-and existing snapshot summaries for that segment-id. If found: mark
+key; before emitting, the publisher checks the segment row's
+published-columns and existing snapshot summaries for that segment-id. If found: mark
 published, delete local segment, done. If not: emit. Concurrent
 publisher protection: a per-table advisory lock (pg_try_advisory_lock)
 plus the REST catalog's own serializability (a second committer gets
@@ -398,9 +442,9 @@ only if measured]
 | **P0** | `storage.rs get_range(path, offset, len)` + footer-driven reads (parquet metadata tail, then column chunks); block cache layer behind StorageIo keyed `(warehouse, path, range)`, LRU, 0700 dir | byte-identity vs `get_bytes` on the S3/local fixtures; range-count assertions on a fixture table (EXPLAIN/LIMIT GET counts — 13-review perf #1 metrics); cache eviction under size cap; NO invalidation path (immutable-path law, §6.2) | R1, P5 |
 | **P1** | `BatchWriter` rolls files at `target_file_size` (GUC-backed), row-group size + compression codec knobs | writer test: N-row push > threshold produces ceil-sized file SET with exact row split; pyiceberg reads the set | R2 |
 | **P2** | GUC family `lakehouse.*` registered via **`DefineCustom*Variable` in `_PG_init`** (the extension seam — NO core edit; supersedes the earlier `guc_tables.c` allowlist route, RULES §3 note): `write_mode`, `target_file_size`, `publish_max_lag`, `delta_dir`, `cache_dir`, `cache_max_bytes` | negative tests (invalid enum rejected), postmaster-restart persistence, `SHOW`/`ALTER SYSTEM` round-trip | R2 |
-| **P3** | delta store: segment format (typed rows + tombstones), custom rmgr (allowlist rmgr ID registration + catversion), replay reconstruction, startup enumeration | **crash tests**: kill-9 after COMMIT-ack → replay rebuilds delta → read-your-writes identical pre/post restart; rmgr chunked-record round-trip > XLogRecordMaxSize | R2 |
-| **P4** | publisher bgworker (dynamic worker, per-table advisory lease), emission via P1, published-snapshot ledger (fsync'd), idempotent publish (§4.4) | the §4.3 crash-window table AS tests (kill at each boundary); duplicate-publish no-op test; 409 retry re-plan test; lag enforcement (publish_max_lag) | R2 |
-| **P5** | optimize trigger layer on the publisher worker: rule thresholds wired to doc 08's analyze stats | fixture table driven past each threshold → compaction fires → post-state assertions (file counts, deleted-record fraction); off-by-default verified | R5 |
+| **P3** | delta store as a POSTGRES TABLE (`lakehouse_delta_segments`: relid, payload bytea (typed batch), staged_at, published bool, published_snapshot_id) — durability by ordinary INSERT inside the committing txn (D1-rev, §2a); no rmgr, no segment files, no ledger file | **crash tests**: kill-9 after COMMIT-ack → the delta row IS restored by PG recovery → read-your-writes identical post-restart; publisher UPDATE visibility tests; autovacuum on the delta table does not touch unpublished rows (fillfactor + prune tests) | R2 |
+| **P4** | publisher bgworker (dynamic worker, per-table advisory lease), emission via P1, idempotent publish — ledger state lives IN the delta row (`published`, `published_snapshot_id`, §2a) | the §4.3 crash-window table AS tests (kill at each boundary); duplicate-publish no-op test; 409 retry re-plan test; lag enforcement (publish_max_lag) | R2 |
+
 
 Ordering law: **P0 → P1 → P2 → P3 → P4** is the staged-INSERT critical path
 (P0/P1/P2 are parallelizable); R3 (doc 14 V3) can proceed in parallel with
