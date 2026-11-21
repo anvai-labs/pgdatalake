@@ -1041,7 +1041,13 @@ fn cell_text(v: &crate::parquet::CellValue) -> String {
     use crate::parquet::CellValue::*;
     match v {
         Null => String::new(),
-        Bool(b) => if *b { "t".into() } else { "f".into() },
+        Bool(b) => {
+            if *b {
+                "t".into()
+            } else {
+                "f".into()
+            }
+        }
         Int64(n) => n.to_string(),
         TimestampMicros(us) => crate::parquet::format_timestamp_micros(*us),
         Float64(f) => f.to_string(),
@@ -1072,8 +1078,8 @@ pub unsafe extern "C" fn pg_datalake_delta_rows_open(
     let outcome = std::panic::catch_unwind(|| -> Result<Box<DeltaRowsHandle>, String> {
         let payload = unsafe { CStr::from_ptr(payload_json) }.to_string_lossy();
         let schema = unsafe { CStr::from_ptr(schema_json) }.to_string_lossy();
-        let cols: Vec<crate::writer::WriteColumn> = serde_json::from_str(&schema)
-            .map_err(|e| format!("delta rows: schema json: {e}"))?;
+        let cols: Vec<crate::writer::WriteColumn> =
+            serde_json::from_str(&schema).map_err(|e| format!("delta rows: schema json: {e}"))?;
         let doc: serde_json::Value =
             serde_json::from_str(&payload).map_err(|e| format!("delta rows: payload json: {e}"))?;
         let rows_json = doc
@@ -1096,9 +1102,8 @@ pub unsafe extern "C" fn pg_datalake_delta_rows_open(
                     row.push((CString::new("").unwrap(), true));
                 } else {
                     row.push((
-                        CString::new(cell_text(c)).map_err(|_| {
-                            format!("delta rows: row {ri}: interior NUL in cell")
-                        })?,
+                        CString::new(cell_text(c))
+                            .map_err(|_| format!("delta rows: row {ri}: interior NUL in cell"))?,
                         false,
                     ));
                 }
@@ -3940,10 +3945,9 @@ mod tests {
                 unsafe { pg_datalake_delta_rows_next(h, err.as_mut_ptr() as *mut _, 1024) },
                 0
             );
-            let got_id =
-                unsafe { CStr::from_ptr(pg_datalake_delta_rows_col_text(h, 0)) }
-                    .to_string_lossy()
-                    .into_owned();
+            let got_id = unsafe { CStr::from_ptr(pg_datalake_delta_rows_col_text(h, 0)) }
+                .to_string_lossy()
+                .into_owned();
             let name_null = unsafe { pg_datalake_delta_rows_col_null(h, 1) };
             assert_eq!(got_id, id);
             assert_eq!(name_null, name.is_empty() && id == "2", "{id}/{name}");
