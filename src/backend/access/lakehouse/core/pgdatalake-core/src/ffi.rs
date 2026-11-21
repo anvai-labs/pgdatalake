@@ -1028,20 +1028,26 @@ pub unsafe extern "C" fn pg_datalake_write_flush(
             .strip_prefix(&format!("{}/", ws.key_prefix))
             .unwrap_or(&wf.key)
     };
-    // metric maps keyed by the TABLE's field ids
-    let ids: Vec<i64> = ws
-        .columns
-        .iter()
-        .filter_map(|c| ws.state.field_ids.get(&c.name).copied())
-        .collect();
+    // metric maps keyed by the TABLE's field ids, IN COLUMN ORDER
+    // (writer stats arrays are parallel to ws.columns)
     let mut file = crate::snapshot_write::NewDataFile {
         file_path: format!("{}/{rel_key}", ws.state.location.trim_end_matches('/')),
         record_count: wf.record_count,
         file_size_in_bytes: wf.file_size_in_bytes,
-        ..Default::default()
+        // M3-R2: real manifest metrics from write_file — prunable bounds,
+        // footer column sizes, exact counts. Empty maps for columns whose
+        // name never resolved a field id (conservative: absent bounds
+        // never prune, never misprune).
+        column_sizes: wf.column_sizes,
+        value_counts: wf.value_counts,
+        null_value_counts: wf.null_value_counts,
+        lower_bounds: wf.lower_bounds,
+        upper_bounds: wf.upper_bounds,
     };
-    for id in &ids {
-        file.value_counts.insert(*id, file.record_count);
+    for (c, _) in ws.columns.iter().enumerate() {
+        if let Some(id) = ws.state.field_ids.get(&ws.columns[c].name) {
+            file.value_counts.entry(*id).or_insert(file.record_count);
+        }
     }
     ws.flushed.push(file);
     ws.staged_rows = 0;
@@ -3154,5 +3160,204 @@ mod tests {
         assert!(msg.contains("interior NUL"), "error names the cause: {msg}");
         unsafe { pg_datalake_rows_close(rows) };
         unsafe { pg_datalake_scan_free(session) };
+    }
+
+    /// M3-R2 e2e anchor: OUR OWN committed table must carry prunable
+    /// bounds. Write ids 1..5 via the FFI write path, commit against the
+    /// mock, then plan two scans: `id > 1000` MUST prune to zero tasks
+    /// (bounds present in OUR manifest), no predicate reads all 5 rows.
+    /// Before this slice the writer emitted EMPTY metric maps — pruning
+    /// was inert on every PG-written table (conservative keep forever).
+    #[test]
+    fn ffi_write_commit_stats_prune_predicate() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
+        std::fs::create_dir_all(dir.path().join("table").join("data")).unwrap();
+        std::fs::create_dir_all(dir.path().join("table").join("metadata")).unwrap();
+        std::fs::create_dir_all(dir.path().join("metadata")).unwrap();
+        let metadata_json = format!(
+            r#"{{"format-version": 2,
+                "table-uuid": "1ca92afa-70b9-4d02-9ba6-7ee1a3ac0f5e",
+                "location": "file://{}/table",
+                "last-sequence-number": 3,
+                "schemas": [{{"type": "struct", "schema-id": 0, "fields": [
+                    {{"id": 1, "name": "id", "required": false, "type": "long"}}]}}],
+                "current-schema-id": 0}}"#,
+            dir.path().display(),
+        );
+        let md_path = dir.path().join("metadata").join("00000-x.metadata.json");
+        std::fs::write(&md_path, &metadata_json).unwrap();
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let md_path_srv = md_path.clone();
+        let md_capture = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let md_capture_t2 = std::sync::Arc::clone(&md_capture);
+        std::thread::spawn(move || {
+            for _ in 0..10 {
+                let Some(mut req) = server.recv().ok() else {
+                    break;
+                };
+                let url = req.url().to_string();
+                let body = if url.contains("/v1/config") {
+                    r#"{"defaults": {"prefix": "pfx"}, "overrides": {}}"#.to_string()
+                } else if url.contains("namespaces") && req.method().as_str() == "POST" {
+                    let mut body_s = String::new();
+                    {
+                        let _ = req.as_reader().read_to_string(&mut body_s);
+                    }
+                    *md_capture_t2.lock().unwrap() = body_s;
+                    r#"{"metadata-location": "file:///committed/00005.metadata.json", "config": {}}"#.to_string()
+                } else {
+                    format!(
+                        r#"{{"metadata-location": "file://{}", "config": {{}}}}"#,
+                        md_path_srv.display()
+                    )
+                };
+                let resp = tiny_http::Response::from_string(body).with_header(
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                        .unwrap(),
+                );
+                let _ = req.respond(resp);
+            }
+        });
+
+        let endpoint = CString::new(format!("http://{addr}")).unwrap();
+        let warehouse = CString::new("smoke").unwrap();
+        let namespace = CString::new("analytics").unwrap();
+        let table = CString::new("events").unwrap();
+        let schema_json = CString::new(r#"[{"name": "id", "type": "long"}]"#).unwrap();
+        let mut err = [0 as c_char; 1024];
+        fn errmsg2(err: &[c_char]) -> String {
+            unsafe { CStr::from_ptr(err.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        }
+
+        let ws = unsafe {
+            pg_datalake_write_new(
+                endpoint.as_ptr(),
+                warehouse.as_ptr(),
+                std::ptr::null(),
+                namespace.as_ptr(),
+                table.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                schema_json.as_ptr(),
+                err.as_mut_ptr(),
+                err.len(),
+            )
+        };
+        assert!(!ws.is_null(), "write_new: {}", errmsg2(&err));
+        for row in ["[1]", "[2]", "[3]", "[4]", "[5]"] {
+            let rj = CString::new(row).unwrap();
+            assert!(
+                unsafe { pg_datalake_write_push(ws, rj.as_ptr(), err.as_mut_ptr(), err.len()) },
+                "push {row}: {}",
+                errmsg2(&err)
+            );
+        }
+        let loc = unsafe { pg_datalake_write_commit(ws, 0, err.as_mut_ptr(), err.len()) };
+        assert!(!loc.is_null(), "commit: {}", errmsg2(&err));
+        unsafe { pg_datalake_write_commit_result_free(loc) };
+
+        // read-back: merge the committed snapshot into the on-disk metadata
+        // (what the catalog does remotely) so the scans re-plan from it
+        {
+            let body = md_capture.lock().unwrap().clone();
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let snap = &v["updates"][0]["snapshot"];
+            let snap_id = snap["snapshot-id"].as_i64().unwrap();
+            let ml_path = snap["manifest-list"].as_str().unwrap().to_string();
+            // wire-level proof: the manifest ENTRY carries the bounds
+            // (LE i64, keyed by field id) that the prune above decoded
+            let manifest_list = crate::manifest::parse_manifest_list(
+                &std::fs::read(ml_path.trim_start_matches("file://")).unwrap(),
+            )
+            .unwrap();
+            let entries = crate::manifest::parse_manifest(
+                &std::fs::read(manifest_list[0].manifest_path.trim_start_matches("file://"))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(
+                entries[0].data_file.lower_bounds.get(&1),
+                Some(&1i64.to_le_bytes().to_vec()),
+                "lower bound"
+            );
+            assert_eq!(
+                entries[0].data_file.upper_bounds.get(&1),
+                Some(&5i64.to_le_bytes().to_vec()),
+                "upper bound"
+            );
+            assert_eq!(entries[0].data_file.value_counts.get(&1), Some(&5));
+            let updated = format!(
+                r#"{{"format-version": 2,
+                    "table-uuid": "1ca92afa-70b9-4d02-9ba6-7ee1a3ac0f5e",
+                    "location": "file://{}/table",
+                    "last-sequence-number": 4,
+                    "schemas": [{{"type": "struct", "schema-id": 0, "fields": [
+                        {{"id": 1, "name": "id", "required": false, "type": "long"}}]}}],
+                    "current-schema-id": 0,
+                    "snapshots": [{{"snapshot-id": {}, "timestamp-ms": 1712345678000,
+                                    "manifest-list": "{}",
+                                    "summary": {{"operation": "append"}}}}],
+                    "current-snapshot-id": {}}}"#,
+                dir.path().display(),
+                snap_id,
+                ml_path,
+                snap_id,
+            );
+            std::fs::write(&md_path, updated).unwrap();
+        }
+
+        let pred = CString::new(r#"{"op":"gt","field":"id","value":1000}"#).unwrap();
+        let pruned = unsafe {
+            pg_datalake_scan_new(
+                endpoint.as_ptr(),
+                warehouse.as_ptr(),
+                std::ptr::null(),
+                namespace.as_ptr(),
+                table.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                pred.as_ptr(),
+                std::ptr::null(),
+                err.as_mut_ptr(),
+                err.len(),
+            )
+        };
+        assert!(!pruned.is_null(), "pruned scan: {}", errmsg2(&err));
+        assert_eq!(
+            unsafe { pg_datalake_scan_task_count(pruned) },
+            0,
+            "id > 1000 must prune OUR file (bounds 1..5)"
+        );
+        unsafe { pg_datalake_scan_free(pruned) };
+
+        // sanity: no predicate keeps the file with all 5 rows
+        let full = unsafe {
+            pg_datalake_scan_new(
+                endpoint.as_ptr(),
+                warehouse.as_ptr(),
+                std::ptr::null(),
+                namespace.as_ptr(),
+                table.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                err.as_mut_ptr(),
+                err.len(),
+            )
+        };
+        assert!(!full.is_null(), "full scan: {}", errmsg2(&err));
+        assert_eq!(unsafe { pg_datalake_scan_task_count(full) }, 1);
+        assert_eq!(unsafe { pg_datalake_scan_task_rows(full, 0) }, 5);
+        unsafe { pg_datalake_scan_free(full) };
     }
 }

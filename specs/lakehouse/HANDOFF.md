@@ -902,6 +902,26 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     t29, bench_rows, vg_bench show lost/misapplied DML). Next: writer
     min/max bounds, or spec 15 (staged-write WAL + background
     compaction + caching, spec-only per user direction).
+  - M3-R2 slice — DONE 2026-11-20 (writer column stats, TDD + live +
+    pyiceberg): pruning no longer inert on PG-written tables. writer.rs
+    collects per-column manifest metrics in write_file: value/null
+    counts from the arrow arrays, min/max bounds serialized per the
+    Iceberg single-value table (LE i32/i64/f32/f64, UTF-8 bytes for
+    string) keyed by FIELD ID, column_sizes from the parquet footer
+    (thrift total_compressed_size summed per column chunk). NaNs
+    excluded from float bounds (spec rule); all-null columns omit
+    bounds (conservative keep). Bounds written for int/long/double/
+    float/string/date/time/timestamp; binary/decimal/uuid/bool omit
+    (read-side prune decoder doesn't compare them yet — conservative).
+    The existing NewDataFile->manifest plumbing carried them unchanged.
+    TESTS: 2 writer unit tests (byte-exact bounds, null/NaN handling) +
+    e2e ffi_write_commit_stats_prune_predicate (commit via mock ->
+    manifest entry bounds asserted at WIRE level -> id>1000 prunes to
+    0 tasks, full scan 5 rows). 107 cargo green, clippy -D warnings
+    clean. LIVE: two-transaction table — EXPLAIN shows files examined
+    2 / pruned 1 / tasks 1; pyiceberg reads our bounds (LE 1000/1010,
+    counts 11/0). NEXT: P0 (ranged reads + block cache, spec 15) or
+    M3 remainder; writer-bounds item CLOSED.
   - Branch/CI discipline + upstream sync — 2026-11-20 (RULES §1a + doc
     10 §1a, incident-driven): discovered cf5631-port pushes only ever
     triggered upstream's NO-OP "CI for PostgreSQL" runs (6-19s
