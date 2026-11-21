@@ -977,8 +977,7 @@ pub unsafe extern "C" fn pg_datalake_write_push(
             // P1 rollover (spec 15 G3): estimated buffered bytes reached
             // the threshold -> roll a file NOW, inside the same snapshot
             if ws.target_file_size_bytes > 0 {
-                let est =
-                    ws.writer.num_rows() as i64 * ws.last_avg_row_bytes as i64;
+                let est = ws.writer.num_rows() as i64 * ws.last_avg_row_bytes as i64;
                 if est >= ws.target_file_size_bytes {
                     if let Err(e) = flush_writer_buffer(ws) {
                         unsafe { set_err(err_buf, err_len, &format!("write push: rollover: {e}")) };
@@ -1070,11 +1069,12 @@ fn flush_writer_buffer(ws: &mut WriteSession) -> Result<(), String> {
         Err(panic) => return Err(panic_message(&panic)),
     };
     ws.file_seq += 1;
-    ws.last_avg_row_bytes = if rows_before > 0 {
-        (wf.file_size_in_bytes as usize / rows_before).max(1)
-    } else {
-        ws.last_avg_row_bytes
-    };
+    if let Some(avg) = (rows_before > 0)
+        .then_some(wf.file_size_in_bytes as usize / rows_before)
+        .map(|v| v.max(1))
+    {
+        ws.last_avg_row_bytes = avg;
+    }
     // the manifest stores the LOCATION URI; the put key may carry the S3
     // bucket-root prefix, which the location already includes
     let rel_key = if ws.key_prefix.is_empty() {
@@ -3506,8 +3506,11 @@ mod tests {
         };
         assert!(!ws.is_null(), "write_new: {}", errmsg3(&err));
         // 1-byte threshold: every buffered row rolls its own file
-        assert!(unsafe { pg_datalake_write_set_target_file_size(ws, 1, err.as_mut_ptr(), err.len()) },
-            "set threshold: {}", errmsg3(&err));
+        assert!(
+            unsafe { pg_datalake_write_set_target_file_size(ws, 1, err.as_mut_ptr(), err.len()) },
+            "set threshold: {}",
+            errmsg3(&err)
+        );
 
         for row in ["[1]", "[2]", "[3]", "[4]", "[5]", "[6]"] {
             let rj = CString::new(row).unwrap();
@@ -3533,10 +3536,8 @@ mod tests {
             )
             .unwrap();
             let entries = crate::manifest::parse_manifest(
-                &std::fs::read(
-                    manifest_list[0].manifest_path.trim_start_matches("file://"),
-                )
-                .unwrap(),
+                &std::fs::read(manifest_list[0].manifest_path.trim_start_matches("file://"))
+                    .unwrap(),
             )
             .unwrap();
             assert_eq!(entries.len(), 6, "six manifest entries");
@@ -3551,5 +3552,4 @@ mod tests {
         }
         unsafe { pg_datalake_write_free(ws) };
     }
-
 }
