@@ -330,6 +330,8 @@ extern char	   *lakehouse_publish_database;
 #define LAKEHOUSE_WRITE_MODE_COW		1
 #define LAKEHOUSE_WRITE_MODE_STAGED		2
 
+static bool xact_callbacks_registered = false;
+
 static void staged_capture_segment(LakehouseWriteEntry *entry);
 
 
@@ -604,7 +606,7 @@ lakehouse_xact_callback(XactEvent event, void *arg)
 				pg_datalake_write_free(entry->ws);
 			MemoryContextDelete(entry->mcxt);
 		}
-		hash_destroy(write_entries);
+			hash_destroy(write_entries);
 		write_entries = NULL;
 	}
 }
@@ -1055,15 +1057,21 @@ decode_lakehouse_reloptions(Relation rel, LakehouseOptions *opts)
 				field = &opts->s3_endpoint;
 				break;
 			case 4:				/* write_mode: int, not a char* field */
-				if (strcmp(start, "staged") == 0)
-					opts->write_mode = LAKEHOUSE_WRITE_MODE_STAGED;
-				else if (strcmp(start, "cow") == 0)
-					opts->write_mode = LAKEHOUSE_WRITE_MODE_COW;
-				else
-					ereport(ERROR,
-							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							 errmsg("invalid write_mode \"%s\" (cow|staged)",
-									start)));
+				if (p > start)
+				{
+					/* empty slot = unset (blobs written before R2 or
+					 * CREATEs without the option) — only a NON-empty
+					 * unrecognized value is a loud error */
+					if (strcmp(start, "staged") == 0)
+						opts->write_mode = LAKEHOUSE_WRITE_MODE_STAGED;
+					else if (strcmp(start, "cow") == 0)
+						opts->write_mode = LAKEHOUSE_WRITE_MODE_COW;
+					else
+						ereport(ERROR,
+								(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+								 errmsg("invalid write_mode \"%s\" (cow|staged)",
+										start)));
+				}
 				break;
 		}
 		if (p > start && i != 4)
@@ -1109,6 +1117,9 @@ get_write_entry(Relation rel)
 												HASH_ENTER, &found);
 	if (!found)
 	{
+		entry->relid = relid;	/* P3: capture/lookup identity — the hash
+								 * key alone never populated this field,
+								 * so staged segments landed with relid 0 */
 		entry->ws = NULL;
 		entry->mcxt = AllocSetContextCreate(TopTransactionContext,
 											"lakehouse managed write",
@@ -2888,7 +2899,12 @@ lakehouse_publisher_main(Datum main_arg)
 							  " WHERE NOT published", true, 0);
 			if (ret == SPI_OK_SELECT && SPI_processed > 0)
 			{
-				MemoryContext sc = MemoryContextSwitchTo(TopTransactionContext);
+				/* TopMemoryContext: the array must SURVIVE the discovery
+				 * transaction's commit — allocating in the txn context
+				 * freed it before the per-table publish loop read it
+				 * (use-after-free: garbage relids, worker SEGV — the
+				 * same context-lifetime class as the M2 entry bug) */
+				MemoryContext sc = MemoryContextSwitchTo(TopMemoryContext);
 
 				relids = (Oid *) palloc(sizeof(Oid) * SPI_processed);
 				for (int i = 0; i < SPI_processed; i++)
@@ -3058,8 +3074,15 @@ _PG_init(void)
 		lakehouse_publisher_enabled)
 		register_publisher_worker();
 
-	RegisterXactCallback(lakehouse_xact_callback, NULL);
-	RegisterSubXactCallback(lakehouse_subxact_callback, NULL);
+	/* idempotent: the library can load more than once per backend
+	 * (extension script + AM handoff); duplicate registrations ran the
+	 * staged capture once PER registration per commit */
+	if (!xact_callbacks_registered)
+	{
+		RegisterXactCallback(lakehouse_xact_callback, NULL);
+		RegisterSubXactCallback(lakehouse_subxact_callback, NULL);
+		xact_callbacks_registered = true;
+	}
 }
 
 /* pg_am oid of the lakehouse AM (resolved once per backend) */
