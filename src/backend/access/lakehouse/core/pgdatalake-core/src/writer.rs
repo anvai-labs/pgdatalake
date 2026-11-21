@@ -173,9 +173,10 @@ pub struct WrittenFile {
 /// with `PARQUET:field_id` — other engines' readers (Trino, pyiceberg)
 /// map parquet columns to the Iceberg schema BY FIELD ID, so without it
 /// they read empty columns (27b live-cycle finding).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WriteColumn {
     pub name: String,
+    #[serde(alias = "type")]
     pub ty: IcebergType,
     pub field_id: Option<i64>,
 }
