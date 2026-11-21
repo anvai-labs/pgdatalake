@@ -60,6 +60,8 @@ flowchart LR
 
 | Date | Slice | PR |
 |---|---|---|
+| 2026-11-21 | parquet/arrow 60.1.0 lockstep bump + spec 15 §6.3a/§6.5 v60 alignment | #14 |
+| 2026-11-21 | Staged-publish acceptance pin (2 segs → 1 snapshot, live) | #13 |
 | 2026-11-21 | Hash-key aliasing fix: per-row staged-capture regression ROOT-CAUSED | #9 |
 | 2026-11-21 | R2: CREATE-time write_mode + never-misread guard | #9 |
 | 2026-11-21 | P4c publisher bgworker (hands-off, live) | #6 |
@@ -72,11 +74,15 @@ flowchart LR
 
 ## 5. Next queue
 
-1. **Publisher append-extend verification** — RETRACTED as a bug (manifest
-   inspection shows correct carry); only needs a regression test pinning
-   the two-batch publish case
-2. **P0b** — lazy ranged parquet reader (zero-GET EXPLAIN, 13-review perf #1)
+1. **P0b** — lazy ranged parquet reader (cache-backed `ChunkReader`,
+   zero-GET EXPLAIN, 13-review perf #1) — branch AFTER the parquet-60
+   upgrade lands (#14)
+2. **P0b2** — cached page indexes + bloom-filter reads through the same
+   block cache (parquet ≥60 building blocks; spec 15 §6.3a) — selective
+   page-level pruning
 3. **M3 close-out** — MVCC models → ADLS/GCS IO + auth → branches/tags →
-   logical-repl decision (gate: 4-store CI matrix + isolation tests)
+   logical-repl decision (gate: 4-store CI matrix + isolation tests);
+   includes the deliberate `object_store` 0.11 → 0.14 bump
 4. **M4** — compaction/expire/orphan/ANALYZE on the P4c worker skeleton;
-   optimize exec tiers (design: doc 08)
+   optimize exec tiers (design: doc 08); writer-gated encodings (ALP,
+   bloom filters — downstream-decoder gate, spec 15 §6.5)
