@@ -1,5 +1,9 @@
 # Lakehouse FDW and managed Iceberg implementation review
 
+For current findings and milestone gates, see the
+[2026-11-21 reassessment](16-release-reassessment-and-scale.md). This
+document preserves the original review baseline.
+
 **Decision, 2026-11-20. Hold production use.** A second managed append can overwrite a data file still referenced by the first snapshot. The new snapshot also omits earlier live manifests. The read-only FDW has independent release blockers in predicate pruning, delete application, parallel execution, and credential handling. An external table can return a plausible, incomplete result. Passing the current suites does not establish these properties.
 
 **Baseline.** This review covers `lakehouse-dev` at `a9000592029`, including the change that removes credential names from managed table reloptions. It covers the SQL extension, FDW, managed TableAM, PostgreSQL time-travel and reloptions changes, C/Rust ABI, REST/OAuth, storage, Iceberg metadata and manifests, Parquet reader and writer, build, CI, and fixtures. FDW writes are absent. Findings about publishing snapshots concern the managed TableAM and the objects subsequently read by both paths. This document proposes changes for review. Requirements below describe acceptance criteria for future changes.
