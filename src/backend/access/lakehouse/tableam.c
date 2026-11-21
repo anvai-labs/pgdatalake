@@ -266,8 +266,17 @@ typedef struct LakehouseTombFile
 
 typedef struct LakehouseWriteEntry
 {
-	int			write_mode;	/* resolved: reloption wins over GUC (R2) */
+	/*
+	 * HASH KEY — MUST be first. dynahash stores the key AT the pointer
+	 * hash_search returns (ELEMENTKEY aliasing): any struct member placed
+	 * before/over the keysize window rewrites the stored key, so every
+	 * subsequent lookup of the same relid MISSES and HASH_ENTER creates a
+	 * duplicate entry per row (the per-row staged-capture regression:
+	 * write_mode sat at offset 0 and its init wrote over the key). The
+	 * field is written by hash_search itself; init code must not touch it.
+	 */
 	Oid			relid;
+	int			write_mode;	/* resolved: reloption wins over GUC (R2) */
 	WriteSession *ws;			/* FFI write session; NULL until 1st insert */
 	MemoryContext mcxt;			/* all entry allocations live here */
 	/* own-writes overlay: staged tuples, copied datum-wise into mcxt */
@@ -351,7 +360,6 @@ static void ensure_in_funcs(LakehouseWriteEntry *entry);
 static void
 lakehouse_xact_callback(XactEvent event, void *arg)
 {
-	elog(LOG, "lakehouse xact callback: event %d", (int) event);
 	HASH_SEQ_STATUS seq;
 	LakehouseWriteEntry *entry;
 
@@ -1148,9 +1156,9 @@ get_write_entry(Relation rel)
 												HASH_ENTER, &found);
 	if (!found)
 	{
-		entry->relid = relid;	/* P3: capture/lookup identity — the hash
-								 * key alone never populated this field,
-								 * so staged segments landed with relid 0 */
+		/* entry->relid is the hash key — dynahash already copied it in;
+		 * rewriting it here would be harmless (same value) but the field
+		 * is documented as hash-owned, so leave it alone */
 		entry->ws = NULL;
 		entry->mcxt = AllocSetContextCreate(TopTransactionContext,
 											"lakehouse managed write",
@@ -1723,10 +1731,10 @@ lakehouse_scan_getnextslot(TableScanDesc bscan, ScanDirection direction,
 				if (lakehouse_write_mode == LAKEHOUSE_WRITE_MODE_STAGED ||
 					scan->opts.write_mode == LAKEHOUSE_WRITE_MODE_STAGED)
 				{
-					if (!scan->delta_loaded)
-						load_delta_segments(scan, tupdesc);
 					char		delta_err[1024];
 
+					if (!scan->delta_loaded)
+						load_delta_segments(scan, tupdesc);
 					while (scan->delta_pos < scan->n_delta)
 					{
 						DeltaRowsHandle *h = scan->delta_rows[scan->delta_pos];
@@ -2158,7 +2166,6 @@ staged_capture_segment(LakehouseWriteEntry *entry)
 	int			i;
 	int			k;
 	bool		first_row = true;
-	Oid			save_uid;
 	int			ret;
 	TupleDesc	tupdesc = entry->tupdesc;
 
@@ -2236,8 +2243,6 @@ lakehouse_tuple_insert(Relation rel, TupleTableSlot *slot, CommandId cid,
 	if (entry->write_mode != LAKEHOUSE_WRITE_MODE_STAGED)
 		open_write_session(entry, RelationGetDescr(rel));
 	stage_slot(entry, slot, RelationGetDescr(rel));
-	elog(LOG, "lakehouse staged row at subid %u",
-		 GetCurrentSubTransactionId());
 }
 
 static void
@@ -2725,11 +2730,7 @@ lakehouse_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	LakehouseWriteEntry *entry;
 
 	if (event != SUBXACT_EVENT_ABORT_SUB || write_entries == NULL)
-	{
-		elog(LOG, "lakehouse subxact event %d subid %u", (int) event, mySubid);
 		return;
-	}
-	elog(LOG, "lakehouse ABORT_SUB subid %u", mySubid);
 	hash_seq_init(&seq, write_entries);
 	while ((entry = hash_seq_search(&seq)) != NULL)
 	{
