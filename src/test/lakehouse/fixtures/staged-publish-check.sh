@@ -60,6 +60,7 @@ CAT_PY='from pyiceberg.catalog import load_catalog
 cat = load_catalog("smoke", type="rest",
                    uri="http://lakekeeper:8181/catalog", warehouse="smoke",
                    **{"s3.endpoint": "http://s3:9000",
+                      "s3.addressing-style": "path",
                       "s3.access-key-id": "lakehouse-test",
                       "s3.secret-access-key": "lakehouse-test-password"})
 '

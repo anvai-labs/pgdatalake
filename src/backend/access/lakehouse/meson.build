@@ -41,6 +41,7 @@ lakehouse_sources = files(
   'fdw.c',
   'fdw_plan.c',
   'fdw_exec.c',
+  'publisher.c',
   'batch_fill.c',
 )
 
