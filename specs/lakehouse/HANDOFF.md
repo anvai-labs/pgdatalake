@@ -922,32 +922,6 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     2 / pruned 1 / tasks 1; pyiceberg reads our bounds (LE 1000/1010,
     counts 11/0). NEXT: P0 (ranged reads + block cache, spec 15) or
     M3 remainder; writer-bounds item CLOSED.
-<<<<<<< HEAD
-  - Branch/CI discipline + upstream sync — 2026-11-20 (RULES §1a + doc
-    10 §1a, incident-driven): discovered cf5631-port pushes only ever
-    triggered upstream's NO-OP "CI for PostgreSQL" runs (6-19s
-    successes) because datalake-ci triggered on lakehouse-dev/main
-    only. datalake-ci now triggers on EVERY branch (path-filtered);
-    RULES §1a binds the branch graph (upstream->main->lakehouse-dev;
-    feature branches merge only INTO lakehouse-dev --no-ff, never
-    cherry-paste between them, deleted after landing) and the CI
-    validity rule (only gh run list --workflow datalake-ci counts).
-    First all-branch run immediately caught 4 real clippy -D warnings
-    (pre-existing V1/V2 code) — gate working. Repo RENAMED
-    anvai-labs/postgres -> anvai-labs/pgdatalake (gh api PATCH; NOTE:
-    repo is currently PUBLIC — HANDOFF previously said private, flag
-    raised with owner). upstream/master was fetched SHALLOW (18
-    commits, single root) which made merges refuse with "unrelated
-    histories" — fixed with --deepen=600; upstream synced into
-    cf5631-port (77 files) and promoted to lakehouse-dev.
-    Docs visualized per direction: doc 01 component map + read/write
-    diagrams (mermaid, real module names), doc 15 sequence + segment
-    lifecycle, doc 10 §1a CI pipeline map + gate-tier table + coverage
-    ratchet + sanitizer nightlies. SPEC 15 (staged writes WAL rmgr +
-    publisher + compaction-as-a-service + immutable-path caching)
-    written spec-only per direction — next major implementation
-    candidate alongside writer min/max bounds.
-=======
   - P2 slice — DONE 2026-11-21 (extension-defined GUCs, TDD): the
     lakehouse.* GUC family registered via DefineCustom*Variable in
     _PG_init — the extension seam; the guc_tables.c allowlist entry
@@ -966,4 +940,7 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     "kB .. kB" format. NEXT: P1 writer rollover (consumes
     lakehouse.target_file_size via a new FFI flush threshold), or P0
     read-path integration (cache into fetch_metadata/manifests).
->>>>>>> cf5631-port
+  - HANDOFF REPAIR 2026-11-21: the P1 commit briefly landed directly on
+    lakehouse-dev (branch-discipline slip, RULES §1a B3) as a merge
+    object; repaired by cherry-pick -m 1 onto cf5631-port + clippy fix
+    (manual_checked_ops on the rollover avg). 112 cargo green.
