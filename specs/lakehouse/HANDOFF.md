@@ -979,3 +979,12 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     is the 9th). PENDING: kill-9 crash test (live), publisher
     read/emission side, tombstone gating (staged DML = R4 after V3).
     Branch: feature/p3-staged-writes (PR next).
+  - P3 CRASH TEST — PASSED 2026-11-21 (live, §7.2 P3 acceptance):
+    staged INSERT of 50 rows committed (write_mode=staged, 1 delta
+    segment, published=false) -> pg_ctl stop -m immediate (kill-class:
+    no clean shutdown, WAL replay on restart) -> recovery ran -> delta
+    segment SURVIVED (count 1) -> read-your-writes after recovery =
+    ALL 50 rows served from the recovered segment. The D1-rev claim
+    ("the row IS the durable record; recovery restores it") is now
+    demonstrated, not asserted. PENDING: publisher read/emission
+    (P4), tombstone gating note for staged DML (R4 after V3).
