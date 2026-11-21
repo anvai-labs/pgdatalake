@@ -318,9 +318,13 @@ pub struct BatchView {
 }
 
 /// Projected row iterator over one parquet object.
-#[derive(Debug)]
 pub struct ParquetRows {
-    batches: std::vec::IntoIter<arrow::record_batch::RecordBatch>,
+    /// P0b3: the batch source is LAZY for the scan path — row groups
+    /// decode on demand as the consumer walks rows, so early termination
+    /// (LIMIT, session abort) skips the remaining groups' decode work
+    /// entirely. `open_all` (delete-file processing, small files) stores an
+    /// eager iterator instead.
+    batches: Box<dyn Iterator<Item = arrow::record_batch::RecordBatch> + Send>,
     current: Option<arrow::record_batch::RecordBatch>,
     row: usize,
     column_names: Vec<String>,
@@ -337,6 +341,16 @@ pub struct ParquetRows {
     /// `deletes.equality[*].columns`); eq columns may lie outside the
     /// projection — they are read internally, never exposed.
     eq_col_indices: Vec<Vec<usize>>,
+}
+
+impl std::fmt::Debug for ParquetRows {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParquetRows")
+            .field("row", &self.row)
+            .field("num_rows_in_current", &self.num_rows_in_current)
+            .field("batch_start_abs", &self.batch_start_abs)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ParquetRows {
@@ -447,12 +461,11 @@ impl ParquetRows {
             ProjectionMask::roots(builder.parquet_schema(), read_field_indices.iter().copied());
         let builder = builder.with_projection(proj_mask);
 
+        // P0b3: the reader is stored LAZILY — row groups decode on demand
+        // as the consumer walks rows (early termination skips the rest).
         let reader = builder
             .build()
             .map_err(|e| StorageError::Decode(format!("parquet reader: {e}")))?;
-        let batches: Vec<arrow::record_batch::RecordBatch> = reader
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| StorageError::Decode(format!("parquet read: {e}")))?;
 
         // A ProjectionMask SELECTS columns, it does not reorder them:
         // masked batches hold the selected set in FILE order. Position of
@@ -500,7 +513,11 @@ impl ParquetRows {
             .collect();
         Ok(Self {
             num_rows_in_current: 0,
-            batches: batches.into_iter(),
+            batches: Box::new(
+                reader.map(|b| {
+                    b.unwrap_or_else(|e| panic!("lakehouse: parquet decode mid-scan: {e}"))
+                }),
+            ),
             current: None,
             row: 0,
             column_names,
@@ -532,7 +549,7 @@ impl ParquetRows {
             .map_err(|e| StorageError::Decode(format!("parquet read: {e}")))?;
         Ok(Self {
             num_rows_in_current: 0,
-            batches: batches.into_iter(),
+            batches: Box::new(batches.into_iter()),
             current: None,
             row: 0,
             column_names: names,
@@ -564,24 +581,25 @@ impl ParquetRows {
                 }
                 return true;
             }
-            match self.batches.next() {
-                Some(batch) => {
-                    // finish the previous batch's contribution to the file
-                    // absolute positions (0 on the first load)
-                    self.batch_start_abs += self.num_rows_in_current as u64;
-                    self.num_rows_in_current = batch.num_rows();
-                    self.current = Some(batch);
-                    self.row = 0;
-                    if self.num_rows_in_current == 0 {
-                        continue;
-                    }
-                    if self.current_row_deleted() {
-                        continue;
-                    }
-                    return true;
-                }
-                None => return false,
+            // P0b3: the LAZY decode happens HERE — the reader decodes the
+            // next row group only when the consumer has drained the
+            // previous one. A decode failure panics: the C FFI wraps this
+            // call in catch_unwind (13-review #8 tri-state), converting it
+            // to a loud ERROR instead of a silent EOF.
+            let Some(batch) = self.batches.next() else {
+                return false; // genuine EOF
+            };
+            self.batch_start_abs += self.num_rows_in_current as u64;
+            self.num_rows_in_current = batch.num_rows();
+            self.current = Some(batch);
+            self.row = 0;
+            if self.num_rows_in_current == 0 {
+                continue;
             }
+            if self.current_row_deleted() {
+                continue;
+            }
+            return true;
         }
     }
 
@@ -637,6 +655,8 @@ impl ParquetRows {
         };
         use arrow::datatypes::DataType as DT;
         loop {
+            // P0b3: LAZY decode — the next row group is pulled only when
+            // the consumer has drained the previous batch.
             let Some(batch) = self.batches.next() else {
                 // keep the shared `current` cursor semantics: after the
                 // last batch, both cursors are exhausted
