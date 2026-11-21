@@ -73,10 +73,11 @@ jobs:
 
       - name: cargo audit (dependency advisories fail the build)
         working-directory: src/backend/access/lakehouse/core
-        # --deny vulnerabilities: RUSTSEC vulns fail the build; "unmaintained"
-        # transitive notices (chrono, humantime) stay warnings until an
-        # upstream fix lands to depend on
-        run: cargo audit --deny vulnerabilities
+        # vulnerabilities fail the build by default; --deny would ADD
+        # classes (warnings/unmaintained/unsound/yanked) — the two
+        # "unmaintained" transitive notices (chrono, humantime) stay
+        # warnings until upstream offers fixed deps
+        run: cargo audit
 
       - name: Bring up docker fixtures (SeaweedFS S3, Lakekeeper, Azurite, fake-gcs)
         run: make lakehouse-up
