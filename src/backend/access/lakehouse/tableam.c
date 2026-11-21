@@ -351,6 +351,7 @@ static void ensure_in_funcs(LakehouseWriteEntry *entry);
 static void
 lakehouse_xact_callback(XactEvent event, void *arg)
 {
+	elog(LOG, "lakehouse xact callback: event %d", (int) event);
 	HASH_SEQ_STATUS seq;
 	LakehouseWriteEntry *entry;
 
@@ -378,34 +379,42 @@ lakehouse_xact_callback(XactEvent event, void *arg)
 		 * callback then frees the sessions) — no partial commit ever
 		 * exists remotely (Iceberg's core guarantee).
 		 */
-		hash_seq_init(&seq, write_entries);
-		while ((entry = hash_seq_search(&seq)) != NULL)
+		/* P3 regression fix: hash_seq_search is INVALIDATED by work
+		 * done mid-iteration (the capture's SPI runs hash operations);
+		 * the old inline capture re-yielded the same entry per row.
+		 * Phase 1: iterate + collect. Phase 2 (seq finished): capture. */
 		{
-			/* staged mode (D1-rev): the delta row IS the commit —
-			 * durability from the heap+WAL machinery, no remote I/O */
-			if (entry->write_mode == LAKEHOUSE_WRITE_MODE_STAGED &&
-				entry->staged_rows > 0)
+			LakehouseWriteEntry *staged_list[64];
+			int			n_staged = 0;
+
+			hash_seq_init(&seq, write_entries);
+			while ((entry = hash_seq_search(&seq)) != NULL)
 			{
-				staged_capture_segment(entry);
-				continue;
-			}
-			/* NEVER-MISREAD GUARD (R2): staged rows with no capture
-			 * path = silent row loss. The first wm_stick insert with an
-			 * unresolved entry mode vanished exactly this way. */
-			if (entry->staged_rows > 0 &&
-				(entry->write_mode != LAKEHOUSE_WRITE_MODE_COW ||
-				 entry->ws == NULL))
-				ereport(ERROR,
-						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("lakehouse: %d staged rows cannot be committed"
-								" (write mode %d, no remote session)",
-								entry->staged_rows, entry->write_mode),
-						 errdetail("This is a lakehouse bug, not an operator"
-								   " error — the rows would be silently"
-								   " lost.")));
-			if (entry->ws == NULL || (entry->staged_rows == 0 &&
-									  entry->n_tomb_files == 0))
-				continue;
+				/* staged mode (D1-rev): the delta row IS the commit —
+				 * durability from the heap+WAL machinery, no remote I/O */
+				if (entry->write_mode == LAKEHOUSE_WRITE_MODE_STAGED &&
+					entry->staged_rows > 0)
+				{
+					if (n_staged < 64)
+						staged_list[n_staged++] = entry;
+					continue;
+				}
+				/* NEVER-MISREAD GUARD (R2): staged rows with no capture
+				 * path = silent row loss. */
+				if (entry->staged_rows > 0 &&
+					(entry->write_mode != LAKEHOUSE_WRITE_MODE_COW ||
+					 entry->ws == NULL))
+					ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("lakehouse: %d staged rows cannot be committed"
+									" (write mode %d, no remote session)",
+									entry->staged_rows, entry->write_mode),
+							 errdetail("This is a lakehouse bug, not an operator"
+									   " error — the rows would be silently"
+									   " lost.")));
+				if (entry->ws == NULL || (entry->staged_rows == 0 &&
+										  entry->n_tomb_files == 0))
+					continue;
 			{
 				char		errbuf[1024];
 				char	   *loc;
@@ -589,6 +598,19 @@ lakehouse_xact_callback(XactEvent event, void *arg)
 				pg_datalake_write_commit_result_free(loc);
 			}
 		}
+
+		/* P3 phase 2: capture the staged entries COLLECTED during the
+		 * seq iteration (the capture's own SPI runs hash operations and
+		 * re-yielded the same entry per row — the live-proven per-row
+		 * capture bug). The seq search has COMPLETED here, so SPI is
+		 * safe. COW entries were handled inline above. */
+		{
+			int			ci;
+
+			for (ci = 0; ci < n_staged; ci++)
+				staged_capture_segment(staged_list[ci]);
+		}
+		}	/* staged_list collection scope */
 	}
 
 	/* teardown: free FFI sessions + the hash. PRE_COMMIT's commit errors
@@ -1035,13 +1057,21 @@ decode_lakehouse_reloptions(Relation rel, LakehouseOptions *opts)
 
 	memset(opts, 0, sizeof(*opts));
 	p = ro->blob;
-	for (i = 0; i < LAKEHOUSE_NUM_RELOPTS; i++)
 	{
-		char	  **field = NULL;
-		char	   *start = p;
+		/* bound the walk by the BLOB LENGTH: legacy blobs hold fewer
+		 * keys than LAKEHOUSE_NUM_RELOPTS, and reading past the last
+		 * NUL hit garbage bytes that (a) errored loudly as an invalid
+		 * write_mode and (b) aborted every statement touching the
+		 * table (CI regression, R2) */
+		char	   *blob_end = ro->blob + ro->blob_len;
 
-		while (*p != '\0')
-			p++;
+		for (i = 0; i < LAKEHOUSE_NUM_RELOPTS && p < blob_end; i++)
+		{
+			char	  **field = NULL;
+			char	   *start = p;
+
+			while (*p != '\0')
+				p++;
 		switch (i)
 		{
 			case 0:
@@ -1074,9 +1104,10 @@ decode_lakehouse_reloptions(Relation rel, LakehouseOptions *opts)
 				}
 				break;
 		}
-		if (p > start && i != 4)
-			*field = pnstrdup(start, p - start);
-		p++;					/* skip the NUL */
+			if (p > start && i != 4)
+				*field = pnstrdup(start, p - start);
+			p++;				/* skip the NUL */
+		}
 	}
 
 	/* split identity into namespace.table (doc 03 §3) */
