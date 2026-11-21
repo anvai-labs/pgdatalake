@@ -1,0 +1,58 @@
+#!/bin/sh
+# pre-commit hygiene gate (RULES §4): pgindent-clean C, rustfmt + clippy
+# (workspace lints = pedantic) on pgdatalake-core. Verification only —
+# the hook never rewrites staged content; it fails with the exact fix
+# command. One-time activation:
+#
+#   git config core.hooksPath .githooks
+#
+# Exit nonzero aborts the commit. Bypass (emergencies only):
+#   git commit --no-verify
+set -eu
+
+ROOT=$(git rev-parse --show-toplevel)
+cd "$ROOT"
+
+STAGED_C=$(git diff --cached --name-only --diff-filter=ACMR -- \
+	'src/backend/access/lakehouse/*.c' 'src/backend/access/lakehouse/*.h' || true)
+STAGED_RS=$(git diff --cached --name-only --diff-filter=ACMR -- \
+	'src/backend/access/lakehouse/core/**/*.rs' || true)
+
+FAIL=0
+
+if [ -n "$STAGED_C" ]; then
+	echo "pre-commit: pgindent check on:"
+	echo "$STAGED_C" | sed 's/^/  /'
+	if ! scripts/pgindent_lakehouse.sh --check $STAGED_C; then
+		echo "" >&2
+		echo "pre-commit: FAILED — fix with:" >&2
+		echo "  scripts/pgindent_lakehouse.sh $STAGED_C" >&2
+		echo "then re-stage and commit." >&2
+		FAIL=1
+	fi
+fi
+
+if [ -n "$STAGED_RS" ]; then
+	echo "pre-commit: cargo fmt + clippy (workspace lints = pedantic) on pgdatalake-core"
+	CORE_MANIFEST=src/backend/access/lakehouse/core/Cargo.toml
+	if ! FMT_OUT=$(cargo fmt --manifest-path "$CORE_MANIFEST" -- --check 2>&1); then
+		echo "$FMT_OUT" | sed 's/^/  fmt: /' >&2
+		echo "pre-commit: FAILED (fmt) — fix with:" >&2
+		echo "  cargo fmt --manifest-path $CORE_MANIFEST" >&2
+		FAIL=1
+	fi
+	if ! CLIPPY_OUT=$(cargo clippy --manifest-path "$CORE_MANIFEST" --workspace \
+		--all-targets -- -D warnings 2>&1); then
+		echo "$CLIPPY_OUT" | tail -20 | sed 's/^/  clippy: /' >&2
+		echo "pre-commit: FAILED (clippy) — fix the reported lints; do NOT" >&2
+		echo "  add #[allow] without a written justification (RULES §4)." >&2
+		FAIL=1
+	fi
+fi
+
+if [ "$FAIL" = 1 ]; then
+	echo "" >&2
+	echo "pre-commit: commit aborted (hygiene gate). --no-verify bypasses." >&2
+	exit 1
+fi
+exit 0

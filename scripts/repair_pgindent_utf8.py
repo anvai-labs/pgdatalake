@@ -5,6 +5,7 @@
 # (em-dash e2 80 94 -> e2 <digits> 94), regardless of locale. Run this AFTER
 # every pgindent pass over src/backend/access/lakehouse/ (the two errmsg
 # em-dashes are user-visible text and regress-expected exact).
+import os
 import re
 import sys
 
@@ -42,7 +43,9 @@ for path in [p for p in (sys.argv[1:] or FILES)]:
     data, m = re.subn(EM + rb"[0-9]+" + EM, EM, data)
     open(path, "wb").write(data)
     print(f"{path}: repaired {n} sequences, collapsed {m}")
-    expected = EXPECTED.get(path, [])
+    # callers may pass a temp copy (hooks/wrappers); key EXPECTED by basename
+    canonical = os.path.join("src/backend/access/lakehouse", os.path.basename(path))
+    expected = EXPECTED.get(path, EXPECTED.get(canonical, []))
     text = data.decode("utf-8")
     for want in expected:
         if want not in data:
