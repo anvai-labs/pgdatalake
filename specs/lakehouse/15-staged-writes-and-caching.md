@@ -448,6 +448,41 @@ doesn't silently become a correctness hazard.
   rule: no file-format capability ships until the fixture-stack readers
   (pyiceberg, Trino) decode it byte-identically.
 
+### 6.6 Metadata elision for trivial aggregates (planned — P0b4)
+
+COUNT(*), MIN(col), MAX(col) over a pinned snapshot are answerable from
+bytes we ALREADY cache (§6.2 footers carry exact per-row-group num_rows
+and per-column min/max; manifest entries carry exact per-file
+record_count). The RangedReader makes those bytes cheap; what is
+missing is a PLANNER-level fast path — today the executor still
+iterates every row (the 28.8M-row count(*) measured ~12 min at SF=10,
+2026-11-21, entirely in row transport, zero of it in fetch).
+
+Elision rules — NEVER fabricate; fall back to the normal scan on any
+uncertainty:
+
+| Case | Elidable? | Mechanism |
+|---|---|---|
+| COUNT(*), pinned snapshot, no deletes | exact | Σ manifest record_counts over the snapshot's live files |
+| COUNT(*), our COW tombstones (slice 28) | exact, trivial | the commit REWRITES affected files — the new snapshot's record_counts are already delete-adjusted |
+| COUNT(*), MoR position deletes | exact | per file: num_rows − \|positions\|; positions live in the delete file (small, read at scan time anyway) |
+| COUNT(*), equality deletes | only when disjoint | footer min/max proving no row can match the deleted tuple elides the file; otherwise full scan |
+| MIN/MAX, no deletes | exact | combine cached footer per-file stats (min of mins / max of maxes) |
+| MIN/MAX, pos-deletes overlap the extremum | bounded verify | read the affected file's column chunk once (cached) to confirm; if the extremum row survived, footer stands |
+| staged overlay (own writes) | exact, cheap | ledger `row_count` column at capture time (COUNT); staged payloads parsed for min/max (few rows; capture-time per-column summaries as the later O(1) form) |
+| concurrent publisher commits S+1 | consistent | manifests are immutable per snapshot — elision reads the PINNED snapshot's manifests, the same AssertRefSnapshotId semantics as row reads |
+
+Mechanism slices — FDW and MANAGED tables take different routes
+because Postgres has no TableAM aggregate hook (GetForeignUpperPaths
+does not fire for AM scans):
+
+| Slice | Covers | Mechanism |
+|---|---|---|
+| A (FDW) | foreign tables | GetForeignUpperPaths + PlanForeignScan: one-row upper ForeignPath computed from manifest record_counts (postgres_fdw aggregate-pushdown pattern) |
+| B (ledger) | both | `row_count` column on lakehouse_delta_segments, capture-time exact — staged overlay input for COUNT; schema rides the next extension-version bump |
+| C (managed) | `USING lakehouse` tables | planner_hook (RULES §3 allowlist) detects trivial aggregates over AM tables and substitutes a one-row plan from manifests + ledger; AM scans cannot be elided from inside the AM (no hook) |
+| D (MIN/MAX) | both | needs footer-stat FFI (scan-level per-column min/max from cached footers); pos-delete extremum verification per §6.6 rules |
+
 ## 7. Prerequisites & rollout (refined 2026-11-20 — verified against code)
 
 ### 7.0 Status snapshot (what exists today vs what this doc needs)

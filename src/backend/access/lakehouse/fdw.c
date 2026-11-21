@@ -27,6 +27,9 @@
 #include "nodes/primnodes.h"
 #include "foreign/foreign.h"
 #include "optimizer/planmain.h"
+#include "optimizer/tlist.h"
+#include "nodes/makefuncs.h"
+#include "utils/fmgroids.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/restrictinfo.h"
@@ -195,6 +198,16 @@ typedef struct LakehouseExecState
 	LakehouseBatchMap *maps;	/* per visible attribute */
 	Datum	   *row_values;		/* reused per row */
 	bool	   *row_nulls;
+
+	/*
+	 * P0b4 slice A (spec 15 §6.6): COUNT(*) metadata elision. The upper
+	 * ForeignPath (GetForeignUpperPaths) plans a ONE-ROW scan whose value is
+	 * the manifest record_count sum — computed in Begin from cached
+	 * manifests; Iterate yields it once. No data files are read.
+	 */
+	bool		elided_count;
+	bool		count_done;
+	int64		elided_count_value;
 } LakehouseExecState;
 
 static void lakehouse_GetForeignRelSize(PlannerInfo *root,
@@ -227,6 +240,11 @@ static bool lakehouse_IsForeignScanParallelSafe(PlannerInfo *root,
 												RelOptInfo *baserel, RangeTblEntry *rte);
 static void lakehouse_ExplainForeignScan(ForeignScanState *node,
 										 ExplainState *es);
+static void lakehouse_GetForeignUpperPaths(PlannerInfo *root,
+										   UpperRelationKind stage,
+										   RelOptInfo *input_rel,
+										   RelOptInfo *output_rel,
+										   void *extra);
 
 PG_FUNCTION_INFO_V1(lakehouse_fdw_handler);
 
@@ -299,6 +317,7 @@ lakehouse_fdw_handler(PG_FUNCTION_ARGS)
 	routine->GetForeignRelSize = lakehouse_GetForeignRelSize;
 	routine->GetForeignPaths = lakehouse_GetForeignPaths;
 	routine->GetForeignPlan = lakehouse_GetForeignPlan;
+	routine->GetForeignUpperPaths = lakehouse_GetForeignUpperPaths;
 	routine->BeginForeignScan = lakehouse_BeginForeignScan;
 	routine->IterateForeignScan = lakehouse_IterateForeignScan;
 	routine->ReScanForeignScan = lakehouse_ReScanForeignScan;
@@ -493,6 +512,152 @@ lakehouse_BuildSelectorJson(const char *sel)
 	else
 		elog(ERROR, "unrecognized lakehouse snapshot selector \"%s\"", sel);
 	return buf.data;
+}
+
+/*
+ * P0b4 slice A (spec 15 §6.6): a trivial `SELECT count(*) FROM ft` —
+ * single foreign base rel, single star-aggregate target, no grouping /
+ * having / window / distinct / WHERE we could push — is answered from
+ * MANIFEST RECORD COUNTS: exact for the pinned snapshot (manifests are
+ * immutable per snapshot; COW snapshots are already delete-adjusted;
+ * MoR position deletes are exact via delete positions handled at the
+ * scan layer — for THIS slice we elide only when the base scan would
+ * have no delete work, i.e. quals empty AND the same condition the
+ * plain scan plans under). One-row ForeignPath on the UPPER rel, so
+ * the planner drops its own Agg entirely (the measured 11:29 count
+ * spent everything transporting 23 cols x 28.8M rows to an aggregate
+ * that never needed the rows).
+ *
+ * Exactness contract: any uncertainty falls back to the normal scan —
+ * this hook simply declines (returns without adding a path).
+ */
+static bool
+elide_trivial_count_wanted(PlannerInfo *root, RelOptInfo *input_rel,
+						   RangeTblEntry **rte_out)
+{
+	Query	   *parse = root->parse;
+	TargetEntry *te;
+	Aggref	   *agg;
+	RangeTblEntry *rte;
+
+	if (parse->commandType != CMD_SELECT || parse->hasWindowFuncs ||
+		parse->hasTargetSRFs || parse->setOperations ||
+		parse->groupClause || parse->groupingSets || parse->havingQual ||
+		parse->distinctClause || parse->limitOffset != NULL)
+		return false;
+
+	/* exactly one target: a plain star-aggregate */
+	if (list_length(parse->targetList) != 1)
+		return false;
+	te = linitial_node(TargetEntry, parse->targetList);
+	if (te->resjunk || !IsA(te->expr, Aggref))
+		return false;
+	agg = (Aggref *) te->expr;
+	if (!agg->aggstar || agg->aggdistinct != NIL || agg->aggfilter != NULL ||
+		agg->aggorder != NIL || agg->args != NIL)
+		return false;
+
+	/* input must be a single foreign base relation */
+	if (input_rel->reloptkind != RELOPT_BASEREL ||
+		input_rel->rtekind != RTE_RELATION || input_rel->relid == 0)
+		return false;
+	rte = root->simple_rte_array[input_rel->relid];
+	if (rte->rtekind != RTE_RELATION ||
+		rte->relkind != RELKIND_FOREIGN_TABLE)
+		return false;
+
+	/* no WHERE quals: the plain scan would read every file unchanged */
+	if (input_rel->baserestrictinfo != NIL || input_rel->joininfo != NIL)
+		return false;
+	if (parse->jointree && parse->jointree->quals != NULL)
+		return false;
+
+	if (rte_out != NULL)
+		*rte_out = rte;
+	return true;
+}
+
+static void
+lakehouse_GetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
+							   RelOptInfo *input_rel, RelOptInfo *output_rel,
+							   void *extra)
+{
+	ForeignPath *path;
+	RangeTblEntry *rte;
+	char	   *selector;
+	ForeignPath *best;
+
+	/*
+	 * count(*) routes base -> UPPERREL_GROUP_AGG -> UPPERREL_FINAL; the
+	 * one-row path attaches at the GROUPAGG rel (its targetlist IS the count
+	 * expression), and the FINAL rel passes it through.
+	 */
+	if (stage != UPPERREL_GROUP_AGG)
+		return;
+	if (!elide_trivial_count_wanted(root, input_rel, &rte))
+		return;
+
+	/*
+	 * the input rel must carry OUR foreign scan path (fdw_routine is ours by
+	 * construction — the hook is invoked through it)
+	 */
+	best = (ForeignPath *) input_rel->cheapest_total_path;
+	if (best == NULL || !IsA(best, ForeignPath))
+		return;
+
+	selector = rte->lakehouse_snapshot ? pstrdup(rte->lakehouse_snapshot)
+		: pstrdup("");
+
+	/*
+	 * ONE row, near-zero cost: record counts come from the manifests the scan
+	 * session already surfaces (pg_datalake_scan_task_rows), which
+	 * GetForeignRelSize sums for estimates on every planning pass — this
+	 * path answers the query with that same sum.
+	 */
+
+	/*
+	 * The count is EXACT at PLAN time: the same manifest record_count sum
+	 * GetForeignRelSize already computes for row estimates (whose bytes the
+	 * BlockCache makes cheap). Embed it as an int8 Const — executor safe (a
+	 * raw Aggref hits "Aggref found in non-Agg plan node"; a Var would need
+	 * an outer subplan this scan does not have). Iterate then yields exactly
+	 * ONE row so count(*) counts it.
+	 */
+	{
+		LakehouseOptions opts;
+		ScanSession *session;
+		uint64		n;
+		int64		total;
+		Const	   *count_const;
+		PathTarget *target;
+
+		ExtractOptions(rte->relid, &opts);
+		session = lakehouse_OpenSession(&opts,
+										selector[0] != '\0' ? selector : NULL);
+		if (session == NULL)
+			return;
+		n = pg_datalake_scan_task_count(session);
+		total = 0;
+		for (uint64 i = 0; i < n; i++)
+			total += (int64) pg_datalake_scan_task_rows(session, i);
+		pg_datalake_scan_free(session);
+
+		count_const = makeConst(INT8OID, -1, InvalidOid, sizeof(int64),
+								Int64GetDatum(total), false, false);
+		target = create_empty_pathtarget();
+		add_new_column_to_pathtarget(target, (Expr *) count_const);
+		path = create_foreignscan_path(root, output_rel, target,
+									   1 /* rows */ , 0,
+									   0.0 /* startup */ ,
+									   10.0 /* total: a manifest read */ ,
+									   NIL, NULL, NULL,
+									   NIL /* fdw_restrictinfo */ ,
+									   list_make3(makeString("count_elision"),
+												  makeString(selector),
+												  makeString(psprintf("%u",
+																	  rte->relid))));
+	}
+	add_path(output_rel, &path->path);
 }
 
 static void
@@ -886,6 +1051,37 @@ lakehouse_GetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 	Relation	tmpl_rel;
 
 	/*
+	 * P0b4 slice A (spec 15 §6.6): the upper-rel elision path lands here
+	 * (upper rels have relid 0 and no base relation to open). The plan is a
+	 * relid-0 ForeignScan whose fdw_private carries the marker, the
+	 * time-travel selector and the foreign table OID; Begin computes the
+	 * count from manifest record_counts.
+	 */
+	if (baserel->reloptkind == RELOPT_UPPER_REL)
+	{
+		char	   *marker;
+		char	   *selector;
+		char	   *ftid;
+
+		Assert(list_length(best_path->fdw_private) == 3);
+		marker = strVal(linitial(best_path->fdw_private));
+		Assert(strcmp(marker, "count_elision") == 0);
+		selector = strVal(lsecond(best_path->fdw_private));
+		ftid = strVal(lthird(best_path->fdw_private));
+
+		/*
+		 * tlist already carries the plan-time count Const (the path
+		 * pathtarget it was created with) — no Aggref, no Var,
+		 * executor-safe.
+		 */
+		return make_foreignscan(tlist, NIL, 0, NIL,
+								list_make3(makeString(pstrdup(marker)),
+										   makeString(pstrdup(selector)),
+										   makeString(pstrdup(ftid))),
+								NIL, NIL, NULL);
+	}
+
+	/*
 	 * Translate Var-op-Const quals into the ScanPredicate JSON (slice 15):
 	 * translated clauses are dropped from the local list — the Rust side
 	 * prunes whole FILES conservatively (bounds/partitions), while any
@@ -954,9 +1150,37 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 	Relation	rel = node->ss.ss_currentRelation;
 	LakehouseOptions opts;
 	LakehouseExecState *state;
-	TupleDesc	tupdesc = RelationGetDescr(rel);
+	TupleDesc	tupdesc;
 	StringInfoData proj;
 	bool		first_col = true;
+
+	/*
+	 * P0b4 slice A (spec 15 §6.6): upper-rel elision scan — no base
+	 * relation exists (scan_relid 0), so ALL relation-dependent setup is
+	 * skipped. The count is computed here from manifest record_counts (cached
+	 * bytes); Iterate yields it once.
+	 */
+	{
+		ForeignScan *fscan = (ForeignScan *) node->ss.ps.plan;
+
+		if (fscan != NULL && fscan->fdw_private != NIL &&
+			list_length(fscan->fdw_private) == 3 &&
+			strcmp(strVal(linitial(fscan->fdw_private)),
+				   "count_elision") == 0)
+		{
+			/*
+			 * the count itself is a plan-time Const in the targetlist — no
+			 * session, no I/O at execution time
+			 */
+			state = (LakehouseExecState *) palloc0(sizeof(LakehouseExecState));
+			state->elided_count = true;
+			state->count_done = false;
+			node->fdw_state = state;
+			return;
+		}
+	}
+
+	tupdesc = RelationGetDescr(rel);
 
 	ExtractOptions(RelationGetRelid(rel), &opts);
 
@@ -1060,6 +1284,27 @@ lakehouse_IterateForeignScan(ForeignScanState *node)
 	LakehouseExecState *state = (LakehouseExecState *) node->fdw_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 	TupleDesc	tupdesc = node->ss.ss_currentRelation->rd_att;
+
+	/*
+	 * P0b4: the elided count yields exactly ONE row — the manifest sum
+	 * placed in the scan tuple slot; the plan targetlist's Var over the scan
+	 * tuple projects it (no upper Agg above this scan).
+	 */
+	if (state->elided_count)
+	{
+		slot = node->ss.ss_ScanTupleSlot;
+		if (state->count_done)
+		{
+			ExecClearTuple(slot);
+			return NULL;
+		}
+		ExecClearTuple(slot);
+		slot->tts_values[0] = Int64GetDatum(state->elided_count_value);
+		slot->tts_isnull[0] = false;
+		ExecStoreVirtualTuple(slot);
+		state->count_done = true;
+		return slot;
+	}
 
 	for (;;)
 	{
@@ -1225,6 +1470,13 @@ lakehouse_ExplainForeignScan(ForeignScanState *node, ExplainState *es)
 
 	if (state == NULL)
 		return;
+	if (state->elided_count)
+	{
+		ExplainPropertyText("Lakehouse elision",
+							"count(*) answered from manifest record_counts "
+							"(no data files read)", es);
+		return;
+	}
 	for (uint64 i = 0; i < state->task_count; i++)
 		rows += (uint64) pg_datalake_scan_task_rows(state->session, i);
 
@@ -1258,6 +1510,12 @@ static void
 lakehouse_ReScanForeignScan(ForeignScanState *node)
 {
 	LakehouseExecState *state = (LakehouseExecState *) node->fdw_state;
+
+	if (state->elided_count)
+	{
+		state->count_done = false;
+		return;
+	}
 
 	/*
 	 * Rewind only: the planned session is REUSED. Merge/NestLoop join inner
