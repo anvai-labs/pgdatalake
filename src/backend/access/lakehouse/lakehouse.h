@@ -29,6 +29,8 @@ typedef struct LakehouseOptions
 	char	   *s3_access_key;
 	char	   *s3_secret_key;
 	char	   *predicate_json; /* translated quals (slice 15) */
+	int			write_mode;		/* 0 = unset (GUC wins), 1 = cow, 2 = staged
+								 * (R2: CREATE/WITH-time sticky mode) */
 	char	   *snapshot_id;	/* time travel pin (slice 18); NULL = current */
 }			LakehouseOptions;
 

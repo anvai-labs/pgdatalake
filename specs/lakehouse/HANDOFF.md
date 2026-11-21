@@ -1032,3 +1032,24 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     pyiceberg reads exactly 10 rows (no duplicates). Offline
     acceptance: publisher.sql (10th test) asserts the worker runs via
     start_publisher. Suite 10/10, 114 cargo.
+  - R2 slice — MOSTLY DONE 2026-11-21 (write_mode table option + guard,
+    live): WITH (write_mode='staged') sticks per table over the session
+    GUC (resolved on every identity path); validator accepts write_mode
+    alone at CREATE (identity attach later); scans/captures/flip all
+    honor the table mode. NEW NEVER-MISREAD GUARD: staged rows with no
+    capture path (mode unresolved + no session) now ereport LOUDLY —
+    the first wm_stick insert vanished silently through exactly that
+    hole (entry mode unresolved on the attach-row identity path; fixed:
+    resolved on EVERY path via a local decode). EDITORIAL INCIDENT:
+    a non-unique sed/replace duplicated ~3000 lines of tableam.c
+    (caught by the compile; truncated at the true handler end and the
+    scan bypass re-applied as a SINGLE pre-OpenSession block — decode
+    into a LOCAL, never into scan->opts (memset clobbers the
+    server-derived endpoint: "builder error")). OPEN BUG (next session
+    first item): the publisher's append REPLACES the previous snapshot
+    instead of extending it — fresh write session per cycle isn't
+    carrying the base snapshot's manifests (wm_stick: published 5, then
+    published 6 -> remote shows only 6/75; prior rows recoverable via
+    the prior snapshot). Suspect carried-manifests handling in the
+    fresh-session commit path. Also cleanup: relid=0 delta rows from
+    the broken window.
