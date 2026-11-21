@@ -439,7 +439,7 @@ pub fn plan_scan(
     // 13-review #6: scope every hop to the table's own location root
     ensure_within_table_root(&snapshot.manifest_list, &md.location)?;
     let (list_io, list_key) = open_for(&snapshot.manifest_list, s3)?;
-    let list_bytes = list_io.get_bytes(&list_key)?;
+    let list_bytes = crate::cache::cached_get_bytes(&list_io, &list_key)?;
     let list_entries = parse_manifest_list(&list_bytes)?;
 
     let schema = md.current_schema();
@@ -487,7 +487,7 @@ pub fn plan_scan(
         }
         ensure_within_table_root(&mle.manifest_path, &md.location)?;
         let (io, key) = open_for(&mle.manifest_path, s3)?;
-        let bytes = io.get_bytes(&key)?;
+        let bytes = crate::cache::cached_get_bytes(&io, &key)?;
         for e in parse_manifest(&bytes)? {
             // DELETED entries are history, not data (doc 06 §2)
             if e.status == crate::manifest::ManifestEntryStatus::Deleted {
@@ -586,7 +586,7 @@ pub fn load_row_deletes(
         // positions apply unconditionally (i64::MAX sentinel sequence).
         // Application itself rides the position-delete machinery.
         if t.entry.data_file.file_format.eq_ignore_ascii_case("puffin") {
-            let bytes = io.get_bytes(&key)?;
+            let bytes = crate::cache::cached_get_bytes(&io, &key)?;
             for dv in crate::puffin::decode_dv_container(&bytes)? {
                 loaded
                     .positions_by_file

@@ -2516,6 +2516,10 @@ _PG_init(void)
 
 	MarkGUCPrefixReserved("lakehouse");
 
+	/* per-backend immutable-object block cache, capped by GUC (spec 15
+	 * §6.2; first call wins — process-lifetime capacity) */
+	pg_datalake_core_cache_init((int64) lakehouse_cache_max_bytes * 1024);
+
 	RegisterXactCallback(lakehouse_xact_callback, NULL);
 	RegisterSubXactCallback(lakehouse_subxact_callback, NULL);
 }

@@ -172,6 +172,10 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 
 /// An open handle to one object-store location.
 pub struct StorageIo {
+    /// Cache namespace (spec 15 §6.2): endpoint+bucket for S3-family
+    /// stores, local-root for file stores — paths are only unique within
+    /// a warehouse, so every cached key is scoped by this.
+    pub scope_id: String,
     store: Box<dyn ObjectStore>,
 }
 
@@ -225,7 +229,18 @@ impl StorageIo {
         // bucket root for S3 (Iceberg locations are absolute within the
         // bucket), or relative to the prefix for Local (which is why the
         // local store is opened rooted). No re-prefixing happens here.
-        Ok(Self { store })
+        //
+        // cache namespace: endpoint+bucket (S3), the local root, or the
+        // http URL — the only globally-unique identity of a store
+        let scope_id = match loc {
+            Location::Local { root } => format!("local:{root}"),
+            Location::S3 { bucket, .. } => format!(
+                "s3:{}:{bucket}",
+                s3.and_then(|o| o.endpoint.as_deref()).unwrap_or("aws")
+            ),
+            Location::Http { url } => format!("http:{url}"),
+        };
+        Ok(Self { store, scope_id })
     }
 
     fn full_path(&self, key: &str) -> object_store::path::Path {
@@ -297,6 +312,11 @@ pub fn fetch_metadata(
     io: &StorageIo,
     metadata_location_key: &str,
 ) -> Result<TableMetadata, StorageError> {
+    // DELIBERATELY NOT cached (spec 15 §2a correction): metadata.json is
+    // the catalog's pointer TARGET — its path may be served with new
+    // content (fixtures, HadoopTables reuse names; a new commit keeps
+    // its own name but the catalog can serve any metadata-location).
+    // Manifests/manifest-lists/DV puffins are content-unique and cached.
     let bytes = io.get_bytes(metadata_location_key)?;
     let bytes = maybe_gunzip(bytes)?;
     serde_json::from_slice(&bytes).map_err(|e| StorageError::Decode(e.to_string()))

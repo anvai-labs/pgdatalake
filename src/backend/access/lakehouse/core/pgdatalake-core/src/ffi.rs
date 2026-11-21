@@ -1024,6 +1024,17 @@ pub unsafe extern "C" fn pg_datalake_write_flush(
     }
 }
 
+/// Initialize the global per-backend block cache capacity (spec 15
+/// §6.2/P0): called once from _PG_init with lakehouse.cache_max_bytes.
+/// First call wins (the cache is process-lifetime; no re-cap).
+///
+/// # Safety
+/// No pointers; always safe.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_core_cache_init(max_bytes: i64) {
+    crate::cache::global_init(max_bytes.max(0) as u64);
+}
+
 /// Set the rollover threshold (P1, spec 15 §7.2): when the buffered
 /// rows' estimated bytes reach this size, push() rolls a file — one
 /// transaction then emits MANY size-bounded files in ONE snapshot
@@ -3551,5 +3562,175 @@ mod tests {
             }
         }
         unsafe { pg_datalake_write_free(ws) };
+    }
+
+    /// P0 integration proof: the scan path's manifest-list/manifest/puffin
+    /// reads go through the immutable-path block cache — after one scan
+    /// has cached them, the FILES can be deleted from the store and a
+    /// second scan STILL plans correctly (no second GET exists).
+    /// metadata.json itself is deliberately uncached (the catalog's
+    /// pointer target — spec 15 §2a correction).
+    #[test]
+    fn scan_reads_served_from_block_cache_after_store_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
+        std::fs::create_dir_all(dir.path().join("table").join("data")).unwrap();
+        std::fs::create_dir_all(dir.path().join("table").join("metadata")).unwrap();
+        std::fs::create_dir_all(dir.path().join("metadata")).unwrap();
+        // data parquet (3 rows)
+        {
+            use arrow::array::Int64Array;
+            use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+            use arrow::record_batch::RecordBatch;
+            use std::sync::Arc;
+            let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+                "id",
+                DataType::Int64,
+                true,
+            )]));
+            let batch =
+                RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])
+                    .unwrap();
+            let f = std::fs::File::create(dir.path().join("table").join("data").join("a.parquet"))
+                .unwrap();
+            let mut w = parquet::arrow::ArrowWriter::try_new(f, batch.schema(), None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+        }
+        let metadata_json = format!(
+            r#"{{"format-version": 2,
+                "table-uuid": "9c12d441-03fe-11ed-8122-d358e75d12eb",
+                "location": "file://{}/table",
+                "schemas": [{{"type": "struct", "schema-id": 0, "fields": [
+                    {{"id": 1, "name": "id", "required": true, "type": "long"}}]}}],
+                "current-schema-id": 0,
+                "snapshots": [{{"snapshot-id": 42, "timestamp-ms": 1712345678000,
+                                "manifest-list": "file://{}/table/metadata/mn-list.avro",
+                                "summary": {{"operation": "append"}}}}],
+                "current-snapshot-id": 42}}"#,
+            dir.path().display(),
+            dir.path().display(),
+        );
+        std::fs::write(
+            dir.path().join("metadata").join("00000-x.metadata.json"),
+            metadata_json,
+        )
+        .unwrap();
+
+        // build manifest list + manifest on disk via the write-side helpers
+        let manifest_bytes = crate::snapshot_write::build_manifest_bytes(
+            &[crate::snapshot_write::NewDataFile {
+                file_path: format!("file://{}/table/data/a.parquet", dir.path().display()),
+                record_count: 3,
+                file_size_in_bytes: 4096,
+                ..Default::default()
+            }],
+            &[],
+            42,
+            1,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("table").join("metadata").join("mn1.avro"),
+            &manifest_bytes,
+        )
+        .unwrap();
+        let list_bytes = crate::snapshot_write::build_manifest_list_bytes(&[
+            crate::manifest::ManifestListEntry {
+                manifest_path: format!("file://{}/table/metadata/mn1.avro", dir.path().display()),
+                manifest_length: manifest_bytes.len() as i64,
+                partition_spec_id: 0,
+                added_snapshot_id: 42,
+                added_files_count: Some(1),
+                existing_files_count: Some(0),
+                deleted_files_count: Some(0),
+                added_rows_count: Some(3),
+                existing_rows_count: Some(0),
+                deleted_rows_count: Some(0),
+                content: Some(0),
+                sequence_number: Some(1),
+                min_sequence_number: Some(1),
+            },
+        ])
+        .unwrap();
+        std::fs::write(
+            dir.path()
+                .join("table")
+                .join("metadata")
+                .join("mn-list.avro"),
+            &list_bytes,
+        )
+        .unwrap();
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let md_path = dir.path().join("metadata").join("00000-x.metadata.json");
+        std::thread::spawn(move || {
+            for _ in 0..8 {
+                let Some(req) = server.recv().ok() else {
+                    break;
+                };
+                let is_config = req.url().contains("/v1/config");
+                let body = if is_config {
+                    r#"{"defaults": {"prefix": "pfx"}, "overrides": {}}"#.to_string()
+                } else {
+                    format!(
+                        r#"{{"metadata-location": "file://{}", "config": {{}}}}"#,
+                        md_path.display()
+                    )
+                };
+                let resp = tiny_http::Response::from_string(body).with_header(
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                        .unwrap(),
+                );
+                let _ = req.respond(resp);
+            }
+        });
+
+        let endpoint = CString::new(format!("http://{addr}")).unwrap();
+        let warehouse = CString::new("smoke").unwrap();
+        let namespace = CString::new("analytics").unwrap();
+        let table = CString::new("events").unwrap();
+        let mut err = [0 as c_char; 1024];
+        let scan_once = |err: &mut [c_char]| -> u64 {
+            let session = unsafe {
+                pg_datalake_scan_new(
+                    endpoint.as_ptr(),
+                    warehouse.as_ptr(),
+                    std::ptr::null(),
+                    namespace.as_ptr(),
+                    table.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    err.as_mut_ptr(),
+                    err.len(),
+                )
+            };
+            assert!(!session.is_null(), "scan_new failed");
+            let n = unsafe { pg_datalake_scan_task_count(session) };
+            unsafe { pg_datalake_scan_free(session) };
+            n
+        };
+
+        // first scan: fills the cache (manifest list + manifest)
+        assert_eq!(scan_once(&mut err), 1, "first scan plans 1 task");
+        // delete the immutable objects from the store entirely
+        std::fs::remove_file(
+            dir.path()
+                .join("table")
+                .join("metadata")
+                .join("mn-list.avro"),
+        )
+        .unwrap();
+        std::fs::remove_file(dir.path().join("table").join("metadata").join("mn1.avro")).unwrap();
+        // second scan: planned ENTIRELY from cache
+        assert_eq!(
+            scan_once(&mut err),
+            1,
+            "second scan plans from cache despite deletion"
+        );
     }
 }

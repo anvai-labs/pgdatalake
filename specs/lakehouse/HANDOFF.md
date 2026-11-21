@@ -944,3 +944,19 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     lakehouse-dev (branch-discipline slip, RULES §1a B3) as a merge
     object; repaired by cherry-pick -m 1 onto cf5631-port + clippy fix
     (manual_checked_ops on the rollover avg). 112 cargo green.
+  - P0 read-path integration — DONE 2026-11-21 (TDD): the scan path's
+    manifest-list, manifest and DV-puffin reads go through the global
+    per-backend BlockCache (cache.rs global + StorageIo.scope_id =
+    endpoint+bucket / local root — the cache namespace). metadata.json
+    is DELIBERATELY UNCACHED: it is the catalog's pointer TARGET and its
+    path can be served with new content (fixtures/HadoopTables reuse
+    names) — the immutable-path law applies to content-unique objects
+    only (correction caught by the e2e mock serving rewritten metadata:
+    the cached version silently planned 0 tasks). PROOF: destructive
+    test — scan once (fills cache), DELETE manifest-list + manifest from
+    the store, scan again plans 1 task entirely from cache. FFI:
+    pg_datalake_core_cache_init(max_bytes) called from _PG_init with
+    lakehouse.cache_max_bytes (first call wins). 113 cargo green,
+    clippy -D warnings, suite 7/7. NEXT: P3 delta store as PG table +
+    P4 publisher worker (staged-INSERT critical path), or P0b lazy
+    ranged parquet reader.
