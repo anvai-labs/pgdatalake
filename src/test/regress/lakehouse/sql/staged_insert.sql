@@ -56,3 +56,41 @@ SELECT count(*) AS segments, bool_and(NOT published) AS all_unpublished
     FROM lakehouse.lakehouse_delta_segments
     WHERE relid = 'stg_r2'::regclass;
 SELECT id, val FROM stg_r2 ORDER BY id;
+
+-- BULK CAPTURE (spec 16 blocker 2): one transaction inserting into MORE
+-- than 64 staged relations must capture EVERY relation. The former
+-- pre-commit collector (a fixed 64-slot entry array) silently dropped
+-- entry 65 onward: rows committed in Postgres but never written to the
+-- delta ledger — silent data loss on exactly the workload staging is
+-- built for (bulk multi-table loads).
+RESET lakehouse.write_mode;
+SET lakehouse.write_mode = 'staged';
+DO $bulk$
+BEGIN
+  FOR i IN 1..65 LOOP
+    EXECUTE format('CREATE TABLE bulk_%s (id bigint, v text) USING lakehouse', i);
+    EXECUTE format('SELECT lakehouse.attach_table(%L::regclass, %L, %L)',
+                   'bulk_' || i, 'analytics.bulk_' || i, 'unreachable_srv');
+  END LOOP;
+END $bulk$;
+BEGIN;
+DO $bulk$
+BEGIN
+  FOR i IN 1..65 LOOP
+    EXECUTE format('INSERT INTO bulk_%s VALUES (%s, %L)', i, i, 'b-' || i);
+  END LOOP;
+END $bulk$;
+COMMIT;
+
+-- ALL 65 relations must carry exactly one unpublished ledger segment
+SELECT count(DISTINCT s.relid) AS bulk_rels_captured
+FROM lakehouse.lakehouse_delta_segments s
+JOIN pg_class c ON c.oid = s.relid
+WHERE c.relname LIKE 'bulk%';
+SELECT count(*) AS bulk_segments
+FROM lakehouse.lakehouse_delta_segments s
+JOIN pg_class c ON c.oid = s.relid
+WHERE c.relname LIKE 'bulk%';
+
+-- read-your-writes holds for the LAST created relation too
+SELECT count(*) AS bulk_65_rows FROM bulk_65;

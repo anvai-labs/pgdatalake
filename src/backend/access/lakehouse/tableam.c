@@ -361,8 +361,23 @@ lakehouse_xact_callback(XactEvent event, void *arg)
 		 * + collect. Phase 2 (seq finished): capture.
 		 */
 		{
-			LakehouseWriteEntry *staged_list[64];
+			/*
+			 * BULK CAPACITY (spec 16 blocker 2): the collector was a FIXED
+			 * 64-slot array that silently dropped entry 65 onward — a
+			 * transaction inserting into 65 staged relations committed its
+			 * rows in Postgres but wrote only 64 ledger segments (silent row
+			 * loss on exactly the bulk multi-table load workload staging
+			 * exists for; reproduced in staged_insert.sql). Size the list
+			 * from the hash itself: every entry can hold staged rows, so slot
+			 * count == entry count. palloc'd in the transaction context;
+			 * freed with it.
+			 */
+			LakehouseWriteEntry **staged_list;
 			int			n_staged = 0;
+
+			staged_list = (LakehouseWriteEntry **)
+				palloc(hash_get_num_entries(write_entries) *
+					   sizeof(LakehouseWriteEntry *));
 
 			hash_seq_init(&seq, write_entries);
 			while ((entry = hash_seq_search(&seq)) != NULL)
@@ -374,8 +389,7 @@ lakehouse_xact_callback(XactEvent event, void *arg)
 				if (entry->write_mode == LAKEHOUSE_WRITE_MODE_STAGED &&
 					entry->staged_rows > 0)
 				{
-					if (n_staged < 64)
-						staged_list[n_staged++] = entry;
+					staged_list[n_staged++] = entry;
 					continue;
 				}
 
