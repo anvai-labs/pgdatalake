@@ -2,6 +2,15 @@
 
 Release/ceremony automation for the lakehouse fork.
 
+- `pgindent_lakehouse.sh` — RULES §4 pgindent enforcement for fork C files.
+  Plain pgindent mangles the fork two ways: unknown typedefs make
+  pg_bsd_indent split `Type *ptr` into `Type * ptr` (supplied mechanically
+  from lakehouse sources + the cbindgen FFI header), and multi-byte UTF-8
+  in string literals gets eaten (repaired by `repair_pgindent_utf8.py`,
+  run after every pass). `--check` mode exits 1 on any diff — that is what
+  the `.githooks/pre-commit` gate runs. Activate the gate:
+  `git config core.hooksPath .githooks`.
+
 - `coldroom-smoke-m0.sh` — the M0 cold-room smoke sequence (RULES §9 step a):
   fresh-clone, fixtures up, `meson setup build -Ddatalake=enabled`, ninja,
   upstream regress suite, `make lakehouse-check`. Generalize per-milestone
