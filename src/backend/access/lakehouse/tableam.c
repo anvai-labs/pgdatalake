@@ -266,6 +266,7 @@ typedef struct LakehouseTombFile
 
 typedef struct LakehouseWriteEntry
 {
+	int			write_mode;	/* resolved: reloption wins over GUC (R2) */
 	Oid			relid;
 	WriteSession *ws;			/* FFI write session; NULL until 1st insert */
 	MemoryContext mcxt;			/* all entry allocations live here */
@@ -380,12 +381,26 @@ lakehouse_xact_callback(XactEvent event, void *arg)
 		{
 			/* staged mode (D1-rev): the delta row IS the commit —
 			 * durability from the heap+WAL machinery, no remote I/O */
-			if (lakehouse_write_mode == LAKEHOUSE_WRITE_MODE_STAGED &&
+			if (entry->write_mode == LAKEHOUSE_WRITE_MODE_STAGED &&
 				entry->staged_rows > 0)
 			{
 				staged_capture_segment(entry);
 				continue;
 			}
+			/* NEVER-MISREAD GUARD (R2): staged rows with no capture
+			 * path = silent row loss. The first wm_stick insert with an
+			 * unresolved entry mode vanished exactly this way. */
+			if (entry->staged_rows > 0 &&
+				(entry->write_mode != LAKEHOUSE_WRITE_MODE_COW ||
+				 entry->ws == NULL))
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("lakehouse: %d staged rows cannot be committed"
+								" (write mode %d, no remote session)",
+								entry->staged_rows, entry->write_mode),
+						 errdetail("This is a lakehouse bug, not an operator"
+								   " error — the rows would be silently"
+								   " lost.")));
 			if (entry->ws == NULL || (entry->staged_rows == 0 &&
 									  entry->n_tomb_files == 0))
 				continue;
@@ -865,9 +880,9 @@ typedef struct LakehouseRelOptions
 }			LakehouseRelOptions;
 
 static const char *lakehouse_relopt_keys[] = {
-	"table", "endpoint", "warehouse", "s3_endpoint",
+	"table", "endpoint", "warehouse", "s3_endpoint", "write_mode",
 };
-#define LAKEHOUSE_NUM_RELOPTS 4
+#define LAKEHOUSE_NUM_RELOPTS 5
 
 /* credentials (token, s3_access_key, s3_secret_key) are deliberately NOT
  * table options: they live in the attach row / secure settings (doc 09)
@@ -926,12 +941,16 @@ lakehouse_relation_reloptions(Datum reloptions, bool validate)
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("lakehouse: unrecognized option \"%s\"", key),
 						 errhint("Known options: table, endpoint, warehouse, "
-								 "s3_endpoint (credentials come from the attach "
-								 "row or secure settings, never table options).")));
+								 "s3_endpoint, write_mode (credentials come "
+								 "from the attach row or secure settings, "
+								 "never table options).")));
 		}
 	}
 
-	if (values[0] == NULL)
+	/* write_mode alone is legal (R2: mode can be set at CREATE, identity
+	 * attached later via lakehouse.attach_table) */
+	if ((values[1] != NULL || values[2] != NULL || values[3] != NULL) &&
+		values[0] == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("lakehouse: the \"table\" option is required"),
@@ -1035,8 +1054,19 @@ decode_lakehouse_reloptions(Relation rel, LakehouseOptions *opts)
 			case 3:
 				field = &opts->s3_endpoint;
 				break;
+			case 4:				/* write_mode: int, not a char* field */
+				if (strcmp(start, "staged") == 0)
+					opts->write_mode = LAKEHOUSE_WRITE_MODE_STAGED;
+				else if (strcmp(start, "cow") == 0)
+					opts->write_mode = LAKEHOUSE_WRITE_MODE_COW;
+				else
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("invalid write_mode \"%s\" (cow|staged)",
+									start)));
+				break;
 		}
-		if (p > start)
+		if (p > start && i != 4)
 			*field = pnstrdup(start, p - start);
 		p++;					/* skip the NUL */
 	}
@@ -1099,6 +1129,17 @@ get_write_entry(Relation rel)
 		/* WITH-options identity wins; attach row still supplies the
 		 * credentials (they never live in reloptions — doc 09) */
 		entry->have_identity = decode_lakehouse_reloptions(rel, &entry->opts);
+		/* R2: WITH (write_mode=...) sticks over the session GUC —
+		 * resolved on EVERY identity path (attach row included), not
+		 * just the WITH-options one */
+		{
+			LakehouseOptions wm_opts;
+			bool			has_wm = decode_lakehouse_reloptions(rel, &wm_opts);
+
+			entry->write_mode = (has_wm && wm_opts.write_mode != 0)
+				? wm_opts.write_mode
+				: lakehouse_write_mode;
+		}
 		if (!ExtractManagedIdentity(relid, &entry->opts))
 			entry->have_identity = entry->have_identity;
 		else if (!entry->have_identity)
@@ -1452,14 +1493,23 @@ lakehouse_scan_common_setup(LakehouseTableScanDesc scan, Relation rel,
 	}
 	scan->projection_csv = proj.data;
 
-	/* staged mode (P3, D2): the scan source is the delta table — no
-	 * remote session; zero tasks means the file loop never runs and the
-	 * delta serve path (below) is the whole scan */
-	if (lakehouse_write_mode == LAKEHOUSE_WRITE_MODE_STAGED)
+	/* R2 staged bypass: a table-level WITH (write_mode='staged') makes
+	 * this a delta-only scan — no remote session, zero tasks. Decoded
+	 * into a LOCAL: opts here carries the server-derived endpoint/
+	 * warehouse that OpenSession needs (decode memsets its target). */
 	{
-		scan->session = NULL;
-		scan->task_count = 0;
-		return;
+		LakehouseOptions wm_opts;
+		bool			has_wm = decode_lakehouse_reloptions(rel, &wm_opts);
+		int				wm = (has_wm && wm_opts.write_mode != 0)
+			? wm_opts.write_mode
+			: lakehouse_write_mode;
+
+		if (wm == LAKEHOUSE_WRITE_MODE_STAGED)
+		{
+			scan->session = NULL;
+			scan->task_count = 0;
+			return;
+		}
 	}
 	scan->session = lakehouse_OpenSession(&scan->opts, rte_selector);
 	scan->task_count = pg_datalake_scan_task_count(scan->session);
@@ -1628,7 +1678,8 @@ lakehouse_scan_getnextslot(TableScanDesc bscan, ScanDirection direction,
 
 				/* staged mode: committed unpublished delta segments
 				 * next (MVCC visibility via the SPI snapshot) */
-				if (lakehouse_write_mode == LAKEHOUSE_WRITE_MODE_STAGED)
+				if (lakehouse_write_mode == LAKEHOUSE_WRITE_MODE_STAGED ||
+					scan->opts.write_mode == LAKEHOUSE_WRITE_MODE_STAGED)
 				{
 					if (!scan->delta_loaded)
 						load_delta_segments(scan, tupdesc);
@@ -2137,8 +2188,10 @@ lakehouse_tuple_insert(Relation rel, TupleTableSlot *slot, CommandId cid,
 
 	slot_getallattrs(slot);
 	/* staged mode (spec 15 D2): durability is the delta table — no
-	 * remote session is opened, ever, on the insert path */
-	if (lakehouse_write_mode != LAKEHOUSE_WRITE_MODE_STAGED)
+	 * remote session is opened, ever, on the insert path. R2: a
+	 * table-level WITH (write_mode='staged') sticks over the session
+	 * GUC. */
+	if (entry->write_mode != LAKEHOUSE_WRITE_MODE_STAGED)
 		open_write_session(entry, RelationGetDescr(rel));
 	stage_slot(entry, slot, RelationGetDescr(rel));
 	elog(LOG, "lakehouse staged row at subid %u",
