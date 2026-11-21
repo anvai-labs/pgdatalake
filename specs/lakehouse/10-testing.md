@@ -208,7 +208,8 @@ slices (P0b4 etc.). Same fixture as §5.1 (TPC-DS SF=10, store_sales
   `active` with **empty wait events** — 100% CPU in row decode/
   transport, 0% blocked on I/O. The fetch side (P0b) is NOT the
   bottleneck anymore; executor-side transport is.
-- Full-table `count(*)` measured ~12 min (row transport); with an
+- Full-table `count(*)` measured 11:29.8 clean (689.8 s; solo run,
+  no contention) — row transport; with an
   empty projection P0b's ProjectionMask already fetches no column
   chunks — elision (P0b4, spec 15 §6.6) removes the transport too by
   answering from manifest record_counts (exact for this snapshot).
@@ -216,8 +217,13 @@ slices (P0b4 etc.). Same fixture as §5.1 (TPC-DS SF=10, store_sales
   to show the batch-ABI + P0b wins; the q3-class full-scan canary
   remains gated on executor-side aggregation (P0b4/P0b3).
 
-Marketed §5.1-style comparison table: deferred until the P0b4 +
-P0b3 slices land and a clean warmup+3 protocol completes.
+**P0b4 slice A LANDED (this PR)**: count(*) on the 28.8M-row
+store_sales = **22.5-31ms** (plan-time manifest Const, exact
+28,800,991) vs 11:29.8 pre-elision — ~30,000x on this shape.
+EXPLAIN shows the elision marker and no data-file access; the
+WHERE case correctly falls back to a real scan (1.06s on the 288k
+sample, exact). Marketed §5.1-style comparison table: deferred until
+the P0b3 slice lands and a clean warmup+3 protocol completes.
 
 ## 6. Developer loop
 
