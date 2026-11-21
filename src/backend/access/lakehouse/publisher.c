@@ -272,6 +272,19 @@ pg_lakehouse_publish_staged(PG_FUNCTION_ARGS)
 	PushActiveSnapshot(GetTransactionSnapshot());
 	{
 		StringInfoData sql;
+		int64	   *claimed;
+		int			n_claimed = 0;
+
+		/*
+		 * SERIALIZE per table (spec 16, "Publishing must reconcile"): a
+		 * manual publish and the worker cycle must not interleave
+		 * selection/emission/flip for the same relation. The transaction
+		 * advisory lock releases at COMMIT/ABORT, so failures never wedge the
+		 * table.
+		 */
+		SPI_execute(psprintf("SELECT pg_advisory_xact_lock(%lld)",
+							 (long long) (unsigned) relid),
+					false, 0);
 
 		initStringInfo(&sql);
 		appendStringInfo(&sql,
@@ -280,67 +293,105 @@ pg_lakehouse_publish_staged(PG_FUNCTION_ARGS)
 						 " WHERE relid = %u AND NOT published"
 						 " ORDER BY seg_id", (unsigned) relid);
 		ret = SPI_execute(sql.data, false, 0);
-	}
-	if (ret != SPI_OK_SELECT)
-		ereport(ERROR,
-				(errcode(ERRCODE_IO_ERROR),
-				 errmsg("lakehouse: publisher could not read delta segments")));
-
-	for (int i = 0; i < SPI_processed; i++)
-	{
-		bool		isnull;
-		Datum		seg_id = SPI_getbinval(SPI_tuptable->vals[i],
-										   SPI_tuptable->tupdesc, 1, &isnull);
-		Datum		payload = SPI_getbinval(SPI_tuptable->vals[i],
-											SPI_tuptable->tupdesc, 2, &isnull);
-		char	   *payload_c;
-
-		if (isnull)
-			continue;
-		payload_c = TextDatumGetCString(payload);
-
-		/*
-		 * emission core (Rust): payload rows -> writer -> flush. COALESCED
-		 * emission: every unpublished segment's rows go into ONE accumulator
-		 * (rollover bounds file sizes), ONE commit.
-		 */
-		if (!pg_datalake_publish_segment(entry->ws, payload_c,
-										 errbuf, sizeof(errbuf)))
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_EXCEPTION),
-					 errmsg("lakehouse: publisher emission failed for segment %lld: %s",
-							(long long) DatumGetInt64(seg_id), errbuf)));
-		published_count++;
-	}
-
-	if (published_count > 0)
-	{
-		char	   *loc;
-		int64		snap_id;
-		int			flip_ret;
-
-		/* ONE append snapshot for the whole batch */
-		loc = pg_datalake_write_commit(entry->ws, 3, errbuf, sizeof(errbuf));
-		if (loc == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_CONNECTION_EXCEPTION),
-					 errmsg("lakehouse: publisher commit failed: %s", errbuf)));
-		snap_id = pg_datalake_write_last_snapshot_id(entry->ws);
-		pg_datalake_write_commit_result_free(loc);
-
-		/* ledger flip: the batch's segments all point at the snapshot */
-		flip_ret = SPI_execute(psprintf("UPDATE"
-										" lakehouse.lakehouse_delta_segments"
-										" SET published = true,"
-										" published_snapshot_id = %lld"
-										" WHERE relid = %u AND NOT published",
-										(long long) snap_id,
-										(unsigned) relid),
-							   false, 0);
-		if (flip_ret != SPI_OK_UPDATE)
+		if (ret != SPI_OK_SELECT)
 			ereport(ERROR,
 					(errcode(ERRCODE_IO_ERROR),
-					 errmsg("lakehouse: publisher ledger flip failed")));
+					 errmsg("lakehouse: publisher could not read delta segments")));
+
+		/*
+		 * DURABLE CLAIM (spec 16): capture the EXACT segment set now. The old
+		 * code selected unbounded and flipped with a blanket "WHERE relid =
+		 * %u AND NOT published" — a concurrent INSERT's segment landing
+		 * between selection and flip was marked published WITHOUT its rows
+		 * ever being emitted (silent loss). The claim is what is emitted AND
+		 * what is flipped; anything else stays unpublished for the next
+		 * cycle.
+		 */
+		claimed = (int64 *) palloc(sizeof(int64) *
+								   (SPI_processed > 0 ? SPI_processed : 1));
+		for (int i = 0; i < SPI_processed; i++)
+		{
+			bool		isnull;
+
+			claimed[n_claimed++] = DatumGetInt64(SPI_getbinval(
+															   SPI_tuptable->vals[i],
+															   SPI_tuptable->tupdesc, 1,
+															   &isnull));
+		}
+
+		for (int i = 0; i < SPI_processed; i++)
+		{
+			bool		isnull;
+			Datum		payload = SPI_getbinval(SPI_tuptable->vals[i],
+												SPI_tuptable->tupdesc, 2, &isnull);
+			char	   *payload_c;
+
+			if (isnull)
+				continue;
+			payload_c = TextDatumGetCString(payload);
+
+			/*
+			 * emission core (Rust): payload rows -> writer -> flush.
+			 * COALESCED emission: every unpublished segment's rows go into
+			 * ONE accumulator (rollover bounds file sizes), ONE commit.
+			 */
+			if (!pg_datalake_publish_segment(entry->ws, payload_c,
+											 errbuf, sizeof(errbuf)))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_EXCEPTION),
+						 errmsg("lakehouse: publisher emission failed for segment %lld: %s",
+								(long long) claimed[i], errbuf)));
+			published_count++;
+		}
+
+		if (published_count > 0)
+		{
+			char	   *loc;
+			int64		snap_id;
+			int			flip_ret;
+			StringInfoData claim;
+
+			/* ONE append snapshot for the whole batch */
+			loc = pg_datalake_write_commit(entry->ws, 3, errbuf, sizeof(errbuf));
+			if (loc == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_CONNECTION_EXCEPTION),
+						 errmsg("lakehouse: publisher commit failed: %s", errbuf)));
+			snap_id = pg_datalake_write_last_snapshot_id(entry->ws);
+			pg_datalake_write_commit_result_free(loc);
+
+			/*
+			 * ledger flip: ONLY the claimed seg_ids, by explicit id list —
+			 * never a blanket relid flip. Verify exact cardinality: the flip
+			 * must mark exactly the emitted set; anything else means someone
+			 * touched the ledger under our lock, which is a bug to surface,
+			 * not paper over.
+			 */
+			initStringInfo(&claim);
+			for (int i = 0; i < n_claimed; i++)
+				appendStringInfo(&claim, "%s%lld", i ? "," : "",
+								 (long long) claimed[i]);
+			flip_ret = SPI_execute(psprintf("UPDATE"
+											" lakehouse.lakehouse_delta_segments"
+											" SET published = true,"
+											" published_snapshot_id = %lld"
+											" WHERE relid = %u AND NOT published"
+											" AND seg_id = ANY(ARRAY[%s])",
+											(long long) snap_id,
+											(unsigned) relid, claim.data),
+								   false, 0);
+			if (flip_ret != SPI_OK_UPDATE ||
+				SPI_processed != published_count)
+				ereport(ERROR,
+						(errcode(ERRCODE_IO_ERROR),
+						 errmsg("lakehouse: publisher ledger flip marked %d"
+								" segments but emitted %d",
+								flip_ret == SPI_OK_UPDATE ? (int) SPI_processed : -1,
+								published_count),
+						 errdetail("The flip must cover exactly the claimed"
+								   " segment set — refusing to leave the"
+								   " ledger inconsistent.")));
+		}
 	}
 	PopActiveSnapshot();
 	SPI_finish();
