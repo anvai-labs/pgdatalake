@@ -6,8 +6,88 @@
 
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::ProjectionMask;
+use parquet::errors::ParquetError;
+use parquet::file::reader::{ChunkReader, Length};
+use std::io::Read as StdRead;
 
+use crate::cache::BlockCache;
 use crate::storage::{StorageError, StorageIo};
+
+/// P0b (spec 15 §6.3a): a parquet `ChunkReader` over ranged cache GETs.
+/// Every access — footer probe, metadata, projected column chunks — is a
+/// `(path, offset, len)` fetch through the immutable-path `BlockCache`, so
+/// a scan never downloads a whole file, unprojected columns are never
+/// fetched at all, and repeat scans of the same file are cache hits with
+/// zero new I/O. `open_all` (delete-file processing, small files) stays
+/// on whole-object reads and remains the byte-level oracle for tests.
+/// OWNED handles: parquet's `ChunkReader` consumers require 'static, so
+/// the io is a cloned `StorageIo` (Arc-cheap) and the cache is 'static
+/// (`global()`, or a leaked test-local instance).
+struct RangedReader {
+    io: StorageIo,
+    cache: &'static BlockCache,
+    key: String,
+    len: u64,
+}
+
+impl Length for RangedReader {
+    fn len(&self) -> u64 {
+        self.len
+    }
+}
+
+impl ChunkReader for RangedReader {
+    type T = RangedSeqRead;
+
+    fn get_read(&self, start: u64) -> parquet::errors::Result<Self::T> {
+        Ok(RangedSeqRead {
+            io: self.io.clone(),
+            cache: self.cache,
+            key: self.key.clone(),
+            pos: start,
+            len: self.len,
+        })
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<Bytes> {
+        if length == 0 {
+            return Ok(Bytes::new());
+        }
+        let end = (start + length as u64).min(self.len);
+        let bytes = self
+            .cache
+            .get_range(&self.io, &self.io.scope_id, &self.key, start, end - start)
+            .map_err(|e| ParquetError::General(e.to_string()))?;
+        Ok(Bytes::from(bytes))
+    }
+}
+
+/// Sequential view over `[pos, file_end)` built on ranged cache GETs.
+/// Owns its handles (independent of the &self borrow).
+struct RangedSeqRead {
+    io: StorageIo,
+    cache: &'static BlockCache,
+    key: String,
+    pos: u64,
+    len: u64,
+}
+
+impl StdRead for RangedSeqRead {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let want = (buf.len() as u64).min(self.len.saturating_sub(self.pos));
+        if want == 0 {
+            return Ok(0); // EOF
+        }
+        let bytes = self
+            .cache
+            .get_range(&self.io, &self.io.scope_id, &self.key, self.pos, want)
+            .map_err(std::io::Error::other)?;
+        self.pos += bytes.len() as u64;
+        buf[..bytes.len()].copy_from_slice(&bytes);
+        Ok(bytes.len())
+    }
+}
 
 /// A decoded cell of one row.
 #[derive(Debug, Clone, PartialEq)]
@@ -264,7 +344,13 @@ impl ParquetRows {
     /// requested order). Unknown columns are a Config error (doc 03 §5:
     /// schema drift surfaces cleanly).
     pub fn open(io: &StorageIo, key: &str, projection: &[&str]) -> Result<Self, StorageError> {
-        Self::open_internal(io, key, projection, RowDeletes::default())
+        Self::open_internal(
+            io,
+            key,
+            projection,
+            RowDeletes::default(),
+            crate::cache::global(),
+        )
     }
 
     /// Open with delete filters applied (slice 20, doc 07). Equality-delete
@@ -276,7 +362,7 @@ impl ParquetRows {
         projection: &[&str],
         deletes: RowDeletes,
     ) -> Result<Self, StorageError> {
-        Self::open_internal(io, key, projection, deletes)
+        Self::open_internal(io, key, projection, deletes, crate::cache::global())
     }
 
     fn open_internal(
@@ -284,9 +370,21 @@ impl ParquetRows {
         key: &str,
         projection: &[&str],
         deletes: RowDeletes,
+        cache: &'static BlockCache,
     ) -> Result<Self, StorageError> {
-        let raw = io.get_bytes(key)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(raw))
+        // P0b (spec 15 §6.3a): ranged, cached, projection-pruned open.
+        // The builder reads ONLY the footer/metadata (two small ranged
+        // GETs); column chunks are fetched per projected column when the
+        // reader materializes — the whole-file get_bytes this used to do
+        // fetched every column of every row group regardless.
+        let file_len = io.stat_len(key)?;
+        let ranged = RangedReader {
+            io: io.clone(),
+            cache,
+            key: key.to_string(),
+            len: file_len,
+        };
+        let builder = ParquetRecordBatchReaderBuilder::try_new(ranged)
             .map_err(|e| StorageError::Decode(format!("parquet open: {e}")))?;
         let arrow_schema = builder.schema().clone();
 
@@ -304,8 +402,9 @@ impl ParquetRows {
             }
         }
 
-        let mut column_indices = Vec::with_capacity(read_names.len());
-        let projection_len = projection.len();
+        // arrow-schema positions of the internal read set, in read order —
+        // used for BOTH type validation and the reader's ProjectionMask
+        let mut read_field_indices = Vec::with_capacity(read_names.len());
         for name in &read_names {
             let idx = arrow_schema
                 .fields()
@@ -321,15 +420,16 @@ impl ParquetRows {
                             .collect::<Vec<_>>()
                     ))
                 })?;
-            column_indices.push(idx);
+            read_field_indices.push(idx);
         }
+        let projection_len = projection.len();
 
         // 13-review #8: unsupported Arrow types must fail BEFORE rows are
         // returned — the per-cell fallthrough maps unknown types to SQL
         // NULL, which silently fabricates data. eq columns are validated
         // too: an unmatchable key type would make deletes never apply.
         for (i, name) in read_names.iter().enumerate() {
-            let ty = arrow_schema.field(column_indices[i]).data_type();
+            let ty = arrow_schema.field(read_field_indices[i]).data_type();
             if !is_supported_arrow_type(ty) {
                 return Err(StorageError::Config(format!(
                     "column {name:?} has unsupported type {ty} in this reader; \
@@ -338,25 +438,14 @@ impl ParquetRows {
             }
         }
 
-        // eq columns resolve against the arrow schema independently (they
-        // may be projected or internal)
-        let mut eq_col_indices = Vec::with_capacity(deletes.equality.len());
-        for eq in &deletes.equality {
-            let mut idxs = Vec::with_capacity(eq.columns.len());
-            for c in &eq.columns {
-                let idx = arrow_schema
-                    .fields()
-                    .iter()
-                    .position(|f| f.name() == c)
-                    .ok_or_else(|| {
-                        StorageError::Config(format!(
-                            "equality delete column {c:?} not in parquet schema"
-                        ))
-                    })?;
-                idxs.push(idx);
-            }
-            eq_col_indices.push(idxs);
-        }
+        // P0b: push the read set INTO the reader — unprojected columns'
+        // chunks are never fetched (the pre-P0b whole-file open decoded
+        // every column regardless). Masked batches hold exactly
+        // read_names in read order, so all column indices below are
+        // positions WITHIN the read set.
+        let proj_mask =
+            ProjectionMask::roots(builder.parquet_schema(), read_field_indices.iter().copied());
+        let builder = builder.with_projection(proj_mask);
 
         let reader = builder
             .build()
@@ -364,6 +453,46 @@ impl ParquetRows {
         let batches: Vec<arrow::record_batch::RecordBatch> = reader
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| StorageError::Decode(format!("parquet read: {e}")))?;
+
+        // A ProjectionMask SELECTS columns, it does not reorder them:
+        // masked batches hold the selected set in FILE order. Position of
+        // a read-set column = rank of its arrow field index among the
+        // selected (sorted) field indices.
+        let mut selected_sorted = read_field_indices.clone();
+        selected_sorted.sort_unstable();
+        let rank = |field_idx: usize| -> usize {
+            selected_sorted
+                .iter()
+                .position(|&f| f == field_idx)
+                .expect("field index is in the selected set by construction")
+        };
+
+        // projected column c -> its position in the masked batch
+        let column_indices: Vec<usize> = projection
+            .iter()
+            .map(|name| {
+                let p = read_names
+                    .iter()
+                    .position(|n| n == name)
+                    .expect("projection ⊆ read set by construction");
+                rank(read_field_indices[p])
+            })
+            .collect();
+
+        // eq columns resolve within the masked batch too (they may be
+        // projected or internal-only)
+        let mut eq_col_indices = Vec::with_capacity(deletes.equality.len());
+        for eq in &deletes.equality {
+            let mut idxs = Vec::with_capacity(eq.columns.len());
+            for c in &eq.columns {
+                let pos = read_names
+                    .iter()
+                    .position(|n| n == c)
+                    .expect("eq column ⊆ read set by construction");
+                idxs.push(rank(read_field_indices[pos]));
+            }
+            eq_col_indices.push(idxs);
+        }
 
         let column_names = projection
             .iter()
@@ -1477,5 +1606,162 @@ mod pos_delete_applicability_tests {
             seen += 1;
         }
         assert_eq!(seen, 2, "deleted row 11 skipped even with empty projection");
+    }
+    // ---- P0b: ranged, cached, projection-pruned opens (spec 15 §6.3a) ----
+
+    /// A fat second column that is NOT projected must never be fetched,
+    /// and a repeat open of the same file must fetch nothing (immutable-
+    /// path cache law, §6.2). Deterministic via a TEST-LOCAL cache (the
+    /// global cache is shared across test threads).
+    #[test]
+    fn ranged_open_is_projection_lazy_and_repeat_free() {
+        use crate::storage::parse_location;
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
+        let schema = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("pad", DataType::Utf8, true),
+        ]);
+        let n = 2000usize;
+        let ids: Vec<i64> = (0..n as i64).collect();
+        let pad: Vec<String> = (0..n).map(|i| format!("{i:0>120}")).collect();
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int64Array::from(ids.clone())),
+                Arc::new(StringArray::from(pad)),
+            ],
+        )
+        .unwrap();
+        let f = std::fs::File::create(dir.path().join("fat.parquet")).unwrap();
+        let mut w = parquet::arrow::ArrowWriter::try_new(f, batch.schema(), None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let io = StorageIo::open(
+            &parse_location(&format!("file://{}", dir.path().display())).unwrap(),
+            None,
+        )
+        .unwrap();
+        let cache: &'static BlockCache = Box::leak(Box::new(BlockCache::new(8 << 20)));
+        let file_len = io.stat_len("fat.parquet").unwrap();
+        assert!(
+            file_len > 150_000,
+            "fixture too small to prove laziness: {file_len}"
+        );
+
+        // open + FULL read of the narrow projection: the fat column must
+        // not ride along (whole-file open fetched {file_len} every time)
+        let before = cache.fetched_bytes();
+        let mut rows =
+            ParquetRows::open_internal(&io, "fat.parquet", &["id"], RowDeletes::default(), cache)
+                .unwrap();
+        let mut count = 0;
+        while rows.next() {
+            count += 1;
+        }
+        assert_eq!(count, n);
+        let delta = cache.fetched_bytes() - before;
+        assert!(
+            delta * 4 < file_len,
+            "projected open fetched {delta} of {file_len} bytes — not projection-lazy"
+        );
+
+        // second full open, same projection: pure cache hits
+        let before2 = cache.fetched_bytes();
+        let mut rows =
+            ParquetRows::open_internal(&io, "fat.parquet", &["id"], RowDeletes::default(), cache)
+                .unwrap();
+        let mut count2 = 0;
+        while rows.next() {
+            count2 += 1;
+        }
+        assert_eq!(count2, n);
+        assert_eq!(
+            cache.fetched_bytes() - before2,
+            0,
+            "repeat scan fetched bytes — the immutable-path cache must serve it"
+        );
+    }
+
+    /// Byte-equivalence: the ranged path returns exactly the rows the
+    /// whole-object (Bytes) oracle returns — same ids, same order, same
+    /// nulls (500 rows incl. NULL names; `open_all` keeps the oracle role).
+    #[test]
+    fn ranged_open_rows_match_whole_file_oracle() {
+        use crate::storage::parse_location;
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
+        let schema = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        let n = 500usize;
+        let ids: Vec<i64> = (0..n as i64).collect();
+        let names: Vec<Option<String>> = (0..n)
+            .map(|i| {
+                if i % 7 == 0 {
+                    None
+                } else {
+                    Some(format!("n-{i}"))
+                }
+            })
+            .collect();
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(names.clone())),
+            ],
+        )
+        .unwrap();
+        let f = std::fs::File::create(dir.path().join("eq.parquet")).unwrap();
+        let mut w = parquet::arrow::ArrowWriter::try_new(f, batch.schema(), None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let io = StorageIo::open(
+            &parse_location(&format!("file://{}", dir.path().display())).unwrap(),
+            None,
+        )
+        .unwrap();
+
+        // ranged open (P0b path), both columns
+        let cache: &'static BlockCache = Box::leak(Box::new(BlockCache::new(4 << 20)));
+        let mut rows = ParquetRows::open_internal(
+            &io,
+            "eq.parquet",
+            &["id", "name"],
+            RowDeletes::default(),
+            cache,
+        )
+        .unwrap();
+        let mut got: Vec<(i64, Option<String>)> = Vec::new();
+        while rows.next() {
+            let id = match rows.value(0) {
+                CellValue::Int64(v) => v,
+                other => panic!("id cell wrong: {other:?}"),
+            };
+            let name = match rows.value(1) {
+                CellValue::Null => None,
+                CellValue::Str(s) => Some(s),
+                other => panic!("name cell wrong: {other:?}"),
+            };
+            got.push((id, name));
+        }
+        let want: Vec<(i64, Option<String>)> = (0..n as i64)
+            .map(|i| (i, names[i as usize].clone()))
+            .collect();
+        assert_eq!(got, want, "ranged rows differ from the whole-file oracle");
     }
 }

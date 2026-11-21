@@ -32,6 +32,7 @@ struct CacheInner {
     tick: u64,
     hits: u64,
     misses: u64,
+    fetched: u64,
 }
 
 impl BlockCache {
@@ -46,6 +47,7 @@ impl BlockCache {
                 tick: 0,
                 hits: 0,
                 misses: 0,
+                fetched: 0,
             }),
             max_bytes,
         }
@@ -85,6 +87,10 @@ impl BlockCache {
             inner.misses += 1;
         }
         let bytes = io.get_range(key, offset, len)?;
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.fetched += bytes.len() as u64;
+        }
         self.fill(sk, bytes.clone());
         Ok(bytes)
     }
@@ -115,6 +121,10 @@ impl BlockCache {
             inner.misses += 1;
         }
         let bytes = io.get_bytes(key)?;
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.fetched += bytes.len() as u64;
+        }
         self.fill(sk, bytes.clone());
         Ok(bytes)
     }
@@ -154,6 +164,15 @@ impl BlockCache {
         let inner = self.inner.lock().unwrap();
         (inner.hits, inner.misses)
     }
+
+    /// Cumulative BYTES fetched from real I/O (miss fills). The P0b
+    /// laziness metric: a ranged parquet reader must fetch strictly less
+    /// than the whole file for partial scans, and cache hits must add
+    /// nothing. Test/diagnostics only.
+    pub fn fetched_bytes(&self) -> u64 {
+        let inner = self.inner.lock().unwrap();
+        inner.fetched
+    }
 }
 
 use std::sync::OnceLock;
@@ -179,6 +198,19 @@ pub fn global() -> &'static BlockCache {
 /// invalidation path exists. Byte-identity with `io.get_bytes`.
 pub fn cached_get_bytes(io: &StorageIo, key: &str) -> Result<Vec<u8>, StorageError> {
     global().get_bytes(io, &io.scope_id, key)
+}
+
+/// Ranged GET through the global cache — the ranged counterpart of
+/// `cached_get_bytes` (spec 15 §6.2/§6.3a: parquet footers, column
+/// chunks, page indexes and bloom filters are byte ranges of immutable
+/// files, so the same no-invalidation law covers them).
+pub fn cached_get_range(
+    io: &StorageIo,
+    key: &str,
+    offset: u64,
+    len: u64,
+) -> Result<Vec<u8>, StorageError> {
+    global().get_range(io, &io.scope_id, key, offset, len)
 }
 
 #[cfg(test)]
@@ -295,5 +327,30 @@ mod tests {
         let got2 = cache.get_bytes(&io, "wh", "data/blob.bin").unwrap();
         assert_eq!(got2, truth, "hit after object deletion");
         assert_eq!(cache.counters(), (1, 1));
+    }
+
+    /// P0b laziness metric: `fetched_bytes` counts ONLY real I/O bytes —
+    /// every miss adds its payload size, every hit adds nothing, and the
+    /// total is exact across mixed range/whole-object traffic.
+    #[test]
+    fn fetched_bytes_counts_real_io_only() {
+        let (_dir, io) = fixture();
+        let cache = BlockCache::new(1 << 20);
+        assert_eq!(cache.fetched_bytes(), 0);
+        // miss: 1000-byte object -> +1000
+        cache.get_bytes(&io, "wh", "data/blob.bin").unwrap();
+        assert_eq!(cache.fetched_bytes(), 1000);
+        // hit: no new I/O
+        cache.get_bytes(&io, "wh", "data/blob.bin").unwrap();
+        assert_eq!(cache.fetched_bytes(), 1000);
+        // ranged miss: +16; ranged repeat: hit, +0
+        cache
+            .get_range(&io, "wh", "data/blob.bin", 500, 16)
+            .unwrap();
+        assert_eq!(cache.fetched_bytes(), 1016);
+        cache
+            .get_range(&io, "wh", "data/blob.bin", 500, 16)
+            .unwrap();
+        assert_eq!(cache.fetched_bytes(), 1016);
     }
 }
