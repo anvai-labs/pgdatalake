@@ -1,0 +1,42 @@
+CREATE EXTENSION IF NOT EXISTS lakehouse;
+NOTICE:  extension "lakehouse" already exists, skipping
+SELECT lakehouse.version();
+          version           
+----------------------------
+ pgdatalake-core 0.1.0 (M0)
+(1 row)
+
+-- P3 foundation (spec 15 §3.3, D1-rev): the staged-delta store is a
+-- Postgres table owned by the extension. Columns ARE the publish
+-- ledger; PUBLIC has no access (RULES §6 — payload carries table data).
+SELECT count(*) AS empty_at_install
+    FROM lakehouse.lakehouse_delta_segments;
+ empty_at_install 
+------------------
+                0
+(1 row)
+
+SELECT attname, format_type(atttypid, atttypmod) AS typ
+    FROM pg_attribute
+    WHERE attrelid = 'lakehouse.lakehouse_delta_segments'::regclass
+      AND attnum > 0 AND NOT attisdropped
+    ORDER BY attnum;
+        attname        |           typ            
+-----------------------+--------------------------
+ seg_id                | bigint
+ relid                 | oid
+ payload               | bytea
+ tombstones            | jsonb
+ staged_at             | timestamp with time zone
+ published             | boolean
+ published_snapshot_id | bigint
+(7 rows)
+
+-- PUBLIC may not touch it
+SELECT has_table_privilege('public',
+    'lakehouse.lakehouse_delta_segments', 'SELECT') AS public_select_denied;
+ public_select_denied 
+----------------------
+ f
+(1 row)
+
