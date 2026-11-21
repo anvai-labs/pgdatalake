@@ -42,6 +42,7 @@ lakehouse_sources = files(
   'fdw_plan.c',
   'fdw_exec.c',
   'publisher.c',
+  'count_elision.c',
   'batch_fill.c',
 )
 
@@ -80,7 +81,7 @@ tests += {
   'sd': meson.project_source_root() / 'src/test/regress/lakehouse',
   'bd': meson.current_build_dir(),
   'regress': {
-    'sql': ['version', 'scan_files', 'fdw', 'fdw_auth', 'time_travel', 'tableam', 'gucs', 'delta_table', 'staged_insert', 'publisher'],
+    'sql': ['version', 'scan_files', 'fdw', 'fdw_auth', 'time_travel', 'tableam', 'gucs', 'delta_table', 'staged_insert', 'count_elision', 'publisher'],
     'test_kwargs': {'timeout': 120},
     'deps': [lakehouse],
   },

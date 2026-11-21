@@ -2095,7 +2095,7 @@ load_delta_segments(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 		MemoryContext sc = MemoryContextSwitchTo(old);
 
 		scan->n_delta = (int) SPI_processed;
-		scan->delta_rows = (DeltaRowsHandle **)
+		scan->delta_rows = (DeltaRowsHandle * *)
 			palloc0(sizeof(DeltaRowsHandle *) * (SPI_processed ? SPI_processed : 1));
 		for (i = 0; i < SPI_processed; i++)
 		{
@@ -3025,6 +3025,7 @@ _PG_init(void)
 	 */
 	if (!xact_callbacks_registered)
 	{
+		install_lakehouse_count_elision();
 		RegisterXactCallback(lakehouse_xact_callback, NULL);
 		RegisterSubXactCallback(lakehouse_subxact_callback, NULL);
 		xact_callbacks_registered = true;
@@ -3032,7 +3033,7 @@ _PG_init(void)
 }
 
 /* pg_am oid of the lakehouse AM (resolved once per backend) */
-static Oid
+Oid
 lakehouse_am_oid(void)
 {
 	static Oid	amoid = InvalidOid;
