@@ -1207,6 +1207,75 @@ pub unsafe extern "C" fn pg_datalake_delta_rows_col_text(
         .unwrap_or(std::ptr::null())
 }
 
+/// Publisher emission core (P4, spec 15 §4): push ONE delta segment's
+/// rows (payload = the typed row-JSON document) through the write
+/// session's accumulator and flush it as a data file. The C publisher
+/// calls this per unpublished segment on ONE write session, then
+/// pg_datalake_write_commit once — one snapshot, size-bounded files
+/// (rollover active), the M3-R2 stats carried. Idempotency note (spec
+/// 15 §4.4): the caller flips the segment's ledger columns only after
+/// the commit result returns; the crash window between commitTable and
+/// the ledger UPDATE is documented for the v1 single-segment-per-commit
+/// discipline.
+///
+/// # Safety
+/// `ws` from pg_datalake_write_new; `payload_json` a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_publish_segment(
+    ws: *mut WriteSession,
+    payload_json: *const c_char,
+    err_buf: *mut c_char,
+    err_len: usize,
+) -> bool {
+    let Some(ws) = (unsafe { ws.as_mut() }) else {
+        unsafe { set_err(err_buf, err_len, "publish segment: NULL session") };
+        return false;
+    };
+    let payload = unsafe { CStr::from_ptr(payload_json) }.to_string_lossy();
+    let doc: serde_json::Value = match serde_json::from_str(&payload) {
+        Ok(v) => v,
+        Err(e) => {
+            unsafe { set_err(err_buf, err_len, &format!("publish segment: payload: {e}")) };
+            return false;
+        }
+    };
+    let rows = match doc.as_array() {
+        Some(r) => r.clone(),
+        None => {
+            unsafe { set_err(err_buf, err_len, "publish segment: payload is not an array") };
+            return false;
+        }
+    };
+    for (ri, rj) in rows.iter().enumerate() {
+        let cells = match crate::writer::parse_row_json(&ws.columns, rj) {
+            Ok(c) => c,
+            Err(e) => {
+                unsafe { set_err(err_buf, err_len, &format!("publish segment: row {ri}: {e}")) };
+                return false;
+            }
+        };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ws.writer.push(&cells))) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                unsafe { set_err(err_buf, err_len, &format!("publish segment: row {ri}: {e}")) };
+                return false;
+            }
+            Err(panic) => {
+                let m = panic_message(&panic);
+                unsafe { set_err(err_buf, err_len, &format!("publish segment: {m}")) };
+                return false;
+            }
+        }
+    }
+    match flush_writer_buffer(ws) {
+        Ok(()) => true,
+        Err(e) => {
+            unsafe { set_err(err_buf, err_len, &format!("publish segment: flush: {e}")) };
+            false
+        }
+    }
+}
+
 /// Initialize the global per-backend block cache capacity (spec 15
 /// §6.2/P0): called once from _PG_init with lakehouse.cache_max_bytes.
 /// First call wins (the cache is process-lifetime; no re-cap).

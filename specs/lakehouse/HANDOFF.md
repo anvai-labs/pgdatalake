@@ -988,3 +988,16 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     ("the row IS the durable record; recovery restores it") is now
     demonstrated, not asserted. PENDING: publisher read/emission
     (P4), tombstone gating note for staged DML (R4 after V3).
+  - P4 slice 1 — DONE 2026-11-21 (publisher emission core + SQL entry,
+    live + pyiceberg): pg_datalake_publish_segment (Rust: payload ->
+    parse_row_json -> writer push -> flush, one data file per segment,
+    M3-R2 stats carried) + lakehouse.publish_staged(regclass) (C:
+    SPI-select unpublished segments ordered by seg_id, ONE write
+    session, publish_segment + write_commit per segment (v1
+    single-segment-per-commit per §4.4), ledger flip immediately after
+    each commit). LIVE: staged 50-row segments -> publish_staged ->
+    TWO APPEND snapshots on the remote table (+50 rows, +1 file each),
+    pyiceberg reads 100 rows, ledger drained to 0 unpublished. P4b
+    TODO: parse snapshot-id from commit result into the ledger column
+    (currently flips published only), bgworker wrapper + publish_max_lag
+    scheduling, coalesced multi-segment emission.

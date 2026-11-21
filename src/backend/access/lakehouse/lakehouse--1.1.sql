@@ -147,3 +147,12 @@ CREATE INDEX lakehouse_delta_unpublished_idx
     ON lakehouse.lakehouse_delta_segments (relid, staged_at)
     WHERE NOT published;
 REVOKE ALL ON lakehouse.lakehouse_delta_segments FROM PUBLIC;
+
+-- P4 (spec 15 §4): publisher entry point — emit ALL unpublished delta
+-- segments of a managed table as files in ONE append snapshot, then
+-- flip each segment's ledger columns. Callable by the owner; the
+-- bgworker wraps this (slice P4b).
+CREATE FUNCTION lakehouse.publish_staged(target regclass)
+RETURNS integer
+AS 'MODULE_PATHNAME', 'pg_lakehouse_publish_staged'
+LANGUAGE C VOLATILE;
