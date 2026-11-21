@@ -3025,7 +3025,14 @@ _PG_init(void)
 	 */
 	if (!xact_callbacks_registered)
 	{
-		install_lakehouse_count_elision();
+		/*
+		 * Managed COUNT elision (former count_elision.c, spec 15 §6.6) is
+		 * GATED OFF (spec 16, "COUNT must be computed at execution"): the
+		 * plan-time Const rewrite served stale counts under prepared-plan
+		 * reuse and stripped the rtable, dropping permission/RLS checks. It
+		 * returns only as an execution-time path with plan-time eligibility
+		 * proof and an ordinary-aggregate fallback.
+		 */
 		RegisterXactCallback(lakehouse_xact_callback, NULL);
 		RegisterSubXactCallback(lakehouse_subxact_callback, NULL);
 		xact_callbacks_registered = true;

@@ -463,10 +463,14 @@ doesn't silently become a correctness hazard.
 
 **2026-11-21 qualification update.** The [execution-time COUNT contract](16-release-reassessment-and-scale.md#count-must-be-computed-at-execution)
 supersedes plan-time literal counts and the assumption that an empty published
-ledger proves a staged-only table. Gate the current paths pending that
-contract. Treat footer extrema as bounds unless their exactness and row
-visibility are proven. The mechanism table below records the original
-design and its planned slices.
+ledger proves a staged-only table. **Gates landed 2026-11-21:** slices A and C
+are REMOVED from the build (FDW upper Const path unwired; managed planner hook
+deleted with count_elision.c). The successor must compute at execution — plan
+descriptor without an embedded count, snapshot resolved per execution, delete
+eligibility re-proved per execution, ordinary-aggregate fallback when proof
+fails. Slice B (`row_count` ledger column) stays. Treat footer extrema as
+bounds unless their exactness and row visibility are proven. The mechanism
+table below records the original design and its planned slices.
 
 COUNT(*), MIN(col), MAX(col) over a pinned snapshot are answerable from
 bytes we ALREADY cache (§6.2 footers carry exact per-row-group num_rows

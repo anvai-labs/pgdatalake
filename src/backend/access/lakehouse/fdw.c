@@ -225,7 +225,15 @@ lakehouse_fdw_handler(PG_FUNCTION_ARGS)
 	routine->GetForeignRelSize = lakehouse_GetForeignRelSize;
 	routine->GetForeignPaths = lakehouse_GetForeignPaths;
 	routine->GetForeignPlan = lakehouse_GetForeignPlan;
-	routine->GetForeignUpperPaths = lakehouse_GetForeignUpperPaths;
+
+	/*
+	 * GetForeignUpperPaths is GATED OFF (spec 16, "COUNT must be computed at
+	 * execution"): the plan-time count Const only revalidated the SUM in
+	 * Begin — never delete eligibility — so a same-total snapshot change
+	 * with deletes overcounted. It returns as an execution-time one-row upper
+	 * path that resolves the snapshot and re-proves delete eligibility per
+	 * execution.
+	 */
 	routine->BeginForeignScan = lakehouse_BeginForeignScan;
 	routine->IterateForeignScan = lakehouse_IterateForeignScan;
 	routine->ReScanForeignScan = lakehouse_ReScanForeignScan;

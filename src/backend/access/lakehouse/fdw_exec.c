@@ -47,66 +47,12 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 	bool		first_col = true;
 
 	/*
-	 * P0b4 slice A (spec 15 §6.6): upper-rel elision scan — no base
-	 * relation exists (scan_relid 0), so ALL relation-dependent setup is
-	 * skipped. The count is computed here from manifest record_counts (cached
-	 * bytes); Iterate yields it once.
+	 * COUNT(*) elision (spec 15 §6.6) is GATED OFF (spec 16, "COUNT must be
+	 * computed at execution"): the plan-time record_count Const only
+	 * revalidated the SUM in Begin — never delete eligibility — so a
+	 * same-total snapshot change with deletes overcounted. The successor is
+	 * an execution-time one-row upper path.
 	 */
-	{
-		ForeignScan *fscan = (ForeignScan *) node->ss.ps.plan;
-
-		if (fscan != NULL && fscan->fdw_private != NIL &&
-			list_length(fscan->fdw_private) == 4 &&
-			strcmp(strVal(linitial(fscan->fdw_private)),
-				   "count_elision") == 0)
-		{
-			char	   *sel = strVal(lsecond(fscan->fdw_private));
-			char	   *ftid_s = strVal(lthird(fscan->fdw_private));
-			char	   *want_s = strVal(lfourth(fscan->fdw_private));
-			Oid			ftid = (Oid) strtoul(ftid_s, NULL, 10);
-			LakehouseOptions eopts;
-			ScanSession *session;
-			uint64		n;
-			int64		now_total;
-
-			/*
-			 * MVCC REVALIDATION (spec 15 §6.6): the count Const was computed
-			 * at PLAN time. A prepared statement may execute a plan built
-			 * against an OLDER snapshot; under READ COMMITTED the answer must
-			 * reflect the CURRENT snapshot. Recompute (cached manifests,
-			 * cheap); on drift, error with retry semantics — the next
-			 * execution replans fresh (the same AssertRefSnapshotId
-			 * philosophy as row scans).
-			 */
-			ExtractOptions(ftid, &eopts);
-			state = (LakehouseExecState *) palloc0(sizeof(LakehouseExecState));
-			state->elided_count = true;
-			state->count_done = false;
-			session = lakehouse_OpenSession(&eopts,
-											sel[0] != '\0' ? sel : NULL);
-			if (session == NULL)
-				ereport(ERROR,
-						(errcode(ERRCODE_CONNECTION_EXCEPTION),
-						 errmsg("lakehouse: elision revalidation could not "
-								"open the scan session")));
-			n = pg_datalake_scan_task_count(session);
-			now_total = 0;
-			for (uint64 i = 0; i < n; i++)
-				now_total += (int64) pg_datalake_scan_task_rows(session, i);
-			pg_datalake_scan_free(session);
-			if ((long long) now_total != strtoll(want_s, NULL, 10))
-				ereport(ERROR,
-						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-						 errmsg("lakehouse: table %u advanced since this "
-								"statement was planned (%lld rows now, "
-								"%s planned)",
-								ftid, (long long) now_total, want_s),
-						 errhint("Re-execute the statement: the retry uses a "
-								 "fresh plan and snapshot.")));
-			node->fdw_state = state;
-			return;
-		}
-	}
 
 	tupdesc = RelationGetDescr(rel);
 
@@ -213,27 +159,6 @@ lakehouse_IterateForeignScan(ForeignScanState *node)
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 	TupleDesc	tupdesc = node->ss.ss_currentRelation->rd_att;
 
-	/*
-	 * P0b4: the elided count yields exactly ONE row — the manifest sum
-	 * placed in the scan tuple slot; the plan targetlist's Var over the scan
-	 * tuple projects it (no upper Agg above this scan).
-	 */
-	if (state->elided_count)
-	{
-		slot = node->ss.ss_ScanTupleSlot;
-		if (state->count_done)
-		{
-			ExecClearTuple(slot);
-			return NULL;
-		}
-		ExecClearTuple(slot);
-		slot->tts_values[0] = Int64GetDatum(state->elided_count_value);
-		slot->tts_isnull[0] = false;
-		ExecStoreVirtualTuple(slot);
-		state->count_done = true;
-		return slot;
-	}
-
 	for (;;)
 	{
 		if (state->rows == NULL)
@@ -336,7 +261,7 @@ lakehouse_IterateForeignScan(ForeignScanState *node)
 						continue;
 					}
 					{
-						const PgDatalakeBatchColumn *col =
+						const		PgDatalakeBatchColumn *col =
 							&state->batch.cols[pcol];
 
 						if (col->nulls[r])
@@ -398,13 +323,6 @@ lakehouse_ExplainForeignScan(ForeignScanState *node, ExplainState *es)
 
 	if (state == NULL)
 		return;
-	if (state->elided_count)
-	{
-		ExplainPropertyText("Lakehouse elision",
-							"count(*) answered from manifest record_counts "
-							"(no data files read)", es);
-		return;
-	}
 	for (uint64 i = 0; i < state->task_count; i++)
 		rows += (uint64) pg_datalake_scan_task_rows(state->session, i);
 
@@ -438,12 +356,6 @@ void
 lakehouse_ReScanForeignScan(ForeignScanState *node)
 {
 	LakehouseExecState *state = (LakehouseExecState *) node->fdw_state;
-
-	if (state->elided_count)
-	{
-		state->count_done = false;
-		return;
-	}
 
 	/*
 	 * Rewind only: the planned session is REUSED. Merge/NestLoop join inner

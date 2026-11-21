@@ -25,7 +25,7 @@
 ## Evidence and next queue
 
 - **Local baseline.** 118 Rust tests passed and one manual benchmark was ignored. A clean assertion-enabled native build passed 243 upstream regression subtests and all 11 lakehouse SQL groups. Fork CI passed on PRs #27 and #28. See the [review receipts](16-release-reassessment-and-scale.md#evidence).
-- **First.** Regress COUNT against prepared-plan reuse, deletes and ordinary query permission semantics. Regress staged capture across 65 relations and publisher failure between local and remote decisions. Land correctness fixes before reporting optimization numbers.
+- **First.** Regress COUNT against prepared-plan reuse, deletes and ordinary query permission semantics. **Done 2026-11-21 (gate):** both plan-time COUNT elisions are off the build (managed hook deleted, FDW upper path unwired); `count_elision.sql` now pins prepared-plan freshness, relation permission checks and the offline staged-serve fallback. Remaining in First: regress staged capture across 65 relations and publisher failure between local and remote decisions. Land correctness fixes before reporting optimization numbers.
 - **Second.** Qualify row-group laziness, bounded and cancelable I/O, cache scope, and byte/memory counters. Land the remote positive smoke and result-digest runner in CI.
 - **Third.** Profile SF10 and one concurrency workload. Use the measured time split to decide between fewer planning calls, batching an exact aggregate, or improving a join/rescan path. Keep page-index work independent.
 - **Milestone completion.** Follow the [TDD and smoke protocol](10-testing.md#milestone-tdd-and-smoke-receipts) and record PASS, FAIL, or NOT RUN against each named gate.

@@ -1,10 +1,12 @@
--- P0b4 slice C (spec 15 §6.6): COUNT(*) elision for MANAGED tables.
--- The planner hook replaces a trivial count(*) over a managed lakehouse
--- table with the ledger row_count sum (exact for the pinned snapshot;
--- DV-free snapshots only — delete work forces the normal scan).
--- This test runs OFFLINE on purpose: the elided plan never touches the
--- catalog (the ledger lives in Postgres), so an unreachable endpoint
--- proves the answer comes from the ledger, not a scan.
+-- COUNT correctness contract (spec 16, "COUNT must be computed at
+-- execution"). The former plan-time elisions — the managed planner-hook
+-- rewrite (former count_elision.c) and the FDW upper Const path — are
+-- GATED OFF: a plan-time Const served a stale count under prepared-plan
+-- reuse, and the managed rewrite stripped the rtable so relation
+-- permission checks never ran. These tests pin the behavior any successor
+-- execution-time path must preserve.
+-- This test runs OFFLINE on purpose: the ledger lives in Postgres, so a
+-- staged-serve scan works against the dead endpoint below.
 CREATE EXTENSION IF NOT EXISTS lakehouse;
 NOTICE:  extension "lakehouse" already exists, skipping
 SELECT lakehouse.version();
@@ -30,15 +32,16 @@ SELECT lakehouse.attach_table('cnt_elide'::regclass, 'analytics.cnt_elide', 'ce_
 (1 row)
 
 INSERT INTO cnt_elide SELECT g, 'e-'||g FROM generate_series(1, 5) g;
--- the elided plan must NOT open a scan session: EXPLAIN shows a bare
--- Result (no scan node at all — the answer is a plan-time Const), and
--- the count is exact
+-- no plan-time Const rewrite: the plan must be a real aggregate over a
+-- scan (retains the rtable -> permission checks), never a bare Result
 EXPLAIN (VERBOSE, COSTS OFF) SELECT count(*) FROM cnt_elide;
-      QUERY PLAN       
------------------------
- Result
-   Output: '5'::bigint
-(2 rows)
+             QUERY PLAN             
+------------------------------------
+ Aggregate
+   Output: count(*)
+   ->  Seq Scan on public.cnt_elide
+         Output: id, name
+(4 rows)
 
 SELECT count(*) AS exact FROM cnt_elide;
  exact 
@@ -46,21 +49,53 @@ SELECT count(*) AS exact FROM cnt_elide;
      5
 (1 row)
 
--- savepoint rollback removes staged rows: elision must reflect pruning
-BEGIN;
+-- prepared plans stay FRESH across commits (spec 16 blocker 1: a generic
+-- prepared COUNT returned 2 before and after a committed third row)
+PREPARE cnt_p AS SELECT count(*) FROM cnt_elide;
+EXECUTE cnt_p;
+ count 
+-------
+     5
+(1 row)
+
 INSERT INTO cnt_elide VALUES (100, 'x');
-SAVEPOINT s1;
+EXECUTE cnt_p;
+ count 
+-------
+     6
+(1 row)
+
 INSERT INTO cnt_elide VALUES (200, 'y');
+EXECUTE cnt_p;
+ count 
+-------
+     7
+(1 row)
+
+DEALLOCATE cnt_p;
+-- savepoint rollback removes staged rows: the count must reflect pruning
+BEGIN;
+INSERT INTO cnt_elide VALUES (300, 'a');
+SAVEPOINT s1;
+INSERT INTO cnt_elide VALUES (400, 'b');
 ROLLBACK TO s1;
 COMMIT;
 SELECT count(*) AS after_savepoint_prune FROM cnt_elide;
  after_savepoint_prune 
 -----------------------
-                     6
+                     8
 (1 row)
 
+-- permission semantics: a role without SELECT on the table must NOT be
+-- able to read its count (the gated-off hook answered from the ledger
+-- without any relation permission check)
+CREATE ROLE cnt_deny;
+SET ROLE cnt_deny;
+SELECT count(*) FROM cnt_elide;
+ERROR:  permission denied for table cnt_elide
+RESET ROLE;
 -- negative control: a WHERE clause forces the normal scan path
--- (dead endpoint -> loud failure; elision must NOT fire)
+-- (dead endpoint -> loud failure; no metadata shortcut may answer it)
 SELECT count(*) AS filtered FROM cnt_elide WHERE id = 1;
  filtered 
 ----------
