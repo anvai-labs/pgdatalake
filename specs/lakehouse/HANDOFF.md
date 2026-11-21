@@ -922,6 +922,7 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     2 / pruned 1 / tasks 1; pyiceberg reads our bounds (LE 1000/1010,
     counts 11/0). NEXT: P0 (ranged reads + block cache, spec 15) or
     M3 remainder; writer-bounds item CLOSED.
+<<<<<<< HEAD
   - Branch/CI discipline + upstream sync — 2026-11-20 (RULES §1a + doc
     10 §1a, incident-driven): discovered cf5631-port pushes only ever
     triggered upstream's NO-OP "CI for PostgreSQL" runs (6-19s
@@ -946,3 +947,23 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     publisher + compaction-as-a-service + immutable-path caching)
     written spec-only per direction — next major implementation
     candidate alongside writer min/max bounds.
+=======
+  - P2 slice — DONE 2026-11-21 (extension-defined GUCs, TDD): the
+    lakehouse.* GUC family registered via DefineCustom*Variable in
+    _PG_init — the extension seam; the guc_tables.c allowlist entry
+    RETIRED (RULES §3 note) before first use. GUCs: write_mode
+    (enum cow/staged, USERSET, byte-exact rejection message + "HINT:
+    Available values: cow, staged."), target_file_size (int,
+    GUC_UNIT_KB, min 128MB, consumed by P1 rollover), publish_max_lag
+    (int, GUC_UNIT_S, SUSET), cache_max_bytes (int, GUC_UNIT_KB,
+    USERSET). GOTCHAS (cost real debugging): GUC_UNIT_MEMORY is a MASK
+    not a unit — use GUC_UNIT_KB; enum GUCs store int, not char*;
+    extension GUCs register PER BACKEND at library load — a test
+    session must load the library (SELECT lakehouse.version()) before
+    SHOW/SET, else SET silently creates unvalidated PLACEHOLDERS (SET
+    on unknown qualified names!). regress test gucs.sql in the suite
+    (7th test); suite 7/7 green. RANGE error text in this tree uses
+    "kB .. kB" format. NEXT: P1 writer rollover (consumes
+    lakehouse.target_file_size via a new FFI flush threshold), or P0
+    read-path integration (cache into fetch_metadata/manifests).
+>>>>>>> cf5631-port

@@ -766,6 +766,12 @@ pub struct WriteSession {
     flushed: Vec<crate::snapshot_write::NewDataFile>,
     file_seq: usize,
     staged_rows: usize,
+    /// P1 rollover threshold in bytes (0 = no rollover: single file per
+    /// session, legacy behavior). The C side passes
+    /// lakehouse.target_file_size * 1024 (GUC is kB).
+    target_file_size_bytes: i64,
+    /// measured bytes/row from the last flush — the rollover estimate
+    last_avg_row_bytes: usize,
 }
 
 /// Open a write session. `schema_json` is `[{"name": ..., "type":
@@ -927,6 +933,8 @@ pub unsafe extern "C" fn pg_datalake_write_new(
         flushed: Vec::new(),
         file_seq: 0,
         staged_rows: 0,
+        target_file_size_bytes: 0,
+        last_avg_row_bytes: 64,
     });
     Box::into_raw(ws)
 }
@@ -966,6 +974,18 @@ pub unsafe extern "C" fn pg_datalake_write_push(
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ws.writer.push(&cells))) {
         Ok(Ok(())) => {
             ws.staged_rows += 1;
+            // P1 rollover (spec 15 G3): estimated buffered bytes reached
+            // the threshold -> roll a file NOW, inside the same snapshot
+            if ws.target_file_size_bytes > 0 {
+                let est =
+                    ws.writer.num_rows() as i64 * ws.last_avg_row_bytes as i64;
+                if est >= ws.target_file_size_bytes {
+                    if let Err(e) = flush_writer_buffer(ws) {
+                        unsafe { set_err(err_buf, err_len, &format!("write push: rollover: {e}")) };
+                        return false;
+                    }
+                }
+            }
             true
         }
         Ok(Err(e)) => {
@@ -996,29 +1016,64 @@ pub unsafe extern "C" fn pg_datalake_write_flush(
         unsafe { set_err(err_buf, err_len, "write flush: NULL session") };
         return false;
     };
+    match flush_writer_buffer(ws) {
+        Ok(()) => true,
+        Err(e) => {
+            unsafe { set_err(err_buf, err_len, &format!("write flush: {e}")) };
+            false
+        }
+    }
+}
+
+/// Set the rollover threshold (P1, spec 15 §7.2): when the buffered
+/// rows' estimated bytes reach this size, push() rolls a file — one
+/// transaction then emits MANY size-bounded files in ONE snapshot
+/// (small-file prevention, G3). bytes <= 0 disables rollover (legacy
+/// single-file behavior). The C side passes
+/// lakehouse.target_file_size * 1024 (the GUC is kB).
+///
+/// # Safety
+/// Same pointer rules as pg_datalake_write_push.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_write_set_target_file_size(
+    ws: *mut WriteSession,
+    bytes: i64,
+    err_buf: *mut c_char,
+    err_len: usize,
+) -> bool {
+    let Some(ws) = (unsafe { ws.as_mut() }) else {
+        unsafe { set_err(err_buf, err_len, "set target file size: NULL session") };
+        return false;
+    };
+    ws.target_file_size_bytes = bytes.max(0);
+    true
+}
+
+/// Flush the writer's buffered rows as one data file + record its
+/// manifest entry (with M3-R2 stats). Shared by pg_datalake_write_flush
+/// and the P1 rollover in push.
+fn flush_writer_buffer(ws: &mut WriteSession) -> Result<(), String> {
     if ws.writer.num_rows() == 0 {
-        return true;
+        return Ok(());
     }
     let data_dir = if ws.key_prefix.is_empty() {
         "data".to_string()
     } else {
         format!("{}/data", ws.key_prefix)
     };
+    let rows_before = ws.writer.num_rows();
     let wf = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ws.writer.write_file(&ws.io, &data_dir, ws.file_seq)
     })) {
         Ok(Ok(w)) => w,
-        Ok(Err(e)) => {
-            unsafe { set_err(err_buf, err_len, &format!("write flush: {e}")) };
-            return false;
-        }
-        Err(panic) => {
-            let m = panic_message(&panic);
-            unsafe { set_err(err_buf, err_len, &format!("write flush: {m}")) };
-            return false;
-        }
+        Ok(Err(e)) => return Err(e.to_string()),
+        Err(panic) => return Err(panic_message(&panic)),
     };
     ws.file_seq += 1;
+    if rows_before > 0 {
+        ws.last_avg_row_bytes =
+            (wf.file_size_in_bytes as usize / rows_before).max(1);
+    }
     // the manifest stores the LOCATION URI; the put key may carry the S3
     // bucket-root prefix, which the location already includes
     let rel_key = if ws.key_prefix.is_empty() {
@@ -1051,7 +1106,7 @@ pub unsafe extern "C" fn pg_datalake_write_flush(
     }
     ws.flushed.push(file);
     ws.staged_rows = 0;
-    true
+    Ok(())
 }
 
 /// Flush remainder + commit the append snapshot. Returns a heap CString
@@ -3360,4 +3415,140 @@ mod tests {
         assert_eq!(unsafe { pg_datalake_scan_task_rows(full, 0) }, 5);
         unsafe { pg_datalake_scan_free(full) };
     }
+
+    /// P1 (spec 15 §7.2): writer rollover at the target-file-size
+    /// threshold — one transaction emitting MANY size-bounded files in
+    /// ONE append snapshot (small-file prevention, G3). With a 1-byte
+    /// threshold every push rolls a file: 6 rows -> 6 files, each with
+    /// exact record_count and per-file bounds, committed as ONE
+    /// snapshot; read-back sees all 6 rows.
+    #[test]
+    fn ffi_write_commit_rollover_multi_file() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
+        std::fs::create_dir_all(dir.path().join("table").join("data")).unwrap();
+        std::fs::create_dir_all(dir.path().join("table").join("metadata")).unwrap();
+        std::fs::create_dir_all(dir.path().join("metadata")).unwrap();
+        let metadata_json = format!(
+            r#"{{"format-version": 2,
+                "table-uuid": "1ca92afa-70b9-4d02-9ba6-7ee1a3ac0f5e",
+                "location": "file://{}/table",
+                "last-sequence-number": 3,
+                "schemas": [{{"type": "struct", "schema-id": 0, "fields": [
+                    {{"id": 1, "name": "id", "required": false, "type": "long"}}]}}],
+                "current-schema-id": 0}}"#,
+            dir.path().display(),
+        );
+        let md_path = dir.path().join("metadata").join("00000-x.metadata.json");
+        std::fs::write(&md_path, &metadata_json).unwrap();
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let md_capture = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let md_capture_t = std::sync::Arc::clone(&md_capture);
+        let md_path_srv = md_path.clone();
+        std::thread::spawn(move || {
+            for _ in 0..10 {
+                let Some(mut req) = server.recv().ok() else {
+                    break;
+                };
+                let url = req.url().to_string();
+                let body = if url.contains("/v1/config") {
+                    r#"{"defaults": {"prefix": "pfx"}, "overrides": {}}"#.to_string()
+                } else if url.contains("namespaces") && req.method().as_str() == "POST" {
+                    let mut body_s = String::new();
+                    {
+                        let _ = req.as_reader().read_to_string(&mut body_s);
+                    }
+                    *md_capture_t.lock().unwrap() = body_s;
+                    r#"{"metadata-location": "file:///committed/00005.metadata.json", "config": {}}"#.to_string()
+                } else {
+                    format!(
+                        r#"{{"metadata-location": "file://{}", "config": {{}}}}"#,
+                        md_path_srv.display()
+                    )
+                };
+                let resp = tiny_http::Response::from_string(body).with_header(
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                        .unwrap(),
+                );
+                let _ = req.respond(resp);
+            }
+        });
+
+        let endpoint = CString::new(format!("http://{addr}")).unwrap();
+        let warehouse = CString::new("smoke").unwrap();
+        let namespace = CString::new("analytics").unwrap();
+        let table = CString::new("events").unwrap();
+        let schema_json = CString::new(r#"[{"name": "id", "type": "long"}]"#).unwrap();
+        let mut err = [0 as c_char; 1024];
+        fn errmsg3(err: &[c_char]) -> String {
+            unsafe { CStr::from_ptr(err.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        }
+
+        let ws = unsafe {
+            pg_datalake_write_new(
+                endpoint.as_ptr(),
+                warehouse.as_ptr(),
+                std::ptr::null(),
+                namespace.as_ptr(),
+                table.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                schema_json.as_ptr(),
+                err.as_mut_ptr(),
+                err.len(),
+            )
+        };
+        assert!(!ws.is_null(), "write_new: {}", errmsg3(&err));
+        // 1-byte threshold: every buffered row rolls its own file
+        assert!(unsafe { pg_datalake_write_set_target_file_size(ws, 1, err.as_mut_ptr(), err.len()) },
+            "set threshold: {}", errmsg3(&err));
+
+        for row in ["[1]", "[2]", "[3]", "[4]", "[5]", "[6]"] {
+            let rj = CString::new(row).unwrap();
+            assert!(
+                unsafe { pg_datalake_write_push(ws, rj.as_ptr(), err.as_mut_ptr(), err.len()) },
+                "push {row}: {}",
+                errmsg3(&err)
+            );
+        }
+        let loc = unsafe { pg_datalake_write_commit(ws, 0, err.as_mut_ptr(), err.len()) };
+        assert!(!loc.is_null(), "commit: {}", errmsg3(&err));
+        unsafe { pg_datalake_write_commit_result_free(loc) };
+
+        // ONE snapshot carrying SIX files
+        {
+            let body = md_capture.lock().unwrap().clone();
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let snap = &v["updates"][0]["snapshot"];
+            assert_eq!(snap["summary"]["added-data-files"], "6", "{body}");
+            let ml_path = snap["manifest-list"].as_str().unwrap().to_string();
+            let manifest_list = crate::manifest::parse_manifest_list(
+                &std::fs::read(ml_path.trim_start_matches("file://")).unwrap(),
+            )
+            .unwrap();
+            let entries = crate::manifest::parse_manifest(
+                &std::fs::read(
+                    manifest_list[0].manifest_path.trim_start_matches("file://"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(entries.len(), 6, "six manifest entries");
+            for (i, e) in entries.iter().enumerate() {
+                assert_eq!(e.data_file.record_count, 1, "entry {i} rows");
+                assert_eq!(
+                    e.data_file.lower_bounds.get(&1),
+                    Some(&((i + 1) as i64).to_le_bytes().to_vec()),
+                    "entry {i} lower bound"
+                );
+            }
+        }
+        unsafe { pg_datalake_write_free(ws) };
+    }
+
 }
