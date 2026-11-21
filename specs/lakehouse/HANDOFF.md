@@ -1131,6 +1131,20 @@ FdwRoutine vtables (interface), exec-state context structs, fdw_private
 plan<->executor messaging, batch_fill adapters. What is missing is
 module boundaries, not patterns.
 
+DONE phase 1-2 (2026-11-21, #23): fdw.c split into fdw_plan.c (~700
+planning + elision + predicate translation) / fdw_exec.c (~600 exec +
+parallel DSM + elided-count mode) / fdw.c (~310 assembly:
+handler/validator/options/sessions) / lakehouse_fdw.h (exec-state +
+hook decls). publisher.c extracted from tableam.c (3128 lines, -400)
+with lakehouse_tableam.h (TombFile/WriteEntry structs incl. the
+hash-aliasing warning, write-state exports). Zero behavior change;
+suite + live elision + staged-publish acceptance green. Fixture note:
+pyiceberg harnesses must pass "s3.addressing-style": "path" (warehouse
+profile is path-style; default virtual-host addressing began 403-ing
+HeadObject). REMAINING (hold until slice work dictates seams):
+tableam.c write/COW vs scan machinery split (~800/~1200 lines).
+
+Original plan (for reference):
 Planned split (AFTER #20 lands — fdw.c is in flight there; standalone
 zero-behavior-change PR, validated by regress suite + live elision/
 publish checks):
