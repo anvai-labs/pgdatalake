@@ -79,15 +79,19 @@ flowchart LR
 
 ## 5. Next queue
 
-1. **P0b2** — cached page indexes + bloom-filter reads through the same
+1. **P0b4 metadata elision** — PROMOTED to first: measured evidence
+   (10-testing §5.2 internal receipts) shows count(*) ships ALL 23
+   columns × 28.8M rows across the FDW boundary, 100% CPU in transport,
+   zero I/O wait — the fetch side is done, the planner is the gap.
+   Planner-level COUNT/MIN/MAX from cached footers + manifest
+   record_counts (spec 15 §6.6); includes row_count column on the
+   delta ledger
+2. **P0b3** — row-group-deferred batch iteration (P0b's open_internal
+   still collects batches eagerly; laziness is per-column/per-scan) —
+   the q3-class full-scan canary needs this + P0b4
+3. **P0b2** — cached page indexes + bloom-filter reads through the same
    block cache (parquet ≥60 building blocks; spec 15 §6.3a) — selective
    page-level pruning
-2. **P0b3** — row-group-deferred batch iteration (P0b's open_internal
-   still collects batches eagerly; laziness is per-column/per-scan)
-3. **P0b4 metadata elision** — planner-level COUNT/MIN/MAX from cached
-   footers + manifest record_counts (spec 15 §6.6); motivated by the
-   measured ~12-min SF=10 count(*) (all row transport, zero fetch);
-   includes row_count column on the delta ledger
 4. **M3 close-out** — MVCC models → ADLS/GCS IO + auth → branches/tags →
    logical-repl decision (gate: 4-store CI matrix + isolation tests)
 5. **M4** — compaction/expire/orphan/ANALYZE on the P4c worker skeleton;
