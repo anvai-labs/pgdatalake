@@ -2294,16 +2294,25 @@ staged_capture_segment(LakehouseWriteEntry *entry)
 	SPI_connect();
 	PushActiveSnapshot(GetTransactionSnapshot());
 	{
-		Oid			argtypes[1] = {TEXTOID};
-		Datum		values[1];
-		char		nulls[2] = {' ', '\0'};
+		/*
+		 * P0b4 slice B (spec 15 §6.6): the segment's row_count is EXACT at
+		 * capture time — it is the txn's own staged-row total — so the
+		 * COUNT elision reads the ledger instead of decoding payloads.
+		 * Pre-upgrade rows have NULL row_count and are tolerated (the elision
+		 * declines on NULL).
+		 */
+		Oid			argtypes[2] = {TEXTOID, INT4OID};
+		Datum		values[2];
+		char		nulls[3] = {' ', ' ', '\0'};
 
 		values[0] = CStringGetTextDatum(payload.data);
+		values[1] = Int32GetDatum((int32) entry->staged_rows);
 		ret = SPI_execute_with_args(psprintf("INSERT INTO"
 											 " lakehouse.lakehouse_delta_segments"
-											 " (relid, payload) VALUES (%u, $1::bytea)",
+											 " (relid, payload, row_count)"
+											 " VALUES (%u, $1::bytea, $2)",
 											 (unsigned) entry->relid),
-									1, argtypes, values, nulls, false, 0);
+									2, argtypes, values, nulls, false, 0);
 	}
 	PopActiveSnapshot();
 	SPI_finish();

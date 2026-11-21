@@ -26,11 +26,12 @@ SELECT attname, format_type(atttypid, atttypmod) AS typ
  seg_id                | bigint
  relid                 | oid
  payload               | bytea
+ row_count             | integer
  tombstones            | jsonb
  staged_at             | timestamp with time zone
  published             | boolean
  published_snapshot_id | bigint
-(7 rows)
+(8 rows)
 
 -- PUBLIC may not touch it
 SELECT has_table_privilege('public',

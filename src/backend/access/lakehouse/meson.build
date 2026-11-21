@@ -66,7 +66,8 @@ lakehouse = shared_module('lakehouse',
 
 install_data(
   ['lakehouse.control', 'lakehouse--1.0.sql',
-   'lakehouse--1.1.sql', 'lakehouse--1.0--1.1.sql'],
+   'lakehouse--1.1.sql', 'lakehouse--1.0--1.1.sql',
+   'lakehouse--1.2.sql', 'lakehouse--1.1--1.2.sql'],
   install_dir: dir_data_extension,
 )
 
