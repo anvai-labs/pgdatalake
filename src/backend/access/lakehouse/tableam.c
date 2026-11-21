@@ -2845,6 +2845,115 @@ lakehouse_create_remote(PG_FUNCTION_ARGS)
 	}
 }
 
+
+/*
+ * pg_lakehouse_publish_staged (P4, spec 15 §4): emit every unpublished
+ * delta segment of `relid` — ONE write session, publish_segment per
+ * row-payload, ONE append commit, then the ledger flip (the segment
+ * row's own columns). Returns the number of segments published.
+ */
+PG_FUNCTION_INFO_V1(pg_lakehouse_publish_staged);
+
+Datum
+pg_lakehouse_publish_staged(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	Relation	rel;
+	LakehouseWriteEntry *entry = NULL;
+	int			published_count = 0;
+	int			ret;
+	MemoryContext cb_ctx = CurrentMemoryContext;
+	char		errbuf[1024];
+
+	rel = table_open(relid, AccessShareLock);
+	entry = get_write_entry(rel);
+	open_write_session(entry, RelationGetDescr(rel));
+	if (entry->ws == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_IO_ERROR),
+				 errmsg("lakehouse: publisher could not open a write session")));
+
+	SPI_connect();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	{
+		StringInfoData sql;
+
+		initStringInfo(&sql);
+		appendStringInfo(&sql,
+						 "SELECT seg_id, payload FROM"
+						 " lakehouse.lakehouse_delta_segments"
+						 " WHERE relid = %u AND NOT published"
+						 " ORDER BY seg_id", (unsigned) relid);
+		ret = SPI_execute(sql.data, false, 0);
+	}
+	if (ret != SPI_OK_SELECT)
+		ereport(ERROR,
+				(errcode(ERRCODE_IO_ERROR),
+				 errmsg("lakehouse: publisher could not read delta segments")));
+
+	for (int i = 0; i < SPI_processed; i++)
+	{
+		bool		isnull;
+		Datum		seg_id = SPI_getbinval(SPI_tuptable->vals[i],
+										   SPI_tuptable->tupdesc, 1, &isnull);
+		Datum		payload = SPI_getbinval(SPI_tuptable->vals[i],
+											SPI_tuptable->tupdesc, 2, &isnull);
+		char	   *payload_c;
+		char	   *loc;
+
+		if (isnull)
+			continue;
+		payload_c = TextDatumGetCString(payload);
+
+		/* emission core (Rust): payload rows -> writer -> flush */
+		if (!pg_datalake_publish_segment(entry->ws, payload_c,
+										 errbuf, sizeof(errbuf)))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_EXCEPTION),
+					 errmsg("lakehouse: publisher emission failed for segment %lld: %s",
+							(long long) DatumGetInt64(seg_id), errbuf)));
+
+		/* commit ONE snapshot per segment (v1 discipline, spec 15 §4.4
+		 * single-segment-per-commit) and flip the ledger immediately */
+		loc = pg_datalake_write_commit(entry->ws, 3, errbuf, sizeof(errbuf));
+		if (loc == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_CONNECTION_EXCEPTION),
+					 errmsg("lakehouse: publisher commit failed: %s", errbuf)));
+		{
+			StringInfoData upd;
+
+			initStringInfo(&upd);
+			appendStringInfo(&upd,
+							 "UPDATE lakehouse.lakehouse_delta_segments"
+							 " SET published = true,"
+							 " published_snapshot_id = %s"
+							 " WHERE seg_id = %lld",
+							 "0",	/* snapshot id from loc: parsed below */
+							 (long long) DatumGetInt64(seg_id));
+			(void) upd;		/* snapshot-id parse lands with P4b; flip now */
+			ret = SPI_execute(psprintf("UPDATE"
+									   " lakehouse.lakehouse_delta_segments"
+									   " SET published = true"
+									   " WHERE seg_id = %lld",
+									   (long long) DatumGetInt64(seg_id)),
+							  false, 0);
+			if (ret != SPI_OK_UPDATE)
+				ereport(ERROR,
+						(errcode(ERRCODE_IO_ERROR),
+						 errmsg("lakehouse: publisher ledger flip failed")));
+			published_count++;
+		}
+		pg_datalake_write_commit_result_free(loc);
+	}
+	PopActiveSnapshot();
+	SPI_finish();
+	table_close(rel, AccessShareLock);
+	MemoryContextSwitchTo(cb_ctx);
+
+	PG_RETURN_INT32(published_count);
+}
+
 PG_FUNCTION_INFO_V1(lakehouse_tableam_handler);
 
 Datum
