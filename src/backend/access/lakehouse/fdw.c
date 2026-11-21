@@ -55,20 +55,22 @@
 #include "optimizer/optimizer.h"
 #include "utils/fmgroids.h"
 #include "utils/builtins.h"
-#include "utils/rel.h"
 
 #include "pg_datalake_core.h"
 
 #include "lakehouse.h"
 #include "batch_fill.h"
 
-/* LakehouseOptions moved to lakehouse.h (M2 slice 26): the table access
- * method shares the option block and the session pipeline. */
+/*
+ * LakehouseOptions moved to lakehouse.h (M2 slice 26): the table access
+ * method shares the option block and the session pipeline.
+ */
 
 /* shared task-claim counter for parallel scans (slice 17) */
 typedef struct LakehouseShared
 {
 	pg_atomic_uint64 next_task;
+
 	/*
 	 * The LEADER's pinned snapshot id, written before workers launch
 	 * (13-review #7 stable-task-mapping contract): workers plan THIS
@@ -76,7 +78,7 @@ typedef struct LakehouseShared
 	 * different files in different processes. 0 = not pinned (serial).
 	 */
 	uint64		snapshot_id;
-}			LakehouseShared;
+} LakehouseShared;
 
 /*
  * Option homes (13-review #6, doc 09 authority model): each option has
@@ -87,15 +89,18 @@ typedef struct LakehouseShared
  * legacy pre-validator definition errors instead of silently using
  * credentials that were never authorized through a mapping.
  */
-#define LOPT_SERVER		(1 << 0)
-#define LOPT_MAPPING	(1 << 1)
-#define LOPT_TABLE		(1 << 2)
+enum
+{
+	LOPT_SERVER = 1 << 0,
+	LOPT_MAPPING = 1 << 1,
+	LOPT_TABLE = 1 << 2
+};
 
 typedef struct LakehouseOptSpec
 {
 	const char *name;
 	int			homes;
-}			LakehouseOptSpec;
+} LakehouseOptSpec;
 
 static const LakehouseOptSpec lakehouse_opt_specs[] = {
 	{"endpoint", LOPT_SERVER},
@@ -131,6 +136,8 @@ option_home_name(int home_flag)
 			return "user mappings";
 		case LOPT_TABLE:
 			return "foreign tables";
+		default:
+			return "unknown";
 	}
 	return "the lakehouse wrapper's supported objects";
 }
@@ -165,26 +172,30 @@ typedef struct LakehouseExecState
 	uint64		current_task;
 	uint64		task_count;
 	char	   *projection_csv; /* visible attribute names, comma-joined */
+
 	/*
 	 * THIS node's parallel coordination (13-review #7): per-executor-node,
-	 * never a process global — two scans in one query (self-join) must
-	 * not claim from or clear each other's queues.
+	 * never a process global — two scans in one query (self-join) must not
+	 * claim from or clear each other's queues.
 	 */
 	LakehouseShared *shared;
 	int			natts;
 	FmgrInfo   *in_funcs;		/* per visible attribute */
 	Oid		   *typioparams;
 	int		   *slot_index;		/* attribute slot per projection column */
-	/* M3-R1 typed batch cursor: one arrow batch at a time, Datums built
-	 * directly (batch_fill.c); the per-row renderer is gone from this
-	 * path. rows_next is no longer called here. */
+
+	/*
+	 * M3-R1 typed batch cursor: one arrow batch at a time, Datums built
+	 * directly (batch_fill.c); the per-row renderer is gone from this path.
+	 * rows_next is no longer called here.
+	 */
 	PgDatalakeRowBatch batch;
 	bool		batch_valid;
 	uint64		batch_cursor;
 	LakehouseBatchMap *maps;	/* per visible attribute */
 	Datum	   *row_values;		/* reused per row */
 	bool	   *row_nulls;
-}			LakehouseExecState;
+} LakehouseExecState;
 
 static void lakehouse_GetForeignRelSize(PlannerInfo *root,
 										RelOptInfo *baserel,
@@ -252,6 +263,8 @@ lakehouse_fdw_validator(PG_FUNCTION_ARGS)
 		case ForeignTableRelationId:
 			home_flag = LOPT_TABLE;
 			object_kind = "foreign tables";
+			break;
+		default:
 			break;
 	}
 
@@ -322,7 +335,7 @@ lakehouse_fdw_handler(PG_FUNCTION_ARGS)
  * level == Postgres schema).
  */
 static void
-ExtractOptions(Oid foreigntableid, LakehouseOptions * opts)
+ExtractOptions(Oid foreigntableid, LakehouseOptions *opts)
 {
 	ForeignServer *server;
 	ForeignTable *table;
@@ -402,7 +415,7 @@ ExtractOptions(Oid foreigntableid, LakehouseOptions * opts)
 }
 
 ScanSession *
-lakehouse_OpenSession(LakehouseOptions * opts, const char *rte_selector)
+lakehouse_OpenSession(LakehouseOptions *opts, const char *rte_selector)
 {
 	char		errbuf[1024];
 	ScanSession *session;
@@ -503,7 +516,7 @@ lakehouse_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 
 	/* estimates; actual rows are known only after execution */
 	baserel->rows = clamp_row_est(total_rows);
-	baserel->pages = clamp_row_est(total_rows / 200.0 + 10);
+	baserel->pages = (BlockNumber) clamp_row_est(total_rows / 200.0 + 10.0);
 }
 
 static void
@@ -527,26 +540,26 @@ lakehouse_GetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
 	/*
 	 * Partial path for parallel scans (slice 17, doc 06 §3): tasks are
 	 * claimed atomically from THIS node's shared queue, and every worker
-	 * plans the leader's PINNED snapshot (13-review #7), so the task
-	 * mapping is stable. Gated on consider_parallel per the path
-	 * invariant (PostgreSQL asserts partial paths only on parallel-safe
-	 * rels — 13-review #7).
+	 * plans the leader's PINNED snapshot (13-review #7), so the task mapping
+	 * is stable. Gated on consider_parallel per the path invariant
+	 * (PostgreSQL asserts partial paths only on parallel-safe rels —
+	 * 13-review #7).
 	 */
 	if (!baserel->consider_parallel)
 		return;
 	{
-	ForeignPath *partial;
+		ForeignPath *partial;
 
-	partial = create_foreignscan_path(root, baserel, NULL,
-									  baserel->rows, 0,
-									  0.0,
-									  (10.0 * baserel->pages +
-									   10.0 * baserel->rows * cpu_operator_cost) / 2.0,
-									  NIL, NULL, NULL, NIL, NIL);
-	partial->path.parallel_workers = 2;
-	/* parallel_aware: workers get the DSM hook and claim tasks atomically */
-	partial->path.parallel_aware = true;
-	add_partial_path(baserel, &partial->path);
+		partial = create_foreignscan_path(root, baserel, NULL,
+										  baserel->rows, 0,
+										  0.0,
+										  (10.0 * baserel->pages +
+										   10.0 * baserel->rows * cpu_operator_cost) / 2.0,
+										  NIL, NULL, NULL, NIL, NIL);
+		partial->path.parallel_workers = 2;
+		/* parallel_aware: workers get the DSM hook and claim tasks atomically */
+		partial->path.parallel_aware = true;
+		add_partial_path(baserel, &partial->path);
 	}
 }
 
@@ -696,8 +709,11 @@ TranslateQual(Expr *expr, TupleDesc tupdesc)
 	opname = get_opname(opno);
 	if (opname == NULL)
 		return NULL;
-	/* spelling alone is not semantics (13-review #4): same-named user
-	 * operators must stay local */
+
+	/*
+	 * spelling alone is not semantics (13-review #4): same-named user
+	 * operators must stay local
+	 */
 	if (!operator_is_builtin(opno))
 		return NULL;
 	if (strcmp(opname, "=") == 0)
@@ -763,13 +779,16 @@ TranslateQual(Expr *expr, TupleDesc tupdesc)
 									 (long long) DatumGetInt32(con->constvalue));
 				break;
 			case DATEOID:
-				/* PG date = days since 2000-01-01; Iceberg = days since
+
+				/*
+				 * PG date = days since 2000-01-01; Iceberg = days since
 				 * 1970-01-01. Pushing the raw datum compared every date
-				 * predicate against bounds 10957 days off. */
+				 * predicate against bounds 10957 days off.
+				 */
 				value_buf = psprintf("%lld",
-									 (long long) (DatumGetInt32(con->constvalue) +
-												  (POSTGRES_EPOCH_JDATE -
-												   UNIX_EPOCH_JDATE)));
+									 (long long) DatumGetInt32(con->constvalue) +
+									 (POSTGRES_EPOCH_JDATE -
+									  UNIX_EPOCH_JDATE));
 				break;
 			case INT8OID:
 				value_buf = psprintf("%lld",
@@ -786,13 +805,15 @@ TranslateQual(Expr *expr, TupleDesc tupdesc)
 			case FLOAT8OID:
 				{
 					char	   *out = DatumGetCString(typid == FLOAT4OID
-						? DirectFunctionCall1(float4out, con->constvalue)
-						: DirectFunctionCall1(float8out, con->constvalue));
+													  ? DirectFunctionCall1(float4out, con->constvalue)
+													  : DirectFunctionCall1(float8out, con->constvalue));
 
-					/* out funcs give shortest round-trip decimal (%g
-					 * loses digits and mis-pruned near-bound files);
-					 * NaN/Infinity are not JSON numbers -> no pushdown
-					 * (the local filter still applies) */
+					/*
+					 * out funcs give shortest round-trip decimal (%g loses
+					 * digits and mis-pruned near-bound files); NaN/Infinity
+					 * are not JSON numbers -> no pushdown (the local filter
+					 * still applies)
+					 */
 					if (strstr(out, "NaN") || strstr(out, "Inf"))
 						return NULL;
 					value_buf = out;
@@ -801,8 +822,11 @@ TranslateQual(Expr *expr, TupleDesc tupdesc)
 			case TEXTOID:
 			case VARCHAROID:
 			case NAMEOID:
-				/* bpchar is deliberately absent: PG's bpchar equality
-				 * ignores trailing blanks, byte equality does not. */
+
+				/*
+				 * bpchar is deliberately absent: PG's bpchar equality ignores
+				 * trailing blanks, byte equality does not.
+				 */
 				{
 					Oid			outfn;
 					bool		isvarlen;
@@ -817,8 +841,8 @@ TranslateQual(Expr *expr, TupleDesc tupdesc)
 					else
 						coll_ok = collation_is_deterministic(var->varcollid);
 					if (!coll_ok)
-						return NULL;	/* stay local: collation semantics
-										 * are not byte semantics */
+						return NULL;	/* stay local: collation semantics are
+										 * not byte semantics */
 
 					getTypeOutputInfo(typid, &outfn, &isvarlen);
 					raw = OidOutputFunctionCall(outfn, con->constvalue);
@@ -828,10 +852,12 @@ TranslateQual(Expr *expr, TupleDesc tupdesc)
 					break;
 				}
 			default:
-				/* 13-review #4: unknown / user-defined types stay local —
+
+				/*
+				 * 13-review #4: unknown / user-defined types stay local —
 				 * their output functions are arbitrary code, and the
-				 * byte-order pruner cannot model their comparison
-				 * semantics */
+				 * byte-order pruner cannot model their comparison semantics
+				 */
 				return NULL;
 		}
 	}
@@ -944,9 +970,11 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 	state->row_nulls = (bool *) palloc(tupdesc->natts * sizeof(bool));
 	state->batch_valid = false;
 
-	/* projection: visible attribute names, in attribute order — a counted
+	/*
+	 * projection: visible attribute names, in attribute order — a counted
 	 * JSON ARRAY, not comma-separated: column names may contain commas
-	 * (13-review #8b) */
+	 * (13-review #8b)
+	 */
 	initStringInfo(&proj);
 	appendStringInfoChar(&proj, '[');
 	for (int i = 0; i < tupdesc->natts; i++)
@@ -984,7 +1012,7 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 	 * fdw_private (plan -> executor) as makeString elements.
 	 */
 	state->parallel = IsParallelWorker();
-	if (node->ss.ps.plan != NIL)
+	if (node->ss.ps.plan != NULL)
 	{
 		ForeignScan *fscan = (ForeignScan *) node->ss.ps.plan;
 
@@ -1072,11 +1100,11 @@ lakehouse_IterateForeignScan(ForeignScanState *node)
 
 		/*
 		 * M3-R1: batch cursor — one pg_datalake_rows_batch_next call per
-		 * arrow batch; rows are served from the materialized typed views
-		 * with Datums built directly (batch_fill.c). The explicit
-		 * ROW/EOF/ERROR tri-state carries over: EOF advances the task,
-		 * ERROR aborts the statement (13-review #8 — a caught panic is
-		 * never mistaken for EOF).
+		 * arrow batch; rows are served from the materialized typed views with
+		 * Datums built directly (batch_fill.c). The explicit ROW/EOF/ERROR
+		 * tri-state carries over: EOF advances the task, ERROR aborts the
+		 * statement (13-review #8 — a caught panic is never mistaken for
+		 * EOF).
 		 */
 		{
 			char		next_err[1024];
@@ -1161,6 +1189,7 @@ lakehouse_IterateForeignScan(ForeignScanState *node)
 																	pcol, r,
 																	cell_err,
 																	sizeof(cell_err));
+
 							if (text == NULL)
 								ereport(ERROR,
 										(errcode(ERRCODE_DATA_EXCEPTION),
@@ -1303,12 +1332,13 @@ lakehouse_InitializeDSMForeignScan(ForeignScanState *node,
 	LakehouseShared *shared = (LakehouseShared *) coordinate;
 
 	pg_atomic_init_u64(&shared->next_task, 0);
+
 	/*
 	 * Begin (per-execution pin — the plancache-fresh boundary) ran before
-	 * this hook everywhere: children initialize before the Gather parent.
-	 * The leader's session therefore holds the just-resolved snapshot;
-	 * record it for the workers, who re-pin in their own Initialize hook
-	 * (13-review #7).
+	 * this hook everywhere: children initialize before the Gather parent. The
+	 * leader's session therefore holds the just-resolved snapshot; record it
+	 * for the workers, who re-pin in their own Initialize hook (13-review
+	 * #7).
 	 */
 	{
 		LakehouseExecState *state = (LakehouseExecState *) node->fdw_state;
@@ -1333,9 +1363,9 @@ lakehouse_InitializeWorkerForeignScan(ForeignScanState *node, shm_toc *toc,
 
 	/*
 	 * Begin already ran here (children init before the Gather parent in
-	 * workers too), so fdw_state carries this node's real state: attach
-	 * the node's queue and re-pin the session to the leader's snapshot.
-	 * (An early state is only a defensive fallback.)
+	 * workers too), so fdw_state carries this node's real state: attach the
+	 * node's queue and re-pin the session to the leader's snapshot. (An early
+	 * state is only a defensive fallback.)
 	 */
 	if (state == NULL)
 	{

@@ -30,7 +30,8 @@ typedef enum LakehouseFastTarget
 	LAKE_FAST_INT4,
 	LAKE_FAST_INT2,
 	LAKE_FAST_FLOAT8,
-	LAKE_FAST_TIMESTAMP,		/* timestamp or timestamptz, precision 6 or unset */
+	LAKE_FAST_TIMESTAMP,		/* timestamp or timestamptz, precision 6 or
+								 * unset */
 	LAKE_FAST_DATE,
 	LAKE_FAST_TEXT,
 	LAKE_FAST_VARCHAR,
@@ -45,16 +46,20 @@ typedef struct LakehouseBatchMap
 	int32		typmod;
 } LakehouseBatchMap;
 
-/* Decide the target once per batch for one attribute. `nrows` is the
- * batch's total row count (range prechecks scan the whole buffer). */
+/*
+ * Decide the target once per batch for one attribute. `nrows` is the
+ * batch's total row count (range prechecks scan the whole buffer).
+ */
 extern void lakehouse_batch_map_column(Form_pg_attribute attr,
 									   const PgDatalakeBatchColumn *col,
 									   uint64 nrows,
 									   FmgrInfo *in_func, Oid typioparam,
 									   LakehouseBatchMap *map);
 
-/* Build the Datum for live batch row `r` of a MAPPED non-NULL cell.
- * Varlena results are palloc'd in the caller's current context. */
+/*
+ * Build the Datum for live batch row `r` of a MAPPED non-NULL cell.
+ * Varlena results are palloc'd in the caller's current context.
+ */
 extern Datum lakehouse_batch_col_datum(const LakehouseBatchMap *map,
 									   const PgDatalakeBatchColumn *col,
 									   uint32 r, const char *attname);

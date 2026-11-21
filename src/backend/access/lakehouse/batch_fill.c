@@ -17,10 +17,15 @@
 
 #include "batch_fill.h"
 
-/* unix epoch (1970-01-01) -> postgres epoch (2000-01-01) */
-#define LAKE_PG_EPOCH_DAYS 10957
-/* lowest PG date: 4714-11-24 BC = julian day 1 (days since 2000-01-01) */
-#define LAKE_PG_DATE_MIN_DAYS -2451545
+/*
+ * unix epoch (1970-01-01) -> postgres epoch (2000-01-01); lowest PG
+ * date: 4714-11-24 BC = julian day 1 (days since 2000-01-01)
+ */
+enum
+{
+	LAKE_PG_EPOCH_DAYS = 10957,
+	LAKE_PG_DATE_MIN_DAYS = -2451545
+};
 
 void
 lakehouse_batch_map_column(Form_pg_attribute attr,
@@ -46,9 +51,11 @@ lakehouse_batch_map_column(Form_pg_attribute attr,
 				map->target = LAKE_FAST_INT8;
 			else if (attr->atttypid == INT4OID || attr->atttypid == INT2OID)
 			{
-				/* parquet long feeding a narrower int column: exactly the
-				 * int4in/int2in range rule or the fallback errors the
-				 * same way the input function would */
+				/*
+				 * parquet long feeding a narrower int column: exactly the
+				 * int4in/int2in range rule or the fallback errors the same
+				 * way the input function would
+				 */
 				const int64 *v = (const int64 *) col->values;
 				int64		lo = PG_INT32_MIN;
 				int64		hi = PG_INT32_MAX;
@@ -75,8 +82,11 @@ lakehouse_batch_map_column(Form_pg_attribute attr,
 		case 3:					/* Float64 */
 			if (attr->atttypid == FLOAT8OID)
 				map->target = LAKE_FAST_FLOAT8;
-			/* float4: the f64->f32 cast can double-round against
-			 * float4in(repr(f64)) in edge cases — fallback */
+
+			/*
+			 * float4: the f64->f32 cast can double-round against
+			 * float4in(repr(f64)) in edge cases — fallback
+			 */
 			break;
 
 		case 4:					/* TimestampUs (epoch micros) */

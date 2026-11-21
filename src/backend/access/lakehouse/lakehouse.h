@@ -16,8 +16,10 @@
 
 #include "pg_datalake_core.h"
 
-/* options for one table (foreign table: server opts + table opts, table
- * wins; managed table: lakehouse.managed_tables identity row) */
+/*
+ * options for one table (foreign table: server opts + table opts, table
+ * wins; managed table: lakehouse.managed_tables identity row)
+ */
 typedef struct LakehouseOptions
 {
 	char	   *endpoint;
@@ -32,17 +34,21 @@ typedef struct LakehouseOptions
 	int			write_mode;		/* 0 = unset (GUC wins), 1 = cow, 2 = staged
 								 * (R2: CREATE/WITH-time sticky mode) */
 	char	   *snapshot_id;	/* time travel pin (slice 18); NULL = current */
-}			LakehouseOptions;
+} LakehouseOptions;
 
-/* Canonical RTE selector string ("ts:<ms>" / "id:<n>" / "ref:<name>") ->
- * selector JSON for the FFI (slice 19). */
+/*
+ * Canonical RTE selector string ("ts:<ms>" / "id:<n>" / "ref:<name>") ->
+ * selector JSON for the FFI (slice 19).
+ */
 extern char *lakehouse_BuildSelectorJson(const char *sel);
 
-/* Plan a scan session (FFI pg_datalake_scan_new with selector priority:
+/*
+ * Plan a scan session (FFI pg_datalake_scan_new with selector priority:
  * RTE pin > snapshot_id option > current). Errors out with
  * ERRCODE_CONNECTION_EXCEPTION on failure — the FDW and the AM share the
- * same fail-fast contract (doc 03 §5). */
-extern ScanSession *lakehouse_OpenSession(LakehouseOptions *opts,
-										  const char *rte_selector);
+ * same fail-fast contract (doc 03 §5).
+ */
+extern ScanSession * lakehouse_OpenSession(LakehouseOptions *opts,
+										   const char *rte_selector);
 
 #endif							/* LAKEHOUSE_H */
