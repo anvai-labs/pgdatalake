@@ -960,3 +960,22 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     clippy -D warnings, suite 7/7. NEXT: P3 delta store as PG table +
     P4 publisher worker (staged-INSERT critical path), or P0b lazy
     ranged parquet reader.
+  - P3 core slice — DONE 2026-11-21 (staged INSERT capture + delta
+    read side, TDD offline): write_mode='staged' now routes managed
+    INSERT through the delta-segments TABLE — durability from the
+    txn's own WAL record (D1-rev): tuple_insert skips the remote
+    session entirely; PRE_COMMIT serializes staged rows as ONE JSON
+    payload (the write path's typed row-JSON) and SPI-INSERTs it into
+    lakehouse.lakehouse_delta_segments ($1::bytea parameterized);
+    scan_begin in staged mode opens NO session (delta-only scan: zero
+    tasks) and scan_getnextslot serves committed unpublished segments
+    via SPI (active snapshot = MVCC — cross-backend staged visibility
+    free, own-txn rows via the overlay, no duplicates). Rust:
+    pg_datalake_delta_rows_* FFI (payload -> renderer-exact text forms;
+    WriteColumn serde accepts "type"). OFFLINE PROOF (the point):
+    staged INSERT COMMITTED against an unreachable catalog with
+    read-your-writes across TWO transactions and TWO segments — COW
+    structurally cannot do this. 114 cargo + suite 9/9 (staged_insert
+    is the 9th). PENDING: kill-9 crash test (live), publisher
+    read/emission side, tombstone gating (staged DML = R4 after V3).
+    Branch: feature/p3-staged-writes (PR next).

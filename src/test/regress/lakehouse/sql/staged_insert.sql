@@ -8,6 +8,11 @@ SELECT lakehouse.version();
 SET lakehouse.write_mode = 'staged';
 
 CREATE TABLE stg (id bigint, name text) USING lakehouse;
+CREATE FOREIGN DATA WRAPPER staged_wrapper HANDLER lakehouse.lakehouse_fdw_handler;
+CREATE SERVER unreachable_srv FOREIGN DATA WRAPPER staged_wrapper
+    OPTIONS (endpoint 'http://127.0.0.1:9', warehouse 'wh',
+             s3_endpoint 'http://s3:9000');
+CREATE USER MAPPING FOR CURRENT_USER SERVER unreachable_srv;
 SELECT lakehouse.attach_table('stg'::regclass, 'analytics.staged_offline', 'unreachable_srv');
 
 -- inserts stage locally; NO remote session is opened in staged mode
@@ -23,8 +28,8 @@ SELECT count(*) AS segments, bool_and(NOT published) AS all_unpublished
     WHERE relid = 'stg'::regclass;
 
 -- payload is a JSON array of 3 row arrays
-SELECT payload::text LIKE '[%' AND payload::text LIKE '%]' AS payload_is_json_array,
-       (length(payload::text) > 10) AS payload_has_content
+SELECT convert_from(payload,'UTF8') LIKE '[%' AS payload_is_json_array,
+       length(convert_from(payload,'UTF8')) > 10 AS payload_has_content
     FROM lakehouse.lakehouse_delta_segments
     WHERE relid = 'stg'::regclass;
 
