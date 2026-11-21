@@ -2895,7 +2895,7 @@ mod tests {
         let f =
             std::fs::File::create(dir.path().join("table").join("data").join("m.parquet")).unwrap();
         let props = parquet::file::properties::WriterProperties::builder()
-            .set_max_row_group_size(batches[0].num_rows())
+            .set_max_row_group_row_count(Some(batches[0].num_rows()))
             .build();
         let mut w =
             parquet::arrow::ArrowWriter::try_new(f, batches[0].schema(), Some(props)).unwrap();

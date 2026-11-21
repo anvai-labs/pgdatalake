@@ -1295,7 +1295,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         crate::storage::test_allow_local_stores();
         let schema = ArrowSchema::new(vec![Field::new("uid", DataType::FixedSizeBinary(16), true)]);
-        let b = FixedSizeBinaryArray::from(vec![
+        let b = FixedSizeBinaryArray::try_from(vec![
             Some(
                 {
                     let mut v = vec![0u8; 16];
@@ -1305,7 +1305,8 @@ mod tests {
                 .as_slice(),
             ),
             None,
-        ]);
+        ])
+        .unwrap();
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(b)]).unwrap();
         let f = std::fs::File::create(dir.path().join("u.parquet")).unwrap();
         let mut w = parquet::arrow::ArrowWriter::try_new(f, batch.schema(), None).unwrap();

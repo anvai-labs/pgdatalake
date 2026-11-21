@@ -377,6 +377,37 @@ Catalog metadata.json / manifest lists / manifests per snapshot-id
 them (13-review perf #1's EXPLAIN GETs); the cache makes repeated
 EXPLAIN/LIMIT genuinely GET-free under the default policy.
 
+### 6.3a Layer 2a: parquet page indexes + bloom filters through the same cache (parquet ≥ 60)
+
+**Scope decision (2026-11-21, after the parquet/arrow 60.1.0 bump).**
+arrow-rs 60 exposes the page-index machinery as first-class building
+blocks (`PageIndexBuilder`, `PageIndexProvider`, separate page-index
+decoding in 60.1, external/cached page indexes, and the
+`ParquetPushDecoder::scan_plan` read-ahead planner). These bytes are
+IMMUTABLE per file path — the §6.2 no-invalidation law covers them with
+zero new mechanism. Alignment:
+
+| Capability (parquet 60/60.1) | Fork slice | Notes |
+|---|---|---|
+| Ranged `ChunkReader` over the BlockCache — footer + column-chunk reads fetch ranges, not whole files | **P0b** (next) | the 13-review perf #1 fix; cache-backed so EXPLAIN is genuinely GET-free |
+| Page indexes fetched once and cached per (path, index-range) | **P0b2** | selective scans then prune PAGES (not just row groups) using cached indexes + §6.2's keying; range-request planning via `scan_plan` |
+| Bloom filters (eq-predicate pruning) | **M4, writer-gated** | parquet bloom filters only exist if the WRITER emits them — enabling is a writer-format decision (§6.5 below) with a downstream-decoder gate |
+| ALP floating-point encoding | **M4, writer-gated** | compact lossless fp; ENABLE only after pyiceberg + Trino decode ALP files byte-identically (60's ALP is new — downstream-reader validation is the precondition, not the default) |
+| INT96 legacy timestamp statistics conversion (60.1) | passive win | relevant to FK/legacy imports later; no fork work |
+
+Keying rule for both new byte classes: same
+`(warehouse-scope, path, range)` key as §6.2 — page indexes and bloom
+filters are byte ranges of the SAME immutable file, so they inherit the
+no-invalidation law and the LRU. No second cache, no new eviction
+policy, no stats table: the "metadata/stats cache" the reader needs IS
+the block cache plus the decoder's in-memory structures.
+
+Deliberately NOT pursued: a persistent statistics/index side store
+(duplicating what the parquet footer + page indexes already carry,
+requiring its own invalidation story). If measurement ever shows cached
+page indexes insufficient (huge tables, tiny selective slices), that is
+a re-design conversation — recorded here so it doesn't grow silently.
+
 ### 6.4 Layer 3: result cache (explicitly LAST, and smaller than it sounds)
 
 A per-instance result cache (query → rows) is only sound when keyed by
@@ -388,6 +419,34 @@ published snapshot on the table (cheap check: snapshot id compare).
 If the invalidation cost or staleness risk outstrips the benefit in
 measurement, this layer is dropped — recorded here so the ambition
 doesn't silently become a correctness hazard.
+
+### 6.5 Migration guardrails from the parquet/arrow 60 bump (2026-11-21)
+
+- arrow/parquet release in LOCKSTEP (same version number). Cargo's
+  semver ranges allow mixed resolution (parquet 60 + arrow 54) — both
+  are pinned to the same version in Cargo.toml; future bumps must move
+  them together.
+- `object_store` is NOT lockstep-bound with parquet (we own our StorageIo
+  and don't enable parquet's object-store feature) — BUT the bump is
+  SECURITY-motivated now, not feature-motivated: `cargo audit` on our
+  lock reports RUSTSEC-2026-0194 + RUSTSEC-2026-0195 (quick-xml 0.37.5
+  via object_store 0.11 — quadratic parse time and unbounded
+  namespace-allocation DoS in S3 error-XML parsing; reachable through
+  operator/user-configured S3 endpoints), and the advisory fix shipped
+  in object_store **0.14.1** (quick-xml 0.41) only. PROMOTED to
+  next-up (first slice after the parquet-60 PR): the 0.11 → 0.14
+  migration touches StorageIo for real — 0.13 moved `get`/`get_range`/
+  `head` to the `ObjectStoreExt` trait and replaced `copy`/`copy_if_not_exists`
+  with `copy_opts`; 0.14 adds CRC64NVME checksums, LocalFileSystem
+  reliable writes (close error checking + opt-in sync), read timeouts,
+  coalesced contiguous ranges, reqwest-optional/pluggable-crypto, Azure
+  CPK + delegation-key SAS caching, and S3 dual-stack endpoints. `cargo
+  audit` joins the CI Rust checks with this bump.
+- Rust toolchain floor for arrow-rs 60 is 1.88; we pin 1.100.0
+  (rust-toolchain.toml) — bump toolchain only in a noted commit.
+- Writer-gated encodings (ALP, bloom filters) follow the v3-conformance
+  rule: no file-format capability ships until the fixture-stack readers
+  (pyiceberg, Trino) decode it byte-identically.
 
 ## 7. Prerequisites & rollout (refined 2026-11-20 — verified against code)
 
