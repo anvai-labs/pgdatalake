@@ -8,6 +8,12 @@
 # M0 gate (specs/lakehouse/12-roadmap.md): build with -Ddatalake=enabled,
 # upstream regress suite green, lakehouse regress green, cargo test green,
 # docker fixtures up.
+#
+# SMART PATH FILTERING (2026-11-21): a `changes` job classifies the diff and
+# gates the heavy jobs — docs/specs-only diffs run NO code jobs (docs-sentinel
+# covers spec hygiene); Rust-only diffs skip the native build; workflow-file
+# diffs still exercise the gates that live in them (so a broken step fails
+# its own PR, as #16 proved). workflow_dispatch forces everything.
 
 name: datalake-ci
 
@@ -27,29 +33,58 @@ on:
     branches: [lakehouse-dev, main]
   workflow_dispatch:
 
+concurrency:
+  group: datalake-ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   # Keep in sync with src/backend/access/lakehouse/core/rust-toolchain.toml
   RUST_PIN: '1.100.0'
   CC: /usr/bin/gcc
 
 jobs:
-  build-and-test:
+  changes:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      native: ${{ steps.filter.outputs.native }}
+      workflow: ${{ steps.filter.outputs.workflow }}
     steps:
       - uses: actions/checkout@v4
+      - name: Classify changed paths
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            # Rust core: crate sources + manifests/lock (drives fmt/clippy/
+            # test/audit AND the backend build, which links the staticlib)
+            rust:
+              - 'src/backend/access/lakehouse/core/**'
+            # Native/backend + tests + build wiring (C code, regress suites,
+            # fixtures, meson/Makefile) — anything the .so and suites cover
+            native:
+              - 'src/**'
+              - '!src/backend/access/lakehouse/core/**'
+              - 'meson.build'
+              - 'meson_options.txt'
+              - 'src/backend/access/meson.build'
+              - 'Makefile'
+            # The workflow itself: run the gates defined in it so a broken
+            # step (e.g. an invalid flag) fails its own PR, not the next one
+            workflow:
+              - '.github/workflows/datalake-ci.yml'
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            bison flex libreadline-dev zlib1g-dev libxml2-dev \
-            libicu-dev libssl-dev libzstd-dev liblz4-dev libnuma-dev \
-            pkg-config python3-pip
-
-      - name: Install meson + ninja
-        run: pip3 install --user meson ninja
-        # keep versions conservative; meson >= 0.57.2 required by meson.build
+  rust-checks:
+    needs: changes
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      needs.changes.outputs.rust == 'true' ||
+      needs.changes.outputs.workflow == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Install pinned Rust toolchain + cbindgen
         run: |
@@ -78,6 +113,38 @@ jobs:
         # "unmaintained" transitive notices (chrono, humantime) stay
         # warnings until upstream offers fixed deps
         run: cargo audit
+
+  build-and-test:
+    needs: changes
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      needs.changes.outputs.rust == 'true' ||
+      needs.changes.outputs.native == 'true' ||
+      needs.changes.outputs.workflow == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bison flex libreadline-dev zlib1g-dev libxml2-dev \
+            libicu-dev libssl-dev libzstd-dev liblz4-dev libnuma-dev \
+            pkg-config python3-pip
+
+      - name: Install meson + ninja
+        run: pip3 install --user meson ninja
+        # keep versions conservative; meson >= 0.57.2 required by meson.build
+
+      - name: Install pinned Rust toolchain + cbindgen
+        run: |
+          rustup toolchain install "$RUST_PIN" --profile default \
+            -c clippy,rustfmt
+          cargo install cbindgen
+        env:
+          RUSTUP_TOOLCHAIN: stable
 
       - name: Bring up docker fixtures (SeaweedFS S3, Lakekeeper, Azurite, fake-gcs)
         run: make lakehouse-up
