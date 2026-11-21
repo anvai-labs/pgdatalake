@@ -45,8 +45,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ub = e.data_file.upper_bounds.get(&f.id);
     println!(
         "bounds present: lower={:?} upper={:?}",
-        lb.map(|b| b.len()),
-        ub.map(|b| b.len())
+        lb.map(std::vec::Vec::len),
+        ub.map(std::vec::Vec::len)
     );
     Ok(())
 }

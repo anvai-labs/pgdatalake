@@ -43,7 +43,7 @@ fn main() {
         "metadata.json OK: format {:?}, uuid {}, fields={}",
         md.format_version,
         md.table_uuid,
-        md.current_schema().map(|s| s.fields.len()).unwrap_or(0)
+        md.current_schema().map_or(0, |s| s.fields.len())
     );
 
     // slice 15: predicate pruning against the live table

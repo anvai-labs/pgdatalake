@@ -4,7 +4,7 @@
 //! - no Rust types cross the boundary other than opaque handles, plain C
 //!   strings, and caller-owned error buffers;
 //! - no panics unwind across the boundary — every entry point runs inside
-//!   catch_unwind and failures return NULL + a message in the caller buffer.
+//!   `catch_unwind` and failures return NULL + a message in the caller buffer.
 
 // Only module allowed to relax the crate-level `deny(unsafe_code)`: the
 // `#[no_mangle]` export below is an unsafe attribute.
@@ -33,7 +33,7 @@ fn version_cstr() -> &'static CStr {
 }
 
 /// An open planned scan; opaque handle owned by the C side, freed with
-/// pg_datalake_scan_free. File-path CStrings are precomputed so accessors
+/// `pg_datalake_scan_free`. File-path `CStrings` are precomputed so accessors
 /// return stable pointers for the session's lifetime.
 pub struct ScanSession {
     plan: ScanPlan,
@@ -232,7 +232,7 @@ pub unsafe extern "C" fn pg_datalake_scan_snapshot_id(session: *mut ScanSession)
     }
 }
 
-/// record_count of task `idx`; 0 when out of range or session NULL.
+/// `record_count` of task `idx`; 0 when out of range or session NULL.
 ///
 /// # Safety
 /// `session` must be NULL or a live handle from `pg_datalake_scan_new`.
@@ -243,8 +243,7 @@ pub unsafe extern "C" fn pg_datalake_scan_task_rows(session: *mut ScanSession, i
             .plan
             .tasks
             .get(idx as usize)
-            .map(|t| t.entry.data_file.record_count)
-            .unwrap_or(0),
+            .map_or(0, |t| t.entry.data_file.record_count),
         None => 0,
     }
 }
@@ -261,7 +260,7 @@ pub struct RowsHandle {
     /// alive for the spans) plus the flat C-facing column array.
     current_batch: Option<crate::parquet::BatchView>,
     batch_cols: Vec<PgDatalakeBatchColumn>,
-    /// backing store for pg_datalake_rows_batch_cell_text
+    /// backing store for `pg_datalake_rows_batch_cell_text`
     fallback_cell: CString,
 }
 
@@ -288,7 +287,7 @@ pub struct PgDatalakeRowBatch {
     /// batch-LOCAL positions of surviving rows (buffer indexes)
     pub live_idx: *const u32,
     /// file-absolute position of batch row 0 (tombstone/TID identity:
-    /// absolute = start_abs + live_idx[k]; position deletes are
+    /// absolute = `start_abs` + `live_idx`[k]; position deletes are
     /// file-scoped, doc 07)
     pub start_abs: u64,
     pub n_cols: u64,
@@ -329,7 +328,7 @@ fn render_row(rows: &mut crate::parquet::ParquetRows) -> Result<(Vec<CString>, V
             crate::parquet::CellValue::Str(s) => s,
             crate::parquet::CellValue::Bytes(b) => {
                 // text form: hex — typed binary Datum conversion is the FDW's job
-                b.iter().map(|x| format!("{x:02x}")).collect()
+                crate::parquet::hex_escape_bytes(&b)
             }
         };
         let cstr = CString::new(c).map_err(|_| {
@@ -347,11 +346,11 @@ fn render_row(rows: &mut crate::parquet::ParquetRows) -> Result<(Vec<CString>, V
 
 /// Open a projected row iterator over task `task_idx` of `session`.
 /// `projection` is a comma-separated column-name list (empty = all columns).
-/// Returns NULL + err_buf on failure.
+/// Returns NULL + `err_buf` on failure.
 ///
 /// # Safety
-/// Same pointer rules as pg_datalake_scan_new; `rows` returned here must be
-/// freed exactly once with pg_datalake_rows_close, and is invalid after the
+/// Same pointer rules as `pg_datalake_scan_new`; `rows` returned here must be
+/// freed exactly once with `pg_datalake_rows_close`, and is invalid after the
 /// session is freed.
 #[no_mangle]
 pub unsafe extern "C" fn pg_datalake_rows_open(
@@ -374,7 +373,10 @@ pub unsafe extern "C" fn pg_datalake_rows_open(
             serde_json::from_str(&projection)
                 .map_err(|e| format!("projection is not a JSON array: {e}"))?
         };
-        let projection: Vec<&str> = projection_owned.iter().map(|s| s.as_str()).collect();
+        let projection: Vec<&str> = projection_owned
+            .iter()
+            .map(std::string::String::as_str)
+            .collect();
         let file_path = s
             .plan
             .tasks
@@ -400,12 +402,11 @@ pub unsafe extern "C" fn pg_datalake_rows_open(
             .data_file
             .partition
             .as_ref()
-            .map(|p| match p {
+            .is_some_and(|p| match p {
                 serde_json::Value::Object(o) => !o.is_empty(),
                 serde_json::Value::Null => false,
                 _ => true,
-            })
-            .unwrap_or(false);
+            });
         let row_deletes = s
             .deletes
             .for_task(&file_path, task.sequence_number, partitioned)
@@ -454,7 +455,7 @@ pub unsafe extern "C" fn pg_datalake_rows_open(
 /// below refer to the row this selects.
 ///
 /// # Safety
-/// `rows` must be a live handle from pg_datalake_rows_open.
+/// `rows` must be a live handle from `pg_datalake_rows_open`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_datalake_rows_next(
     rows: *mut RowsHandle,
@@ -507,13 +508,13 @@ pub unsafe extern "C" fn pg_datalake_rows_next(
 /// Advance the batch cursor (M3-R1, 13-review perf #3): materialize the
 /// next arrow batch with surviving rows and fill `out` with typed
 /// per-column views plus the live-row index list. Status: 0 = batch
-/// delivered, 1 = EOF, 2 = ERROR (message in err_buf). Pointers inside
-/// `out` are valid until the next batch call or rows_close — the C
+/// delivered, 1 = EOF, 2 = ERROR (message in `err_buf`). Pointers inside
+/// `out` are valid until the next batch call or `rows_close` — the C
 /// consumer must copy any varlena it keeps. Deletes (position/equality/
-/// DV) are already applied via live_idx; the C side never sees dead rows.
+/// DV) are already applied via `live_idx`; the C side never sees dead rows.
 ///
 /// # Safety
-/// `rows` must be a live handle from pg_datalake_rows_open; `out` must
+/// `rows` must be a live handle from `pg_datalake_rows_open`; `out` must
 /// point to writable memory owned by the caller.
 #[no_mangle]
 pub unsafe extern "C" fn pg_datalake_rows_batch_next(
@@ -541,16 +542,16 @@ pub unsafe extern "C" fn pg_datalake_rows_batch_next(
                 for c in &view.cols {
                     let (values, spans) = match c.kind {
                         crate::parquet::BatchKind::Bool => (
-                            c.bools.as_ptr() as *const std::ffi::c_void,
+                            c.bools.as_ptr().cast::<std::ffi::c_void>(),
                             std::ptr::null(),
                         ),
                         crate::parquet::BatchKind::Int64
                         | crate::parquet::BatchKind::TimestampUs
                         | crate::parquet::BatchKind::Date32 => {
-                            (c.i64s.as_ptr() as *const std::ffi::c_void, std::ptr::null())
+                            (c.i64s.as_ptr().cast::<std::ffi::c_void>(), std::ptr::null())
                         }
                         crate::parquet::BatchKind::Float64 => {
-                            (c.f64s.as_ptr() as *const std::ffi::c_void, std::ptr::null())
+                            (c.f64s.as_ptr().cast::<std::ffi::c_void>(), std::ptr::null())
                         }
                         _ => (std::ptr::null(), c.spans.as_ptr()),
                     };
@@ -592,12 +593,12 @@ pub unsafe extern "C" fn pg_datalake_rows_batch_next(
 
 /// Text form of one cell of the CURRENT batch (M3-R1 fallback path): the
 /// C consumers use this for (kind, type) combinations without an exact
-/// fast mapping, feeding InputFunctionCall exactly as the old per-row
+/// fast mapping, feeding `InputFunctionCall` exactly as the old per-row
 /// path did. The bytes are identical to the per-row renderer. The
 /// returned pointer is valid until the next call on this handle.
 ///
 /// # Safety
-/// Same pointer rules as pg_datalake_rows_batch_next.
+/// Same pointer rules as `pg_datalake_rows_batch_next`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_datalake_rows_batch_cell_text(
     rows: *mut RowsHandle,
@@ -606,6 +607,7 @@ pub unsafe extern "C" fn pg_datalake_rows_batch_cell_text(
     err_buf: *mut c_char,
     err_len: usize,
 ) -> *const c_char {
+    use crate::parquet::BatchKind;
     let Some(h) = rows.as_mut() else {
         unsafe { set_err(err_buf, err_len, "NULL rows handle") };
         return std::ptr::null();
@@ -624,7 +626,6 @@ pub unsafe extern "C" fn pg_datalake_rows_batch_cell_text(
             return std::ptr::null();
         }
         let r = batch_row as usize;
-        use crate::parquet::BatchKind;
         match cview.kind {
             BatchKind::Bool => {
                 if cview.bools[r] != 0 {
@@ -646,12 +647,7 @@ pub unsafe extern "C" fn pg_datalake_rows_batch_cell_text(
             BatchKind::Bytes => {
                 let sp = &cview.spans[r];
                 let b = unsafe { std::slice::from_raw_parts(sp.ptr, sp.len as usize) };
-                let mut hex = String::with_capacity(2 + b.len() * 2);
-                hex.push_str("\\x");
-                for x in b {
-                    hex.push_str(&format!("{x:02x}"));
-                }
-                hex
+                crate::parquet::hex_escape_bytes(b)
             }
         }
     };
@@ -662,7 +658,7 @@ pub unsafe extern "C" fn pg_datalake_rows_batch_cell_text(
 /// Column count of the projection.
 ///
 /// # Safety
-/// `rows` must be a live handle from pg_datalake_rows_open.
+/// `rows` must be a live handle from `pg_datalake_rows_open`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_datalake_rows_column_count(rows: *mut RowsHandle) -> u64 {
     match rows.as_ref() {
@@ -674,7 +670,7 @@ pub unsafe extern "C" fn pg_datalake_rows_column_count(rows: *mut RowsHandle) ->
 /// Name of column `idx`; NULL when out of range.
 ///
 /// # Safety
-/// `rows` must be a live handle from pg_datalake_rows_open.
+/// `rows` must be a live handle from `pg_datalake_rows_open`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_datalake_rows_column_name(
     rows: *mut RowsHandle,
@@ -689,7 +685,7 @@ pub unsafe extern "C" fn pg_datalake_rows_column_name(
 /// Whether column `idx` of the current row is NULL.
 ///
 /// # Safety
-/// `rows` must be a live handle from pg_datalake_rows_open.
+/// `rows` must be a live handle from `pg_datalake_rows_open`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_datalake_rows_col_null(rows: *mut RowsHandle, idx: u64) -> bool {
     match rows.as_ref() {
@@ -701,7 +697,7 @@ pub unsafe extern "C" fn pg_datalake_rows_col_null(rows: *mut RowsHandle, idx: u
 /// Text form of column `idx` of the current row; NULL for NULL cells.
 ///
 /// # Safety
-/// `rows` must be a live handle from pg_datalake_rows_open.
+/// `rows` must be a live handle from `pg_datalake_rows_open`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_datalake_rows_col_text(
     rows: *mut RowsHandle,
@@ -740,7 +736,7 @@ pub unsafe extern "C" fn pg_datalake_scan_files_after_pruning(session: *mut Scan
 /// Free a rows handle. NULL is a no-op.
 ///
 /// # Safety
-/// `rows` must be NULL or a pointer returned by pg_datalake_rows_open.
+/// `rows` must be NULL or a pointer returned by `pg_datalake_rows_open`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_datalake_rows_close(rows: *mut RowsHandle) {
     if !rows.is_null() {
@@ -749,7 +745,7 @@ pub unsafe extern "C" fn pg_datalake_rows_close(rows: *mut RowsHandle) {
 }
 
 /// An open managed-append write session (M2 slice 27b): accumulates rows
-/// into the slice-24 BatchWriter and flushes/commits via session.rs's
+/// into the slice-24 `BatchWriter` and flushes/commits via session.rs's
 /// write pipeline. Opaque handle owned by the C side.
 pub struct WriteSession {
     client: crate::session::CatalogClient,
@@ -760,7 +756,7 @@ pub struct WriteSession {
     writer: crate::writer::BatchWriter,
     io: crate::storage::StorageIo,
     /// S3 keys are bucket-relative: the location's path prefix must ride
-    /// on every data-file put (write_snapshot handles its own metadata
+    /// on every data-file put (`write_snapshot` handles its own metadata
     /// keys; this covers the data files).
     key_prefix: String,
     flushed: Vec<crate::snapshot_write::NewDataFile>,
@@ -768,7 +764,7 @@ pub struct WriteSession {
     staged_rows: usize,
     /// P1 rollover threshold in bytes (0 = no rollover: single file per
     /// session, legacy behavior). The C side passes
-    /// lakehouse.target_file_size * 1024 (GUC is kB).
+    /// `lakehouse.target_file_size` * 1024 (GUC is kB).
     target_file_size_bytes: i64,
     /// measured bytes/row from the last flush — the rollover estimate
     last_avg_row_bytes: usize,
@@ -782,7 +778,7 @@ pub struct WriteSession {
 /// any failure (no panics across the FFI).
 ///
 /// # Safety
-/// All CStrings must be valid NUL-terminated pointers.
+/// All `CStrings` must be valid NUL-terminated pointers.
 #[no_mangle]
 pub unsafe extern "C" fn pg_datalake_write_new(
     endpoint: *const c_char,
@@ -876,9 +872,9 @@ pub unsafe extern "C" fn pg_datalake_write_new(
     let ns_levels: Vec<String> = ns
         .split('.')
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .collect();
-    let ns_refs: Vec<&str> = ns_levels.iter().map(|s| s.as_str()).collect();
+    let ns_refs: Vec<&str> = ns_levels.iter().map(std::string::String::as_str).collect();
 
     let client = match crate::session::CatalogClient::new(
         &endpoint,
@@ -1039,9 +1035,9 @@ pub struct DeltaRowsHandle {
     column_names: Vec<CString>,
 }
 
-/// CellValue -> text, byte-identical to render_row's match.
+/// `CellValue` -> text, byte-identical to `render_row`'s match.
 fn cell_text(v: &crate::parquet::CellValue) -> String {
-    use crate::parquet::CellValue::*;
+    use crate::parquet::CellValue::{Bool, Bytes, Float64, Int64, Null, Str, TimestampMicros};
     match v {
         Null => String::new(),
         Bool(b) => {
@@ -1055,14 +1051,7 @@ fn cell_text(v: &crate::parquet::CellValue) -> String {
         TimestampMicros(us) => crate::parquet::format_timestamp_micros(*us),
         Float64(f) => f.to_string(),
         Str(s) => s.clone(),
-        Bytes(b) => {
-            let mut hex = String::with_capacity(2 + b.len() * 2);
-            hex.push_str("\\x");
-            for x in b {
-                hex.push_str(&format!("{x:02x}"));
-            }
-            hex
-        }
+        Bytes(b) => crate::parquet::hex_escape_bytes(b),
     }
 }
 
@@ -1070,7 +1059,7 @@ fn cell_text(v: &crate::parquet::CellValue) -> String {
 /// ride in the same schema JSON the write path uses.
 /// # Safety
 /// Both C strings must be valid NUL-terminated pointers; the returned
-/// handle is freed exactly once with pg_datalake_delta_rows_close.
+/// handle is freed exactly once with `pg_datalake_delta_rows_close`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_datalake_delta_rows_open(
     payload_json: *const c_char,
@@ -1138,7 +1127,7 @@ pub unsafe extern "C" fn pg_datalake_delta_rows_open(
 }
 
 /// # Safety
-/// `h` must be a live handle from pg_datalake_delta_rows_open.
+/// `h` must be a live handle from `pg_datalake_delta_rows_open`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_datalake_delta_rows_close(h: *mut DeltaRowsHandle) {
     if !h.is_null() {
@@ -1166,24 +1155,21 @@ pub unsafe extern "C" fn pg_datalake_delta_rows_next(
     err_buf: *mut c_char,
     err_len: usize,
 ) -> i32 {
-    match unsafe { h.as_mut() } {
-        Some(d) => {
-            if d.row_pos < d.rows.len() {
-                d.row_pos += 1;
-                0
-            } else {
-                1
-            }
+    if let Some(d) = unsafe { h.as_mut() } {
+        if d.row_pos < d.rows.len() {
+            d.row_pos += 1;
+            0
+        } else {
+            1
         }
-        None => {
-            unsafe { set_err(err_buf, err_len, "delta rows: NULL handle") };
-            2
-        }
+    } else {
+        unsafe { set_err(err_buf, err_len, "delta rows: NULL handle") };
+        2
     }
 }
 
 /// # Safety
-/// `h` must be a live handle; call after a 0 from next().
+/// `h` must be a live handle; call after a 0 from `next()`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_datalake_delta_rows_col_null(
     h: *mut DeltaRowsHandle,
@@ -1192,12 +1178,11 @@ pub unsafe extern "C" fn pg_datalake_delta_rows_col_null(
     unsafe { h.as_ref() }
         .and_then(|d| d.rows.get(d.row_pos.saturating_sub(1)))
         .and_then(|r| r.get(idx as usize))
-        .map(|(_, isnull)| *isnull)
-        .unwrap_or(true)
+        .is_none_or(|(_, isnull)| *isnull)
 }
 
 /// # Safety
-/// `h` must be a live handle; call after a 0 from next().
+/// `h` must be a live handle; call after a 0 from `next()`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_datalake_delta_rows_col_text(
     h: *mut DeltaRowsHandle,
@@ -1206,15 +1191,14 @@ pub unsafe extern "C" fn pg_datalake_delta_rows_col_text(
     unsafe { h.as_ref() }
         .and_then(|d| d.rows.get(d.row_pos.saturating_sub(1)))
         .and_then(|r| r.get(idx as usize))
-        .map(|(t, _)| t.as_ptr())
-        .unwrap_or(std::ptr::null())
+        .map_or(std::ptr::null(), |(t, _)| t.as_ptr())
 }
 
 /// Publisher emission core (P4, spec 15 §4): push ONE delta segment's
 /// rows (payload = the typed row-JSON document) through the write
 /// session's accumulator and flush it as a data file. The C publisher
 /// calls this per unpublished segment on ONE write session, then
-/// pg_datalake_write_commit once — one snapshot, size-bounded files
+/// `pg_datalake_write_commit` once — one snapshot, size-bounded files
 /// (rollover active), the M3-R2 stats carried. Idempotency note (spec
 /// 15 §4.4): the caller flips the segment's ledger columns only after
 /// the commit result returns; the crash window between commitTable and
@@ -1222,7 +1206,7 @@ pub unsafe extern "C" fn pg_datalake_delta_rows_col_text(
 /// discipline.
 ///
 /// # Safety
-/// `ws` from pg_datalake_write_new; `payload_json` a valid C string.
+/// `ws` from `pg_datalake_write_new`; `payload_json` a valid C string.
 #[no_mangle]
 pub unsafe extern "C" fn pg_datalake_publish_segment(
     ws: *mut WriteSession,
@@ -1242,12 +1226,11 @@ pub unsafe extern "C" fn pg_datalake_publish_segment(
             return false;
         }
     };
-    let rows = match doc.as_array() {
-        Some(r) => r.clone(),
-        None => {
-            unsafe { set_err(err_buf, err_len, "publish segment: payload is not an array") };
-            return false;
-        }
+    let rows = if let Some(r) = doc.as_array() {
+        r.clone()
+    } else {
+        unsafe { set_err(err_buf, err_len, "publish segment: payload is not an array") };
+        return false;
     };
     for (ri, rj) in rows.iter().enumerate() {
         let cells = match crate::writer::parse_row_json(&ws.columns, rj) {
@@ -1293,7 +1276,7 @@ pub unsafe extern "C" fn pg_datalake_write_last_snapshot_id(ws: *mut WriteSessio
 }
 
 /// Initialize the global per-backend block cache capacity (spec 15
-/// §6.2/P0): called once from _PG_init with lakehouse.cache_max_bytes.
+/// §6.2/P0): called once from _`PG_init` with `lakehouse.cache_max_bytes`.
 /// First call wins (the cache is process-lifetime; no re-cap).
 ///
 /// # Safety
@@ -1304,14 +1287,14 @@ pub unsafe extern "C" fn pg_datalake_core_cache_init(max_bytes: i64) {
 }
 
 /// Set the rollover threshold (P1, spec 15 §7.2): when the buffered
-/// rows' estimated bytes reach this size, push() rolls a file — one
+/// rows' estimated bytes reach this size, `push()` rolls a file — one
 /// transaction then emits MANY size-bounded files in ONE snapshot
 /// (small-file prevention, G3). bytes <= 0 disables rollover (legacy
 /// single-file behavior). The C side passes
-/// lakehouse.target_file_size * 1024 (the GUC is kB).
+/// `lakehouse.target_file_size` * 1024 (the GUC is kB).
 ///
 /// # Safety
-/// Same pointer rules as pg_datalake_write_push.
+/// Same pointer rules as `pg_datalake_write_push`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_datalake_write_set_target_file_size(
     ws: *mut WriteSession,
@@ -1328,7 +1311,7 @@ pub unsafe extern "C" fn pg_datalake_write_set_target_file_size(
 }
 
 /// Flush the writer's buffered rows as one data file + record its
-/// manifest entry (with M3-R2 stats). Shared by pg_datalake_write_flush
+/// manifest entry (with M3-R2 stats). Shared by `pg_datalake_write_flush`
 /// and the P1 rollover in push.
 fn flush_writer_buffer(ws: &mut WriteSession) -> Result<(), String> {
     if ws.writer.num_rows() == 0 {
@@ -1389,9 +1372,9 @@ fn flush_writer_buffer(ws: &mut WriteSession) -> Result<(), String> {
     Ok(())
 }
 
-/// Flush remainder + commit the append snapshot. Returns a heap CString
+/// Flush remainder + commit the append snapshot. Returns a heap `CString`
 /// with the new metadata-location, or NULL + err. THE CALLER FREES the
-/// returned string with pg_datalake_write_commit_result_free.
+/// returned string with `pg_datalake_write_commit_result_free`.
 ///
 /// # Safety
 /// `ws` must be a live handle.
@@ -1414,7 +1397,7 @@ pub unsafe extern "C" fn pg_datalake_write_commit(
 /// the snapshot an overwrite (M2 slice 28 COW UPDATE/DELETE).
 ///
 /// # Safety
-/// `ws` must be a live handle; err_buf rules as usual.
+/// `ws` must be a live handle; `err_buf` rules as usual.
 unsafe fn commit_internal(
     ws: &mut WriteSession,
     deleted: &[crate::snapshot_write::DeletedDataFile],
@@ -1429,7 +1412,11 @@ unsafe fn commit_internal(
         unsafe { set_err(err_buf, err_len, "write commit: no rows staged") };
         return std::ptr::null_mut();
     }
-    let ns_refs: Vec<&str> = ws.namespace.iter().map(|s| s.as_str()).collect();
+    let ns_refs: Vec<&str> = ws
+        .namespace
+        .iter()
+        .map(std::string::String::as_str)
+        .collect();
     let commit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ws.client.commit_append(
             &ws.state,
@@ -1465,10 +1452,10 @@ unsafe fn commit_internal(
 /// flushed rows become ADDED files, `deleted_json` rows become DELETED
 /// manifest entries. `deleted_json` is `[["path", record_count, size],
 /// ...]` — identity of files REMOVED by this statement, as read from the
-/// base snapshot's task list. Returns/ownership like pg_datalake_write_commit.
+/// base snapshot's task list. Returns/ownership like `pg_datalake_write_commit`.
 ///
 /// # Safety
-/// Same rules as pg_datalake_write_commit.
+/// Same rules as `pg_datalake_write_commit`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_datalake_write_commit_overwrite(
     ws: *mut WriteSession,
@@ -1502,7 +1489,7 @@ pub unsafe extern "C" fn pg_datalake_write_commit_overwrite(
                     err_buf,
                     err_len,
                     &format!("overwrite commit: deleted list must be [[path,count,size],...]: {e}"),
-                )
+                );
             };
             return std::ptr::null_mut();
         }
@@ -1515,11 +1502,11 @@ pub unsafe extern "C" fn pg_datalake_write_commit_overwrite(
 /// snapshot — a concurrent writer may have moved it) using the write
 /// session's storage credentials. The path is scope-gated to the
 /// session's table root. Projection is a counted JSON array of column
-/// names, as in pg_datalake_rows_open.
+/// names, as in `pg_datalake_rows_open`.
 ///
 /// # Safety
 /// `ws` must be a live handle; the returned handle is freed exactly once
-/// with pg_datalake_rows_close.
+/// with `pg_datalake_rows_close`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_datalake_rows_open_path(
     ws: *mut WriteSession,
@@ -1547,7 +1534,10 @@ pub unsafe extern "C" fn pg_datalake_rows_open_path(
                 serde_json::from_str(&projection)
                     .map_err(|e| format!("projection is not a JSON array: {e}"))?
             };
-            let projection: Vec<&str> = projection_owned.iter().map(|s| s.as_str()).collect();
+            let projection: Vec<&str> = projection_owned
+                .iter()
+                .map(std::string::String::as_str)
+                .collect();
             let (io, key) =
                 crate::scan::open_for(&file_path, Some(&w.state.s3)).map_err(|e| e.to_string())?;
             let rows = crate::parquet::ParquetRows::open(&io, &key, &projection)
@@ -1583,7 +1573,7 @@ pub unsafe extern "C" fn pg_datalake_rows_open_path(
 /// the ORIGINAL file's size; 0 when NULL session or out of range).
 ///
 /// # Safety
-/// `session` must be NULL or a live handle from pg_datalake_scan_new.
+/// `session` must be NULL or a live handle from `pg_datalake_scan_new`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_datalake_scan_task_size(session: *mut ScanSession, idx: u64) -> i64 {
     let Some(s) = (unsafe { session.as_ref() }) else {
@@ -1592,17 +1582,16 @@ pub unsafe extern "C" fn pg_datalake_scan_task_size(session: *mut ScanSession, i
     s.plan
         .tasks
         .get(idx as usize)
-        .map(|t| t.entry.data_file.file_size_in_bytes)
-        .unwrap_or(0)
+        .map_or(0, |t| t.entry.data_file.file_size_in_bytes)
 }
 
 /// Create the remote Iceberg table from a column list (managed CREATE,
 /// slice 27c). Namespace is created if missing. Returns 0 + err on
-/// failure; on success returns a heap CString with the server-assigned
-/// metadata-location (freed via pg_datalake_write_commit_result_free).
+/// failure; on success returns a heap `CString` with the server-assigned
+/// metadata-location (freed via `pg_datalake_write_commit_result_free`).
 ///
 /// # Safety
-/// All CStrings must be valid NUL-terminated pointers.
+/// All `CStrings` must be valid NUL-terminated pointers.
 #[no_mangle]
 pub unsafe extern "C" fn pg_datalake_create_table(
     endpoint: *const c_char,
@@ -1693,7 +1682,7 @@ pub unsafe extern "C" fn pg_datalake_create_table(
     let ns_levels: Vec<String> = ns
         .split('.')
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .collect();
     let client = match crate::session::CatalogClient::new(
         &endpoint,
@@ -1710,7 +1699,7 @@ pub unsafe extern "C" fn pg_datalake_create_table(
         Ok(c) => c,
         Err(e) => return fail(format!("lakehouse create: {e}"), err_buf, err_len),
     };
-    let ns_refs: Vec<&str> = ns_levels.iter().map(|s| s.as_str()).collect();
+    let ns_refs: Vec<&str> = ns_levels.iter().map(std::string::String::as_str).collect();
     match client.create_table(&ns_refs, &table, &cols) {
         Ok(loc) => match std::ffi::CString::new(loc) {
             Ok(c) => c.into_raw(),
@@ -1727,7 +1716,7 @@ pub unsafe extern "C" fn pg_datalake_create_table(
 /// Free a commit result string.
 ///
 /// # Safety
-/// `ptr` must be NULL or a pointer returned by pg_datalake_write_commit.
+/// `ptr` must be NULL or a pointer returned by `pg_datalake_write_commit`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_datalake_write_commit_result_free(ptr: *mut c_char) {
     if !ptr.is_null() {
@@ -1740,7 +1729,7 @@ pub unsafe extern "C" fn pg_datalake_write_commit_result_free(ptr: *mut c_char) 
 /// orphan GC per doc 07 §2 ABORT).
 ///
 /// # Safety
-/// `ws` must be NULL or a live handle from pg_datalake_write_new.
+/// `ws` must be NULL or a live handle from `pg_datalake_write_new`.
 #[no_mangle]
 pub unsafe extern "C" fn pg_datalake_write_free(ws: *mut WriteSession) {
     if !ws.is_null() {
@@ -1760,7 +1749,7 @@ mod tests {
     }
 
     /// End-to-end FFI test over an in-process mock catalog + local store:
-    /// scan_new -> task accessors -> free (RULES §4 panic-free boundary).
+    /// `scan_new` -> task accessors -> free (RULES §4 panic-free boundary).
     #[test]
     fn ffi_scan_roundtrip_with_mock_catalog() {
         use apache_avro::types::{Record, Value};
@@ -2139,8 +2128,7 @@ mod tests {
             });
             let mut ids = Vec::new();
             let mut next_err = [0i8; 1024];
-            while unsafe { pg_datalake_rows_next(rows, next_err.as_mut_ptr() as *mut _, 1024) } == 0
-            {
+            while unsafe { pg_datalake_rows_next(rows, next_err.as_mut_ptr().cast(), 1024) } == 0 {
                 let n = unsafe { pg_datalake_rows_column_count(rows) };
                 assert_eq!(n, 1);
                 let v = unsafe { pg_datalake_rows_col_text(rows, 0) };
@@ -2253,14 +2241,19 @@ mod tests {
         assert!(!msg.is_empty(), "error buffer populated");
     }
     /// TDD anchor (M2 slice 27b-i): the FFI WRITE path end-to-end against
-    /// the mock catalog — write_new -> push rows -> write_commit (mock
+    /// the mock catalog — `write_new` -> push rows -> `write_commit` (mock
     /// captures the commitTable body: requirements pin the base, updates
-    /// carry the AddSnapshot + SetSnapshotRef) -> the captured snapshot is
-    /// merged into the on-disk metadata -> pg_datalake_scan_new reads OUR
+    /// carry the `AddSnapshot` + `SetSnapshotRef`) -> the captured snapshot is
+    /// merged into the on-disk metadata -> `pg_datalake_scan_new` reads OUR
     /// OWN written rows back. Write->commit->read, full circle, no
     /// external engine.
     #[test]
     fn ffi_write_commit_read_back_with_mock_catalog() {
+        fn errmsg(err: &[c_char]) -> String {
+            unsafe { CStr::from_ptr(err.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        }
         let dir = tempfile::tempdir().unwrap();
         crate::storage::test_allow_local_stores();
         std::fs::create_dir_all(dir.path().join("table").join("metadata")).unwrap();
@@ -2328,11 +2321,6 @@ mod tests {
         let table = CString::new("events").unwrap();
         let schema_json = CString::new(r#"[{"name": "id", "type": "long"}]"#).unwrap();
         let mut err = [0 as c_char; 1024];
-        fn errmsg(err: &[c_char]) -> String {
-            unsafe { CStr::from_ptr(err.as_ptr()) }
-                .to_string_lossy()
-                .into_owned()
-        }
 
         let ws = unsafe {
             pg_datalake_write_new(
@@ -2472,8 +2460,7 @@ mod tests {
             assert!(!rows.is_null(), "rows_open: {}", errmsg(&err));
             let mut ids = Vec::new();
             let mut next_err = [0i8; 1024];
-            while unsafe { pg_datalake_rows_next(rows, next_err.as_mut_ptr() as *mut _, 1024) } == 0
-            {
+            while unsafe { pg_datalake_rows_next(rows, next_err.as_mut_ptr().cast(), 1024) } == 0 {
                 let v = unsafe { pg_datalake_rows_col_text(rows, 0) };
                 ids.push(unsafe { CStr::from_ptr(v) }.to_string_lossy().into_owned());
             }
@@ -2579,7 +2566,7 @@ mod tests {
             fallback_cell: CString::new("").unwrap_or_default(),
         }));
         let mut err = [0i8; 1024];
-        let st = unsafe { pg_datalake_rows_next(h, err.as_mut_ptr() as *mut _, 1024) };
+        let st = unsafe { pg_datalake_rows_next(h, err.as_mut_ptr().cast(), 1024) };
         assert_eq!(st, 2, "NUL value must be ERROR status, got {st}");
         let msg = unsafe { CStr::from_ptr(err.as_ptr()) }.to_string_lossy();
         assert!(
@@ -2589,8 +2576,8 @@ mod tests {
         unsafe { drop(Box::from_raw(h)) };
     }
 
-    /// 13-review #8: LargeUtf8 columns decode — downcasting them to
-    /// StringArray silently produced SQL NULL.
+    /// 13-review #8: `LargeUtf8` columns decode — downcasting them to
+    /// `StringArray` silently produced SQL NULL.
     #[test]
     fn large_utf8_decodes() {
         use arrow::array::{ArrayRef, LargeStringArray};
@@ -2636,7 +2623,7 @@ mod tests {
         }));
         let mut err = [0i8; 1024];
         assert_eq!(
-            unsafe { pg_datalake_rows_next(h, err.as_mut_ptr() as *mut _, 1024) },
+            unsafe { pg_datalake_rows_next(h, err.as_mut_ptr().cast(), 1024) },
             0,
             "row status"
         );
@@ -2649,12 +2636,17 @@ mod tests {
         unsafe { drop(Box::from_raw(h)) };
     }
 
-    /// COW rewrite plumbing (M2 slice 28): rows_open_path re-reads a BASE
+    /// COW rewrite plumbing (M2 slice 28): `rows_open_path` re-reads a BASE
     /// snapshot file through the write session's credentials, scope-gated
-    /// to the table root; commit_overwrite emits the overwrite snapshot
+    /// to the table root; `commit_overwrite` emits the overwrite snapshot
     /// with the deleted file's identity.
     #[test]
     fn ffi_rows_open_path_and_overwrite_commit() {
+        fn errmsg(err: &[c_char]) -> String {
+            unsafe { CStr::from_ptr(err.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        }
         let dir = tempfile::tempdir().unwrap();
         crate::storage::test_allow_local_stores();
         let location = format!("file://{}", dir.path().join("table").display());
@@ -2785,11 +2777,6 @@ mod tests {
         let table = CString::new("events").unwrap();
         let schema_json = CString::new(r#"[{"name": "id", "type": "long"}]"#).unwrap();
         let mut err = [0 as c_char; 1024];
-        fn errmsg(err: &[c_char]) -> String {
-            unsafe { CStr::from_ptr(err.as_ptr()) }
-                .to_string_lossy()
-                .into_owned()
-        }
 
         let ws = unsafe {
             pg_datalake_write_new(
@@ -2824,7 +2811,7 @@ mod tests {
             };
             assert!(!rows.is_null(), "rows_open_path: {}", errmsg(&err));
             let mut got = |h: *mut RowsHandle| -> i64 {
-                let st = unsafe { pg_datalake_rows_next(h, err.as_mut_ptr() as *mut _, err.len()) };
+                let st = unsafe { pg_datalake_rows_next(h, err.as_mut_ptr().cast(), err.len()) };
                 assert_eq!(st, 0, "row expected, status {st}: {}", errmsg(&err));
                 unsafe { CStr::from_ptr(pg_datalake_rows_col_text(h, 0)) }
                     .to_string_lossy()
@@ -2833,7 +2820,7 @@ mod tests {
             };
             assert_eq!(got(rows), 1);
             assert_eq!(got(rows), 2);
-            let st = unsafe { pg_datalake_rows_next(rows, err.as_mut_ptr() as *mut _, err.len()) };
+            let st = unsafe { pg_datalake_rows_next(rows, err.as_mut_ptr().cast(), err.len()) };
             assert_eq!(st, 1, "EOF");
             unsafe { pg_datalake_rows_close(rows) };
 
@@ -2853,8 +2840,7 @@ mod tests {
         }
 
         // commit_overwrite: deleted identity travels to the snapshot
-        let deleted_json =
-            CString::new(format!(r#"[["{}", 2, {}]]"#, data_path, data_size)).unwrap();
+        let deleted_json = CString::new(format!(r#"[["{data_path}", 2, {data_size}]]"#)).unwrap();
         let loc = unsafe {
             pg_datalake_write_commit_overwrite(
                 ws,
@@ -2885,7 +2871,7 @@ mod tests {
 
     /// Build a local multi-type table + mock catalog; returns (session,
     /// endpoint). Caller frees the session. Modelled on
-    /// ffi_scan_roundtrip_with_mock_catalog (slice 20 harness).
+    /// `ffi_scan_roundtrip_with_mock_catalog` (slice 20 harness).
     fn batch_fixture(
         dir: &tempfile::TempDir,
         fields_json: &str,
@@ -3289,7 +3275,8 @@ mod tests {
         });
 
         let mut rb: PgDatalakeRowBatch = unsafe { std::mem::zeroed() };
-        let st = unsafe { pg_datalake_rows_batch_next(rows, &mut rb, err.as_mut_ptr(), err.len()) };
+        let st =
+            unsafe { pg_datalake_rows_batch_next(rows, &raw mut rb, err.as_mut_ptr(), err.len()) };
         assert_eq!(st, 0, "first batch: {:?}", unsafe {
             CStr::from_ptr(err.as_ptr()).to_string_lossy()
         });
@@ -3312,15 +3299,15 @@ mod tests {
         assert_eq!(s_nulls, &[0, 1, 0]);
 
         // widened int32 buffer
-        let i4 = unsafe { std::slice::from_raw_parts(cols[1].values as *const i64, 3) };
+        let i4 = unsafe { std::slice::from_raw_parts(cols[1].values.cast::<i64>(), 3) };
         assert_eq!(i4, &[10, 20, 30]);
-        let i8 = unsafe { std::slice::from_raw_parts(cols[2].values as *const i64, 3) };
+        let i8 = unsafe { std::slice::from_raw_parts(cols[2].values.cast::<i64>(), 3) };
         assert_eq!(i8, &[1, 2, 3]);
-        let f8 = unsafe { std::slice::from_raw_parts(cols[3].values as *const f64, 3) };
+        let f8 = unsafe { std::slice::from_raw_parts(cols[3].values.cast::<f64>(), 3) };
         assert_eq!(f8, &[1.5, 2.5, 3.5]);
-        let ts = unsafe { std::slice::from_raw_parts(cols[5].values as *const i64, 3) };
+        let ts = unsafe { std::slice::from_raw_parts(cols[5].values.cast::<i64>(), 3) };
         assert_eq!(ts, &[1_600_000_000_000_000i64; 3]);
-        let d32 = unsafe { std::slice::from_raw_parts(cols[7].values as *const i64, 3) };
+        let d32 = unsafe { std::slice::from_raw_parts(cols[7].values.cast::<i64>(), 3) };
         assert_eq!(d32, &[19000, 19001, 19002]);
 
         // text spans (zero-copy) + binary spans incl. EMPTY NON-NULL and
@@ -3359,13 +3346,14 @@ mod tests {
         );
 
         // second call: EOF
-        let st = unsafe { pg_datalake_rows_batch_next(rows, &mut rb, err.as_mut_ptr(), err.len()) };
+        let st =
+            unsafe { pg_datalake_rows_batch_next(rows, &raw mut rb, err.as_mut_ptr(), err.len()) };
         assert_eq!(st, 1, "EOF after the single batch");
         unsafe { pg_datalake_rows_close(rows) };
         unsafe { pg_datalake_scan_free(session) };
     }
 
-    /// Batches advance across the reader's RecordBatch boundaries
+    /// Batches advance across the reader's `RecordBatch` boundaries
     /// (arrow-rs yields up to 1024 rows per batch, merging row groups);
     /// a position delete must die in whichever batch holds its absolute
     /// position, and live indices are batch-local (never misread).
@@ -3412,17 +3400,19 @@ mod tests {
         });
 
         let mut rb: PgDatalakeRowBatch = unsafe { std::mem::zeroed() };
-        let st = unsafe { pg_datalake_rows_batch_next(rows, &mut rb, err.as_mut_ptr(), err.len()) };
+        let st =
+            unsafe { pg_datalake_rows_batch_next(rows, &raw mut rb, err.as_mut_ptr(), err.len()) };
         assert_eq!(st, 0);
         assert_eq!(rb.rows, 1024, "first reader batch");
         assert_eq!(rb.live_count, 1024);
         let live = unsafe { std::slice::from_raw_parts(rb.live_idx, 2) };
         assert_eq!(&live[..2], &[0, 1]);
         let cols = unsafe { std::slice::from_raw_parts(rb.cols, 1) };
-        let ids = unsafe { std::slice::from_raw_parts(cols[0].values as *const i64, 2) };
+        let ids = unsafe { std::slice::from_raw_parts(cols[0].values.cast::<i64>(), 2) };
         assert_eq!(ids, &[1, 2]);
 
-        let st = unsafe { pg_datalake_rows_batch_next(rows, &mut rb, err.as_mut_ptr(), err.len()) };
+        let st =
+            unsafe { pg_datalake_rows_batch_next(rows, &raw mut rb, err.as_mut_ptr(), err.len()) };
         assert_eq!(st, 0);
         assert_eq!(rb.rows, 1024, "second reader batch");
         assert_eq!(
@@ -3437,22 +3427,24 @@ mod tests {
         );
         assert_eq!(*live.last().unwrap(), 1023);
         let cols = unsafe { std::slice::from_raw_parts(rb.cols, 1) };
-        let ids = unsafe { std::slice::from_raw_parts(cols[0].values as *const i64, 2) };
+        let ids = unsafe { std::slice::from_raw_parts(cols[0].values.cast::<i64>(), 2) };
         assert_eq!(ids[0], 1025, "dead row's raw buffer slot still holds 1025");
         assert_eq!(ids[1], 1026);
 
-        let st = unsafe { pg_datalake_rows_batch_next(rows, &mut rb, err.as_mut_ptr(), err.len()) };
+        let st =
+            unsafe { pg_datalake_rows_batch_next(rows, &raw mut rb, err.as_mut_ptr(), err.len()) };
         assert_eq!(st, 0, "third batch (46 remaining rows)");
         assert_eq!(rb.rows, 2, "2050 - 2*1024 = 2");
         assert_eq!(rb.live_count, 2);
 
-        let st = unsafe { pg_datalake_rows_batch_next(rows, &mut rb, err.as_mut_ptr(), err.len()) };
+        let st =
+            unsafe { pg_datalake_rows_batch_next(rows, &raw mut rb, err.as_mut_ptr(), err.len()) };
         assert_eq!(st, 1, "EOF");
         unsafe { pg_datalake_rows_close(rows) };
         unsafe { pg_datalake_scan_free(session) };
     }
 
-    /// The render_row law carries over: interior NUL in a TEXT column is a
+    /// The `render_row` law carries over: interior NUL in a TEXT column is a
     /// loud batch error, never a truncated string (a silent truncation
     /// would fabricate a value).
     #[test]
@@ -3490,7 +3482,8 @@ mod tests {
         });
 
         let mut rb: PgDatalakeRowBatch = unsafe { std::mem::zeroed() };
-        let st = unsafe { pg_datalake_rows_batch_next(rows, &mut rb, err.as_mut_ptr(), err.len()) };
+        let st =
+            unsafe { pg_datalake_rows_batch_next(rows, &raw mut rb, err.as_mut_ptr(), err.len()) };
         assert_eq!(st, 2, "loud ERROR, not a batch");
         let msg = unsafe { CStr::from_ptr(err.as_ptr()) }.to_string_lossy();
         assert!(msg.contains("interior NUL"), "error names the cause: {msg}");
@@ -3506,6 +3499,11 @@ mod tests {
     /// was inert on every PG-written table (conservative keep forever).
     #[test]
     fn ffi_write_commit_stats_prune_predicate() {
+        fn errmsg2(err: &[c_char]) -> String {
+            unsafe { CStr::from_ptr(err.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        }
         let dir = tempfile::tempdir().unwrap();
         crate::storage::test_allow_local_stores();
         std::fs::create_dir_all(dir.path().join("table").join("data")).unwrap();
@@ -3564,11 +3562,6 @@ mod tests {
         let table = CString::new("events").unwrap();
         let schema_json = CString::new(r#"[{"name": "id", "type": "long"}]"#).unwrap();
         let mut err = [0 as c_char; 1024];
-        fn errmsg2(err: &[c_char]) -> String {
-            unsafe { CStr::from_ptr(err.as_ptr()) }
-                .to_string_lossy()
-                .into_owned()
-        }
 
         let ws = unsafe {
             pg_datalake_write_new(
@@ -3701,10 +3694,15 @@ mod tests {
     /// threshold — one transaction emitting MANY size-bounded files in
     /// ONE append snapshot (small-file prevention, G3). With a 1-byte
     /// threshold every push rolls a file: 6 rows -> 6 files, each with
-    /// exact record_count and per-file bounds, committed as ONE
+    /// exact `record_count` and per-file bounds, committed as ONE
     /// snapshot; read-back sees all 6 rows.
     #[test]
     fn ffi_write_commit_rollover_multi_file() {
+        fn errmsg3(err: &[c_char]) -> String {
+            unsafe { CStr::from_ptr(err.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        }
         let dir = tempfile::tempdir().unwrap();
         crate::storage::test_allow_local_stores();
         std::fs::create_dir_all(dir.path().join("table").join("data")).unwrap();
@@ -3763,11 +3761,6 @@ mod tests {
         let table = CString::new("events").unwrap();
         let schema_json = CString::new(r#"[{"name": "id", "type": "long"}]"#).unwrap();
         let mut err = [0 as c_char; 1024];
-        fn errmsg3(err: &[c_char]) -> String {
-            unsafe { CStr::from_ptr(err.as_ptr()) }
-                .to_string_lossy()
-                .into_owned()
-        }
 
         let ws = unsafe {
             pg_datalake_write_new(
@@ -4028,7 +4021,7 @@ mod tests {
         assert_eq!(unsafe { pg_datalake_delta_rows_column_count(h) }, 2);
         for (id, name) in [("1", "a"), ("2", ""), ("3", "c")] {
             assert_eq!(
-                unsafe { pg_datalake_delta_rows_next(h, err.as_mut_ptr() as *mut _, 1024) },
+                unsafe { pg_datalake_delta_rows_next(h, err.as_mut_ptr().cast(), 1024) },
                 0
             );
             let got_id = unsafe { CStr::from_ptr(pg_datalake_delta_rows_col_text(h, 0)) }
@@ -4045,7 +4038,7 @@ mod tests {
             }
         }
         assert_eq!(
-            unsafe { pg_datalake_delta_rows_next(h, err.as_mut_ptr() as *mut _, 1024) },
+            unsafe { pg_datalake_delta_rows_next(h, err.as_mut_ptr().cast(), 1024) },
             1,
             "EOF"
         );

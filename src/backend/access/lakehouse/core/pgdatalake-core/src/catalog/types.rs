@@ -1,6 +1,6 @@
 //! Wire types for the Iceberg REST catalog spec (specs/lakehouse/03-catalog.md §2).
 //!
-//! M1 slice 1: `GET /v1/config`. Field names follow the Iceberg REST OpenAPI
+//! M1 slice 1: `GET /v1/config`. Field names follow the Iceberg REST `OpenAPI`
 //! spec exactly (serde rename where rust idioms differ).
 
 use serde::Deserialize;
@@ -26,7 +26,7 @@ mod tests {
     use super::*;
 
     /// TDD anchor (M1 slice 1): a spec-shaped `GET /v1/config` response parses
-    /// into CatalogConfig with defaults/overrides intact.
+    /// into `CatalogConfig` with defaults/overrides intact.
     #[test]
     fn catalog_config_from_json_parses_defaults_and_overrides() {
         let json = r#"{

@@ -1,4 +1,4 @@
-//! OAuth2 client-credentials token provider (specs/lakehouse/03-catalog.md §2).
+//! `OAuth2` client-credentials token provider (specs/lakehouse/03-catalog.md §2).
 //!
 //! Iceberg REST spec token endpoint: `POST /v1/oauth/tokens` with
 //! form-encoded `grant_type=client_credentials`, `client_id`,
@@ -35,7 +35,7 @@ struct CachedToken {
     ttl: Duration,
 }
 
-/// OAuth2 client-credentials provider; implements [`TokenProvider`].
+/// `OAuth2` client-credentials provider; implements [`TokenProvider`].
 pub struct OAuth2ClientCredentials {
     token_endpoint: String,
     client_id: String,
@@ -56,6 +56,7 @@ pub struct OAuth2Builder {
 }
 
 impl OAuth2ClientCredentials {
+    #[must_use]
     pub fn builder() -> OAuth2Builder {
         OAuth2Builder {
             token_endpoint: String::new(),
@@ -69,6 +70,7 @@ impl OAuth2ClientCredentials {
 
 impl OAuth2Builder {
     /// Full URL of the token endpoint, e.g. `{endpoint}/v1/oauth/tokens`.
+    #[must_use]
     pub fn token_endpoint(mut self, url: String) -> Self {
         self.token_endpoint = url;
         self
@@ -76,6 +78,7 @@ impl OAuth2Builder {
 
     /// Client id and secret (sent form-encoded per the Iceberg REST spec;
     /// Basic-auth profiles are added as profile data in a later slice).
+    #[must_use]
     pub fn client_id(mut self, id: &str, secret: &str) -> Self {
         self.client_id = id.to_string();
         self.client_secret = secret.to_string();
@@ -83,12 +86,14 @@ impl OAuth2Builder {
     }
 
     /// Optional OAuth scope.
+    #[must_use]
     pub fn scope(mut self, scope: &str) -> Self {
         self.scope = Some(scope.to_string());
         self
     }
 
     /// Fraction of TTL after which a refresh happens (default 0.8).
+    #[must_use]
     pub fn refresh_after_fraction(mut self, fraction: f64) -> Self {
         self.refresh_fraction = fraction.clamp(0.0, 1.0);
         self
@@ -172,7 +177,7 @@ impl TokenProvider for OAuth2ClientCredentials {
                 }
             }
         }
-        Ok(state.as_ref().map(|c| c.token.clone()).unwrap_or_default())
+        Ok(state.as_ref().map_or_default(|c| c.token.clone()))
     }
 }
 

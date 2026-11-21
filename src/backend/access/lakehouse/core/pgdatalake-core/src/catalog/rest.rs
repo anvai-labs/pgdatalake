@@ -1,8 +1,8 @@
 //! REST catalog client (specs/lakehouse/03-catalog.md §2, tier 1).
 //!
 //! M1 slice 1: `GET /v1/config`. Auth model: bearer token from a
-//! `TokenProvider` (OAuth2 client-credentials flow with proactive refresh
-//! lands in the next slice; SigV4 profiles after that).
+//! `TokenProvider` (`OAuth2` client-credentials flow with proactive refresh
+//! lands in the next slice; `SigV4` profiles after that).
 
 use std::time::Duration;
 
@@ -30,6 +30,7 @@ impl TokenProvider for StaticToken {
 /// Mask anything credential-shaped in a URL before it lands in an error
 /// message (13-review #6): userinfo (`user:pass@`) and query VALUES are
 /// redacted; scheme/host/path stay for diagnosis.
+#[must_use]
 pub fn redact_url(url: &str) -> String {
     let (base, query) = match url.split_once('?') {
         Some((b, q)) => (b, Some(q)),
@@ -84,7 +85,7 @@ fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
         } else {
             attempt.error(format!(
                 "catalog redirect crosses origins: {} -> {} (refused)",
-                redact_url(prev.as_ref().map(|u| u.as_str()).unwrap_or_default()),
+                redact_url(prev.as_ref().map_or_default(reqwest::Url::as_str)),
                 redact_url(target.as_str())
             ))
         }
@@ -97,7 +98,7 @@ pub struct RestCatalog {
     pub(crate) tokens: Box<dyn TokenProvider>,
     pub(crate) inner: reqwest::blocking::Client,
     /// Table-route prefix from the config response (`overrides.prefix` in
-    /// the Iceberg REST spec); set via with_prefix() or fetch_config().
+    /// the Iceberg REST spec); set via `with_prefix()` or `fetch_config()`.
     pub(crate) prefix: std::sync::Mutex<Option<String>>,
 }
 
@@ -116,9 +117,9 @@ pub enum RestError {
     /// 404 from loadTable/dropTable etc. — distinct because the caller can
     /// react (doc 03 §5: remote table deleted under us → rel invalid).
     NotFound(String),
-    /// commitTable returned 409 CommitFailedException — a requirement we
+    /// commitTable returned 409 `CommitFailedException` — a requirement we
     /// sent failed server-side (concurrent commit won). The ONLY retryable
-    /// error class (doc 03 §5): commit_with_retry re-plans from a fresh
+    /// error class (doc 03 §5): `commit_with_retry` re-plans from a fresh
     /// loadTable; everything else aborts the transaction.
     Conflict(String),
     Decode(String),
@@ -154,7 +155,8 @@ impl RestCatalog {
     }
 
     /// Set the table-route prefix explicitly (normally stored automatically
-    /// by fetch_config from the response's `overrides.prefix`).
+    /// by `fetch_config` from the response's `overrides.prefix`).
+    #[must_use]
     pub fn with_prefix(self, prefix: &str) -> Self {
         *self.prefix.lock().expect("prefix mutex poisoned") = Some(prefix.to_string());
         self
@@ -179,7 +181,7 @@ impl RestCatalog {
         let url = format!(
             "{}/v1{}/namespaces/{ns}/tables/{}",
             self.endpoint,
-            prefix.as_ref().map(|p| format!("/{p}")).unwrap_or_default(),
+            prefix.as_ref().map_or_default(|p| format!("/{p}")),
             urlencoding::encode(table),
         );
         let resp = self
@@ -216,13 +218,13 @@ impl RestCatalog {
         let prefix = self.prefix.lock().expect("prefix mutex poisoned").clone();
         let ns_json = namespace
             .iter()
-            .map(|c| format!("\"{}\"", c))
+            .map(|c| format!("\"{c}\""))
             .collect::<Vec<_>>()
             .join(",");
         let url = format!(
             "{}/v1{}/namespaces",
             self.endpoint,
-            prefix.as_ref().map(|p| format!("/{p}")).unwrap_or_default()
+            prefix.as_ref().map_or_default(|p| format!("/{p}"))
         );
         let body = format!("{{\"namespace\": [{ns_json}]}}");
         let resp = self
@@ -270,7 +272,7 @@ impl RestCatalog {
         let url = format!(
             "{}/v1{}/namespaces/{ns}/tables",
             self.endpoint,
-            prefix.as_ref().map(|p| format!("/{p}")).unwrap_or_default()
+            prefix.as_ref().map_or_default(|p| format!("/{p}"))
         );
         let payload = serde_json::json!({
             "name": table,
@@ -322,7 +324,8 @@ impl RestCatalog {
     pub fn fetch_config(&self, warehouse: Option<&str>) -> Result<CatalogConfig, RestError> {
         let mut url = format!("{}/v1/config", self.endpoint);
         if let Some(w) = warehouse {
-            url.push_str(&format!("?warehouse={}", urlencoding::encode(w)));
+            use std::fmt::Write as _;
+            let _ = write!(url, "?warehouse={}", urlencoding::encode(w));
         }
         let resp = self
             .inner
@@ -504,7 +507,7 @@ mod tests {
 
     /// loadTable (doc 03 §2): GET /v1/{prefix}/namespaces/{ns}/tables/{tbl}
     /// with namespace levels joined by %1F and components URL-encoded; the
-    /// catalog prefix comes from the config response (fetch_config stores it).
+    /// catalog prefix comes from the config response (`fetch_config` stores it).
     #[test]
     fn load_table_builds_spec_path_and_parses_result() {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();

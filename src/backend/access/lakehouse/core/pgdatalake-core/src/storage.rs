@@ -1,6 +1,6 @@
 //! Object-store file IO (specs/lakehouse/01-architecture.md layer 1,
 //! doc 04-storage.md). Slice 4: location parsing + metadata.json fetch over
-//! any object_store backend (local for tests, S3/SeaweedFS in fixtures;
+//! any `object_store` backend (local for tests, S3/SeaweedFS in fixtures;
 //! ADLS/GCS land in M3). Blocking surface: the C glue is synchronous, so a
 //! shared single-thread tokio runtime lives behind these calls.
 
@@ -10,7 +10,7 @@ use object_store::{ObjectStore, PutPayload};
 
 use crate::catalog::metadata::TableMetadata;
 
-/// Errors surfaced to the C glue; NotFound is distinct (doc 03 §5).
+/// Errors surfaced to the C glue; `NotFound` is distinct (doc 03 §5).
 #[derive(Debug)]
 pub enum StorageError {
     NotFound(String),
@@ -55,7 +55,7 @@ pub enum Location {
 
 /// Parsed location: scheme + bucket/key. For S3 the key is the FULL path
 /// from the bucket root (Iceberg locations are absolute within the bucket);
-/// for Local the root is the directory prefix and get_bytes() keys are
+/// for Local the root is the directory prefix and `get_bytes()` keys are
 /// relative to it.
 pub fn parse_location(loc: &str) -> Result<Location, StorageError> {
     if let Some(rest) = loc.strip_prefix("s3://") {
@@ -102,6 +102,7 @@ pub struct S3Options {
 
 impl S3Options {
     /// Keys per the Iceberg REST config conventions (`s3.*`).
+    #[must_use]
     pub fn from_config(cfg: &std::collections::BTreeMap<String, String>) -> Self {
         Self {
             endpoint: cfg.get("s3.endpoint").cloned(),
@@ -110,8 +111,7 @@ impl S3Options {
             secret_access_key: cfg.get("s3.secret-access-key").cloned(),
             path_style: cfg
                 .get("s3.path-style-access")
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(true),
+                .is_none_or(|v| v == "true" || v == "1"),
         }
     }
 }
@@ -157,7 +157,7 @@ pub fn test_allow_local_stores() {
 /// http:// endpoints (fixture stores). TLS-only otherwise — no endpoint
 /// configured means AWS, never plaintext.
 fn s3_allow_http(endpoint: Option<&str>) -> bool {
-    endpoint.map(|e| e.starts_with("http://")).unwrap_or(false)
+    endpoint.is_some_and(|e| e.starts_with("http://"))
 }
 
 fn runtime() -> &'static tokio::runtime::Runtime {
@@ -190,15 +190,12 @@ impl StorageIo {
                 // 13-review #6: ambient cloud credential fallback is
                 // removed — no static keys means a loud config error
                 // (pointing at the user mapping), never an IMDS probe.
-                let (ak, sk) = match (&opts.access_key_id, &opts.secret_access_key) {
-                    (Some(k), Some(sec)) => (k, sec),
-                    _ => {
-                        return Err(StorageError::Config(
-                            "static S3 credentials missing: set s3_access_key/s3_secret_key \
-                             on the user mapping (ambient cloud-credential fallback is disabled)"
-                                .into(),
-                        ));
-                    }
+                let (Some(ak), Some(sk)) = (&opts.access_key_id, &opts.secret_access_key) else {
+                    return Err(StorageError::Config(
+                        "static S3 credentials missing: set s3_access_key/s3_secret_key \
+                         on the user mapping (ambient cloud-credential fallback is disabled)"
+                            .into(),
+                    ));
                 };
                 let mut b = object_store::aws::AmazonS3Builder::new()
                     .with_bucket_name(bucket)
@@ -220,7 +217,7 @@ impl StorageIo {
             // lands with remote-profile slices
             Location::Http { url } => Box::new(
                 object_store::http::HttpBuilder::new()
-                    .with_url(url.to_string())
+                    .with_url(url.clone())
                     .build()
                     .map_err(|e| StorageError::Config(e.to_string()))?,
             ),
@@ -240,16 +237,16 @@ impl StorageIo {
             ),
             Location::Http { url } => format!("http:{url}"),
         };
-        Ok(Self { store, scope_id })
+        Ok(Self { scope_id, store })
     }
 
-    fn full_path(&self, key: &str) -> object_store::path::Path {
+    fn full_path(key: &str) -> object_store::path::Path {
         object_store::path::Path::from(key)
     }
 
-    /// GET one object as bytes; 404s map to StorageError::NotFound.
+    /// GET one object as bytes; 404s map to `StorageError::NotFound`.
     pub fn get_bytes(&self, key: &str) -> Result<Vec<u8>, StorageError> {
-        let path = self.full_path(key);
+        let path = Self::full_path(key);
         match runtime().block_on(self.store.get(&path)) {
             Ok(res) => {
                 let bytes = runtime()
@@ -268,10 +265,10 @@ impl StorageIo {
     /// §6.2): the read-side prerequisite for footer-driven reads and the
     /// block cache. Byte-identity contract: the returned bytes MUST
     /// equal `&get_bytes(key)[offset..offset+len]` (tested). Out-of-range
-    /// is an Http error from object_store, surfaced as-is.
+    /// is an Http error from `object_store`, surfaced as-is.
     pub fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>, StorageError> {
         use object_store::{GetOptions, GetRange};
-        let path = self.full_path(key);
+        let path = Self::full_path(key);
         let opts = GetOptions {
             range: Some(GetRange::Bounded({
                 let o = offset as usize;
@@ -298,7 +295,7 @@ impl StorageIo {
     /// fixture example can verify the roundtrip).
     #[allow(dead_code)]
     pub fn put_bytes(&self, key: &str, data: Vec<u8>) -> Result<(), StorageError> {
-        let path = self.full_path(key);
+        let path = Self::full_path(key);
         runtime()
             .block_on(self.store.put(&path, PutPayload::from_bytes(data.into())))
             .map_err(|e| StorageError::Http(e.to_string()))?;
@@ -346,15 +343,14 @@ mod tests {
     /// 13-review #6: file:// object stores are refused unless explicitly
     /// opted in — and the opt-in API is cfg(test) only, so the shipped
     /// binary structurally cannot open catalog/manifest-supplied local
-    /// paths. (The gate is tested directly on open_local_store so the
+    /// paths. (The gate is tested directly on `open_local_store` so the
     /// process-global monotonic flag never races parallel tests.)
     #[test]
     fn file_store_requires_explicit_opt_in() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_string_lossy().into_owned();
-        let err = match open_local_store(&root, false) {
-            Err(e) => e,
-            Ok(_) => panic!("local store must be refused without opt-in"),
+        let Err(err) = open_local_store(&root, false) else {
+            panic!("local store must be refused without opt-in")
         };
         assert!(
             matches!(err, StorageError::Config(ref m) if m.contains("explicit opt-in")),
@@ -373,9 +369,8 @@ mod tests {
             bucket: "warehouse".into(),
             key: "t/metadata/x.json".into(),
         };
-        let err = match StorageIo::open(&loc, Some(&S3Options::default())) {
-            Err(e) => e,
-            Ok(_) => panic!("missing static keys must fail"),
+        let Err(err) = StorageIo::open(&loc, Some(&S3Options::default())) else {
+            panic!("missing static keys must fail")
         };
         assert!(
             matches!(err, StorageError::Config(ref m) if m.contains("static S3 credentials")),
@@ -403,7 +398,7 @@ mod tests {
     }
 
     /// TDD anchor (M1 slice 4): an s3:// location parses into
-    /// (bucket, key) — the metadata_location from slice 3's loadTable.
+    /// (bucket, key) — the `metadata_location` from slice 3's loadTable.
     #[test]
     fn parses_s3_location() {
         let loc =
@@ -417,7 +412,7 @@ mod tests {
         }
     }
 
-    /// file:// locations roundtrip through object_store's local backend
+    /// file:// locations roundtrip through `object_store`'s local backend
     /// (this is how unit tests exercise the full fetch+parse path with no
     /// network, doc 10 §1).
     #[test]
@@ -451,7 +446,7 @@ mod tests {
     }
 
     /// Gzipped metadata (Lakekeeper writes .gz.metadata.json) decodes
-    /// transparently in fetch_metadata.
+    /// transparently in `fetch_metadata`.
     #[test]
     fn fetch_metadata_decodes_gzip() {
         use flate2::write::GzEncoder;
@@ -483,7 +478,7 @@ mod tests {
         );
     }
 
-    /// A missing object is a NotFound, distinct from transport errors
+    /// A missing object is a `NotFound`, distinct from transport errors
     /// (doc 03 §5 failure semantics; callers surface per-kind errors).
     #[test]
     fn missing_object_is_not_found() {

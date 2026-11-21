@@ -80,19 +80,22 @@ impl<'a> PuffinFile<'a> {
         })
     }
 
+    #[must_use]
     pub fn blobs(&self) -> &[BlobJson] {
         &self.blobs
     }
 
+    #[must_use]
     pub fn blob_properties(&self, idx: usize) -> &std::collections::BTreeMap<String, String> {
         &self.blobs[idx].properties
     }
 
+    #[must_use]
     pub fn blob_type(&self, idx: usize) -> &str {
         &self.blobs[idx].blob_type
     }
 
-    /// Raw payload of blob `idx` (still compressed if compression_codec
+    /// Raw payload of blob `idx` (still compressed if `compression_codec`
     /// says so — deletion-vector-v1 blobs are written uncompressed).
     pub fn blob_payload(&self, idx: usize) -> Result<&'a [u8], StorageError> {
         let b = &self.blobs[idx];
@@ -144,7 +147,7 @@ pub fn decode_dv_payload(payload: &[u8]) -> Result<RoaringTreemap, StorageError>
         if pl.len() < 4 {
             return Err(StorageError::Decode("dv: truncated bitmap key".into()));
         }
-        let key = u32::from_le_bytes(pl[0..4].try_into().unwrap()) as i64;
+        let key = i64::from(u32::from_le_bytes(pl[0..4].try_into().unwrap()));
         if key <= last_key {
             return Err(StorageError::Decode("dv: bitmap keys not ascending".into()));
         }
@@ -153,8 +156,8 @@ pub fn decode_dv_payload(payload: &[u8]) -> Result<RoaringTreemap, StorageError>
         let bm32 = roaring::bitmap::RoaringBitmap::deserialize_from(pl)
             .map_err(|e| StorageError::Decode(format!("dv: roaring decode: {e}")))?;
         let consumed = bm32.serialized_size();
-        for v in bm32.iter() {
-            out.insert(((key as u64) << 32) | v as u64);
+        for v in &bm32 {
+            out.insert(((key as u64) << 32) | u64::from(v));
         }
         pl = &pl[consumed..];
         last_key = key;
@@ -196,9 +199,9 @@ mod tests {
             dir.join("tests/fixtures/v3_dv_table/data")
                 .read_dir()
                 .expect("fixture data dir")
-                .filter_map(|e| e.ok())
+                .filter_map(std::result::Result::ok)
                 .map(|e| e.path())
-                .find(|p| p.extension().map(|x| x == "puffin").unwrap_or(false))
+                .find(|p| p.extension().is_some_and(|x| x == "puffin"))
                 .expect("fixture puffin file"),
         )
         .expect("read fixture puffin")
@@ -208,7 +211,7 @@ mod tests {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         std::fs::read_dir(dir.join("tests/fixtures/v3_dv_table/data"))
             .expect("fixture data dir")
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .find(|n| n.ends_with(".parquet"))
             .expect("fixture parquet name")

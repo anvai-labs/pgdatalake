@@ -1,5 +1,5 @@
 //! Catalog scan session: the one-call orchestrator the FFI/FDW face uses —
-//! config -> loadTable -> metadata fetch -> plan_scan (specs/lakehouse/
+//! config -> loadTable -> metadata fetch -> `plan_scan` (specs/lakehouse/
 //! 03-catalog.md, 06-execution.md). Slice 9.
 
 //! Catalog scan session: the one-call orchestrator the FFI/FDW face uses
@@ -7,7 +7,7 @@
 //!
 //! Holds one REST catalog handle + storage credentials for the warehouse's
 //! object store; `scan_table()` walks config -> loadTable -> metadata fetch
-//! -> plan_scan. Credentialed OAuth2 providers plug in via TokenProvider
+//! -> `plan_scan`. Credentialed `OAuth2` providers plug in via `TokenProvider`
 //! (slice 2); the FFI face (ffi.rs) wraps this with panic-free boundaries.
 
 use crate::catalog::rest::{RestCatalog, StaticToken, TokenProvider};
@@ -130,11 +130,10 @@ impl CatalogClient {
         // the writer can actually emit")
         match md.format_version {
             crate::catalog::metadata::FormatVersion::V2 => {}
-            other => {
+            crate::catalog::metadata::FormatVersion::V3 => {
                 return Err(crate::storage::StorageError::Config(format!(
-                    "write path: table {table} is format-version {:?}; this writer emits v2",
-                    other
-                )))
+                    "write path: table {table} is format-version V3; this writer emits v2"
+                )));
             }
         }
         if let Some(spec) = md
@@ -219,20 +218,17 @@ impl CatalogClient {
                     // the catalog serves it, else fetch the referenced
                     // metadata file (13-review blocker #2)
                     let md_owned;
-                    let md = match lt.metadata.as_ref() {
-                        Some(m) => m,
-                        None => {
-                            let (mio, mkey) =
-                                crate::scan::open_for(&lt.metadata_location, Some(&st.s3))
-                                    .map_err(|e| {
-                                        crate::catalog::rest::RestError::Http(e.to_string())
-                                    })?;
-                            md_owned =
-                                crate::storage::fetch_metadata(&mio, &mkey).map_err(|e| {
+                    let md = if let Some(m) = lt.metadata.as_ref() { m } else {
+                        let (mio, mkey) =
+                            crate::scan::open_for(&lt.metadata_location, Some(&st.s3))
+                                .map_err(|e| {
                                     crate::catalog::rest::RestError::Http(e.to_string())
                                 })?;
-                            &md_owned
-                        }
+                        md_owned =
+                            crate::storage::fetch_metadata(&mio, &mkey).map_err(|e| {
+                                crate::catalog::rest::RestError::Http(e.to_string())
+                            })?;
+                        &md_owned
                     };
                     let base_seq = md.last_sequence_number;
                     let parent = md.current_snapshot_id;
@@ -283,8 +279,7 @@ impl CatalogClient {
                         let u = uuid::Uuid::new_v4().as_u128();
                         let ms = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as i64)
-                            .unwrap_or(1);
+                            .map_or(1, |d| d.as_millis() as i64);
                         ((ms << 20) | ((u >> 44) as i64 & 0xF_FFFF)) & i64::MAX
                     };
 
@@ -296,8 +291,7 @@ impl CatalogClient {
                             snapshot_id,
                             timestamp_ms: std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_millis() as i64)
-                                .unwrap_or(0),
+                                .map_or(0, |d| d.as_millis() as i64),
                             parent_snapshot_id: parent,
                             last_sequence_number: base_seq,
                             schema_id: st.schema_id,
@@ -578,7 +572,7 @@ mod tests {
         )
         .unwrap();
         let err = client.scan_table(&["ns"], "t", None, None).unwrap_err();
-        assert!(!err.to_string().is_empty());
+        assert_ne!(err.to_string(), "");
     }
 
     // ---- slice 28: overwrite commits (COW UPDATE/DELETE) ----
@@ -645,7 +639,7 @@ mod tests {
         format!("file://{}", md_file.display())
     }
 
-    /// commit_append with a deleted file emits an overwrite snapshot:
+    /// `commit_append` with a deleted file emits an overwrite snapshot:
     /// the commit request carries operation=overwrite and the deleted
     /// path as a DELETED manifest entry, and the commit succeeds.
     #[test]
@@ -661,7 +655,7 @@ mod tests {
             let _ = req.respond(tiny_http::Response::from_string(
                 r#"{"defaults": {}, "overrides": {}}"#,
             ));
-            let resp_body = format!(r#"{{"metadata-location": "{}", "config": {{}}}}"#, md_loc);
+            let resp_body = format!(r#"{{"metadata-location": "{md_loc}", "config": {{}}}}"#);
             let req = server.recv().unwrap(); // loadTable (write_table_open)
             let _ = req.respond(tiny_http::Response::from_string(resp_body.clone()));
             let req = server.recv().unwrap(); // loadTable (commit_append)
@@ -672,8 +666,7 @@ mod tests {
             // the response parser opens metadata-location: keep it local+real
             let next_loc = md_loc.replace("00001-abc", "00002-x");
             let _ = req.respond(tiny_http::Response::from_string(format!(
-                r#"{{"metadata-location": "{}", "config": {{}}}}"#,
-                next_loc
+                r#"{{"metadata-location": "{next_loc}", "config": {{}}}}"#
             )));
             body
         });
@@ -716,13 +709,12 @@ mod tests {
         };
         let list_file = std::fs::read_dir(dir.path().join("metadata"))
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .map(|e| e.path())
             .find(|p| {
                 p.file_name()
                     .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with(&format!("snap-{snap_id}-")))
-                    .unwrap_or(false)
+                    .is_some_and(|n| n.starts_with(&format!("snap-{snap_id}-")))
             })
             .expect("commit's manifest-list written to the store");
         let list =
@@ -764,7 +756,7 @@ mod tests {
             let _ = req.respond(tiny_http::Response::from_string(
                 r#"{"defaults": {}, "overrides": {}}"#,
             ));
-            let resp_body = format!(r#"{{"metadata-location": "{}", "config": {{}}}}"#, md_loc);
+            let resp_body = format!(r#"{{"metadata-location": "{md_loc}", "config": {{}}}}"#);
             let req = server.recv().unwrap(); // loadTable (write_table_open)
             let _ = req.respond(tiny_http::Response::from_string(resp_body.clone()));
             let req = server.recv().unwrap(); // loadTable (commit_append)

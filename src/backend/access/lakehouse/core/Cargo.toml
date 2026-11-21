@@ -6,3 +6,30 @@ members = ["pgdatalake-core"]
 version = "0.1.0"
 edition = "2021"
 license = "PostgreSQL"
+
+# Lint law (specs/lakehouse/HANDOFF): pedantic must stay clean; gate in CI with
+#   cargo clippy --workspace --all-targets -- -D warnings
+# (the [workspace.lints] block below raises pedantic; do NOT pass -W clippy::pedantic
+# on the command line — it would override the justified allows below)
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Style-noise lints that fight this codebase's conventions; each needs a
+# justification. Revisit when the crate's API surface settles.
+module_name_repetitions = "allow"	# ffi.rs re-exports cbindgen-shaped names
+missing_errors_doc = "allow"	# internal Result surfaces; doc'd at call sites
+missing_panics_doc = "allow"	# no public panicking entry points
+# Numeric casts are pervasive on the batch ABI: C callers hand us u64 indices
+# that are range-checked against Vec lengths immediately before use, and
+# guarded conversions (`p >= 0` match guards, blob-length-bounded decodes)
+# make truncation unreachable. Replacing them with try_from chains would
+# bury the guard the `as`-site already documents.
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+# FFI write paths (writer.rs staged writes, scan.rs row streams) are long by
+# necessity; splitting them is feature work, not hygiene, and would move
+# invariant comments away from the code they describe.
+too_many_lines = "allow"
+# Batch column arrays use domain-short names (i64s/f64s/spans/idxs);
+# renaming would break parity with the cbindgen header and C naming.
+similar_names = "allow"
