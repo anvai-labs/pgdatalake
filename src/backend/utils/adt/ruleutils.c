@@ -40,6 +40,7 @@
 #include "commands/defrem.h"
 #include "commands/tablespace.h"
 #include "common/keywords.h"
+#include "datatype/timestamp.h"
 #include "executor/spi.h"
 #include "funcapi.h"
 #include "mb/pg_wchar.h"
@@ -63,6 +64,7 @@
 #include "utils/guc.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
+#include "utils/timestamp.h"
 #include "utils/partcache.h"
 #include "utils/rel.h"
 #include "utils/ruleutils.h"
@@ -6029,6 +6031,105 @@ get_select_query_def(Query *query, deparse_context *context)
 				appendStringInfoString(buf, " NOWAIT");
 			else if (rc->waitPolicy == LockWaitSkip)
 				appendStringInfoString(buf, " SKIP LOCKED");
+		}
+	}
+
+	/*
+	 * lakehouse time travel (spec 16 blocker 3): re-emit the FOR ... AS OF
+	 * pin carried on this level's foreign-table RTEs — pg_get_viewdef is
+	 * what a logical dump stores, so a deparse that drops the pin would
+	 * silently repoint the restored view to the latest snapshot. The selector
+	 * is a canonical string minted by the parser (parse_clause.c
+	 * transformLakehouseSnapshot): "id:<int>", "ts:<epoch-ms>" or
+	 * "ref:<name>". applyLakehouseTimeTravel pins ONE query-level selector on
+	 * every foreign-table RTE, so conflicting pins are not representable as
+	 * SQL — refuse rather than emit a wrong definition. The clause parses
+	 * in the locking-clause position (after LIMIT, same slot as FOR UPDATE),
+	 * which is where we emit it.
+	 */
+	{
+		char	   *selector = NULL;
+		bool		conflict = false;
+
+		foreach(l, query->rtable)
+		{
+			RangeTblEntry *rte = (RangeTblEntry *) lfirst(l);
+
+			if (!rte->inFromCl || rte->rtekind != RTE_RELATION ||
+				rte->relkind != RELKIND_FOREIGN_TABLE ||
+				rte->lakehouse_snapshot == NULL)
+				continue;
+			if (selector == NULL)
+				selector = rte->lakehouse_snapshot;
+			else if (strcmp(selector, rte->lakehouse_snapshot) != 0)
+				conflict = true;
+		}
+		if (conflict)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot deparse conflicting lakehouse "
+							"time-travel pins"),
+					 errdetail("One query level cannot pin more than one "
+							   "snapshot selector.")));
+		if (selector != NULL)
+		{
+			if (strncmp(selector, "id:", 3) == 0)
+			{
+				/* digits only (minted by psprintf): emit verbatim */
+				appendStringInfo(buf, " FOR VERSION AS OF %s",
+								 selector + 3);
+			}
+			else if (strncmp(selector, "ts:", 3) == 0)
+			{
+				/*
+				 * epoch-ms back to an ABSOLUTE ISO literal with an explicit
+				 * +00 offset: emitted in UTC directly (timestamp2tm with a
+				 * pinned UTC zone, never timestamptz_out, which honors the
+				 * session's DateStyle and TimeZone and would bake session
+				 * display settings into stored definitions). The parser's
+				 * floor-to-ms keeps the round-trip exact — the stored value
+				 * is a whole number of ms.
+				 */
+				int64		ms = strtoll(selector + 3, NULL, 10);
+				TimestampTz ts = (ms - 946684800000LL) * 1000;
+				struct pg_tm tm;
+				fsec_t		fsec;
+				int			tz;
+
+				if (timestamp2tm(ts, &tz, &tm, &fsec, NULL,
+								 pg_tzset("UTC")) != 0)
+					elog(ERROR, "lakehouse time-travel timestamp out of "
+						 "range: " INT64_FORMAT " epoch-ms", ms);
+				appendStringInfo(buf,
+								 " FOR TIMESTAMP AS OF "
+								 "'%04d-%02d-%02d %02d:%02d:%02d",
+								 tm.tm_year, tm.tm_mon, tm.tm_mday,
+								 tm.tm_hour, tm.tm_min, tm.tm_sec);
+				if (fsec != 0)
+					appendStringInfo(buf, ".%03d", (int) (fsec / 1000));
+				appendStringInfoString(buf, "+00'");
+			}
+			else if (strncmp(selector, "ref:", 4) == 0)
+			{
+				/* string literal: escape embedded single quotes */
+				StringInfoData q;
+				const char *p;
+
+				initStringInfo(&q);
+				appendStringInfoChar(&q, '\'');
+				for (p = selector + 4; *p; p++)
+				{
+					if (*p == '\'')
+						appendStringInfoChar(&q, '\'');
+					appendStringInfoChar(&q, *p);
+				}
+				appendStringInfoChar(&q, '\'');
+				appendStringInfo(buf, " FOR TAG AS OF %s", q.data);
+				pfree(q.data);
+			}
+			else
+				elog(ERROR, "unrecognized lakehouse time-travel selector "
+					 "\"%s\" in rule storage", selector);
 		}
 	}
 }

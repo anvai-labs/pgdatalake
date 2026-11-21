@@ -75,7 +75,48 @@ CREATE VIEW lakehouse_ft_plain_v AS
     SELECT id FROM lakehouse_ft;
 SELECT count(*) FROM lakehouse_ft_plain_v;
 
-DROP VIEW lakehouse_ft_v, lakehouse_ft_ts_v, lakehouse_ft_plain_v;
+-- DEPARSE RECONSTRUCTION (spec 16 blocker 3): pg_get_viewdef is what a
+-- logical dump stores, so it MUST reproduce the FOR ... AS OF clause —
+-- a viewdef that drops the pin silently repoints the restored view to
+-- the latest snapshot. The deparse must also round-trip: re-creating a
+-- view from the emitted text yields the same pinned definition again
+-- (fixed point).
+SELECT pg_get_viewdef('lakehouse_ft_v'::regclass, true) AS version_viewdef;
+SELECT pg_get_viewdef('lakehouse_ft_ts_v'::regclass, true) AS ts_viewdef;
+SELECT pg_get_viewdef('lakehouse_ft_plain_v'::regclass, true) AS plain_viewdef;
+
+CREATE VIEW lakehouse_ft_v_rt AS
+    SELECT id FROM lakehouse_ft FOR VERSION AS OF 12345;
+SELECT pg_get_viewdef('lakehouse_ft_v_rt'::regclass, true) =
+       pg_get_viewdef('lakehouse_ft_v'::regclass, true) AS roundtrip_fixed_point;
+
+-- timestamp viewdef must re-parse to the SAME instant (epoch ms round-trip;
+-- the stored selector is an absolute value, timezone-independent)
+CREATE VIEW lakehouse_ft_ts_rt AS SELECT id FROM lakehouse_ft
+    FOR TIMESTAMP AS OF '2026-01-01 00:00:00+00';
+SELECT pg_get_viewdef('lakehouse_ft_ts_rt'::regclass, true) =
+       pg_get_viewdef('lakehouse_ft_ts_v'::regclass, true) AS ts_roundtrip_stable;
+
+-- tag pins deparse too (ref: selector), with quote-safe emission
+CREATE VIEW lakehouse_ft_tag_v AS
+    SELECT id FROM lakehouse_ft FOR TAG AS OF 'it''s friday';
+SELECT pg_get_viewdef('lakehouse_ft_tag_v'::regclass, true) AS tag_viewdef;
+SELECT count(*) FROM lakehouse_ft_tag_v;
+
+-- LOGICAL DUMP/RESTORE acceptance (spec 16 blocker 3): pg_dump stores
+-- exactly the pg_get_viewdef text, so a piped dump|restore must land the
+-- view with the pin intact. Piped (no temp files); the restore loads the
+-- extension + wrapper + server + foreign table from the dump itself.
+\! dropdb --if-exists regression_lakehouse_restore
+\! createdb regression_lakehouse_restore
+\! pg_dump regression_lakehouse | psql -d regression_lakehouse_restore 2>&1 | grep -c "^ERROR"
+\! psql -d regression_lakehouse_restore -tAc "SELECT pg_get_viewdef('lakehouse_ft_v'::regclass, true)" | grep -c "FOR VERSION AS OF 12345"
+\! psql -d regression_lakehouse_restore -tAc "SELECT pg_get_viewdef('lakehouse_ft_ts_v'::regclass, true)" | grep -c "FOR TIMESTAMP AS OF '2026-01-01 00:00:00+00'"
+\! psql -d regression_lakehouse_restore -tAc "SELECT pg_get_viewdef('lakehouse_ft_tag_v'::regclass, true)" | grep -c "FOR TAG AS OF"
+\! dropdb --if-exists regression_lakehouse_restore
+
+DROP VIEW lakehouse_ft_v, lakehouse_ft_ts_v, lakehouse_ft_plain_v,
+          lakehouse_ft_v_rt, lakehouse_ft_ts_rt, lakehouse_ft_tag_v;
 DROP TABLE local_t;
 DROP FOREIGN TABLE lakehouse_ft;
 DROP USER MAPPING FOR CURRENT_USER SERVER smoke_server;
