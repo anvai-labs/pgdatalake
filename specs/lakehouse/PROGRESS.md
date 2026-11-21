@@ -16,7 +16,7 @@
 | Milestone | Implementation | Release evidence still needed |
 |---|---|---|
 | **M0 Foundation** | Historically accepted at `milestone/m0` | Revalidate clean builds, extension install and supported upgrades at each candidate SHA. |
-| **M1 External reads** | FDW, REST/S3, pruning, typed scans, time travel and supported v2/v3 delete reads landed | Independent result equivalence, qualified time-travel dump/restore, delete combinations, parallel pinning, cancellation and resource limits. |
+| **M1 External reads** | FDW, REST/S3, pruning, typed scans, time travel and supported v2/v3 delete reads landed. Time-travel deparse + dump/restore landed 2026-11-21 (ruleutils re-emits the pin; `time_travel.sql` carries the acceptance test) | Independent result equivalence, delete combinations, parallel pinning, cancellation and resource limits. |
 | **M2 Managed writes** | Append history, COW DML/MERGE, staged capture and a publisher exist | Exact bulk staging and crash/concurrency visibility. Demonstrate the documented local/remote commit semantics and publish-retry outcomes. |
 | **M3 Semantics and cloud parity** | In progress. Ranged projection, cached bytes, lazy projected decode, and initial COUNT paths landed | Qualify COUNT and lazy reads. Close isolation, ADLS/GCS transport and auth, branch/tag/history semantics and the logical replication decision. |
 | **M4 Production hardening** | Design available for maintenance, statistics and execution tiers | Implement and qualify compaction, expiry, orphan safety, ANALYZE and bounded scan/publish resource use. |
