@@ -137,9 +137,9 @@ option_home_name(int home_flag)
 		case LOPT_TABLE:
 			return "foreign tables";
 		default:
-			return "unknown";
+			/* multi-bit or unset homes: the wrapper-level catch-all */
+			return "the lakehouse wrapper's supported objects";
 	}
-	return "the lakehouse wrapper's supported objects";
 }
 
 static void

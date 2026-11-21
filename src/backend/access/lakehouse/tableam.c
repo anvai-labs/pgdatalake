@@ -1686,10 +1686,14 @@ lakehouse_scan_common_setup(LakehouseTableScanDesc scan, Relation rel,
 	scan->projection_csv = proj.data;
 
 	/*
-	 * R2 staged bypass: a table-level WITH (write_mode='staged') makes this a
-	 * delta-only scan — no remote session, zero tasks. Decoded into a
+	 * R2 staged bypass: a table-level WITH (write_mode='staged') makes this
+	 * a delta-only scan — no remote session, zero tasks. Decoded into a
 	 * LOCAL: opts here carries the server-derived endpoint/ warehouse that
-	 * OpenSession needs (decode memsets its target).
+	 * OpenSession needs. Same gate as the write path: discriminate on
+	 * wm_opts.write_mode alone (see get_write_entry) — keying on decode's
+	 * "has identity" return silently ignored a write_mode-only blob.
+	 * decode skips its memset on early returns (no rd_options, foreign
+	 * layout), so zero the struct here first.
 	 */
 	{
 		LakehouseOptions wm_opts;

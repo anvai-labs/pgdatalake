@@ -18,6 +18,15 @@ FILES = [
 ]
 EM = "—".encode("utf-8")
 
+# the two known pgindent-mangled string sites and their canonical bytes;
+# extend when a new non-ASCII string literal lands
+EXPECTED = {
+    "src/backend/access/lakehouse/tableam.c": [
+        b'lakehouse.managed_tables is missing \xe2\x80\x94 "',
+        b' error \xe2\x80\x94 the rows would be silently',
+    ],
+}
+
 for path in [p for p in (sys.argv[1:] or FILES)]:
     data = open(path, "rb").read()
     # invalid utf-8 sequences (lead e2 eaten, digits + trailing 94 remain)
@@ -33,3 +42,13 @@ for path in [p for p in (sys.argv[1:] or FILES)]:
     data, m = re.subn(EM + rb"[0-9]+" + EM, EM, data)
     open(path, "wb").write(data)
     print(f"{path}: repaired {n} sequences, collapsed {m}")
+    expected = EXPECTED.get(path, [])
+    text = data.decode("utf-8")
+    for want in expected:
+        if want not in data:
+            print(f"WARNING: {path}: expected site {want!r} not intact — "
+                  "inspect manually; a blind em-dash substitution may have "
+                  "corrupted different bytes", file=sys.stderr)
+    if n > len(expected):
+        print(f"WARNING: {path}: {n} em-dash insertions but only "
+              f"{len(expected)} known sites — verify each", file=sys.stderr)

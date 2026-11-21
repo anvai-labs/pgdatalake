@@ -1015,6 +1015,19 @@ fn format_uuid16(b: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins the bytea-hex text form shared by the per-row, batch, and delta
+    /// render paths: `\x` prefix + two lowercase hex digits per byte
+    /// (byteaout hex-mode compatible). All three consumers MUST agree —
+    /// `hex_escape_bytes` consolidation (lint pass) deliberately changed the
+    /// per-row path from bare hex to this form.
+    #[test]
+    fn hex_escape_bytes_bytea_form() {
+        assert_eq!(hex_escape_bytes(b""), "\\x");
+        assert_eq!(hex_escape_bytes(b"AB"), "\\x4142");
+        assert_eq!(hex_escape_bytes(&[0x00, 0xff, 0x7f]), "\\x00ff7f");
+        assert_eq!(hex_escape_bytes(b"abc"), "\\x616263");
+    }
     use crate::storage::{parse_location, StorageIo};
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
