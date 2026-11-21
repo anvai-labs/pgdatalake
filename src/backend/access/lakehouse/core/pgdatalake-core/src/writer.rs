@@ -15,12 +15,158 @@ use crate::storage::{StorageError, StorageIo};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use std::sync::Arc;
 
+/// Per-file manifest metric maps (keyed by field ID).
+#[derive(Default, Debug, Clone)]
+pub struct ColumnStats {
+    pub column_sizes: std::collections::BTreeMap<i64, i64>,
+    pub value_counts: std::collections::BTreeMap<i64, i64>,
+    pub null_value_counts: std::collections::BTreeMap<i64, i64>,
+    pub lower_bounds: std::collections::BTreeMap<i64, Vec<u8>>,
+    pub upper_bounds: std::collections::BTreeMap<i64, Vec<u8>>,
+}
+
+/// Min/max bounds of one typed arrow column, serialized per the Iceberg
+/// spec's single-value table: int/date 4-byte LE, long/time/timestamp
+/// 8-byte LE, float/double LE IEEE, string UTF-8 bytes (byte order).
+/// NULLs are skipped; NaN floats are skipped (spec: bounds must not be
+/// NaN); an all-null/all-NaN column yields None (bounds omitted —
+/// conservative keep on read, never a misread). Bool/binary/decimal/
+/// uuid yield None (this reader's prune decoder doesn't compare them
+/// yet — omitting is always safe).
+fn column_bounds(
+    ty: &IcebergType,
+    col: &Arc<dyn arrow::array::Array>,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    use arrow::array::{
+        Array as _, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
+        Time64MicrosecondArray,
+    };
+    use std::cmp::Ordering;
+    macro_rules! prim_minmax {
+        ($a:ty, $t:ty, $enc:expr) => {{
+            let a = col.as_any().downcast_ref::<$a>()?;
+            let mut lo: Option<$t> = None;
+            let mut hi: Option<$t> = None;
+            for i in 0..a.len() {
+                if a.is_null(i) {
+                    continue;
+                }
+                let v = a.value(i);
+                match lo {
+                    None => {
+                        lo = Some(v);
+                        hi = Some(v);
+                    }
+                    Some(l) => {
+                        if v < l {
+                            lo = Some(v);
+                        }
+                        if v > hi.unwrap() {
+                            hi = Some(v);
+                        }
+                    }
+                }
+            }
+            lo.and_then(|l| hi.map(|h| ($enc(l), $enc(h))))
+        }};
+    }
+    macro_rules! float_minmax {
+        ($a:ty, $t:ty) => {{
+            let a = col.as_any().downcast_ref::<$a>()?;
+            let mut lo: Option<$t> = None;
+            let mut hi: Option<$t> = None;
+            for i in 0..a.len() {
+                if a.is_null(i) {
+                    continue;
+                }
+                let v = a.value(i);
+                if v.is_nan() {
+                    continue; // spec: bounds exclude NaN
+                }
+                match lo {
+                    None => {
+                        lo = Some(v);
+                        hi = Some(v);
+                    }
+                    Some(l) => {
+                        if v < l {
+                            lo = Some(v);
+                        }
+                        if v > hi.unwrap() {
+                            hi = Some(v);
+                        }
+                    }
+                }
+            }
+            lo.map(|l| {
+                let h = hi.unwrap_or(l);
+                (l.to_le_bytes().to_vec(), h.to_le_bytes().to_vec())
+            })
+        }};
+    }
+    match ty {
+        IcebergType::Int => prim_minmax!(Int32Array, i32, |v: i32| v.to_le_bytes().to_vec()),
+        IcebergType::Long | IcebergType::Timestamp | IcebergType::Timestamptz => {
+            prim_minmax!(Int64Array, i64, |v: i64| v.to_le_bytes().to_vec())
+        }
+        IcebergType::Date => prim_minmax!(Date32Array, i32, |v: i32| v.to_le_bytes().to_vec()),
+        IcebergType::Time => prim_minmax!(Time64MicrosecondArray, i64, |v: i64| v
+            .to_le_bytes()
+            .to_vec()),
+        // timestamp arrays are their own primitive types on the write side
+        // (mirror of the read-side downcast quirk)
+        IcebergType::String => {
+            let a = col.as_any().downcast_ref::<StringArray>()?;
+            let mut lo: Option<&str> = None;
+            let mut hi: Option<&str> = None;
+            for i in 0..a.len() {
+                if a.is_null(i) {
+                    continue;
+                }
+                let v = a.value(i);
+                match lo {
+                    None => {
+                        lo = Some(v);
+                        hi = Some(v);
+                    }
+                    Some(l) => {
+                        if v.as_bytes() < l.as_bytes() {
+                            lo = Some(v);
+                        }
+                        if v.as_bytes() > hi.unwrap().as_bytes() {
+                            hi = Some(v);
+                        }
+                    }
+                }
+            }
+            lo.map(|l| (l.as_bytes().to_vec(), hi.unwrap().as_bytes().to_vec()))
+        }
+        IcebergType::Float => float_minmax!(Float32Array, f32),
+        IcebergType::Double => float_minmax!(Float64Array, f64),
+        _ => {
+            let _ = Ordering::Less;
+            None
+        }
+    }
+}
+
 /// Identity + metrics of one written data file (from write_file).
 #[derive(Debug, Clone)]
 pub struct WrittenFile {
     pub key: String,
     pub record_count: i64,
     pub file_size_in_bytes: i64,
+    /// Per-column stats keyed by FIELD ID (Iceberg manifest metrics, M3-R2):
+    /// prunable min/max bounds serialized per the spec's single-value
+    /// table (LE ints/floats, UTF-8 strings), footer-derived column
+    /// sizes, exact value/null counts. Columns with no representable
+    /// bound (binary/decimal/uuid/bool) omit their bound keys —
+    /// conservative, never wrong.
+    pub column_sizes: std::collections::BTreeMap<i64, i64>,
+    pub value_counts: std::collections::BTreeMap<i64, i64>,
+    pub null_value_counts: std::collections::BTreeMap<i64, i64>,
+    pub lower_bounds: std::collections::BTreeMap<i64, Vec<u8>>,
+    pub upper_bounds: std::collections::BTreeMap<i64, Vec<u8>>,
 }
 
 /// One column of the write schema. `field_id` stamps the parquet footer
@@ -408,7 +554,11 @@ impl BatchWriter {
     }
 
     /// Drain accumulated rows into one parquet byte buffer.
-    pub fn flush_bytes(&mut self) -> Result<Vec<u8>, StorageError> {
+    /// flush_bytes + per-column manifest stats (M3-R2): value/null
+    /// counts and spec-serialized bounds from the finished arrays;
+    /// column_sizes from the parquet footer (compressed bytes per
+    /// column chunk, summed over row groups).
+    pub fn flush_bytes_with_stats(&mut self) -> Result<(Vec<u8>, ColumnStats), StorageError> {
         let mut fields = Vec::with_capacity(self.columns.len());
         for c in &self.columns {
             let mut f = Field::new(&c.name, arrow_type(&c.ty)?, true);
@@ -421,28 +571,40 @@ impl BatchWriter {
             fields.push(f);
         }
         let schema = Arc::new(ArrowSchema::new(fields));
-        let batch = arrow::record_batch::RecordBatch::try_new(
-            schema.clone(),
-            self.builders
-                .iter_mut()
-                .map(|b| match b {
-                    Builder::Bool(b) => Arc::new(b.finish()) as Arc<dyn arrow::array::Array>,
-                    Builder::Int32(b) => Arc::new(b.finish()),
-                    Builder::Int64(b) => Arc::new(b.finish()),
-                    Builder::Float32(b) => Arc::new(b.finish()),
-                    Builder::Float64(b) => Arc::new(b.finish()),
-                    Builder::Str(b) => Arc::new(b.finish()),
-                    Builder::Binary(b) => Arc::new(b.finish()),
-                    Builder::Date32(b) => Arc::new(b.finish()),
-                    Builder::Time64Us(b) => Arc::new(b.finish()),
-                    Builder::TsUs(b) => Arc::new(b.finish()),
-                    Builder::Decimal(b) => Arc::new(b.finish()),
-                    Builder::Uuid(b) => Arc::new(b.finish()),
-                })
-                .collect(),
-        )
-        .map_err(|e| StorageError::Config(format!("write path: batch build: {e}")))?;
+        let arrays: Vec<Arc<dyn arrow::array::Array>> = self
+            .builders
+            .iter_mut()
+            .map(|b| match b {
+                Builder::Bool(b) => Arc::new(b.finish()) as Arc<dyn arrow::array::Array>,
+                Builder::Int32(b) => Arc::new(b.finish()),
+                Builder::Int64(b) => Arc::new(b.finish()),
+                Builder::Float32(b) => Arc::new(b.finish()),
+                Builder::Float64(b) => Arc::new(b.finish()),
+                Builder::Str(b) => Arc::new(b.finish()),
+                Builder::Binary(b) => Arc::new(b.finish()),
+                Builder::Date32(b) => Arc::new(b.finish()),
+                Builder::Time64Us(b) => Arc::new(b.finish()),
+                Builder::TsUs(b) => Arc::new(b.finish()),
+                Builder::Decimal(b) => Arc::new(b.finish()),
+                Builder::Uuid(b) => Arc::new(b.finish()),
+            })
+            .collect();
+        let batch = arrow::record_batch::RecordBatch::try_new(schema.clone(), arrays.clone())
+            .map_err(|e| StorageError::Config(format!("write path: batch build: {e}")))?;
         self.rows = 0;
+
+        // ---- M3-R2 stats (keyed by FIELD ID; columns without one are skipped) ----
+        let mut stats: ColumnStats = Default::default();
+        for (i, c) in self.columns.iter().enumerate() {
+            let Some(id) = c.field_id else { continue };
+            let arr = &arrays[i];
+            stats.value_counts.insert(id, arr.len() as i64);
+            stats.null_value_counts.insert(id, arr.null_count() as i64);
+            if let Some((lo, hi)) = column_bounds(&c.ty, arr) {
+                stats.lower_bounds.insert(id, lo);
+                stats.upper_bounds.insert(id, hi);
+            }
+        }
 
         let mut out = Vec::with_capacity(64 * 1024);
         {
@@ -451,10 +613,24 @@ impl BatchWriter {
                 .map_err(|e| StorageError::Config(format!("write path: parquet: {e}")))?;
             w.write(&batch)
                 .map_err(|e| StorageError::Config(format!("write path: parquet write: {e}")))?;
-            w.close()
+            let footer = w
+                .close()
                 .map_err(|e| StorageError::Config(format!("write path: parquet close: {e}")))?;
+            // ArrowWriter::close() hands back the thrift FileMetaData:
+            // row_groups -> columns -> meta_data.total_compressed_size
+            for rg in &footer.row_groups {
+                for (ci, col) in rg.columns.iter().enumerate() {
+                    let Some(meta) = &col.meta_data else {
+                        continue;
+                    };
+                    // schema field order == self.columns order (fields built above)
+                    if let Some(id) = self.columns.get(ci).and_then(|c| c.field_id) {
+                        *stats.column_sizes.entry(id).or_insert(0) += meta.total_compressed_size;
+                    }
+                }
+            }
         }
-        Ok(out)
+        Ok((out, stats))
     }
 
     /// Write accumulated rows as one file under `key_prefix` (a /data/
@@ -471,7 +647,7 @@ impl BatchWriter {
         seq: usize,
     ) -> Result<WrittenFile, StorageError> {
         let rows = self.rows;
-        let bytes = self.flush_bytes()?;
+        let (bytes, stats) = self.flush_bytes_with_stats()?;
         let size = bytes.len() as i64;
         let flush_id = uuid::Uuid::new_v4();
         let key = format!(
@@ -486,6 +662,11 @@ impl BatchWriter {
             key,
             record_count: rows as i64,
             file_size_in_bytes: size,
+            column_sizes: stats.column_sizes,
+            value_counts: stats.value_counts,
+            null_value_counts: stats.null_value_counts,
+            lower_bounds: stats.lower_bounds,
+            upper_bounds: stats.upper_bounds,
         })
     }
 }
@@ -1043,5 +1224,128 @@ mod tests {
             seen += 1;
         }
         assert_eq!(seen, 1000);
+    }
+
+    /// M3-R2 (13-review: pruning inert on our tables): write_file must
+    /// collect per-column stats — value/null counts, min/max bounds
+    /// serialized per the Iceberg single-value table (LE ints/floats,
+    /// UTF-8 strings) keyed by FIELD ID — so the manifest entries carry
+    /// prunable bounds. Byte-exact expectations.
+    #[test]
+    fn write_file_collects_column_stats() {
+        use crate::catalog::metadata::IcebergType as IT;
+        use crate::storage::{parse_location, StorageIo};
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
+        let loc = format!("file://{}", dir.path().display());
+        let io = StorageIo::open(&parse_location(&loc).unwrap(), None).unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+
+        let mut w = BatchWriter::new(vec![
+            WriteColumn {
+                name: "id".into(),
+                ty: IT::Long,
+                field_id: Some(1),
+            },
+            WriteColumn {
+                name: "score".into(),
+                ty: IT::Double,
+                field_id: Some(2),
+            },
+            WriteColumn {
+                name: "name".into(),
+                ty: IT::String,
+                field_id: Some(3),
+            },
+        ])
+        .unwrap();
+        w.push(&[
+            CellValue::Int64(10),
+            CellValue::Null,
+            CellValue::Str("zebra".into()),
+        ])
+        .unwrap();
+        w.push(&[
+            CellValue::Int64(2),
+            CellValue::Float64(1.5),
+            CellValue::Str("apple".into()),
+        ])
+        .unwrap();
+        w.push(&[
+            CellValue::Int64(7),
+            CellValue::Float64(9.25),
+            CellValue::Str("mango".into()),
+        ])
+        .unwrap();
+
+        let wf = w
+            .write_file(&io, &format!("{}/data", dir.path().display()), 0)
+            .unwrap();
+
+        // counts: 3 values each, one null in `score`... (null is in col 2? col "score" row0)
+        assert_eq!(wf.value_counts[&1], 3);
+        assert_eq!(wf.value_counts[&3], 3);
+        // score has one NULL (row 0) — excluded from bounds, counted here
+        assert_eq!(wf.null_value_counts[&2], 1);
+        assert_eq!(wf.null_value_counts[&1], 0);
+        assert_eq!(wf.null_value_counts[&3], 0);
+
+        // bounds: id in [2, 10], score in [1.5, 9.25], name in ["apple", "zebra"]
+        assert_eq!(wf.lower_bounds[&1], 2i64.to_le_bytes().to_vec());
+        assert_eq!(wf.upper_bounds[&1], 10i64.to_le_bytes().to_vec());
+        assert_eq!(wf.lower_bounds[&2], 1.5f64.to_le_bytes().to_vec());
+        assert_eq!(wf.upper_bounds[&2], 9.25f64.to_le_bytes().to_vec());
+        assert_eq!(wf.lower_bounds[&3], b"apple".to_vec());
+        assert_eq!(wf.upper_bounds[&3], b"zebra".to_vec());
+
+        // column_sizes present for every field and positive (footer-derived)
+        for id in [1i64, 2, 3] {
+            assert!(*wf.column_sizes.get(&id).unwrap_or(&0) > 0, "col {id} size");
+        }
+    }
+
+    /// Nulls excluded from bounds, all-null columns omit bounds entirely,
+    /// and NaN floats never poison min/max (spec: bounds skip NaN).
+    #[test]
+    fn write_file_stats_handle_nulls_and_nan() {
+        use crate::catalog::metadata::IcebergType as IT;
+        use crate::storage::{parse_location, StorageIo};
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
+        let loc = format!("file://{}", dir.path().display());
+        let io = StorageIo::open(&parse_location(&loc).unwrap(), None).unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+
+        let mut w = BatchWriter::new(vec![
+            WriteColumn {
+                name: "x".into(),
+                ty: IT::Double,
+                field_id: Some(1),
+            },
+            WriteColumn {
+                name: "gone".into(),
+                ty: IT::Int,
+                field_id: Some(2),
+            },
+        ])
+        .unwrap();
+        w.push(&[CellValue::Float64(f64::NAN), CellValue::Null])
+            .unwrap();
+        w.push(&[CellValue::Float64(4.0), CellValue::Null]).unwrap();
+        let wf = w
+            .write_file(&io, &format!("{}/data", dir.path().display()), 0)
+            .unwrap();
+
+        assert_eq!(wf.null_value_counts[&2], 2, "all-null int column");
+        assert!(
+            !wf.lower_bounds.contains_key(&2),
+            "all-null column omits bounds"
+        );
+        assert_eq!(
+            wf.lower_bounds[&1],
+            4.0f64.to_le_bytes().to_vec(),
+            "NaN excluded from min; 4.0 is the lower bound"
+        );
+        assert_eq!(wf.upper_bounds[&1], 4.0f64.to_le_bytes().to_vec());
     }
 }
