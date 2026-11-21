@@ -82,4 +82,4 @@ ERROR:  invalid value for parameter "lakehouse.write_mode": "bogus"
 HINT:  Available values: cow, staged.
 -- invalid numeric rejected loudly
 SET lakehouse.target_file_size = '0';
-ERROR:  0 kB is outside the valid range for parameter "lakehouse.target_file_size" (131072 kB .. 2147483647 kB)
+ERROR:  0 kB is outside the valid range for parameter "lakehouse.target_file_size" (128 kB .. 2147483647 kB)

@@ -155,6 +155,31 @@ impl BlockCache {
     }
 }
 
+use std::sync::OnceLock;
+
+/// The per-backend global cache (spec 15 §2a C1: per-backend LRU at the
+/// I/O layer; capacity fixed by the first `global_init` — _PG_init does
+/// it from lakehouse.cache_max_bytes before any scan can run).
+static GLOBAL: OnceLock<BlockCache> = OnceLock::new();
+
+pub fn global_init(max_bytes: u64) {
+    let _ = GLOBAL.set(BlockCache::new(max_bytes));
+}
+
+/// The global cache, or a lazily-created default (256 MB) when
+/// `global_init` was never called (Rust-only test builds, standalone
+/// tooling).
+pub fn global() -> &'static BlockCache {
+    GLOBAL.get_or_init(|| BlockCache::new(256 * 1024 * 1024))
+}
+
+/// Whole-object GET through the global cache. Iceberg metadata.json /
+/// manifest / manifest-list paths are immutable per snapshot — no
+/// invalidation path exists. Byte-identity with `io.get_bytes`.
+pub fn cached_get_bytes(io: &StorageIo, key: &str) -> Result<Vec<u8>, StorageError> {
+    global().get_bytes(io, &io.scope_id, key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
