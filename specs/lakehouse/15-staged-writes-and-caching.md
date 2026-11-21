@@ -273,6 +273,17 @@ path.
 
 ### 4.3 The published-snapshot ledger (in-row: `published`, `published_snapshot_id`)
 
+**2026-11-21 qualification update.** The [publication contract](16-release-reassessment-and-scale.md#publishing-must-reconcile-remote-success-with-local-visibility)
+supersedes the proposed recovery mechanism below. Use a durable claim for
+the exact segment IDs before network I/O, a stable operation marker on the
+remote commit, and a local completion record after remote verification.
+Use bounded multi-segment batches independently of Parquet file boundaries.
+A lease must survive the local transaction that records the claim, and a
+resumed publisher must recover or reconcile the existing operation before
+opening a new claim. Distinguish a rejected commit from an unknown result.
+A completed ledger entry is eligible for cleanup only when its recovery
+state and every supported reader's pinned snapshot allow retirement.
+
 After a successful commitTable, the publisher records
 `(segment → published snapshot-id)` IN THE SEGMENT'S DELTA ROW
 (D1-rev: the ledger is columns, not a file — same crash durability as
@@ -449,6 +460,17 @@ doesn't silently become a correctness hazard.
   (pyiceberg, Trino) decode it byte-identically.
 
 ### 6.6 Metadata elision for trivial aggregates (planned — P0b4)
+
+**2026-11-21 qualification update.** The [execution-time COUNT contract](16-release-reassessment-and-scale.md#count-must-be-computed-at-execution)
+supersedes plan-time literal counts and the assumption that an empty published
+ledger proves a staged-only table. **Gates landed 2026-11-21:** slices A and C
+are REMOVED from the build (FDW upper Const path unwired; managed planner hook
+deleted with count_elision.c). The successor must compute at execution — plan
+descriptor without an embedded count, snapshot resolved per execution, delete
+eligibility re-proved per execution, ordinary-aggregate fallback when proof
+fails. Slice B (`row_count` ledger column) stays. Treat footer extrema as
+bounds unless their exactness and row visibility are proven. The mechanism
+table below records the original design and its planned slices.
 
 COUNT(*), MIN(col), MAX(col) over a pinned snapshot are answerable from
 bytes we ALREADY cache (§6.2 footers carry exact per-row-group num_rows

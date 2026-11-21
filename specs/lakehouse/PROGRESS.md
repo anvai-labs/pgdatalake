@@ -1,104 +1,33 @@
-# PROGRESS.md — visual tracker (update at every slice/milestone landing)
+# Lakehouse progress and release gates
 
-*(Living tracker, 2026-11-21. Percentages are working estimates anchored
-on the ROADMAP (12-roadmap.md), spec 15 §7 prerequisite chain, doc 14
-slices, and the 13-review blocker ledger. Update protocol: append a
-HANDOFF entry AND touch this file in the same commit when a slice or
-milestone lands.)*
+**Reviewed on 2026-11-21 at `perf-release` `eb8e3602179`. Production qualification is on hold.** The original review is the 2026-11-20 baseline. The [reassessment](16-release-reassessment-and-scale.md) maps all eight findings to current code and acceptance tests. Update this tracker and the handoff whenever a slice lands. Give each milestone its own smoke and measurement receipt.
 
-## 1. Milestone completion
+## What changed since the original review
 
-```mermaid
-pie showData
-    title Milestone-weighted overall progress (~77%)
-    "M0 Foundation — 100%" : 100
-    "M1 Read path — 100%" : 100
-    "M2 Managed writes — 100%" : 100
-    "M3 Semantics & parity — 65%" : 65
-    "M4 Maintenance — 20%" : 20
-```
-
-| Milestone | Progress | Remaining |
+| Assessment | Evidence | Next action |
 |---|---|---|
-| **M0** Foundation | 100% ✅ | — |
-| **M1** Read path (REST, FDW, S3, types, time travel) | 100% ✅ | — |
-| **M2** Managed writes (TableAM, COW DML, MERGE, ceremony) | 100% ✅ | — |
-| **M3** Semantics & cloud parity | ~65% 🔶 | MVCC models · ADLS/GCS IO + auth · branches/tags SQL · logical-repl decision |
-| **M4** Maintenance & hardening | ~20% 🔶 | compaction/expire/orphan/ANALYZE + optimize exec (designed, doc 08) |
-| **M5** Seamless layer | ongoing | engine integrations |
+| **Beautiful** | Immutable object naming and manifest carry-forward repair the original append-history failure. Normal PostgreSQL heap/WAL durability is a sound foundation for staged inserts. The typed batch ABI, projected reads, and decode-on-demand remove work at the right layers. | Preserve these seams. Test old snapshots with an independent reader, and prove ranged early stopping and memory bounds. |
+| **Good** | The fork ported to the CF #5631 AM-options contract, added commit-base validation, improved delete/schema handling, added validators and mappings, split the FDW and publisher, and landed dependency audit checks. Fresh local Rust and assertion-enabled SQL suites passed. | Retain the unit and SQL coverage. Extend the required CI path to live success cases, role boundaries, and fault barriers. |
+| **Bad** | M3 isolation and cloud parity are incomplete. The all-columns read remains eager. SF10 q1 timed out in the latest receipt, and q2/q3 baselines are unqualified. The benchmark runner lacks snapshot and result-digest qualification. | Fix the test harness, record one comparable baseline and profile the hot paths before choosing the next optimization. |
+| **Ugly** | A generic prepared COUNT kept returning 2 after a third row committed. A transaction inserting into 65 staged relations committed with only 64 ledger entries. Managed COUNT also removes query relation metadata, and publication has a remote/local failure window. | Gate the affected paths. Fix COUNT at execution and use durable, exact publication claims with remote reconciliation. Require negative tests before restoring the fast paths. |
 
-## 2. Current milestone (M3) detail
+## Milestone status
 
-```mermaid
-flowchart LR
-    subgraph done["✅ done"]
-        TT["time travel"]
-        PERF["perf: batch ABI 3.2x\nwriter bounds, pruning"]
-        STG["staged writes:\ndelta table + publisher\nbgworker, crash-tested"]
-        CACHE["block cache +\nranged reads"]
-    end
-    subgraph todo["❌ remaining"]
-        MVCC["mvcc models\nRR/SERIALIZABLE"]
-        CLOUD["ADLS/GCS IO\n+ auth chains"]
-        BR["branches/tags\nrollback SQL"]
-        LR["logical repl\ndecision"]
-    end
-    done --> todo
-```
-
-## 3. Track-by-track
-
-| Track | Progress | Detail |
+| Milestone | Implementation | Release evidence still needed |
 |---|---|---|
-| Staged writes (spec 15 R2) | 85% ✅ | P0–P4c + R2 core all landed (PRs #5/#6/#9); left: polish + coalesce edge cases |
-| v3 conformance (doc 14) | 50% 🔶 | V0/V1/V2 ✅ — V3 (DV write) V4 (lineage) V5 (defaults) remain |
-| 13-review blockers | ~80% ✅ | #1 #5 #6 #7 #8 done; #2/#3 partial (writer-side), #4 partial (identity partitions) |
-| CI/CD (doc 10 §1a) | ~75% ✅ | all-branch datalake-ci ✅ docs-sentinel ✅ · sanitizer/coverage jobs ❌ |
-| Perf (13-review E) | ~80% ✅ | batch ABI ✅ bounds ✅ · P0b ranged+cached+projection-pruned opens ✅ (#17) · P0b2 page-index pruning ❌ P0b3 row-group-deferred ❌ |
+| **M0 Foundation** | Historically accepted at `milestone/m0` | Revalidate clean builds, extension install and supported upgrades at each candidate SHA. |
+| **M1 External reads** | FDW, REST/S3, pruning, typed scans, time travel and supported v2/v3 delete reads landed | Independent result equivalence, qualified time-travel dump/restore, delete combinations, parallel pinning, cancellation and resource limits. |
+| **M2 Managed writes** | Append history, COW DML/MERGE, staged capture and a publisher exist | Exact bulk staging and crash/concurrency visibility. Demonstrate the documented local/remote commit semantics and publish-retry outcomes. |
+| **M3 Semantics and cloud parity** | In progress. Ranged projection, cached bytes, lazy projected decode, and initial COUNT paths landed | Qualify COUNT and lazy reads. Close isolation, ADLS/GCS transport and auth, branch/tag/history semantics and the logical replication decision. |
+| **M4 Production hardening** | Design available for maintenance, statistics and execution tiers | Implement and qualify compaction, expiry, orphan safety, ANALYZE and bounded scan/publish resource use. |
+| **M5 Engine integrations** | Backlog | Compare independently against the same pinned dataset, permission scope, resource budgets and result digests. |
 
-## 4. Recently landed (reverse-chronological, evidence in HANDOFF)
+## Evidence and next queue
 
-| Date | Slice | PR |
-|---|---|---|
-| 2026-11-21 | P0b3 row-group-deferred decode (lazy batch source) | #28 |
-| 2026-11-21 | P0b4 COUNT elision (~30,000x) + DV guard + MVCC revalidation; fdw/tableam decomposition | #20-#23 |
-| 2026-11-21 | P0b ranged/cached/projection-pruned parquet opens (laziness + repeat-free proven) | #17 |
-| 2026-11-21 | CI: cargo audit gate + smart path filtering (docs-only skips code jobs) | #16 |
-| 2026-11-21 | object_store 0.11→0.14.2 — RUSTSEC-2026-0194/-0195 cleared | #15 |
-| 2026-11-21 | Pre-commit hygiene gate: pgindent (fork typedefs) + fmt/clippy pedantic | #13 |
-| 2026-11-21 | Staged-publish acceptance pin (2 segs → 1 snapshot, live) | #13 |
-| 2026-11-21 | parquet/arrow 60.1.0 lockstep bump + spec 15 §6.3a/§6.5 v60 alignment | #14 |
-| 2026-11-21 | Staged-publish acceptance pin (2 segs → 1 snapshot, live) | #13 |
-| 2026-11-21 | Hash-key aliasing fix: per-row staged-capture regression ROOT-CAUSED | #9 |
-| 2026-11-21 | R2: CREATE-time write_mode + never-misread guard | #9 |
-| 2026-11-21 | P4c publisher bgworker (hands-off, live) | #6 |
-| 2026-11-21 | P3/P4 core: delta table, staged INSERT, coalesced publisher, crash test | #5 |
-| 2026-11-21 | P3 foundation: delta-segments store as PG table | #4 |
-| 2026-11-21 | P2 GUCs (32MB/4GB/128MB) · P0 caches · P1 rollover | #3/#2 |
-| 2026-11-21 | M3-R2 writer min/max bounds (pruning live) | PR #5-lineage |
-| 2026-11-21 | M3-R1 typed batch ABI (3.2×) + corruption fix | PR #5-lineage |
-| 2026-11-21 | Specs 15/§1a/01-diagrams; RULES §1a; branch protection; repo rename | #1/#8 |
+- **Local baseline.** 118 Rust tests passed and one manual benchmark was ignored. A clean assertion-enabled native build passed 243 upstream regression subtests and all 11 lakehouse SQL groups. Fork CI passed on PRs #27 and #28. See the [review receipts](16-release-reassessment-and-scale.md#evidence).
+- **First.** Regress COUNT against prepared-plan reuse, deletes and ordinary query permission semantics. **Done 2026-11-21 (gate):** both plan-time COUNT elisions are off the build (managed hook deleted, FDW upper path unwired); `count_elision.sql` now pins prepared-plan freshness, relation permission checks and the offline staged-serve fallback. Remaining in First: regress staged capture across 65 relations and publisher failure between local and remote decisions. Land correctness fixes before reporting optimization numbers.
+- **Second.** Qualify row-group laziness, bounded and cancelable I/O, cache scope, and byte/memory counters. Land the remote positive smoke and result-digest runner in CI.
+- **Third.** Profile SF10 and one concurrency workload. Use the measured time split to decide between fewer planning calls, batching an exact aggregate, or improving a join/rescan path. Keep page-index work independent.
+- **Milestone completion.** Follow the [TDD and smoke protocol](10-testing.md#milestone-tdd-and-smoke-receipts) and record PASS, FAIL, or NOT RUN against each named gate.
 
-## 5. Next queue
-
-1. **P0b4 metadata elision** — PROMOTED to first: measured evidence
-   (10-testing §5.2 internal receipts) shows count(*) ships ALL 23
-   columns × 28.8M rows across the FDW boundary, 100% CPU in transport,
-   zero I/O wait — the fetch side is done, the planner is the gap.
-   Planner-level COUNT/MIN/MAX from cached footers + manifest
-   record_counts (spec 15 §6.6); includes row_count column on the
-   delta ledger
-2. **P0b3** — row-group-deferred batch iteration (P0b's open_internal
-   still collects batches eagerly; laziness is per-column/per-scan) —
-   the q3-class full-scan canary needs this + P0b4
-3. **P0b2** — cached page indexes + bloom-filter reads through the same
-   block cache (parquet ≥60 building blocks; spec 15 §6.3a) — selective
-   page-level pruning
-4. **M3 close-out** — MVCC models → ADLS/GCS IO + auth → branches/tags →
-   logical-repl decision (gate: 4-store CI matrix + isolation tests)
-5. **M4** — compaction/expire/orphan/ANALYZE on the P4c worker skeleton;
-   optimize exec tiers (design: doc 08); writer-gated encodings (ALP,
-   bloom filters — downstream-decoder gate, spec 15 §6.5)
-6. **object_store follow-ups** — DONE 0.14.2 in #15 (RUSTSEC cleared,
-   cargo audit in CI); remaining: CRC64NVME checksummed writes +
-   read-timeout wiring when StorageIo hardening resumes
+Historical slice notes and receipts are in the [handoff](HANDOFF.md) and [takeover notes](HANDOFF-TAKEOVER.md). Dates, commit IDs, limitations and raw measurements belong with the receipt.

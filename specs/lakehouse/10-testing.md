@@ -225,6 +225,38 @@ WHERE case correctly falls back to a real scan (1.06s on the 288k
 sample, exact). Marketed §5.1-style comparison table: deferred until
 the P0b3 slice lands and a clean warmup+3 protocol completes.
 
+## Milestone TDD and smoke receipts
+
+Use this protocol for each milestone in the [roadmap](12-roadmap.md) and
+for the release blockers in the [current review](16-release-reassessment-and-scale.md).
+It extends the cold-room ceremony in [RULES §9](RULES.md). A slice can land
+behind a feature gate while the milestone awaits qualification.
+
+1. **Red.** Before changing behavior, write a regression against the parent SHA. At the smallest useful layer, assert the contract with exact rows or an observable resource counter. Add a normal SQL entry-point test for bugs spanning planning, permissions, transactions or publishing. Use independent expected rows and deterministic fault barriers for concurrent cases. Confirm that the regression fails for the intended reason and record its output.
+2. **Green.** Run the new test and the closest existing suites. For an optimization, run the same fixed inputs with the optimization enabled and disabled, including a negative control that forces the fallback. For a crash test, verify logical rows and the physical or ledger state after restart. Keep the test and fix in the same change.
+3. **Clean.** Run formatting and lint, the locked Rust suite, the assertion-enabled SQL regressions and the relevant integration suite. Include an instrumented run for changes to ABI, buffers or handle lifetime. Exercise fresh extension install and upgrades when touching extension SQL.
+4. **Smoke after each milestone.** Use a new database and disposable catalog at the candidate SHA. Build and install into an isolated directory. Run the previously accepted smoke cases plus the new milestone's positive and failure cases. Check actual rows and SQLSTATEs, remote state where applicable, and the absence of test processes after cancellation or restart. Run the full cold-room ceremony before promoting a milestone.
+5. **Measure on a separate release build.** Pin inputs by snapshot and result digest. Use the same machine, fixture, settings and cache state for before and after runs. Keep instrumented and release timings separate. Record failed runs and server-side timeouts. Warm measurements need at least five comparable repetitions for a median and range. Report tail quantiles only with enough samples and a documented method. Each claim names the path it measured.
+
+| Milestone | Required new smoke case | Measurements to retain |
+|---|---|---|
+| **M0** | Clean build with feature on and off, extension install and version | Build time, test totals, binary and extension versions |
+| **M1** | Live FDW read with projection, pruning, deletes and a historical snapshot. Check exact rows against an independent reader and serial/parallel equality. | Planning and first-row time, rows returned, files and groups examined/pruned/read, GET counts and bytes, peak RSS |
+| **M2** | Two appends with historical reads, disjoint and conflicting writers, staged crash and replay. Include rollback and external reader results. | Foreground commit and publish times, staged bytes, file count and size, conflicts, retries, and ledger age |
+| **M3** | Execution-time snapshot semantics, prepared plans, fallbacks, representative cloud transport/auth and cancellation. Run the supported four-store matrix. | End-to-end p50 and range, first-row time, request count, transferred bytes, decoded memory, aggregate input/output rows and concurrent throughput |
+| **M4** | Compact and expire while snapshots are pinned. Recover a publisher backlog and run qualified SF10 canaries plus a concurrent read/write case. | SF10 per-query wall/CPU/peak RSS, cache hit ratio, disk and WAL peaks, backlog recovery, bytes rewritten, exact row digests |
+| **M5** | Compare the chosen engine to the reference path on pinned inputs, including null, type and permission cases | Exact result equivalence, plan and FFI overhead, throughput, latency, CPU and memory |
+
+File one receipt per milestone in [retro/](retro/README.md) and link it from
+[PROGRESS](PROGRESS.md). Include candidate and baseline SHA, supported
+feature/format matrix, toolchain, fixture IDs or digests, settings and
+concurrency, test commands with pass/fail counts, manual SQL and external
+oracle results, and a link to red/green output. Record each gate as PASS,
+FAIL or NOT RUN with a reason. Keep raw per-run metrics and profile artifact
+IDs. Measure CPU sampling and allocation or RSS profiling with symbols
+for both PostgreSQL and Rust. A smoke run can establish behavior on a
+small fixture. Use the qualification matrix for performance claims.
+
 ## 6. Developer loop
 
 ```bash

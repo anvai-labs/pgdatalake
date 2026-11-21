@@ -53,6 +53,7 @@ later formats inherit them.
 | [10-testing.md](10-testing.md) | Test strategy: MinIO/Azurite/fake-gcs, regression suites |
 | [11-related-work.md](11-related-work.md) | Prior art: pg_lake, pg_duckdb, Aurora, PXF, DuckDB Iceberg |
 | [12-roadmap.md](12-roadmap.md) | Phased milestones M0–M5 with acceptance criteria |
+| [16-release-reassessment-and-scale.md](16-release-reassessment-and-scale.md) | Current review status, release gates, and scalable execution design |
 | [13-implementation-review.md](13-implementation-review.md) | FDW and managed Iceberg release blockers, verified findings, and implementation acceptance tests |
 | [RULES.md](RULES.md) | Fork discipline: branching, upstream sync, patch rules, code style |
 | [HANDOFF.md](HANDOFF.md) | State snapshot for the next working session |

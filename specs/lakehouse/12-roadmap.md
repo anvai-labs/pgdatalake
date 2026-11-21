@@ -3,6 +3,10 @@
 Each milestone ends with the named acceptance gate; no milestone overlaps
 another's gate. Rough sizing assumes 1–2 engineers + this agent.
 
+Use the [milestone TDD and smoke protocol](10-testing.md#milestone-tdd-and-smoke-receipts)
+for each acceptance gate. The [progress tracker](PROGRESS.md) describes
+what has landed and which evidence the current candidate still needs.
+
 ## M0 — Repo & build foundation (days) — DONE 2026-11-19, tag `milestone/m0`
 - [x] `main` as fork base (upstream `master` at fork creation `61f6021b110`,
       merge-synced with upstream per RULES §1 amendment)

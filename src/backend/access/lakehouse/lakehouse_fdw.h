@@ -33,8 +33,6 @@ typedef struct LakehouseShared
 	uint64		snapshot_id;
 } LakehouseShared;
 
-#define LAKEHOUSE_COUNT_ELISION_MARKER "count_elision"
-
 /*
  * per-executor-node state (owned by fdw_exec.c; planned data flows in
  * via fdw_private)
@@ -74,16 +72,6 @@ typedef struct LakehouseExecState
 	LakehouseBatchMap *maps;	/* per visible attribute */
 	Datum	   *row_values;		/* reused per row */
 	bool	   *row_nulls;
-
-	/*
-	 * P0b4 slice A (spec 15 §6.6): COUNT(*) metadata elision. The upper
-	 * ForeignPath (GetForeignUpperPaths) plans a ONE-ROW scan whose value is
-	 * the manifest record_count sum — computed in Begin from cached
-	 * manifests; Iterate yields it once. No data files are read.
-	 */
-	bool		elided_count;
-	bool		count_done;
-	int64		elided_count_value;
 } LakehouseExecState;
 
 /* fdw.c */
@@ -101,11 +89,6 @@ extern ForeignScan *lakehouse_GetForeignPlan(PlannerInfo *root,
 											 List *tlist,
 											 List *scan_clauses,
 											 Plan *outer_plan);
-extern void lakehouse_GetForeignUpperPaths(PlannerInfo *root,
-										   UpperRelationKind stage,
-										   RelOptInfo *input_rel,
-										   RelOptInfo *output_rel,
-										   void *extra);
 
 /* fdw_exec.c */
 extern void lakehouse_BeginForeignScan(ForeignScanState *node, int eflags);
