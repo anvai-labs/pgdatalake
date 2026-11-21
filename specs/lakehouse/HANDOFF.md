@@ -1063,3 +1063,22 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     guard); the 6-vs-11 discrepancy came from repeated manual test
     attempts, not snapshot replacement. The publisher's append path is
     correct as-is; carried-manifests handling needs NO change.
+  - ⚠️ OPEN REGRESSION — staged capture fires PER ROW (PR #9 red, do
+    not merge). LIVE-PROVEN: a 3-row single-statement staged INSERT in
+    ONE transaction (same txid 702, probed with GetTopTransactionIdIfAny)
+    fires staged_capture_segment THREE TIMES with staged_rows=1 each,
+    producing 3 single-row segments ([[1]],[[2]],[[3]]) instead of ONE
+    [[1],[2],[3]]. get_write_entry's !found init ALSO fires per row
+    (entry re-created per tuple_insert). The write_entries hash entry
+    (keyed by relid, HASH_BLOBS) is somehow LOST between rows of one
+    statement — without the teardown running (its probe stayed silent)
+    and without write_entries ever being NULLed outside the teardown.
+    SUSPECTS (next session): hash_create/hash_seq_search interplay with
+    the R2 resolution block's decode call in get_write_entry; or the
+    entry->mcxt/entry memory being reset by something in the executor
+    path between rows. NOTE: the entry->relid=0 bug (field never
+    assigned — P3's capture was its first reader) and the
+    empty-5th-slot over-read (blob layout + NUM_RELOPTS 5) are FIXED
+    and committed. ALL probes removed. Suite red on PR #9
+    (tableam + staged_insert): LOCAL repro = DROP/CREATE/attach/SET
+    staged/INSERT 3 rows on vg-m3.
