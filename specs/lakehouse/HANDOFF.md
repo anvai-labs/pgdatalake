@@ -1001,3 +1001,14 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     TODO: parse snapshot-id from commit result into the ledger column
     (currently flips published only), bgworker wrapper + publish_max_lag
     scheduling, coalesced multi-segment emission.
+  - P4 slice 2 — DONE 2026-11-21 (coalesced emission + ledger snapshot
+    id, live): commit_append now returns (metadata-location,
+    snapshot-id) — the id captured from the locally-generated AddSnapshot
+    (the REST response carries only metadata-location); C-side
+    pg_datalake_write_last_snapshot_id; publish_staged COALESCES all
+    unpublished segments into ONE snapshot (rollover bounds file sizes)
+    and flips every segment's ledger to published=true +
+    published_snapshot_id=<real id>. LIVE: 2 segments (20+11 rows) -> 1
+    commit -> ledger {2, all_pub=t, snap=1882430676134503717}; cow-mode
+    remote scan reads 31 rows, sum exact. P4c remaining: bgworker
+    wrapper + publish_max_lag scheduling.

@@ -772,6 +772,8 @@ pub struct WriteSession {
     target_file_size_bytes: i64,
     /// measured bytes/row from the last flush — the rollover estimate
     last_avg_row_bytes: usize,
+    /// snapshot id of the LAST successful commit (P4 ledger)
+    last_snapshot_id: i64,
 }
 
 /// Open a write session. `schema_json` is `[{"name": ..., "type":
@@ -935,6 +937,7 @@ pub unsafe extern "C" fn pg_datalake_write_new(
         staged_rows: 0,
         target_file_size_bytes: 0,
         last_avg_row_bytes: 64,
+        last_snapshot_id: 0,
     });
     Box::into_raw(ws)
 }
@@ -1276,6 +1279,19 @@ pub unsafe extern "C" fn pg_datalake_publish_segment(
     }
 }
 
+/// Snapshot id of the LAST successful commit on this session (P4
+/// ledger flip). 0 when no commit has happened.
+///
+/// # Safety
+/// `ws` must be a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_write_last_snapshot_id(ws: *mut WriteSession) -> i64 {
+    match unsafe { ws.as_ref() } {
+        Some(w) => w.last_snapshot_id,
+        None => 0,
+    }
+}
+
 /// Initialize the global per-backend block cache capacity (spec 15
 /// §6.2/P0): called once from _PG_init with lakehouse.cache_max_bytes.
 /// First call wins (the cache is process-lifetime; no re-cap).
@@ -1425,7 +1441,8 @@ unsafe fn commit_internal(
         )
     }));
     match commit {
-        Ok(Ok(loc)) => {
+        Ok(Ok((loc, snap_id))) => {
+            ws.last_snapshot_id = snap_id;
             ws.flushed.clear();
             match std::ffi::CString::new(loc) {
                 Ok(c) => c.into_raw(),
