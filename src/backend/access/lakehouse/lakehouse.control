@@ -2,7 +2,7 @@
 # (specs/lakehouse/02-sql-surface.md). SQL-visible names live in the
 # `lakehouse` schema (RULES.md §4); Iceberg is the first FORMAT layer.
 comment = 'Lakehouse storage engine support (open table formats)'
-default_version = '1.1'
+default_version = '1.2'
 module_pathname = '$libdir/lakehouse'
 relocatable = false
 superuser = true
