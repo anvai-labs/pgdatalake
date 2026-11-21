@@ -622,15 +622,13 @@ impl BatchWriter {
                 .close()
                 .map_err(|e| StorageError::Config(format!("write path: parquet close: {e}")))?;
             // ArrowWriter::close() hands back the thrift FileMetaData:
-            // row_groups -> columns -> meta_data.total_compressed_size
-            for rg in &footer.row_groups {
-                for (ci, col) in rg.columns.iter().enumerate() {
-                    let Some(meta) = &col.meta_data else {
-                        continue;
-                    };
+            // row_groups -> columns -> compressed_size (parquet 60 accessor;
+            // <=54 exposed this as col.meta_data.total_compressed_size)
+            for rg in footer.row_groups() {
+                for (ci, col) in rg.columns().iter().enumerate() {
                     // schema field order == self.columns order (fields built above)
                     if let Some(id) = self.columns.get(ci).and_then(|c| c.field_id) {
-                        *stats.column_sizes.entry(id).or_insert(0) += meta.total_compressed_size;
+                        *stats.column_sizes.entry(id).or_insert(0) += col.compressed_size();
                     }
                 }
             }

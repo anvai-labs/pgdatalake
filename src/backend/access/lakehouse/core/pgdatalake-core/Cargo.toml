@@ -22,8 +22,8 @@ object_store = { version = "0.11", default-features = false, features = ["aws", 
 bytes = "1"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 apache-avro = { version = "0.17", default-features = false }
-parquet = { version = "54", default-features = false, features = ["arrow", "snap", "zstd"] }
-arrow = { version = "54", default-features = false }
+parquet = { version = "60", default-features = false, features = ["arrow", "snap", "zstd"] }
+arrow = { version = "60", default-features = false }
 tokio = { version = "1", default-features = false, features = ["rt"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 roaring = "0.12.0"
