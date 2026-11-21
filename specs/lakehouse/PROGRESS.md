@@ -60,6 +60,7 @@ flowchart LR
 
 | Date | Slice | PR |
 |---|---|---|
+| 2026-11-21 | P0b3 row-group-deferred decode (lazy batch source) | #28 |
 | 2026-11-21 | P0b4 COUNT elision (~30,000x) + DV guard + MVCC revalidation; fdw/tableam decomposition | #20-#23 |
 | 2026-11-21 | P0b ranged/cached/projection-pruned parquet opens (laziness + repeat-free proven) | #17 |
 | 2026-11-21 | CI: cargo audit gate + smart path filtering (docs-only skips code jobs) | #16 |

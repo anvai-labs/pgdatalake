@@ -1131,6 +1131,17 @@ FdwRoutine vtables (interface), exec-state context structs, fdw_private
 plan<->executor messaging, batch_fill adapters. What is missing is
 module boundaries, not patterns.
 
+DONE phase 3 (2026-11-21, #28): P0b3 — ParquetRows holds the
+ParquetRecordBatchReader LAZILY (Box<dyn Iterator> over RecordBatch;
+open_all/delete-file path stays eager). Row groups decode on demand:
+LIMIT/early-termination queries skip remaining groups' decode; decode
+failures mid-scan panic -> FFI catch_unwind -> tri-state ERROR
+(13-review #8). All consumption sites unchanged (self.batches.next()).
+The tableam_write.c extraction (write path -> separate file) remains
+DEFERRED — scripts saved at /tmp/{split_final,build_write_file}.py,
+failure modes documented (decl-vs-def anchors, col-0 brace, +1
+overcut), needs a fresh session.
+
 DONE phase 1-2 (2026-11-21, #23): fdw.c split into fdw_plan.c (~700
 planning + elision + predicate translation) / fdw_exec.c (~600 exec +
 parallel DSM + elided-count mode) / fdw.c (~310 assembly:
