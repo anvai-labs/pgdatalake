@@ -249,6 +249,36 @@ impl StorageIo {
         }
     }
 
+    /// Ranged GET of `[offset, offset+len)` bytes (slice P0, spec 15
+    /// §6.2): the read-side prerequisite for footer-driven reads and the
+    /// block cache. Byte-identity contract: the returned bytes MUST
+    /// equal `&get_bytes(key)[offset..offset+len]` (tested). Out-of-range
+    /// is an Http error from object_store, surfaced as-is.
+    pub fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>, StorageError> {
+        use object_store::{GetOptions, GetRange};
+        let path = self.full_path(key);
+        let opts = GetOptions {
+            range: Some(GetRange::Bounded({
+                let o = offset as usize;
+                let l = len as usize;
+                o..o.saturating_add(l)
+            })),
+            ..Default::default()
+        };
+        match runtime().block_on(self.store.get_opts(&path, opts)) {
+            Ok(res) => {
+                let bytes = runtime()
+                    .block_on(res.bytes())
+                    .map_err(|e| StorageError::Http(e.to_string()))?;
+                Ok(bytes.to_vec())
+            }
+            Err(object_store::Error::NotFound { path, source }) => {
+                Err(StorageError::NotFound(format!("{path}: {source}")))
+            }
+            Err(e) => Err(StorageError::Http(e.to_string())),
+        }
+    }
+
     /// PUT one object (used by later write-path slices; exposed now so the
     /// fixture example can verify the roundtrip).
     #[allow(dead_code)]

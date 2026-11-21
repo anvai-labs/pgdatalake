@@ -84,7 +84,7 @@ reference.
 | grammar | `src/backend/parser/gram.y` (iceberg `FOR … AS OF` clause, `USING lakehouse FORMAT iceberg`), `src/backend/nodes/*` if a new node needed |
 | grammar plumbing | `src/include/parser/kwlist.h`, `src/backend/parser/parse_clause.c` (+ `.h`), `src/backend/parser/parse_relation.c`, `src/backend/parser/analyze.c`, `src/include/nodes/parsenodes.h` (one RTE field), `src/include/nodes/primnodes.h`, `src/include/catalog/catversion.h` (bump with parsed-tree changes) — lakehouse time travel `FOR … AS OF` resolution only (slice 19 amendment 2026-11-19); keep each touch to a small, commented hook |
 | reloptions | `src/backend/access/common/reloptions.c`, `src/include/utils/rel.h` |
-| GUCs | `src/backend/utils/misc/guc_tables.c`, `postgresql.conf.sample` |
+| GUCs | *(superseded 2026-11-20)*: extension-defined GUCs via `DefineCustom*Variable` in `_PG_init` are the sanctioned seam — no core edit exists or is permitted for lakehouse GUCs. The historical `guc_tables.c`/`postgresql.conf.sample` allowlist entry is RETIRED before first use (spec 15 P2). |
 | autovacuum dispatch | `src/backend/postmaster/autovacuum.c` |
 | storage hooks | `src/backend/catalog/storage.c` (relfilenode-less rels), `src/include/storage/smgr.h` |
 | meson/build | `meson.build`, `src/backend/access/meson.build`, `config/` |
