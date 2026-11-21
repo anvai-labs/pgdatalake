@@ -1012,3 +1012,23 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     commit -> ledger {2, all_pub=t, snap=1882430676134503717}; cow-mode
     remote scan reads 31 rows, sum exact. P4c remaining: bgworker
     wrapper + publish_max_lag scheduling.
+  - P4c slice — DONE 2026-11-21 (publisher bgworker, TDD + live): the
+    hands-off loop — discover DISTINCT unpublished relids via SPI,
+    publish each table in its OWN transaction (publish_staged's
+    coalesced emission + ledger flip), sleep
+    lakehouse.publish_max_lag, repeat. Registration DUAL: static under
+    shared_preload (production, lakehouse.publisher_enabled +
+    lakehouse.publish_database GUCs, PGC_POSTMASTER — defined only
+    during preload: defining them in a backend FATALs), DYNAMIC via
+    lakehouse.start_publisher() (tests/dev — no preload needed;
+    postmaster-owned, survives the registering backend; guards via
+    pg_stat_activity). GOTCHAS CAUGHT LIVE: the worker entry must be
+    PGDLLEXPORT (-fvisibility=hidden hid it: "could not find
+    lakehouse_publisher_main"); AND the per-table txn must COMMIT not
+    ABORT — aborting rolled back the ledger flip so every cycle
+    re-published the same segment (duplicate rows remote-side, seen as
+    40 rows of the same 10). FIXED + verified hands-off: staged insert
+    -> 2 cycles -> segments published=true with the real snapshot id;
+    pyiceberg reads exactly 10 rows (no duplicates). Offline
+    acceptance: publisher.sql (10th test) asserts the worker runs via
+    start_publisher. Suite 10/10, 114 cargo.
