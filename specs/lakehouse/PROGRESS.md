@@ -60,6 +60,7 @@ flowchart LR
 
 | Date | Slice | PR |
 |---|---|---|
+| 2026-11-21 | Hash-key aliasing fix: per-row staged-capture regression ROOT-CAUSED | #9 |
 | 2026-11-21 | R2: CREATE-time write_mode + never-misread guard | #9 |
 | 2026-11-21 | P4c publisher bgworker (hands-off, live) | #6 |
 | 2026-11-21 | P3/P4 core: delta table, staged INSERT, coalesced publisher, crash test | #5 |

@@ -1063,41 +1063,28 @@ layout, style, secrets, TDD (§8), smoke-test ceremony (§9). Follow it.
     guard); the 6-vs-11 discrepancy came from repeated manual test
     attempts, not snapshot replacement. The publisher's append path is
     correct as-is; carried-manifests handling needs NO change.
-  - ⚠️ OPEN REGRESSION — staged capture fires PER ROW (PR #9 red, do
-    not merge). LIVE-PROVEN: a 3-row single-statement staged INSERT in
-    ONE transaction (same txid 702, probed with GetTopTransactionIdIfAny)
-    fires staged_capture_segment THREE TIMES with staged_rows=1 each,
-    producing 3 single-row segments ([[1]],[[2]],[[3]]) instead of ONE
-    [[1],[2],[3]]. get_write_entry's !found init ALSO fires per row
-    (entry re-created per tuple_insert). The write_entries hash entry
-    (keyed by relid, HASH_BLOBS) is somehow LOST between rows of one
-    statement — without the teardown running (its probe stayed silent)
-    and without write_entries ever being NULLed outside the teardown.
-    SUSPECTS (next session): hash_create/hash_seq_search interplay with
-    the R2 resolution block's decode call in get_write_entry; or the
-    entry->mcxt/entry memory being reset by something in the executor
-    path between rows. NOTE: the entry->relid=0 bug (field never
-    assigned — P3's capture was its first reader) and the
-    empty-5th-slot over-read (blob layout + NUM_RELOPTS 5) are FIXED
-    and committed. ALL probes removed. Suite red on PR #9
-    (tableam + staged_insert): LOCAL repro = DROP/CREATE/attach/SET
-    staged/INSERT 3 rows on vg-m3.
-  - ⚠️ REGRESSION NARROWED (PR #9 still open): two REAL bugs FIXED and
-    verified (tableam passes again): (1) the decode walk now bounds by
-    blob length — legacy 4-key blobs + NUM_RELOPTS 5 read garbage past
-    the last NUL and errored loudly, aborting EVERY statement touching
-    the table (the CI 22023 + the 8-ABORT bursts); (2) entry->relid
-    assignment. REMAINING (repro: fresh staged table, single 3-row
-    INSERT txn): the capture STILL fires once PER ROW — get_write_entry
-    re-creates the write_entries hash entry per tuple_insert (!found
-    per row, same txid — probed), yielding 3 single-row segments
-    instead of 1 three-row segment. NOT the xact-callback registration
-    (idempotent, tried), NOT the teardown (probe silent mid-insert),
-    NOT the seq-search iteration (two-phase collect-then-capture
-    restructure in place, didn't change the count). NEXT: probe
-    hash_search HASH_ENTER/HASH_REMOVE on write_entries directly
-    (who deletes the entry between rows of one txn), and diff
-    get_write_entry's call path per row. All probes currently REMOVED.
-    Also commit 5ded905e: the P3 phase-2 two-phase PRE_COMMIT
-    restructure (collect during seq iteration, capture after it
-    completes) — correct pattern regardless.
+  - ✅ PER-ROW CAPTURE REGRESSION FIXED (commit 42f2174b23e, PR #9
+    should go green). ROOT CAUSE: dynahash hash-key aliasing. hash_search
+    returns a pointer to the KEY BYTES (ELEMENTKEY) — the entry struct
+    overlays them. LakehouseWriteEntry declared `int write_mode` at
+    offset 0 (inside the 4-byte keysize window), so its !found init
+    (`entry->write_mode = ...`) rewrote the stored key: every later
+    HASH_ENTER for the same relid MISSED and minted a duplicate entry —
+    one per row, each with 1 staged row, each captured as its own
+    segment. Probes proved it directly: `found 0` three times, hash
+    growing 1→2→3, same relid, same hashp. COW multi-row had the same
+    bug latently (one write session per row). Fix: `Oid relid` is the
+    FIRST member (canonical dynahash idiom, matching
+    LakehouseScanRegistryEntry); init code never touches the key
+    field. Also removed: redundant entry->relid init, unused save_uid,
+    C90 mixed-declaration warning in the delta-serve path. Verified:
+    probe log found=0 once then found=1 per row, ONE entry rows=3, ONE
+    capture; lakehouse suite 10/10 green, upstream regress suite green.
+    LESSON (generalizes): any struct used as a dynahash HASH_ELEM entry
+    must declare the key first and treat it as hash-owned — a member
+    landing inside [0, keysize) silently corrupts lookups.
+  - (history) The two suspects previously eliminated — xact-callback
+    registration and seq-search iteration — were never the cause; the
+    earlier "capture 3× with staged_rows=1" observation was the alias
+    entries. The two-phase PRE_COMMIT restructure (commit 5ded905e) is
+    still the correct pattern and stays.
