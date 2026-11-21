@@ -51,6 +51,11 @@
 #include "access/reloptions.h"
 #include "utils/guc.h"
 #include "executor/spi.h"
+#include "postmaster/bgworker.h"
+#include "storage/ipc.h"
+#include "storage/latch.h"
+#include "tcop/tcopprot.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/builtins.h"
 #include "utils/fmgrprotos.h"
@@ -316,6 +321,11 @@ extern int		lakehouse_write_mode;	/* enum: 1 = cow, 2 = staged */
 extern int		lakehouse_target_file_size;
 extern int		lakehouse_publish_max_lag;
 extern int		lakehouse_cache_max_bytes;
+
+/* P4c publisher worker knobs (defined + registered in _PG_init) */
+extern bool		lakehouse_publisher_enabled;
+extern char	   *lakehouse_publish_database;
+
 #define LAKEHOUSE_WRITE_MODE_COW		1
 #define LAKEHOUSE_WRITE_MODE_STAGED		2
 
@@ -2698,6 +2708,214 @@ int			lakehouse_write_mode = 1;	/* enum: 1 = cow, 2 = staged */
 int			lakehouse_target_file_size = 128 * 1024;	/* kB; SHOWs as 128MB */
 int			lakehouse_publish_max_lag = 30;		/* s */
 int			lakehouse_cache_max_bytes = 256 * 1024;		/* kB; SHOWs as 256MB */
+bool		lakehouse_publisher_enabled = true;
+char	   *lakehouse_publish_database = NULL;	/* default: "postgres" */
+
+static void
+register_publisher_worker(void)
+{
+	BackgroundWorker bgw;
+	MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
+	memset(&bgw, 0, sizeof(bgw));
+	snprintf(bgw.bgw_name, BGW_MAXLEN, "lakehouse publisher");
+	snprintf(bgw.bgw_type, BGW_MAXLEN, "lakehouse publisher");
+	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+	bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	bgw.bgw_restart_time = 30;
+	snprintf(bgw.bgw_library_name, BGW_MAXLEN, "lakehouse");
+	snprintf(bgw.bgw_function_name, BGW_MAXLEN, "lakehouse_publisher_main");
+	bgw.bgw_main_arg = 0;
+	RegisterBackgroundWorker(&bgw);
+	MemoryContextSwitchTo(old);
+}
+
+/*
+ * pg_lakehouse_start_publisher (P4c, dynamic path): register the
+ * publisher worker from a NORMAL backend — no preload required (tests,
+ * dev, and upgrades of an existing installation). Returns true when a
+ * worker was registered; false when one is already running (checked via
+ * pg_stat_activity; the static preload path makes this a no-op).
+ */
+PG_FUNCTION_INFO_V1(pg_lakehouse_start_publisher);
+
+Datum
+pg_lakehouse_start_publisher(PG_FUNCTION_ARGS)
+{
+	BackgroundWorker bgw;
+	BackgroundWorkerHandle *handle;
+	int			running = 0;
+	int			ret;
+
+	if (!lakehouse_publisher_enabled)
+		PG_RETURN_BOOL(false);
+
+	SPI_connect();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	ret = SPI_execute("SELECT count(*) FROM pg_stat_activity"
+					  " WHERE backend_type = 'lakehouse publisher'",
+					  true, 0);
+	if (ret == SPI_OK_SELECT && SPI_processed > 0)
+	{
+		bool		isnull;
+
+		running = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+											  SPI_tuptable->tupdesc, 1,
+											  &isnull));
+	}
+	PopActiveSnapshot();
+	SPI_finish();
+	if (running > 0)
+		PG_RETURN_BOOL(false);
+
+	memset(&bgw, 0, sizeof(bgw));
+	snprintf(bgw.bgw_name, BGW_MAXLEN, "lakehouse publisher");
+	snprintf(bgw.bgw_type, BGW_MAXLEN, "lakehouse publisher");
+	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+	bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	bgw.bgw_restart_time = 30;
+	snprintf(bgw.bgw_library_name, BGW_MAXLEN, "lakehouse");
+	snprintf(bgw.bgw_function_name, BGW_MAXLEN, "lakehouse_publisher_main");
+	bgw.bgw_main_arg = 0;
+
+	if (!RegisterDynamicBackgroundWorker(&bgw, &handle))
+		ereport(ERROR,
+				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+				 errmsg("lakehouse: could not register the publisher worker")));
+	PG_RETURN_BOOL(true);
+}
+
+/*
+ * publisher_main (P4c, spec 15 §4/§G5): the hands-off publisher loop.
+ * One cycle per publish_max_lag: find every table with unpublished
+ * delta segments and run lakehouse.publish_staged() for it (the
+ * emission core + ledger flip of slices P4.1/2). Each table publishes
+ * in its OWN transaction so one bad table never wedges the loop; a
+ * failing table (e.g. unreachable catalog) logs a WARNING and is
+ * retried next cycle — never fatal to the worker.
+ */
+static volatile sig_atomic_t got_sigterm = false;
+
+static void
+publisher_sigterm(SIGNAL_ARGS)
+{
+	got_sigterm = true;
+	SetLatch(MyLatch);
+}
+
+PGDLLEXPORT void
+lakehouse_publisher_main(Datum main_arg);	/* bgw entry: must be exported */
+
+void
+lakehouse_publisher_main(Datum main_arg)
+{
+	const char *dbname = lakehouse_publish_database
+		? lakehouse_publish_database : "postgres";
+
+	pqsignal(SIGTERM, publisher_sigterm);
+	BackgroundWorkerUnblockSignals();
+	BackgroundWorkerInitializeConnection(dbname, NULL, 0);
+
+	while (!got_sigterm)
+	{
+		int			rc;
+		int			ret;
+		int			nrels = 0;
+		Oid		   *relids = NULL;
+
+		/* one transaction per CYCLE: discover + publish + flip */
+		SetCurrentStatementStartTimestamp();
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
+		SPI_connect();
+		PG_TRY();
+		{
+			ret = SPI_execute("SELECT DISTINCT relid FROM"
+							  " lakehouse.lakehouse_delta_segments"
+							  " WHERE NOT published", true, 0);
+			if (ret == SPI_OK_SELECT && SPI_processed > 0)
+			{
+				MemoryContext sc = MemoryContextSwitchTo(TopTransactionContext);
+
+				relids = (Oid *) palloc(sizeof(Oid) * SPI_processed);
+				for (int i = 0; i < SPI_processed; i++)
+				{
+					bool		isnull;
+
+					relids[nrels] = DatumGetObjectId(SPI_getbinval(
+						SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1,
+						&isnull));
+					if (!isnull)
+						nrels++;
+				}
+				MemoryContextSwitchTo(sc);
+			}
+		}
+		PG_CATCH();
+		{
+			/* keep the worker alive no matter what */
+			FlushErrorState();
+			SPI_finish();
+			PopActiveSnapshot();
+			AbortCurrentTransaction();
+			ereport(LOG,
+					(errmsg("lakehouse publisher: discovery failed, retrying")));
+			goto sleep_cycle;
+		}
+		PG_END_TRY();
+		SPI_finish();
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+
+		for (int i = 0; i < nrels; i++)
+		{
+			SetCurrentStatementStartTimestamp();
+			StartTransactionCommand();
+			PushActiveSnapshot(GetTransactionSnapshot());
+			SPI_connect();
+			PG_TRY();
+			{
+				StringInfoData sql;
+
+				initStringInfo(&sql);
+				appendStringInfo(&sql,
+								 "SELECT lakehouse.publish_staged(%u)",
+								 (unsigned) relids[i]);
+				SPI_execute(sql.data, false, 0);
+				SPI_finish();
+				PopActiveSnapshot();
+				/* COMMIT, not abort: the ledger flip of publish_staged
+				 * must SURVIVE the cycle, or the segment stays
+				 * unpublished and re-publishes every cycle (duplicate
+				 * rows remote-side — caught live: 4 cycles x same 10
+				 * rows). */
+				CommitTransactionCommand();
+			}
+			PG_CATCH();
+			{
+				/* failure path: abort (ledger untouched) — the segment
+				 * retries next cycle */
+				FlushErrorState();
+				AbortCurrentTransaction();
+				ereport(LOG,
+						(errmsg("lakehouse publisher: publish of %u failed,"
+								" retrying next cycle",
+								(unsigned) relids[i])));
+			}
+			PG_END_TRY();
+		}
+
+sleep_cycle:
+		rc = WaitLatch(MyLatch,
+					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+					   (long) lakehouse_publish_max_lag * 1000,
+					   PG_WAIT_EXTENSION);
+		ResetLatch(MyLatch);
+		if (rc & WL_POSTMASTER_DEATH || got_sigterm)
+			break;
+	}
+	proc_exit(0);
+}
 
 static const struct config_enum_entry lakehouse_write_mode_options[] = {
 	{"cow", 1, false},
@@ -2747,11 +2965,45 @@ _PG_init(void)
 							GUC_UNIT_KB,
 							NULL, NULL, NULL);
 
+	/* POSTMASTER-context GUCs are legal only during preload; a
+	 * non-preload load (CREATE EXTENSION) skips them — the publisher
+	 * then runs via lakehouse.start_publisher()'s dynamic registration
+	 * with its built-in defaults. */
+	if (process_shared_preload_libraries_in_progress)
+	{
+		DefineCustomBoolVariable("lakehouse.publisher_enabled",
+							 "Run the staged-delta publisher background worker (spec 15 §4).",
+							 NULL,
+							 &lakehouse_publisher_enabled,
+							 true,
+							 PGC_POSTMASTER,
+							 0,
+							 NULL, NULL, NULL);
+
+		DefineCustomStringVariable("lakehouse.publish_database",
+							   "Database the publisher worker connects to.",
+							   NULL,
+							   &lakehouse_publish_database,
+							   "postgres",
+							   PGC_POSTMASTER,
+							   0,
+							   NULL, NULL, NULL);
+	}	/* end preload-only GUC block */
+
 	MarkGUCPrefixReserved("lakehouse");
 
 	/* per-backend immutable-object block cache, capped by GUC (spec 15
 	 * §6.2; first call wins — process-lifetime capacity) */
 	pg_datalake_core_cache_init((int64) lakehouse_cache_max_bytes * 1024);
+
+	/* P4c: the publisher worker registers STATICALLY under preload
+	 * (production) and DYNAMICALLY via lakehouse.start_publisher()
+	 * when the library loads without preload (tests/dev) — dynamic
+	 * workers are postmaster-owned and survive the registering
+	 * backend. */
+	if (process_shared_preload_libraries_in_progress &&
+		lakehouse_publisher_enabled)
+		register_publisher_worker();
 
 	RegisterXactCallback(lakehouse_xact_callback, NULL);
 	RegisterSubXactCallback(lakehouse_subxact_callback, NULL);

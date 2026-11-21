@@ -156,3 +156,9 @@ CREATE FUNCTION lakehouse.publish_staged(target regclass)
 RETURNS integer
 AS 'MODULE_PATHNAME', 'pg_lakehouse_publish_staged'
 LANGUAGE C VOLATILE;
+
+-- P4c: start the publisher worker from a normal backend (no preload
+-- needed); no-op when one is already running.
+CREATE FUNCTION lakehouse.start_publisher() RETURNS boolean
+AS 'MODULE_PATHNAME', 'pg_lakehouse_start_publisher'
+LANGUAGE C VOLATILE;
