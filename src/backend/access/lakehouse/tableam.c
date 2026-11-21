@@ -49,6 +49,7 @@
 #include "storage/smgr.h"
 #include "utils/lsyscache.h"
 #include "access/reloptions.h"
+#include "utils/guc.h"
 #include "utils/rel.h"
 #include "utils/builtins.h"
 #include "utils/fmgrprotos.h"
@@ -2444,9 +2445,62 @@ lakehouse_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	(void) parentSubid;
 }
 
+/* lakehouse GUC surface (spec 15 §7.2 P2): extension-defined via
+ * DefineCustom*Variable — the seam Postgres provides; NO core edit
+ * (RULES §3: the guc_tables.c allowlist entry is retired). */
+int			lakehouse_write_mode = 1;	/* enum: 1 = cow, 2 = staged */
+int			lakehouse_target_file_size = 128 * 1024;	/* kB; SHOWs as 128MB */
+int			lakehouse_publish_max_lag = 30;		/* s */
+int			lakehouse_cache_max_bytes = 256 * 1024;		/* kB; SHOWs as 256MB */
+
+static const struct config_enum_entry lakehouse_write_mode_options[] = {
+	{"cow", 1, false},
+	{"staged", 2, false},
+	{NULL, 0, false},
+};
+
 void
 _PG_init(void)
 {
+	DefineCustomEnumVariable("lakehouse.write_mode",
+							 "Managed write mode: cow (copy-on-write, default) or staged (deferred publish, spec 15).",
+							 NULL,
+							 &lakehouse_write_mode,
+							 1,	/* boot default: cow */
+							 lakehouse_write_mode_options,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomIntVariable("lakehouse.target_file_size",
+							"Target size of one written data file; the writer rolls files at this threshold.",
+							NULL,
+							&lakehouse_target_file_size,
+							128 * 1024, 128 * 1024, PG_INT32_MAX,
+							PGC_USERSET,
+							GUC_UNIT_KB,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("lakehouse.publish_max_lag",
+							"Maximum age of unpublished staged deltas before the publisher must flush (spec 15 G5).",
+							NULL,
+							&lakehouse_publish_max_lag,
+							30, 0, PG_INT32_MAX / 2,
+							PGC_SUSET,
+							GUC_UNIT_S,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("lakehouse.cache_max_bytes",
+							"Byte cap of the per-backend immutable-object read cache (spec 15 §6.2).",
+							NULL,
+							&lakehouse_cache_max_bytes,
+							256 * 1024, 0, PG_INT32_MAX,
+							PGC_USERSET,
+							GUC_UNIT_KB,
+							NULL, NULL, NULL);
+
+	MarkGUCPrefixReserved("lakehouse");
+
 	RegisterXactCallback(lakehouse_xact_callback, NULL);
 	RegisterSubXactCallback(lakehouse_subxact_callback, NULL);
 }

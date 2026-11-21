@@ -75,7 +75,7 @@ tests += {
   'sd': meson.project_source_root() / 'src/test/regress/lakehouse',
   'bd': meson.current_build_dir(),
   'regress': {
-    'sql': ['version', 'scan_files', 'fdw', 'fdw_auth', 'time_travel', 'tableam'],
+    'sql': ['version', 'scan_files', 'fdw', 'fdw_auth', 'time_travel', 'tableam', 'gucs'],
     'test_kwargs': {'timeout': 120},
     'deps': [lakehouse],
   },

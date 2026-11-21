@@ -1,0 +1,85 @@
+-- another test may have created it; force a library load into THIS
+-- backend either way: extension GUCs register per backend at load time
+CREATE EXTENSION IF NOT EXISTS lakehouse;
+NOTICE:  extension "lakehouse" already exists, skipping
+SELECT lakehouse.version();
+          version           
+----------------------------
+ pgdatalake-core 0.1.0 (M0)
+(1 row)
+
+-- lakehouse GUC surface (spec 15 §7.2 P2): extension-defined via
+-- DefineCustom*Variable in _PG_init — NO core edit (RULES §3 note).
+-- Security posture: filesystem-path knobs are SUSET (RULES §6: cache/
+-- delta dirs carry table data); tuning knobs are USERSET.
+-- defaults
+SHOW lakehouse.write_mode;
+ lakehouse.write_mode 
+----------------------
+ cow
+(1 row)
+
+SHOW lakehouse.target_file_size;
+ lakehouse.target_file_size 
+----------------------------
+ 128MB
+(1 row)
+
+SHOW lakehouse.publish_max_lag;
+ lakehouse.publish_max_lag 
+---------------------------
+ 30s
+(1 row)
+
+SHOW lakehouse.cache_max_bytes;
+ lakehouse.cache_max_bytes 
+---------------------------
+ 256MB
+(1 row)
+
+-- session set/reset round-trip
+SET lakehouse.write_mode = 'staged';
+SHOW lakehouse.write_mode;
+ lakehouse.write_mode 
+----------------------
+ staged
+(1 row)
+
+RESET lakehouse.write_mode;
+SHOW lakehouse.write_mode;
+ lakehouse.write_mode 
+----------------------
+ cow
+(1 row)
+
+SET lakehouse.target_file_size = '256MB';
+SHOW lakehouse.target_file_size;
+ lakehouse.target_file_size 
+----------------------------
+ 256MB
+(1 row)
+
+RESET lakehouse.target_file_size;
+SET lakehouse.publish_max_lag = 120;
+SHOW lakehouse.publish_max_lag;
+ lakehouse.publish_max_lag 
+---------------------------
+ 2min
+(1 row)
+
+RESET lakehouse.publish_max_lag;
+SET lakehouse.cache_max_bytes = '512MB';
+SHOW lakehouse.cache_max_bytes;
+ lakehouse.cache_max_bytes 
+---------------------------
+ 512MB
+(1 row)
+
+RESET lakehouse.cache_max_bytes;
+-- invalid enum value rejected loudly
+SET lakehouse.write_mode = 'bogus';
+ERROR:  invalid value for parameter "lakehouse.write_mode": "bogus"
+HINT:  Available values: cow, staged.
+-- invalid numeric rejected loudly
+SET lakehouse.target_file_size = '0';
+ERROR:  0 kB is outside the valid range for parameter "lakehouse.target_file_size" (131072 kB .. 2147483647 kB)
