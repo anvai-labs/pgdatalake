@@ -80,9 +80,12 @@ flowchart LR
 2. **P0b2** — cached page indexes + bloom-filter reads through the same
    block cache (parquet ≥60 building blocks; spec 15 §6.3a) — selective
    page-level pruning
-3. **M3 close-out** — MVCC models → ADLS/GCS IO + auth → branches/tags →
-   logical-repl decision (gate: 4-store CI matrix + isolation tests);
-   includes the deliberate `object_store` 0.11 → 0.14 bump
+3. **object_store 0.11 → 0.14.1** — PROMOTED (security: RUSTSEC-2026-0194/
+   -0195 via quick-xml, fixed only in 0.14.1; spec 15 §6.5). Breaking:
+   ObjectStoreExt trait split + copy_opts; StorageIo migration +
+   `cargo audit` in CI
+4. **M3 close-out** — MVCC models → ADLS/GCS IO + auth → branches/tags →
+   logical-repl decision (gate: 4-store CI matrix + isolation tests)
 4. **M4** — compaction/expire/orphan/ANALYZE on the P4c worker skeleton;
    optimize exec tiers (design: doc 08); writer-gated encodings (ALP,
    bloom filters — downstream-decoder gate, spec 15 §6.5)

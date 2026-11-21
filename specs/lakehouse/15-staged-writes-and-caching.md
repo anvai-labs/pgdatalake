@@ -427,9 +427,21 @@ doesn't silently become a correctness hazard.
   are pinned to the same version in Cargo.toml; future bumps must move
   them together.
 - `object_store` is NOT lockstep-bound with parquet (we own our StorageIo
-  and don't enable parquet's object-store feature); 60.1 pairs with
-  0.14.1 upstream while we are on 0.11 — bump separately, deliberately,
-  when StorageIo needs its range-request/prefetch improvements.
+  and don't enable parquet's object-store feature) — BUT the bump is
+  SECURITY-motivated now, not feature-motivated: `cargo audit` on our
+  lock reports RUSTSEC-2026-0194 + RUSTSEC-2026-0195 (quick-xml 0.37.5
+  via object_store 0.11 — quadratic parse time and unbounded
+  namespace-allocation DoS in S3 error-XML parsing; reachable through
+  operator/user-configured S3 endpoints), and the advisory fix shipped
+  in object_store **0.14.1** (quick-xml 0.41) only. PROMOTED to
+  next-up (first slice after the parquet-60 PR): the 0.11 → 0.14
+  migration touches StorageIo for real — 0.13 moved `get`/`get_range`/
+  `head` to the `ObjectStoreExt` trait and replaced `copy`/`copy_if_not_exists`
+  with `copy_opts`; 0.14 adds CRC64NVME checksums, LocalFileSystem
+  reliable writes (close error checking + opt-in sync), read timeouts,
+  coalesced contiguous ranges, reqwest-optional/pluggable-crypto, Azure
+  CPK + delegation-key SAS caching, and S3 dual-stack endpoints. `cargo
+  audit` joins the CI Rust checks with this bump.
 - Rust toolchain floor for arrow-rs 60 is 1.88; we pin 1.100.0
   (rust-toolchain.toml) — bump toolchain only in a noted commit.
 - Writer-gated encodings (ALP, bloom filters) follow the v3-conformance
