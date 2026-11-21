@@ -80,19 +80,18 @@ RESET lakehouse.cache_max_bytes;
 SET lakehouse.write_mode = 'bogus';
 ERROR:  invalid value for parameter "lakehouse.write_mode": "bogus"
 HINT:  Available values: cow, staged.
--- invalid numeric rejected loudly
+-- invalid numeric rejected loudly (min 32MB, max 4GB — kB bounds)
 SET lakehouse.target_file_size = '0';
-ERROR:  0 kB is outside the valid range for parameter "lakehouse.target_file_size" (128 kB .. 10485760 kB)
--- hard ceiling: 10GB (10485760 kB) on both size knobs (spec 15 P2)
-SET lakehouse.target_file_size = '11GB';
-ERROR:  11534336 kB is outside the valid range for parameter "lakehouse.target_file_size" (128 kB .. 10485760 kB)
-SET lakehouse.cache_max_bytes = '11GB';
-ERROR:  11534336 kB is outside the valid range for parameter "lakehouse.cache_max_bytes" (0 kB .. 10485760 kB)
-SET lakehouse.target_file_size = '10GB';
+ERROR:  0 kB is outside the valid range for parameter "lakehouse.target_file_size" (32768 kB .. 4194304 kB)
+SET lakehouse.target_file_size = '31MB';
+ERROR:  31744 kB is outside the valid range for parameter "lakehouse.target_file_size" (32768 kB .. 4194304 kB)
+SET lakehouse.cache_max_bytes = '5GB';
+ERROR:  5242880 kB is outside the valid range for parameter "lakehouse.cache_max_bytes" (32768 kB .. 4194304 kB)
+SET lakehouse.target_file_size = '4GB';
 SHOW lakehouse.target_file_size;
  lakehouse.target_file_size 
 ----------------------------
- 10GB
+ 4GB
 (1 row)
 
 RESET lakehouse.target_file_size;
