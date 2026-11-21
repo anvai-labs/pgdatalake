@@ -1,0 +1,140 @@
+# Lakehouse test fixtures (specs/lakehouse/10-testing.md §1, CI-fast tier).
+#
+#   make lakehouse-up    (from repo root, or run via docker compose -f ... up --wait)
+#
+# All credentials here are fixture-local fakes (specs/lakehouse/RULES.md §6) —
+# never replace them with real cloud credentials; real clouds are exercised
+# via OIDC-federated CI runs only.
+#
+# Store note (amendment 2026-11-19, specs/lakehouse/10-testing.md §1): MinIO
+# deleted its Docker Hub images in Sept 2026 (quay.io pulls now require auth),
+# so the S3-compatible fixture store is SeaweedFS (`chrislusf/seaweedfs`,
+# upstream first-party image). Everything talks to it through the plain S3
+# API with endpoint override, same as MinIO; swap if real gaps appear.
+#
+# M0 brings the containers up and documents endpoints; REST/table traffic
+# against them starts in M1.
+
+name: pgdatalake
+
+services:
+  # Object store: S3-compatible (SeaweedFS) + parity targets Azurite (ADLS
+  # Gen2) and fake-gcs-server (GCS), so store-specific code paths (auth,
+  # listing semantics, checksum headers) can be exercised in CI-fast from M3.
+  s3:
+    image: chrislusf/seaweedfs:latest
+    command: >-
+      server -dir /data -ip 0.0.0.0
+      -s3 -s3.port 9000 -s3.config /etc/seaweedfs/s3.config
+      -master.volumeSizeLimitMB 8192
+    ports:
+      - "9000:9000"
+    # master API (9333) stays container-internal; healthcheck uses it
+    volumes:
+      - s3-data:/data
+      - ./fixtures/seaweedfs-s3.config.json:/etc/seaweedfs/s3.config:ro
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9333/cluster/status"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  # Create the fixture bucket; proves the access keys actually work.
+  s3-setup:
+    image: rclone/rclone:latest
+    depends_on:
+      s3:
+        condition: service_healthy
+    environment:
+      RCLONE_CONFIG_S3_TYPE: s3
+      RCLONE_CONFIG_S3_PROVIDER: Other
+      RCLONE_CONFIG_S3_ACCESS_KEY_ID: lakehouse-test
+      RCLONE_CONFIG_S3_SECRET_ACCESS_KEY: lakehouse-test-password
+      RCLONE_CONFIG_S3_ENDPOINT: http://s3:9000
+      RCLONE_CONFIG_S3_NO_CHECK_BUCKET: "true"
+    command: mkdir s3:warehouse
+
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    command: azurite-blob --blobHost 0.0.0.0 --blobPort 10000 --loose --skipApiVersionCheck
+    ports:
+      - "10000:10000"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 10000 || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  fake-gcs:
+    image: fsouza/fake-gcs-server:latest
+    command: -scheme http -port 4443 -public-host 127.0.0.1
+    ports:
+      - "4443:4443"
+
+  # REST catalog (specs/lakehouse/03-catalog.md: REST is primary). Lakekeeper
+  # keeps its own metadata in a small postgres instance managed here.
+  lakekeeper-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: lakekeeper
+      POSTGRES_PASSWORD: lakekeeper-password
+      POSTGRES_DB: catalog
+    volumes:
+      - lakekeeper-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lakekeeper -d catalog"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  lakekeeper-migrate:
+    image: quay.io/lakekeeper/catalog:latest-main
+    command: migrate
+    environment:
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://lakekeeper:lakekeeper-password@lakekeeper-db:5432/catalog
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://lakekeeper:lakekeeper-password@lakekeeper-db:5432/catalog
+    depends_on:
+      lakekeeper-db:
+        condition: service_healthy
+
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:latest-main
+    command: serve
+    depends_on:
+      lakekeeper-db:
+        condition: service_healthy
+      lakekeeper-migrate:
+        condition: service_completed_successfully
+    environment:
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://lakekeeper:lakekeeper-password@lakekeeper-db:5432/catalog
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://lakekeeper:lakekeeper-password@lakekeeper-db:5432/catalog
+    ports:
+      - "8181:8181"
+    # NOTE: image is distroless (no sh/curl/wget) — no in-container healthcheck;
+    # verify readiness via `curl http://localhost:8181/health` from the host.
+
+  # Trino writer for the interop gates (M1: "Trino reads a table we wrote" /
+  # "we read a Trino-written table"). One-shot exec service — start with
+  #   docker compose -p pgdatalake run --rm trino
+  # and drive it via `trino --server http://localhost:8080` in another shell,
+  # or keep it running with `up -d trino`. Profiles off by default so the
+  # regular fixture stack stays light.
+  trino:
+    image: trinodb/trino:latest
+    profiles: ["trino"]
+    depends_on:
+      lakekeeper:
+        condition: service_started
+    volumes:
+      - ./fixtures/trino-catalog.properties:/etc/trino/catalog/iceberg.properties:ro
+      - trino-data:/data
+    environment:
+      # fixture-stack JVM footprint
+      JAVA_TOOL_OPTIONS: "-Xmx1G"
+    ports:
+      - "18081:8080"
+
+volumes:
+  s3-data:
+  lakekeeper-db-data:
+  trino-data:

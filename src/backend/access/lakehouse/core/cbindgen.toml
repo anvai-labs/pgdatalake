@@ -1,0 +1,41 @@
+# cbindgen configuration for pgdatalake-core (specs/lakehouse/01-architecture.md
+# decision D2). The generated header lands in the meson build dir; a checked-in
+# stable copy moves to src/include/access/lakehouse/pg_datalake_core.h once the API
+# settles (planned M1, doc 01 §2).
+language = "C"
+no_includes = true
+include_guard = "PGDATALAKE_CORE_H"
+
+[export]
+include = [
+    "pg_datalake_core_version",
+    "pg_datalake_core_cache_init",
+    "pg_datalake_publish_segment",
+    "pg_datalake_delta_rows_open",
+    "pg_datalake_delta_rows_close",
+    "pg_datalake_delta_rows_next",
+    "pg_datalake_delta_rows_col_null",
+    "pg_datalake_delta_rows_col_text",
+    "pg_datalake_delta_rows_column_count",
+    "DeltaRowsHandle",
+    "ScanSession",
+    "pg_datalake_scan_new",
+    "pg_datalake_scan_free",
+    "pg_datalake_scan_task_count",
+    "pg_datalake_scan_task_file",
+    "pg_datalake_scan_task_rows",
+    "RowsHandle",
+    "pg_datalake_rows_open",
+    "pg_datalake_rows_next",
+    "pg_datalake_rows_batch_next",
+    "pg_datalake_rows_batch_cell_text",
+    "PgDatalakeRowBatch",
+    "PgDatalakeBatchColumn",
+    "pg_datalake_rows_column_count",
+    "pg_datalake_rows_column_name",
+    "pg_datalake_rows_col_null",
+    "pg_datalake_rows_col_text",
+    "pg_datalake_rows_close",
+    "pg_datalake_scan_files_before_pruning",
+    "pg_datalake_scan_files_after_pruning",
+]

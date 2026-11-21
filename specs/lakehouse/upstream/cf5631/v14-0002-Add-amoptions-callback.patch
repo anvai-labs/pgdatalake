@@ -1,0 +1,1728 @@
+From 293f3dcaead535253b96a8c8d3634d3c2aee7456 Mon Sep 17 00:00:00 2001
+From: Andrew Dunstan <andrew@dunslane.net>
+Date: Sat, 29 Aug 2026 11:00:02 -0400
+Subject: [PATCH v13 1/2] Add amoptions callback to table access methods
+
+Table AMs have had no way to define their own storage parameters:
+CREATE TABLE and ALTER TABLE always parsed them with the heap parser,
+whatever the table's access method.  Index AMs have long been able to
+do this with IndexAmRoutine.amoptions; give table AMs the same.
+
+TableAmRoutine gets an optional amoptions callback, with the same
+signature as the index AM one.  table_reloptions() calls it if it's
+set, and heap_reloptions() otherwise.  The bytea it returns is stored
+in rd_options, in whatever layout the AM chooses.
+
+Core code that reads StdRdOptions fields from rd_options, such as
+RelationGetFillFactor() and vacuum_rel(), now checks
+RelationHasStdRdOptions() first.  That is true if the AM has no
+amoptions callback, or if it sets the new has_std_options_prefix flag
+to say that its options struct begins with a StdRdOptions.  The
+answer is worked out when the relcache entry's options are parsed
+and kept in the new rd_stdoptions field, so the check costs no more
+than the old test of rd_options.
+
+add_reloption_to_kind() makes an existing option valid for another
+relopt_kind, so that an AM can accept standard options without
+defining them again.  This is also the only way for an AM to accept
+autovacuum_* options that affect autovacuum, which always uses the
+heap parser to read them.  add_std_reloptions_to_kind() does this
+for all the standard options at once, and copies their parse table
+entries for an AM whose options struct begins with a StdRdOptions.
+
+ALTER TABLE ... SET ACCESS METHOD checks the table's options against
+the new AM after applying any SET or RESET in the same command, and
+raises an error if the new AM doesn't accept them.
+
+src/test/modules/dummy_table_am provides two test AMs: dummy_table_am,
+whose options struct begins with StdRdOptions, and
+dummy_custom_table_am, whose options struct doesn't.
+
+Discussion: https://www.postgresql.org/message-id/flat/ea1c4d33-0780-473c-96dc-1468cf733a04@dunslane.net
+---
+ doc/src/sgml/ref/alter_table.sgml             |  15 +
+ doc/src/sgml/tableam.sgml                     |  90 ++++++
+ src/backend/access/common/reloptions.c        |  88 +++++-
+ src/backend/catalog/index.c                   |   3 +-
+ src/backend/commands/tablecmds.c              | 137 +++++++--
+ src/backend/commands/vacuum.c                 |   5 +-
+ src/backend/utils/cache/relcache.c            |  16 +-
+ src/include/access/reloptions.h               |   9 +
+ src/include/access/tableam.h                  |  26 ++
+ src/include/utils/rel.h                       |  26 +-
+ src/test/modules/Makefile                     |   1 +
+ src/test/modules/dummy_table_am/Makefile      |  20 ++
+ src/test/modules/dummy_table_am/README        |  25 ++
+ .../dummy_table_am/dummy_table_am--1.0.sql    |  21 ++
+ .../modules/dummy_table_am/dummy_table_am.c   | 253 +++++++++++++++++
+ .../dummy_table_am/dummy_table_am.control     |   5 +
+ .../dummy_table_am/expected/custom_layout.out |  64 +++++
+ .../dummy_table_am/expected/reloptions.out    | 264 ++++++++++++++++++
+ src/test/modules/dummy_table_am/meson.build   |  34 +++
+ .../dummy_table_am/sql/custom_layout.sql      |  41 +++
+ .../modules/dummy_table_am/sql/reloptions.sql | 141 ++++++++++
+ src/test/modules/meson.build                  |   1 +
+ 22 files changed, 1247 insertions(+), 38 deletions(-)
+ create mode 100644 src/test/modules/dummy_table_am/Makefile
+ create mode 100644 src/test/modules/dummy_table_am/README
+ create mode 100644 src/test/modules/dummy_table_am/dummy_table_am--1.0.sql
+ create mode 100644 src/test/modules/dummy_table_am/dummy_table_am.c
+ create mode 100644 src/test/modules/dummy_table_am/dummy_table_am.control
+ create mode 100644 src/test/modules/dummy_table_am/expected/custom_layout.out
+ create mode 100644 src/test/modules/dummy_table_am/expected/reloptions.out
+ create mode 100644 src/test/modules/dummy_table_am/meson.build
+ create mode 100644 src/test/modules/dummy_table_am/sql/custom_layout.sql
+ create mode 100644 src/test/modules/dummy_table_am/sql/reloptions.sql
+
+diff --git a/doc/src/sgml/ref/alter_table.sgml b/doc/src/sgml/ref/alter_table.sgml
+index 0f9d698d170..d73f5759852 100644
+--- a/doc/src/sgml/ref/alter_table.sgml
++++ b/doc/src/sgml/ref/alter_table.sgml
+@@ -807,6 +807,21 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
+       causing future partitions to default to
+       <varname>default_table_access_method</varname>.
+      </para>
++     <para>
++      The new access method must accept all of the table's storage
++      parameters, or an error is raised.  An access method can define its
++      own storage parameters, so parameters set under the old access method
++      might not be accepted by the new one.  Such parameters can be removed
++      in the same command, for example:
++<programlisting>
++ALTER TABLE measurement
++    SET ACCESS METHOD heap,
++    RESET (compression);
++</programlisting>
++      The parameters are checked after any <literal>SET</literal> or
++      <literal>RESET</literal> of storage parameters in the same command has
++      been applied, so the order of the subcommands does not matter.
++     </para>
+     </listitem>
+    </varlistentry>
+ 
+diff --git a/doc/src/sgml/tableam.sgml b/doc/src/sgml/tableam.sgml
+index 9ccf5b739ed..bcb2c6bfd7c 100644
+--- a/doc/src/sgml/tableam.sgml
++++ b/doc/src/sgml/tableam.sgml
+@@ -152,4 +152,94 @@ my_tableam_handler(PG_FUNCTION_ARGS)
+   its implementation.
+  </para>
+ 
++ <sect1 id="tableam-reloptions">
++  <title>Table Access Method Options</title>
++
++  <para>
++   A table access method can define its own options, also called
++   <firstterm>reloptions</firstterm>, which users set as storage parameters
++   (see <xref linkend="sql-createtable-storage-parameters"/>), with the
++   <literal>WITH</literal> clause of <command>CREATE TABLE</command> and with
++   <command>ALTER TABLE ... SET</command>.  To do so it supplies an
++   <structfield>amoptions</structfield> callback in its
++   <structname>TableAmRoutine</structname>:
++<programlisting>
++bytea *
++amoptions (Datum reloptions,
++           bool validate);
++</programlisting>
++   <parameter>reloptions</parameter> is a <type>text</type> array containing
++   entries of the form
++   <replaceable>name</replaceable><literal>=</literal><replaceable>value</replaceable>;
++   the callback is not called if the relation has no options.
++   The function should construct a <type>bytea</type> value, which will be
++   copied into the <structfield>rd_options</structfield> field of the
++   relation's relcache entry.  The contents of the <type>bytea</type> value
++   are up to the access method.  It is OK to return NULL if default behavior
++   is wanted.
++  </para>
++
++  <para>
++   <parameter>validate</parameter> is true when the options are being set by
++   <command>CREATE TABLE</command> or <command>ALTER TABLE</command>.  The
++   function must then raise an error if any option is unrecognized or has an
++   invalid value.  It must not accept such a value and use something else in
++   its place, for example by substituting a default for an out-of-range
++   value, since the stored options would then not be the ones in effect.
++   <parameter>validate</parameter> is false when building the relcache entry
++   from options already stored in <structname>pg_class</structname>; the
++   function must then ignore invalid entries without raising an error.
++  </para>
++
++  <para>
++   An access method that does not supply <structfield>amoptions</structfield>
++   accepts the same options as <literal>heap</literal>, and
++   <structfield>rd_options</structfield> holds a
++   <structname>StdRdOptions</structname> struct.  Some core code, such as the
++   code that determines a table's fill factor, reads
++   <structname>StdRdOptions</structname> fields directly.  For a relation
++   whose access method supplies <structfield>amoptions</structfield>, that
++   code assumes the options are not set, unless the access method also sets
++   <structfield>has_std_options_prefix</structfield> to declare that the
++   struct its callback returns begins with a
++   <structname>StdRdOptions</structname>.  In that case every field of the
++   embedded <structname>StdRdOptions</structname> must be filled in.
++  </para>
++
++  <para>
++   An access method that uses the reloption functions in
++   <filename>src/include/access/reloptions.h</filename> registers its own
++   options for a kind it obtains from
++   <function>add_reloption_kind()</function>.  To accept a standard option
++   such as <literal>fillfactor</literal> as well, it calls
++   <function>add_reloption_to_kind()</function> to make the existing
++   definition valid for its kind, rather than defining an option with the
++   same name.  An access method that sets
++   <structfield>has_std_options_prefix</structfield> can instead call
++   <function>add_std_reloptions_to_kind()</function>, which does this for
++   every standard option and also copies their entries into the start of the
++   access method's parse table.
++  </para>
++
++  <para>
++   Autovacuum always reads a table's <literal>autovacuum_*</literal> options
++   using the standard heap parser, regardless of its access method.  So an
++   access method that wants these options to affect autovacuum must accept
++   them under their standard names, using
++   <function>add_reloption_to_kind()</function>.
++  </para>
++
++  <para>
++   <command>ALTER TABLE ... SET ACCESS METHOD</command> checks the table's
++   options against the new access method, after applying any
++   <literal>SET</literal> or <literal>RESET</literal> of options in the same
++   command.
++  </para>
++
++  <para>
++   <filename>src/test/modules/dummy_table_am</filename> contains two example
++   access methods that define their own options.
++  </para>
++ </sect1>
++
+ </chapter>
+diff --git a/src/backend/access/common/reloptions.c b/src/backend/access/common/reloptions.c
+index ea9a0417909..82770c9d7d0 100644
+--- a/src/backend/access/common/reloptions.c
++++ b/src/backend/access/common/reloptions.c
+@@ -24,6 +24,7 @@
+ #include "access/nbtree.h"
+ #include "access/reloptions.h"
+ #include "access/spgist_private.h"
++#include "access/tableam.h"
+ #include "catalog/pg_type.h"
+ #include "commands/defrem.h"
+ #include "commands/tablespace.h"
+@@ -621,6 +622,7 @@ static relopt_gen **custom_options = NULL;
+ static bool need_initialization = true;
+ 
+ static void initialize_reloptions(void);
++static relopt_gen *find_reloption(const char *name, relopt_kind kind);
+ static void parse_one_reloption(relopt_value *option, char *text_str,
+ 								int text_len, bool validate);
+ 
+@@ -843,6 +845,26 @@ add_reloption_kind(void)
+ 	return (relopt_kind) last_assigned_kind;
+ }
+ 
++/*
++ * add_reloption_to_kind
++ *		Make a heap reloption valid for an additional kind.
++ *
++ * This lets a table access method with its own relopt_kind accept a
++ * standard option such as fillfactor without defining it again.
++ */
++void
++add_reloption_to_kind(const char *name, relopt_kind kind)
++{
++	relopt_gen *gen = find_reloption(name, RELOPT_KIND_HEAP);
++
++	if (gen == NULL)
++		ereport(ERROR,
++				(errcode(ERRCODE_UNDEFINED_OBJECT),
++				 errmsg("reloption \"%s\" does not exist", name)));
++
++	gen->kinds |= kind;
++}
++
+ /*
+  * add_reloption
+  *		Add an already-created custom reloption to the list, and recompute the
+@@ -1609,8 +1631,11 @@ extractRelOptions(HeapTuple tuple, TupleDesc tupdesc,
+ 	switch (classForm->relkind)
+ 	{
+ 		case RELKIND_RELATION:
+-		case RELKIND_TOASTVALUE:
+ 		case RELKIND_MATVIEW:
++			options = table_reloptions(amoptions, classForm->relkind,
++									   datum, false);
++			break;
++		case RELKIND_TOASTVALUE:
+ 			options = heap_reloptions(classForm->relkind, datum, false);
+ 			break;
+ 		case RELKIND_PARTITIONED_TABLE:
+@@ -2120,6 +2145,9 @@ static const relopt_parse_elt stdRdOptionsTab[] = {
+ 	offsetof(StdRdOptions, vacuum_max_eager_freeze_failure_rate)}
+ };
+ 
++StaticAssertDecl(lengthof(stdRdOptionsTab) == NUM_STD_RELOPTIONS,
++				 "NUM_STD_RELOPTIONS must match stdRdOptionsTab");
++
+ /*
+  * Option parser for anything that uses StdRdOptions.
+  */
+@@ -2132,6 +2160,27 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
+ 									  lengthof(stdRdOptionsTab));
+ }
+ 
++/*
++ * add_std_reloptions_to_kind
++ *		Make all the standard table options valid for an additional kind.
++ *
++ * This is for a table access method whose options struct begins with a
++ * StdRdOptions (see has_std_options_prefix in tableam.h).  Each option is
++ * made valid for kind with add_reloption_to_kind(), and its parse table
++ * entry is copied into tab, which must have room for NUM_STD_RELOPTIONS
++ * entries.  Since the StdRdOptions is at the start of the access method's
++ * struct, the entries' offsets are correct for it as they stand.
++ */
++void
++add_std_reloptions_to_kind(relopt_kind kind, relopt_parse_elt *tab)
++{
++	for (int i = 0; i < lengthof(stdRdOptionsTab); i++)
++	{
++		add_reloption_to_kind(stdRdOptionsTab[i].optname, kind);
++		tab[i] = stdRdOptionsTab[i];
++	}
++}
++
+ /*
+  * find_reloption
+  *		Look up a reloption of the given kind by name.
+@@ -2390,6 +2439,43 @@ heap_reloptions(char relkind, Datum reloptions, bool validate)
+ 	}
+ }
+ 
++/*
++ * Parse options for a table or materialized view.
++ *
++ *	amoptions	the table AM's amoptions callback, or NULL to use
++ *				heap_reloptions()
++ *	relkind		the relation's kind
++ *	reloptions	options as text[] datum
++ *	validate	error flag
++ */
++bytea *
++table_reloptions(amoptions_function amoptions, char relkind,
++				 Datum reloptions, bool validate)
++{
++	if (amoptions == NULL)
++		return heap_reloptions(relkind, reloptions, validate);
++
++	/* Assume the AM's defaults are wanted if no options were given */
++	if (DatumGetPointer(reloptions) == NULL)
++		return NULL;
++
++	return amoptions(reloptions, validate);
++}
++
++/*
++ * Returns the options parser to pass to table_reloptions() for a table or
++ * materialized view: its table AM's amoptions callback, or NULL if the
++ * relation's options are parsed with heap_reloptions().
++ */
++amoptions_function
++RelationGetTableAmOptions(Relation relation)
++{
++	Assert(relation->rd_rel->relkind == RELKIND_RELATION ||
++		   relation->rd_rel->relkind == RELKIND_MATVIEW);
++
++	return relation->rd_tableam ? relation->rd_tableam->amoptions : NULL;
++}
++
+ 
+ /*
+  * Parse options for indexes.
+diff --git a/src/backend/catalog/index.c b/src/backend/catalog/index.c
+index 4d232b85ad5..c2e4b959509 100644
+--- a/src/backend/catalog/index.c
++++ b/src/backend/catalog/index.c
+@@ -2972,7 +2972,8 @@ index_update_stats(Relation rel,
+ 	{
+ 		if (AutoVacuumingActive())
+ 		{
+-			StdRdOptions *options = (StdRdOptions *) rel->rd_options;
++			StdRdOptions *options = RelationHasStdRdOptions(rel) ?
++				(StdRdOptions *) rel->rd_options : NULL;
+ 
+ 			if (options != NULL &&
+ 				options->autovacuum.enabled == PG_TERNARY_FALSE)
+diff --git a/src/backend/commands/tablecmds.c b/src/backend/commands/tablecmds.c
+index 0274d892f2e..93378600f26 100644
+--- a/src/backend/commands/tablecmds.c
++++ b/src/backend/commands/tablecmds.c
+@@ -696,9 +696,12 @@ static void ATPrepSetTableSpace(AlteredTableInfo *tab, Relation rel,
+ 								const char *tablespacename, LOCKMODE lockmode);
+ static void ATExecSetTableSpace(Oid tableOid, Oid newTableSpace, LOCKMODE lockmode);
+ static void ATExecSetTableSpaceNoStorage(Relation rel, Oid newTableSpace);
++static void ATValidateAccessMethodOptions(List **wqueue);
++static amoptions_function GetTableAmOptions(Oid amoid);
+ static void ATExecSetRelOptions(Relation rel, List *defList,
+ 								AlterTableType operation,
+-								LOCKMODE lockmode);
++								LOCKMODE lockmode,
++								bool deferValidation);
+ static void ATExecEnableDisableTrigger(Relation rel, const char *trigname,
+ 									   char fires_when, bool skip_system, bool recurse,
+ 									   LOCKMODE lockmode);
+@@ -945,6 +948,28 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
+ 	if (!OidIsValid(ownerId))
+ 		ownerId = GetUserId();
+ 
++	/*
++	 * For relations with table AM and partitioned tables, select access
++	 * method to use: an explicitly indicated one, or (in the case of a
++	 * partitioned table) the parent's, if it has one.
++	 */
++	if (stmt->accessMethod != NULL)
++	{
++		Assert(RELKIND_HAS_TABLE_AM(relkind) || relkind == RELKIND_PARTITIONED_TABLE);
++		accessMethodId = get_table_am_oid(stmt->accessMethod, false);
++	}
++	else if (RELKIND_HAS_TABLE_AM(relkind) || relkind == RELKIND_PARTITIONED_TABLE)
++	{
++		if (stmt->partbound)
++		{
++			Assert(list_length(inheritOids) == 1);
++			accessMethodId = get_rel_relam(linitial_oid(inheritOids));
++		}
++
++		if (RELKIND_HAS_TABLE_AM(relkind) && !OidIsValid(accessMethodId))
++			accessMethodId = get_table_am_oid(default_table_access_method, false);
++	}
++
+ 	/*
+ 	 * Parse and validate reloptions, if any.
+ 	 */
+@@ -959,6 +984,11 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
+ 		case RELKIND_PARTITIONED_TABLE:
+ 			(void) partitioned_table_reloptions(reloptions, true);
+ 			break;
++		case RELKIND_RELATION:
++		case RELKIND_MATVIEW:
++			(void) table_reloptions(GetTableAmOptions(accessMethodId),
++									relkind, reloptions, true);
++			break;
+ 		default:
+ 			(void) heap_reloptions(relkind, reloptions, true);
+ 	}
+@@ -1053,28 +1083,6 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
+ 
+ 	TupleDescFinalize(descriptor);
+ 
+-	/*
+-	 * For relations with table AM and partitioned tables, select access
+-	 * method to use: an explicitly indicated one, or (in the case of a
+-	 * partitioned table) the parent's, if it has one.
+-	 */
+-	if (stmt->accessMethod != NULL)
+-	{
+-		Assert(RELKIND_HAS_TABLE_AM(relkind) || relkind == RELKIND_PARTITIONED_TABLE);
+-		accessMethodId = get_table_am_oid(stmt->accessMethod, false);
+-	}
+-	else if (RELKIND_HAS_TABLE_AM(relkind) || relkind == RELKIND_PARTITIONED_TABLE)
+-	{
+-		if (stmt->partbound)
+-		{
+-			Assert(list_length(inheritOids) == 1);
+-			accessMethodId = get_rel_relam(linitial_oid(inheritOids));
+-		}
+-
+-		if (RELKIND_HAS_TABLE_AM(relkind) && !OidIsValid(accessMethodId))
+-			accessMethodId = get_table_am_oid(default_table_access_method, false);
+-	}
+-
+ 	/*
+ 	 * Create the relation.  Inherited defaults and CHECK constraints are
+ 	 * passed in for immediate handling --- since they don't need parsing,
+@@ -4947,6 +4955,9 @@ ATController(AlterTableStmt *parsetree,
+ 	/* Phase 2: update system catalogs */
+ 	ATRewriteCatalogs(&wqueue, lockmode, context);
+ 
++	/* Validate options as needed */
++	ATValidateAccessMethodOptions(&wqueue);
++
+ 	/* Phase 3: scan/rewrite tables as needed, and run afterStmts */
+ 	ATRewriteTables(parsetree, &wqueue, lockmode, context);
+ }
+@@ -5612,7 +5623,13 @@ ATExecCmd(List **wqueue, AlteredTableInfo *tab,
+ 		case AT_SetRelOptions:	/* SET (...) */
+ 		case AT_ResetRelOptions:	/* RESET (...) */
+ 		case AT_ReplaceRelOptions:	/* replace entire option list */
+-			ATExecSetRelOptions(rel, (List *) cmd->def, cmd->subtype, lockmode);
++
++			/*
++			 * With SET ACCESS METHOD, ATValidateAccessMethodOptions() checks
++			 * the final option list instead.
++			 */
++			ATExecSetRelOptions(rel, (List *) cmd->def, cmd->subtype, lockmode,
++								tab->chgAccessMethod);
+ 			break;
+ 		case AT_EnableTrig:		/* ENABLE TRIGGER name */
+ 			ATExecEnableDisableTrigger(rel, cmd->name,
+@@ -17304,12 +17321,77 @@ ATPrepSetTableSpace(AlteredTableInfo *tab, Relation rel, const char *tablespacen
+ 	tab->newTableSpace = tablespaceId;
+ }
+ 
++/*
++ * Check the reloptions of each relation whose access method is being changed
++ * against the new access method's parser.  This runs after phase 2, so the
++ * options checked are the final ones, after any SET, RESET or REPLACE
++ * subcommands; checking each of those against the new AM as it runs would
++ * make the outcome depend on their order.  The check is needed even when the
++ * new AM uses the standard heap parser, since the old AM may have accepted
++ * options that heap does not.  Without it, an option the new AM doesn't
++ * recognize would stay in pg_class.reloptions but be ignored when the
++ * relcache entry is built.
++ */
++static void
++ATValidateAccessMethodOptions(List **wqueue)
++{
++	ListCell   *ltab;
++
++	foreach(ltab, *wqueue)
++	{
++		AlteredTableInfo *tab = (AlteredTableInfo *) lfirst(ltab);
++		HeapTuple	reltup;
++		Datum		reloptions;
++		bool		isnull;
++
++		/*
++		 * A partitioned table may be set to have no access method, in which
++		 * case there's nothing to check.
++		 */
++		if (!tab->chgAccessMethod || !OidIsValid(tab->newAccessMethod))
++			continue;
++
++		reltup = SearchSysCache1(RELOID, ObjectIdGetDatum(tab->relid));
++		if (!HeapTupleIsValid(reltup))
++			elog(ERROR, "cache lookup failed for relation %u", tab->relid);
++		reloptions = SysCacheGetAttr(RELOID, reltup,
++									 Anum_pg_class_reloptions, &isnull);
++		if (!isnull)
++			(void) table_reloptions(GetTableAmOptions(tab->newAccessMethod),
++									((Form_pg_class) GETSTRUCT(reltup))->relkind,
++									reloptions, true);
++		ReleaseSysCache(reltup);
++	}
++}
++
++/*
++ * Return the amoptions callback of the table access method with the given
++ * OID, or NULL if it has none.
++ */
++static amoptions_function
++GetTableAmOptions(Oid amoid)
++{
++	HeapTuple	amtup;
++	Oid			amhandler;
++
++	amtup = SearchSysCache1(AMOID, ObjectIdGetDatum(amoid));
++	if (!HeapTupleIsValid(amtup))
++		elog(ERROR, "cache lookup failed for access method %u", amoid);
++	amhandler = ((Form_pg_am) GETSTRUCT(amtup))->amhandler;
++	ReleaseSysCache(amtup);
++
++	return GetTableAmRoutine(amhandler)->amoptions;
++}
++
+ /*
+  * Set, reset, or replace reloptions.
++ *
++ * If deferValidation is true, the new options of a table or materialized view
++ * are not validated here; the caller arranges for that to be done later.
+  */
+ static void
+ ATExecSetRelOptions(Relation rel, List *defList, AlterTableType operation,
+-					LOCKMODE lockmode)
++					LOCKMODE lockmode, bool deferValidation)
+ {
+ 	Oid			relid;
+ 	Relation	pgclass;
+@@ -17361,7 +17443,10 @@ ATExecSetRelOptions(Relation rel, List *defList, AlterTableType operation,
+ 	{
+ 		case RELKIND_RELATION:
+ 		case RELKIND_MATVIEW:
+-			(void) heap_reloptions(rel->rd_rel->relkind, newOptions, true);
++			if (!deferValidation)
++				(void) table_reloptions(RelationGetTableAmOptions(rel),
++										rel->rd_rel->relkind,
++										newOptions, true);
+ 			break;
+ 		case RELKIND_PARTITIONED_TABLE:
+ 			(void) partitioned_table_reloptions(newOptions, true);
+diff --git a/src/backend/commands/vacuum.c b/src/backend/commands/vacuum.c
+index d8c2f33c615..0d7897b4e44 100644
+--- a/src/backend/commands/vacuum.c
++++ b/src/backend/commands/vacuum.c
+@@ -2211,7 +2211,8 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams params,
+ 	 * whose parameters the caller handed down for that purpose.  For anything
+ 	 * else, params.main_relopts is NULL, and this just copies our own.
+ 	 */
+-	relopts = merge_toast_reloptions((StdRdOptions *) rel->rd_options,
++	relopts = merge_toast_reloptions(RelationHasStdRdOptions(rel) ?
++									 (StdRdOptions *) rel->rd_options : NULL,
+ 									 params.main_relopts);
+ 
+ 	/*
+@@ -2306,7 +2307,7 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams params,
+ 	 * a copy while we still have the relation open; the relcache entry can go
+ 	 * away once we close it.
+ 	 */
+-	if (OidIsValid(toast_relid) && rel->rd_options)
++	if (OidIsValid(toast_relid) && RelationHasStdRdOptions(rel))
+ 	{
+ 		memcpy(&relopts_copy, rel->rd_options, sizeof(StdRdOptions));
+ 		toast_vacuum_params.main_relopts = &relopts_copy;
+diff --git a/src/backend/utils/cache/relcache.c b/src/backend/utils/cache/relcache.c
+index d8f04a05309..35334f84c22 100644
+--- a/src/backend/utils/cache/relcache.c
++++ b/src/backend/utils/cache/relcache.c
+@@ -473,19 +473,30 @@ RelationParseRelOptions(Relation relation, HeapTuple tuple)
+ {
+ 	bytea	   *options;
+ 	amoptions_function amoptsfn;
++	bool		stdoptions = false;
+ 
+ 	relation->rd_options = NULL;
++	relation->rd_stdoptions = false;
+ 
+ 	/*
+ 	 * Look up any AM-specific parse function; fall out if relkind should not
+-	 * have options.
++	 * have options.  Also note whether the options will be a StdRdOptions, or
++	 * begin with one: that is so if they're parsed with heap_reloptions(), or
++	 * by a table AM that sets has_std_options_prefix.
+ 	 */
+ 	switch (relation->rd_rel->relkind)
+ 	{
+ 		case RELKIND_RELATION:
++		case RELKIND_MATVIEW:
++			amoptsfn = RelationGetTableAmOptions(relation);
++			stdoptions = amoptsfn == NULL ||
++				relation->rd_tableam->has_std_options_prefix;
++			break;
+ 		case RELKIND_TOASTVALUE:
++			amoptsfn = NULL;
++			stdoptions = true;
++			break;
+ 		case RELKIND_VIEW:
+-		case RELKIND_MATVIEW:
+ 		case RELKIND_PARTITIONED_TABLE:
+ 			amoptsfn = NULL;
+ 			break;
+@@ -516,6 +527,7 @@ RelationParseRelOptions(Relation relation, HeapTuple tuple)
+ 												  VARSIZE(options));
+ 		memcpy(relation->rd_options, options, VARSIZE(options));
+ 		pfree(options);
++		relation->rd_stdoptions = stdoptions;
+ 	}
+ }
+ 
+diff --git a/src/include/access/reloptions.h b/src/include/access/reloptions.h
+index ccff4717b62..2ad19ed9840 100644
+--- a/src/include/access/reloptions.h
++++ b/src/include/access/reloptions.h
+@@ -186,7 +186,13 @@ typedef struct local_relopts
+ 	((optstruct)->member == 0 ? NULL : \
+ 	 (char *)(optstruct) + (optstruct)->member)
+ 
++/* Number of options in StdRdOptions, see add_std_reloptions_to_kind() */
++#define NUM_STD_RELOPTIONS 27
++
+ extern relopt_kind add_reloption_kind(void);
++extern void add_reloption_to_kind(const char *name, relopt_kind kind);
++extern void add_std_reloptions_to_kind(relopt_kind kind,
++									   relopt_parse_elt *tab);
+ extern void add_bool_reloption(uint32 kinds, const char *name, const char *desc,
+ 							   bool default_val, LOCKMODE lockmode);
+ extern void add_ternary_reloption(uint32 kinds, const char *name,
+@@ -250,6 +256,9 @@ extern bytea *default_reloptions(Datum reloptions, bool validate,
+ extern struct StdRdOptions *merge_toast_reloptions(const struct StdRdOptions *toast_opts,
+ 												   const struct StdRdOptions *main_opts);
+ extern bytea *heap_reloptions(char relkind, Datum reloptions, bool validate);
++extern amoptions_function RelationGetTableAmOptions(Relation relation);
++extern bytea *table_reloptions(amoptions_function amoptions, char relkind,
++							   Datum reloptions, bool validate);
+ extern bytea *view_reloptions(Datum reloptions, bool validate);
+ extern bytea *partitioned_table_reloptions(Datum reloptions, bool validate);
+ extern bytea *index_reloptions(amoptions_function amoptions, Datum reloptions,
+diff --git a/src/include/access/tableam.h b/src/include/access/tableam.h
+index ea3f2a6be99..58adc13a21a 100644
+--- a/src/include/access/tableam.h
++++ b/src/include/access/tableam.h
+@@ -325,6 +325,32 @@ typedef struct TableAmRoutine
+ 	NodeTag		type;
+ 
+ 
++	/* ------------------------------------------------------------------------
++	 * Reloption parsing.
++	 * ------------------------------------------------------------------------
++	 */
++
++	/*
++	 * Parse and validate the relation's reloptions, returning the bytea to be
++	 * stored in rd_options.  Optional; if NULL, the standard heap parser is
++	 * used and rd_options is a StdRdOptions.  See the "Table Access Method
++	 * Options" section of the documentation.
++	 */
++	bytea	   *(*amoptions) (Datum reloptions, bool validate);
++
++	/*
++	 * Set this if amoptions is non-NULL and the struct it returns begins with
++	 * a StdRdOptions, in which case core code reads standard options such as
++	 * fillfactor straight out of rd_options, as it does for heap.  The AM
++	 * must then register every StdRdOptions option for its own kind and list
++	 * it in its parse table, which add_std_reloptions_to_kind() does, so that
++	 * each field gets its default when the user doesn't set it;
++	 * build_reloptions() leaves unlisted fields zeroed, which is not a valid
++	 * default for all of them.  Ignored if amoptions is NULL.
++	 */
++	bool		has_std_options_prefix;
++
++
+ 	/* ------------------------------------------------------------------------
+ 	 * Slot related callbacks.
+ 	 * ------------------------------------------------------------------------
+diff --git a/src/include/utils/rel.h b/src/include/utils/rel.h
+index 7b8c2b1e362..f22f76dd0ae 100644
+--- a/src/include/utils/rel.h
++++ b/src/include/utils/rel.h
+@@ -170,9 +170,11 @@ typedef struct RelationData
+ 	/*
+ 	 * rd_options is set whenever rd_rel is loaded into the relcache entry.
+ 	 * Note that you can NOT look into rd_rel for this data.  NULL means "use
+-	 * defaults".
++	 * defaults".  rd_stdoptions is true if rd_options is a StdRdOptions, or a
++	 * struct that begins with one; see RelationParseRelOptions().
+ 	 */
+ 	bytea	   *rd_options;		/* parsed pg_class.reloptions */
++	bool		rd_stdoptions;	/* rd_options holds StdRdOptions? */
+ 
+ 	/*
+ 	 * Oid of the handler for this relation. For an index this is a function
+@@ -381,12 +383,24 @@ typedef struct StdRdOptions
+ #define HEAP_MIN_FILLFACTOR			10
+ #define HEAP_DEFAULT_FILLFACTOR		100
+ 
++/*
++ * RelationHasStdRdOptions
++ *		Returns true if rd_options can be read as StdRdOptions.  The macros
++ *		below must check this, since a table AM with its own amoptions
++ *		callback may use a different layout.
++ */
++static inline bool
++RelationHasStdRdOptions(Relation relation)
++{
++	return relation->rd_stdoptions;
++}
++
+ /*
+  * RelationGetToastTupleTarget
+  *		Returns the relation's toast_tuple_target.  Note multiple eval of argument!
+  */
+ #define RelationGetToastTupleTarget(relation, defaulttarg) \
+-	((relation)->rd_options ? \
++	(RelationHasStdRdOptions(relation) ? \
+ 	 ((StdRdOptions *) (relation)->rd_options)->toast_tuple_target : (defaulttarg))
+ 
+ /*
+@@ -394,7 +408,7 @@ typedef struct StdRdOptions
+  *		Returns the relation's toast_value_type.  Note multiple eval of argument!
+  */
+ #define RelationGetToastValueType(relation, defaulttarg) \
+-	((relation)->rd_options ? \
++	(RelationHasStdRdOptions(relation) ? \
+ 	 ((StdRdOptions *) (relation)->rd_options)->toast_value_type : (defaulttarg))
+ 
+ /*
+@@ -402,7 +416,7 @@ typedef struct StdRdOptions
+  *		Returns the relation's fillfactor.  Note multiple eval of argument!
+  */
+ #define RelationGetFillFactor(relation, defaultff) \
+-	((relation)->rd_options ? \
++	(RelationHasStdRdOptions(relation) ? \
+ 	 ((StdRdOptions *) (relation)->rd_options)->fillfactor : (defaultff))
+ 
+ /*
+@@ -425,7 +439,7 @@ typedef struct StdRdOptions
+  *		from the pov of logical decoding.  Note multiple eval of argument!
+  */
+ #define RelationIsUsedAsCatalogTable(relation)	\
+-	((relation)->rd_options && \
++	(RelationHasStdRdOptions(relation) && \
+ 	 ((relation)->rd_rel->relkind == RELKIND_RELATION || \
+ 	  (relation)->rd_rel->relkind == RELKIND_MATVIEW) ? \
+ 	 ((StdRdOptions *) (relation)->rd_options)->user_catalog_table : false)
+@@ -436,7 +450,7 @@ typedef struct StdRdOptions
+  *		Note multiple eval of argument!
+  */
+ #define RelationGetParallelWorkers(relation, defaultpw) \
+-	((relation)->rd_options ? \
++	(RelationHasStdRdOptions(relation) ? \
+ 	 ((StdRdOptions *) (relation)->rd_options)->parallel_workers : (defaultpw))
+ 
+ /* ViewOptions->check_option values */
+diff --git a/src/test/modules/Makefile b/src/test/modules/Makefile
+index 71a2e65ad70..e3c0ce7e051 100644
+--- a/src/test/modules/Makefile
++++ b/src/test/modules/Makefile
+@@ -10,6 +10,7 @@ SUBDIRS = \
+ 		  delay_execution \
+ 		  dummy_index_am \
+ 		  dummy_seclabel \
++		  dummy_table_am \
+ 		  index \
+ 		  libpq_pipeline \
+ 		  oauth_validator \
+diff --git a/src/test/modules/dummy_table_am/Makefile b/src/test/modules/dummy_table_am/Makefile
+new file mode 100644
+index 00000000000..cd9f63f2897
+--- /dev/null
++++ b/src/test/modules/dummy_table_am/Makefile
+@@ -0,0 +1,20 @@
++# src/test/modules/dummy_table_am/Makefile
++
++MODULES = dummy_table_am
++
++EXTENSION = dummy_table_am
++DATA = dummy_table_am--1.0.sql
++PGFILEDESC = "dummy_table_am - table access method template"
++
++REGRESS = reloptions custom_layout
++
++ifdef USE_PGXS
++PG_CONFIG = pg_config
++PGXS := $(shell $(PG_CONFIG) --pgxs)
++include $(PGXS)
++else
++subdir = src/test/modules/dummy_table_am
++top_builddir = ../../../..
++include $(top_builddir)/src/Makefile.global
++include $(top_srcdir)/contrib/contrib-global.mk
++endif
+diff --git a/src/test/modules/dummy_table_am/README b/src/test/modules/dummy_table_am/README
+new file mode 100644
+index 00000000000..bbeded62b1c
+--- /dev/null
++++ b/src/test/modules/dummy_table_am/README
+@@ -0,0 +1,25 @@
++Dummy Table AM
++==============
++
++This module provides two table access methods for testing the amoptions
++callback and add_std_reloptions_to_kind().  Both use heap's callbacks for
++everything except reloption parsing, so their tables behave like heap
++tables, except that indexes cannot be built on them: heap_getnext(),
++which index builds use, accepts only heap's own TableAmRoutine.
++
++dummy_table_am accepts all of heap's options, plus these:
++
++  - "option_int"     (integer, -10..100)
++  - "option_real"    (real, -10..100)
++  - "option_bool"    (boolean)
++  - "option_enum"    (enum, one|two)
++
++Its options struct begins with StdRdOptions, and it sets
++has_std_options_prefix.
++
++dummy_custom_table_am accepts only three integer options, "option_a",
++"option_b" and "option_c" (0..100, default 0).  Its options struct does
++not begin with StdRdOptions, and its fields are at the offsets of
++StdRdOptions' fillfactor, toast_tuple_target and toast_value_type, so
++that core code wrongly reading StdRdOptions fields from it gets values
++that show up in the tests.
+diff --git a/src/test/modules/dummy_table_am/dummy_table_am--1.0.sql b/src/test/modules/dummy_table_am/dummy_table_am--1.0.sql
+new file mode 100644
+index 00000000000..fb438a8c735
+--- /dev/null
++++ b/src/test/modules/dummy_table_am/dummy_table_am--1.0.sql
+@@ -0,0 +1,21 @@
++/* src/test/modules/dummy_table_am/dummy_table_am--1.0.sql */
++
++-- complain if script is sourced in psql, rather than via CREATE EXTENSION
++\echo Use "CREATE EXTENSION dummy_table_am" to load this file. \quit
++
++CREATE FUNCTION dthandler(internal)
++RETURNS table_am_handler
++AS 'MODULE_PATHNAME'
++LANGUAGE C;
++
++-- Access method
++CREATE ACCESS METHOD dummy_table_am TYPE TABLE HANDLER dthandler;
++COMMENT ON ACCESS METHOD dummy_table_am IS 'dummy table access method';
++
++CREATE FUNCTION dcthandler(internal)
++RETURNS table_am_handler
++AS 'MODULE_PATHNAME'
++LANGUAGE C;
++
++CREATE ACCESS METHOD dummy_custom_table_am TYPE TABLE HANDLER dcthandler;
++COMMENT ON ACCESS METHOD dummy_custom_table_am IS 'dummy table access method with a custom options layout';
+diff --git a/src/test/modules/dummy_table_am/dummy_table_am.c b/src/test/modules/dummy_table_am/dummy_table_am.c
+new file mode 100644
+index 00000000000..e2a032f38ef
+--- /dev/null
++++ b/src/test/modules/dummy_table_am/dummy_table_am.c
+@@ -0,0 +1,253 @@
++/*-------------------------------------------------------------------------
++ *
++ * dummy_table_am.c
++ *		Table AMs for testing the amoptions callback.
++ *
++ * This module provides two table access methods that use heap's callbacks
++ * for everything except reloption parsing.  dummy_table_am's options struct
++ * begins with a StdRdOptions; dummy_custom_table_am's does not.
++ *
++ * Indexes cannot be built on tables of either AM, since that uses
++ * heap_getnext(), which accepts only heap's own TableAmRoutine.
++ *
++ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
++ * Portions Copyright (c) 1994, Regents of the University of California
++ *
++ * IDENTIFICATION
++ *	  src/test/modules/dummy_table_am/dummy_table_am.c
++ *
++ *-------------------------------------------------------------------------
++ */
++#include "postgres.h"
++
++#include "access/reloptions.h"
++#include "access/tableam.h"
++#include "catalog/pg_am_d.h"
++#include "fmgr.h"
++#include "utils/rel.h"
++
++PG_MODULE_MAGIC;
++
++/* Kind of relation options for dummy_table_am */
++static relopt_kind dt_relopt_kind;
++
++/* Parse table and kind of relation options for dummy_custom_table_am */
++static relopt_parse_elt dct_relopt_tab[3];
++static relopt_kind dct_relopt_kind;
++
++enum DummyTableEnum
++{
++	DUMMY_TABLE_ENUM_ONE,
++	DUMMY_TABLE_ENUM_TWO,
++};
++
++/*
++ * dummy_table_am options.  Since dummy_table_am sets has_std_options_prefix,
++ * "std" must be first, and each of its fields must be in the parse table so
++ * that it gets its default when not set.
++ */
++struct DummyTableOptions
++{
++	StdRdOptions std;			/* must be first, see above */
++	int			option_int;
++	double		option_real;
++	bool		option_bool;
++	enum DummyTableEnum option_enum;
++};
++
++/* Parse table for dummy_table_am: the standard options and 4 of its own */
++static relopt_parse_elt dt_relopt_tab[NUM_STD_RELOPTIONS + 4];
++
++/*
++ * dummy_custom_table_am options.  This is smaller than StdRdOptions, and its
++ * fields are at the offsets of StdRdOptions' fillfactor, toast_tuple_target
++ * and toast_value_type, so that core code reading a StdRdOptions field
++ * without checking RelationHasStdRdOptions() gets a visibly wrong value.
++ */
++struct DummyCustomTableOptions
++{
++	int32		vl_len_;		/* varlena header (do not touch directly!) */
++	int			option_a;
++	int			option_b;
++	int			option_c;
++};
++
++static relopt_enum_elt_def dummyTableEnumValues[] =
++{
++	{"one", DUMMY_TABLE_ENUM_ONE},
++	{"two", DUMMY_TABLE_ENUM_TWO},
++	{(const char *) NULL}		/* list terminator */
++};
++
++static void create_reloptions_table(void);
++static void create_custom_reloptions_table(void);
++static bytea *dtoptions(Datum reloptions, bool validate);
++static bytea *dctoptions(Datum reloptions, bool validate);
++static Oid	dummy_table_relation_toast_am(Relation rel);
++
++PG_FUNCTION_INFO_V1(dthandler);
++PG_FUNCTION_INFO_V1(dcthandler);
++
++/*
++ * Register dummy_table_am's options and populate its parse table.
++ */
++static void
++create_reloptions_table(void)
++{
++	int			i = NUM_STD_RELOPTIONS;
++
++	dt_relopt_kind = add_reloption_kind();
++
++	/* accept all the standard options */
++	add_std_reloptions_to_kind(dt_relopt_kind, dt_relopt_tab);
++
++	add_int_reloption(dt_relopt_kind, "option_int",
++					  "Integer option for dummy_table_am",
++					  10, -10, 100, AccessExclusiveLock);
++	dt_relopt_tab[i].optname = "option_int";
++	dt_relopt_tab[i].opttype = RELOPT_TYPE_INT;
++	dt_relopt_tab[i].offset = offsetof(struct DummyTableOptions, option_int);
++	i++;
++
++	add_real_reloption(dt_relopt_kind, "option_real",
++					   "Real option for dummy_table_am",
++					   3.1415, -10, 100, AccessExclusiveLock);
++	dt_relopt_tab[i].optname = "option_real";
++	dt_relopt_tab[i].opttype = RELOPT_TYPE_REAL;
++	dt_relopt_tab[i].offset = offsetof(struct DummyTableOptions, option_real);
++	i++;
++
++	add_bool_reloption(dt_relopt_kind, "option_bool",
++					   "Boolean option for dummy_table_am",
++					   true, AccessExclusiveLock);
++	dt_relopt_tab[i].optname = "option_bool";
++	dt_relopt_tab[i].opttype = RELOPT_TYPE_BOOL;
++	dt_relopt_tab[i].offset = offsetof(struct DummyTableOptions, option_bool);
++	i++;
++
++	add_enum_reloption(dt_relopt_kind, "option_enum",
++					   "Enum option for dummy_table_am",
++					   dummyTableEnumValues,
++					   DUMMY_TABLE_ENUM_ONE,
++					   "Valid values are \"one\" and \"two\".",
++					   AccessExclusiveLock);
++	dt_relopt_tab[i].optname = "option_enum";
++	dt_relopt_tab[i].opttype = RELOPT_TYPE_ENUM;
++	dt_relopt_tab[i].offset = offsetof(struct DummyTableOptions, option_enum);
++	i++;
++}
++
++/*
++ * Register dummy_custom_table_am's options and populate its parse table.
++ */
++static void
++create_custom_reloptions_table(void)
++{
++	static const char *const names[] = {"option_a", "option_b", "option_c"};
++	static const int offsets[] = {
++		offsetof(struct DummyCustomTableOptions, option_a),
++		offsetof(struct DummyCustomTableOptions, option_b),
++		offsetof(struct DummyCustomTableOptions, option_c),
++	};
++
++	StaticAssertDecl(lengthof(names) == lengthof(dct_relopt_tab),
++					 "names and dct_relopt_tab must have the same length");
++	StaticAssertDecl(lengthof(offsets) == lengthof(dct_relopt_tab),
++					 "offsets and dct_relopt_tab must have the same length");
++
++	dct_relopt_kind = add_reloption_kind();
++
++	for (int i = 0; i < lengthof(dct_relopt_tab); i++)
++	{
++		add_int_reloption(dct_relopt_kind, names[i],
++						  "Integer option for dummy_custom_table_am",
++						  0, 0, 100, AccessExclusiveLock);
++		dct_relopt_tab[i].optname = names[i];
++		dct_relopt_tab[i].opttype = RELOPT_TYPE_INT;
++		dct_relopt_tab[i].offset = offsets[i];
++	}
++}
++
++/*
++ * Parse reloptions for dummy_table_am.
++ */
++static bytea *
++dtoptions(Datum reloptions, bool validate)
++{
++	return (bytea *) build_reloptions(reloptions, validate,
++									  dt_relopt_kind,
++									  sizeof(struct DummyTableOptions),
++									  dt_relopt_tab, lengthof(dt_relopt_tab));
++}
++
++/*
++ * Parse reloptions for dummy_custom_table_am.
++ */
++static bytea *
++dctoptions(Datum reloptions, bool validate)
++{
++	return (bytea *) build_reloptions(reloptions, validate,
++									  dct_relopt_kind,
++									  sizeof(struct DummyCustomTableOptions),
++									  dct_relopt_tab, lengthof(dct_relopt_tab));
++}
++
++/*
++ * Make TOAST tables plain heap tables.  Heap's own callback returns the
++ * relation's AM, and building the TOAST table's index would then fail in
++ * heap_getnext().
++ */
++static Oid
++dummy_table_relation_toast_am(Relation rel)
++{
++	return HEAP_TABLE_AM_OID;
++}
++
++/*
++ * Handler for dummy_table_am.
++ */
++Datum
++dthandler(PG_FUNCTION_ARGS)
++{
++	static TableAmRoutine routine;
++	static bool initialized = false;
++
++	if (!initialized)
++	{
++		memcpy(&routine, GetHeapamTableAmRoutine(), sizeof(routine));
++		routine.amoptions = dtoptions;
++		routine.has_std_options_prefix = true;
++		routine.relation_toast_am = dummy_table_relation_toast_am;
++		initialized = true;
++	}
++
++	PG_RETURN_POINTER(&routine);
++}
++
++/*
++ * Handler for dummy_custom_table_am.
++ */
++Datum
++dcthandler(PG_FUNCTION_ARGS)
++{
++	static TableAmRoutine routine;
++	static bool initialized = false;
++
++	if (!initialized)
++	{
++		memcpy(&routine, GetHeapamTableAmRoutine(), sizeof(routine));
++		routine.amoptions = dctoptions;
++		routine.has_std_options_prefix = false;
++		routine.relation_toast_am = dummy_table_relation_toast_am;
++		initialized = true;
++	}
++
++	PG_RETURN_POINTER(&routine);
++}
++
++void
++_PG_init(void)
++{
++	create_reloptions_table();
++	create_custom_reloptions_table();
++}
+diff --git a/src/test/modules/dummy_table_am/dummy_table_am.control b/src/test/modules/dummy_table_am/dummy_table_am.control
+new file mode 100644
+index 00000000000..08f2f868d49
+--- /dev/null
++++ b/src/test/modules/dummy_table_am/dummy_table_am.control
+@@ -0,0 +1,5 @@
++# dummy_table_am extension
++comment = 'dummy_table_am - table access method template'
++default_version = '1.0'
++module_pathname = '$libdir/dummy_table_am'
++relocatable = true
+diff --git a/src/test/modules/dummy_table_am/expected/custom_layout.out b/src/test/modules/dummy_table_am/expected/custom_layout.out
+new file mode 100644
+index 00000000000..abd1678994d
+--- /dev/null
++++ b/src/test/modules/dummy_table_am/expected/custom_layout.out
+@@ -0,0 +1,64 @@
++-- Tests for a table AM whose options struct does not begin with StdRdOptions
++CREATE EXTENSION dummy_table_am;
++-- Standard options are not accepted
++CREATE TABLE dct_bad (a int) USING dummy_custom_table_am WITH (fillfactor = 50);
++ERROR:  unrecognized parameter "fillfactor"
++-- TOAST tables get the default toast_value_type.  option_c is at the offset
++-- of StdRdOptions.toast_value_type; 0 is not a valid value for that, and 2
++-- would select oid8.
++CREATE TABLE dct_default (a int, b text) USING dummy_custom_table_am;
++CREATE TABLE dct_c0 (a int, b text) USING dummy_custom_table_am
++    WITH (option_c = 0);
++CREATE TABLE dct_c2 (a int, b text) USING dummy_custom_table_am
++    WITH (option_a = 10, option_b = 20, option_c = 2);
++SELECT c.relname, c.reloptions, a.atttypid::regtype AS chunk_id_type
++    FROM pg_class c
++    JOIN pg_attribute a ON a.attrelid = c.reltoastrelid AND a.attname = 'chunk_id'
++    WHERE c.relname IN ('dct_default', 'dct_c0', 'dct_c2')
++    ORDER BY c.relname;
++   relname   |              reloptions              | chunk_id_type 
++-------------+--------------------------------------+---------------
++ dct_c0      | {option_c=0}                         | oid
++ dct_c2      | {option_a=10,option_b=20,option_c=2} | oid
++ dct_default |                                      | oid
++(3 rows)
++
++-- VACUUM of a table with TOAST data
++INSERT INTO dct_c2
++    SELECT 1, string_agg(md5(i::text), '') FROM generate_series(1, 500) i;
++SELECT pg_relation_size(reltoastrelid) > 0 AS has_toast_data
++    FROM pg_class WHERE oid = 'dct_c2'::regclass;
++ has_toast_data 
++----------------
++ t
++(1 row)
++
++VACUUM dct_c2;
++SELECT a, length(b) FROM dct_c2;
++ a | length 
++---+--------
++ 1 |  16000
++(1 row)
++
++-- Switching to heap requires resetting the AM's options
++ALTER TABLE dct_c2 SET ACCESS METHOD heap;
++ERROR:  unrecognized parameter "option_a"
++ALTER TABLE dct_c2 SET ACCESS METHOD heap, SET (fillfactor = 50),
++    RESET (option_a, option_b, option_c);
++SELECT (SELECT amname FROM pg_am WHERE oid = relam) AS amname, reloptions
++    FROM pg_class WHERE oid = 'dct_c2'::regclass;
++ amname |   reloptions    
++--------+-----------------
++ heap   | {fillfactor=50}
++(1 row)
++
++SELECT a, length(b) FROM dct_c2;
++ a | length 
++---+--------
++ 1 |  16000
++(1 row)
++
++DROP TABLE dct_default;
++DROP TABLE dct_c0;
++DROP TABLE dct_c2;
++DROP EXTENSION dummy_table_am;
+diff --git a/src/test/modules/dummy_table_am/expected/reloptions.out b/src/test/modules/dummy_table_am/expected/reloptions.out
+new file mode 100644
+index 00000000000..7b9853b995b
+--- /dev/null
++++ b/src/test/modules/dummy_table_am/expected/reloptions.out
+@@ -0,0 +1,264 @@
++-- Tests for the table AM amoptions callback and add_reloption_to_kind()
++CREATE EXTENSION dummy_table_am;
++-- AM-specific and standard options are accepted
++CREATE TABLE dummy_t (a int) USING dummy_table_am
++    WITH (option_int = 17, option_real = 2.5, option_bool = false,
++          option_enum = 'two', fillfactor = 60);
++SELECT reloptions FROM pg_class
++    WHERE oid = 'dummy_t'::regclass ORDER BY reloptions;
++                                   reloptions                                    
++---------------------------------------------------------------------------------
++ {option_int=17,option_real=2.5,option_bool=false,option_enum=two,fillfactor=60}
++(1 row)
++
++-- Out-of-range and unknown options are rejected
++CREATE TABLE dummy_oor (a int) USING dummy_table_am WITH (option_int = 9999);
++ERROR:  value 9999 out of bounds for option "option_int"
++DETAIL:  Valid values are between "-10" and "100".
++CREATE TABLE dummy_bad (a int) USING dummy_table_am WITH (no_such_option = 4);
++ERROR:  unrecognized parameter "no_such_option"
++-- Defaults are not stored in pg_class
++CREATE TABLE dummy_defaults (a int) USING dummy_table_am;
++SELECT reloptions FROM pg_class WHERE oid = 'dummy_defaults'::regclass;
++ reloptions 
++------------
++ 
++(1 row)
++
++DROP TABLE dummy_defaults;
++-- ALTER TABLE SET and RESET
++ALTER TABLE dummy_t SET (option_int = 42);
++SELECT reloptions FROM pg_class WHERE oid = 'dummy_t'::regclass;
++                                   reloptions                                    
++---------------------------------------------------------------------------------
++ {option_real=2.5,option_bool=false,option_enum=two,fillfactor=60,option_int=42}
++(1 row)
++
++ALTER TABLE dummy_t SET (no_such_option = 4);
++ERROR:  unrecognized parameter "no_such_option"
++ALTER TABLE dummy_t RESET (option_int);
++SELECT reloptions FROM pg_class WHERE oid = 'dummy_t'::regclass;
++                            reloptions                             
++-------------------------------------------------------------------
++ {option_real=2.5,option_bool=false,option_enum=two,fillfactor=60}
++(1 row)
++
++-- SET ACCESS METHOD keeps standard options the new AM accepts
++CREATE TABLE heap_t (a int) WITH (fillfactor = 70, autovacuum_vacuum_threshold = 4);
++ALTER TABLE heap_t SET ACCESS METHOD dummy_table_am;
++SELECT amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
++    WHERE c.oid = 'heap_t'::regclass;
++     amname     
++----------------
++ dummy_table_am
++(1 row)
++
++SELECT reloptions FROM pg_class WHERE oid = 'heap_t'::regclass;
++                  reloptions                   
++-----------------------------------------------
++ {fillfactor=70,autovacuum_vacuum_threshold=4}
++(1 row)
++
++-- ... and fails if the new AM doesn't accept them, unless they're reset
++ALTER TABLE heap_t SET ACCESS METHOD dummy_custom_table_am;
++ERROR:  unrecognized parameter "fillfactor"
++SELECT amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
++    WHERE c.oid = 'heap_t'::regclass;
++     amname     
++----------------
++ dummy_table_am
++(1 row)
++
++SELECT reloptions FROM pg_class WHERE oid = 'heap_t'::regclass;
++                  reloptions                   
++-----------------------------------------------
++ {fillfactor=70,autovacuum_vacuum_threshold=4}
++(1 row)
++
++ALTER TABLE heap_t SET ACCESS METHOD dummy_custom_table_am,
++    RESET (fillfactor, autovacuum_vacuum_threshold);
++SELECT amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
++    WHERE c.oid = 'heap_t'::regclass;
++        amname         
++-----------------------
++ dummy_custom_table_am
++(1 row)
++
++SELECT reloptions FROM pg_class WHERE oid = 'heap_t'::regclass;
++ reloptions 
++------------
++ 
++(1 row)
++
++ALTER TABLE heap_t SET ACCESS METHOD heap;
++SELECT amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
++    WHERE c.oid = 'heap_t'::regclass;
++ amname 
++--------
++ heap
++(1 row)
++
++-- SET ACCESS METHOD with SET of an option only the new AM accepts
++CREATE TABLE heap_to_dt (a int);
++ALTER TABLE heap_to_dt SET ACCESS METHOD dummy_table_am, SET (option_int = 25);
++SELECT amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
++    WHERE c.oid = 'heap_to_dt'::regclass;
++     amname     
++----------------
++ dummy_table_am
++(1 row)
++
++SELECT reloptions FROM pg_class WHERE oid = 'heap_to_dt'::regclass;
++   reloptions    
++-----------------
++ {option_int=25}
++(1 row)
++
++-- Switching to heap fails while an option heap doesn't accept is set
++ALTER TABLE heap_to_dt SET ACCESS METHOD heap;
++ERROR:  unrecognized parameter "option_int"
++SELECT amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
++    WHERE c.oid = 'heap_to_dt'::regclass;
++     amname     
++----------------
++ dummy_table_am
++(1 row)
++
++SELECT reloptions FROM pg_class WHERE oid = 'heap_to_dt'::regclass;
++   reloptions    
++-----------------
++ {option_int=25}
++(1 row)
++
++ALTER TABLE heap_to_dt SET ACCESS METHOD heap, RESET (option_int);
++SELECT amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
++    WHERE c.oid = 'heap_to_dt'::regclass;
++ amname 
++--------
++ heap
++(1 row)
++
++SELECT reloptions FROM pg_class WHERE oid = 'heap_to_dt'::regclass;
++ reloptions 
++------------
++ 
++(1 row)
++
++-- Only the final options are checked, so a RESET may follow a SET
++ALTER TABLE heap_to_dt SET ACCESS METHOD dummy_table_am, SET (option_int = 25);
++ALTER TABLE heap_to_dt SET ACCESS METHOD heap, SET (option_real = 1),
++    RESET (option_int);
++ERROR:  unrecognized parameter "option_real"
++ALTER TABLE heap_to_dt SET ACCESS METHOD heap, SET (fillfactor = 50),
++    RESET (option_int);
++SELECT amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
++    WHERE c.oid = 'heap_to_dt'::regclass;
++ amname 
++--------
++ heap
++(1 row)
++
++SELECT reloptions FROM pg_class WHERE oid = 'heap_to_dt'::regclass;
++   reloptions    
++-----------------
++ {fillfactor=50}
++(1 row)
++
++-- Option values are still checked
++ALTER TABLE heap_to_dt SET ACCESS METHOD dummy_table_am, SET (option_int = 9999);
++ERROR:  value 9999 out of bounds for option "option_int"
++DETAIL:  Valid values are between "-10" and "100".
++SELECT amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
++    WHERE c.oid = 'heap_to_dt'::regclass;
++ amname 
++--------
++ heap
++(1 row)
++
++SELECT reloptions FROM pg_class WHERE oid = 'heap_to_dt'::regclass;
++   reloptions    
++-----------------
++ {fillfactor=50}
++(1 row)
++
++-- fillfactor takes effect
++CREATE TABLE dummy_ff10 (a int) USING dummy_table_am WITH (fillfactor = 10);
++CREATE TABLE dummy_ff100 (a int) USING dummy_table_am WITH (fillfactor = 100);
++INSERT INTO dummy_ff10 SELECT generate_series(1, 5000);
++INSERT INTO dummy_ff100 SELECT generate_series(1, 5000);
++VACUUM dummy_ff10;
++VACUUM dummy_ff100;
++SELECT (SELECT relpages FROM pg_class WHERE oid = 'dummy_ff10'::regclass) >
++       (SELECT relpages FROM pg_class WHERE oid = 'dummy_ff100'::regclass)
++       AS low_fillfactor_uses_more_pages;
++ low_fillfactor_uses_more_pages 
++--------------------------------
++ t
++(1 row)
++
++DROP TABLE dummy_ff10;
++DROP TABLE dummy_ff100;
++-- Tables with a TOAST table, with and without options
++CREATE TABLE dummy_txt (a int, b text) USING dummy_table_am;
++INSERT INTO dummy_txt VALUES (1, repeat('x', 10000));
++SELECT a, length(b) FROM dummy_txt;
++ a | length 
++---+--------
++ 1 |  10000
++(1 row)
++
++DROP TABLE dummy_txt;
++CREATE TABLE dummy_txt_opt (a int, b text)
++    USING dummy_table_am WITH (option_int = 7);
++INSERT INTO dummy_txt_opt VALUES (1, repeat('x', 10000));
++SELECT a, length(b) FROM dummy_txt_opt;
++ a | length 
++---+--------
++ 1 |  10000
++(1 row)
++
++DROP TABLE dummy_txt_opt;
++-- A partition's options are checked by the AM it inherits from its parent
++CREATE TABLE parted (a int) PARTITION BY RANGE (a) USING dummy_table_am;
++CREATE TABLE parted_p1 PARTITION OF parted FOR VALUES FROM (0) TO (100)
++    WITH (option_int = 11);
++SELECT c.relname,
++       (SELECT amname FROM pg_am WHERE oid = c.relam) AS amname,
++       c.reloptions
++    FROM pg_class c
++    WHERE c.oid IN ('parted'::regclass, 'parted_p1'::regclass)
++    ORDER BY c.relname;
++  relname  |     amname     |   reloptions    
++-----------+----------------+-----------------
++ parted    | dummy_table_am | 
++ parted_p1 | dummy_table_am | {option_int=11}
++(2 rows)
++
++-- ... or the one given in USING
++CREATE TABLE parted_p2 PARTITION OF parted FOR VALUES FROM (100) TO (200)
++    USING heap WITH (option_int = 9);
++ERROR:  unrecognized parameter "option_int"
++-- ... or default_table_access_method, if the parent has no AM
++SET default_table_access_method = dummy_table_am;
++CREATE TABLE parted_noam (a int) PARTITION BY RANGE (a);
++CREATE TABLE parted_noam_p1 PARTITION OF parted_noam
++    FOR VALUES FROM (0) TO (100) WITH (option_int = 12);
++SELECT c.relname,
++       (SELECT amname FROM pg_am WHERE oid = c.relam) AS amname,
++       c.reloptions
++    FROM pg_class c
++    WHERE c.oid IN ('parted_noam'::regclass, 'parted_noam_p1'::regclass)
++    ORDER BY c.relname;
++    relname     |     amname     |   reloptions    
++----------------+----------------+-----------------
++ parted_noam    |                | 
++ parted_noam_p1 | dummy_table_am | {option_int=12}
++(2 rows)
++
++RESET default_table_access_method;
++DROP TABLE parted_noam;
++DROP TABLE parted;
++DROP TABLE heap_to_dt;
++DROP TABLE heap_t;
++DROP TABLE dummy_t;
++DROP EXTENSION dummy_table_am;
+diff --git a/src/test/modules/dummy_table_am/meson.build b/src/test/modules/dummy_table_am/meson.build
+new file mode 100644
+index 00000000000..35ffde4d151
+--- /dev/null
++++ b/src/test/modules/dummy_table_am/meson.build
+@@ -0,0 +1,34 @@
++# Copyright (c) 2026, PostgreSQL Global Development Group
++
++dummy_table_am_sources = files(
++  'dummy_table_am.c',
++)
++
++if host_system == 'windows'
++  dummy_table_am_sources += rc_lib_gen.process(win32ver_rc, extra_args: [
++    '--NAME', 'dummy_table_am',
++    '--FILEDESC', 'dummy_table_am - table access method template',])
++endif
++
++dummy_table_am = shared_module('dummy_table_am',
++  dummy_table_am_sources,
++  kwargs: pg_test_mod_args,
++)
++test_install_libs += dummy_table_am
++
++test_install_data += files(
++  'dummy_table_am.control',
++  'dummy_table_am--1.0.sql',
++)
++
++tests += {
++  'name': 'dummy_table_am',
++  'sd': meson.current_source_dir(),
++  'bd': meson.current_build_dir(),
++  'regress': {
++    'sql': [
++      'reloptions',
++      'custom_layout',
++    ],
++  },
++}
+diff --git a/src/test/modules/dummy_table_am/sql/custom_layout.sql b/src/test/modules/dummy_table_am/sql/custom_layout.sql
+new file mode 100644
+index 00000000000..6eb3950a853
+--- /dev/null
++++ b/src/test/modules/dummy_table_am/sql/custom_layout.sql
+@@ -0,0 +1,41 @@
++-- Tests for a table AM whose options struct does not begin with StdRdOptions
++CREATE EXTENSION dummy_table_am;
++
++-- Standard options are not accepted
++CREATE TABLE dct_bad (a int) USING dummy_custom_table_am WITH (fillfactor = 50);
++
++-- TOAST tables get the default toast_value_type.  option_c is at the offset
++-- of StdRdOptions.toast_value_type; 0 is not a valid value for that, and 2
++-- would select oid8.
++CREATE TABLE dct_default (a int, b text) USING dummy_custom_table_am;
++CREATE TABLE dct_c0 (a int, b text) USING dummy_custom_table_am
++    WITH (option_c = 0);
++CREATE TABLE dct_c2 (a int, b text) USING dummy_custom_table_am
++    WITH (option_a = 10, option_b = 20, option_c = 2);
++SELECT c.relname, c.reloptions, a.atttypid::regtype AS chunk_id_type
++    FROM pg_class c
++    JOIN pg_attribute a ON a.attrelid = c.reltoastrelid AND a.attname = 'chunk_id'
++    WHERE c.relname IN ('dct_default', 'dct_c0', 'dct_c2')
++    ORDER BY c.relname;
++
++-- VACUUM of a table with TOAST data
++INSERT INTO dct_c2
++    SELECT 1, string_agg(md5(i::text), '') FROM generate_series(1, 500) i;
++SELECT pg_relation_size(reltoastrelid) > 0 AS has_toast_data
++    FROM pg_class WHERE oid = 'dct_c2'::regclass;
++VACUUM dct_c2;
++SELECT a, length(b) FROM dct_c2;
++
++-- Switching to heap requires resetting the AM's options
++ALTER TABLE dct_c2 SET ACCESS METHOD heap;
++ALTER TABLE dct_c2 SET ACCESS METHOD heap, SET (fillfactor = 50),
++    RESET (option_a, option_b, option_c);
++SELECT (SELECT amname FROM pg_am WHERE oid = relam) AS amname, reloptions
++    FROM pg_class WHERE oid = 'dct_c2'::regclass;
++SELECT a, length(b) FROM dct_c2;
++
++DROP TABLE dct_default;
++DROP TABLE dct_c0;
++DROP TABLE dct_c2;
++
++DROP EXTENSION dummy_table_am;
+diff --git a/src/test/modules/dummy_table_am/sql/reloptions.sql b/src/test/modules/dummy_table_am/sql/reloptions.sql
+new file mode 100644
+index 00000000000..3b714939d74
+--- /dev/null
++++ b/src/test/modules/dummy_table_am/sql/reloptions.sql
+@@ -0,0 +1,141 @@
++-- Tests for the table AM amoptions callback and add_reloption_to_kind()
++CREATE EXTENSION dummy_table_am;
++
++-- AM-specific and standard options are accepted
++CREATE TABLE dummy_t (a int) USING dummy_table_am
++    WITH (option_int = 17, option_real = 2.5, option_bool = false,
++          option_enum = 'two', fillfactor = 60);
++SELECT reloptions FROM pg_class
++    WHERE oid = 'dummy_t'::regclass ORDER BY reloptions;
++
++-- Out-of-range and unknown options are rejected
++CREATE TABLE dummy_oor (a int) USING dummy_table_am WITH (option_int = 9999);
++CREATE TABLE dummy_bad (a int) USING dummy_table_am WITH (no_such_option = 4);
++
++-- Defaults are not stored in pg_class
++CREATE TABLE dummy_defaults (a int) USING dummy_table_am;
++SELECT reloptions FROM pg_class WHERE oid = 'dummy_defaults'::regclass;
++DROP TABLE dummy_defaults;
++
++-- ALTER TABLE SET and RESET
++ALTER TABLE dummy_t SET (option_int = 42);
++SELECT reloptions FROM pg_class WHERE oid = 'dummy_t'::regclass;
++ALTER TABLE dummy_t SET (no_such_option = 4);
++ALTER TABLE dummy_t RESET (option_int);
++SELECT reloptions FROM pg_class WHERE oid = 'dummy_t'::regclass;
++
++-- SET ACCESS METHOD keeps standard options the new AM accepts
++CREATE TABLE heap_t (a int) WITH (fillfactor = 70, autovacuum_vacuum_threshold = 4);
++ALTER TABLE heap_t SET ACCESS METHOD dummy_table_am;
++SELECT amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
++    WHERE c.oid = 'heap_t'::regclass;
++SELECT reloptions FROM pg_class WHERE oid = 'heap_t'::regclass;
++
++-- ... and fails if the new AM doesn't accept them, unless they're reset
++ALTER TABLE heap_t SET ACCESS METHOD dummy_custom_table_am;
++SELECT amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
++    WHERE c.oid = 'heap_t'::regclass;
++SELECT reloptions FROM pg_class WHERE oid = 'heap_t'::regclass;
++ALTER TABLE heap_t SET ACCESS METHOD dummy_custom_table_am,
++    RESET (fillfactor, autovacuum_vacuum_threshold);
++SELECT amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
++    WHERE c.oid = 'heap_t'::regclass;
++SELECT reloptions FROM pg_class WHERE oid = 'heap_t'::regclass;
++
++ALTER TABLE heap_t SET ACCESS METHOD heap;
++SELECT amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
++    WHERE c.oid = 'heap_t'::regclass;
++
++-- SET ACCESS METHOD with SET of an option only the new AM accepts
++CREATE TABLE heap_to_dt (a int);
++ALTER TABLE heap_to_dt SET ACCESS METHOD dummy_table_am, SET (option_int = 25);
++SELECT amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
++    WHERE c.oid = 'heap_to_dt'::regclass;
++SELECT reloptions FROM pg_class WHERE oid = 'heap_to_dt'::regclass;
++
++-- Switching to heap fails while an option heap doesn't accept is set
++ALTER TABLE heap_to_dt SET ACCESS METHOD heap;
++SELECT amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
++    WHERE c.oid = 'heap_to_dt'::regclass;
++SELECT reloptions FROM pg_class WHERE oid = 'heap_to_dt'::regclass;
++ALTER TABLE heap_to_dt SET ACCESS METHOD heap, RESET (option_int);
++SELECT amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
++    WHERE c.oid = 'heap_to_dt'::regclass;
++SELECT reloptions FROM pg_class WHERE oid = 'heap_to_dt'::regclass;
++
++-- Only the final options are checked, so a RESET may follow a SET
++ALTER TABLE heap_to_dt SET ACCESS METHOD dummy_table_am, SET (option_int = 25);
++ALTER TABLE heap_to_dt SET ACCESS METHOD heap, SET (option_real = 1),
++    RESET (option_int);
++ALTER TABLE heap_to_dt SET ACCESS METHOD heap, SET (fillfactor = 50),
++    RESET (option_int);
++SELECT amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
++    WHERE c.oid = 'heap_to_dt'::regclass;
++SELECT reloptions FROM pg_class WHERE oid = 'heap_to_dt'::regclass;
++
++-- Option values are still checked
++ALTER TABLE heap_to_dt SET ACCESS METHOD dummy_table_am, SET (option_int = 9999);
++SELECT amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam
++    WHERE c.oid = 'heap_to_dt'::regclass;
++SELECT reloptions FROM pg_class WHERE oid = 'heap_to_dt'::regclass;
++
++-- fillfactor takes effect
++CREATE TABLE dummy_ff10 (a int) USING dummy_table_am WITH (fillfactor = 10);
++CREATE TABLE dummy_ff100 (a int) USING dummy_table_am WITH (fillfactor = 100);
++INSERT INTO dummy_ff10 SELECT generate_series(1, 5000);
++INSERT INTO dummy_ff100 SELECT generate_series(1, 5000);
++VACUUM dummy_ff10;
++VACUUM dummy_ff100;
++SELECT (SELECT relpages FROM pg_class WHERE oid = 'dummy_ff10'::regclass) >
++       (SELECT relpages FROM pg_class WHERE oid = 'dummy_ff100'::regclass)
++       AS low_fillfactor_uses_more_pages;
++DROP TABLE dummy_ff10;
++DROP TABLE dummy_ff100;
++
++-- Tables with a TOAST table, with and without options
++CREATE TABLE dummy_txt (a int, b text) USING dummy_table_am;
++INSERT INTO dummy_txt VALUES (1, repeat('x', 10000));
++SELECT a, length(b) FROM dummy_txt;
++DROP TABLE dummy_txt;
++
++CREATE TABLE dummy_txt_opt (a int, b text)
++    USING dummy_table_am WITH (option_int = 7);
++INSERT INTO dummy_txt_opt VALUES (1, repeat('x', 10000));
++SELECT a, length(b) FROM dummy_txt_opt;
++DROP TABLE dummy_txt_opt;
++
++-- A partition's options are checked by the AM it inherits from its parent
++CREATE TABLE parted (a int) PARTITION BY RANGE (a) USING dummy_table_am;
++CREATE TABLE parted_p1 PARTITION OF parted FOR VALUES FROM (0) TO (100)
++    WITH (option_int = 11);
++SELECT c.relname,
++       (SELECT amname FROM pg_am WHERE oid = c.relam) AS amname,
++       c.reloptions
++    FROM pg_class c
++    WHERE c.oid IN ('parted'::regclass, 'parted_p1'::regclass)
++    ORDER BY c.relname;
++
++-- ... or the one given in USING
++CREATE TABLE parted_p2 PARTITION OF parted FOR VALUES FROM (100) TO (200)
++    USING heap WITH (option_int = 9);
++
++-- ... or default_table_access_method, if the parent has no AM
++SET default_table_access_method = dummy_table_am;
++CREATE TABLE parted_noam (a int) PARTITION BY RANGE (a);
++CREATE TABLE parted_noam_p1 PARTITION OF parted_noam
++    FOR VALUES FROM (0) TO (100) WITH (option_int = 12);
++SELECT c.relname,
++       (SELECT amname FROM pg_am WHERE oid = c.relam) AS amname,
++       c.reloptions
++    FROM pg_class c
++    WHERE c.oid IN ('parted_noam'::regclass, 'parted_noam_p1'::regclass)
++    ORDER BY c.relname;
++RESET default_table_access_method;
++DROP TABLE parted_noam;
++
++DROP TABLE parted;
++DROP TABLE heap_to_dt;
++DROP TABLE heap_t;
++DROP TABLE dummy_t;
++
++DROP EXTENSION dummy_table_am;
+diff --git a/src/test/modules/meson.build b/src/test/modules/meson.build
+index 77e1a2810e5..d1fcbae0cdb 100644
+--- a/src/test/modules/meson.build
++++ b/src/test/modules/meson.build
+@@ -5,6 +5,7 @@ subdir('commit_ts')
+ subdir('delay_execution')
+ subdir('dummy_index_am')
+ subdir('dummy_seclabel')
++subdir('dummy_table_am')
+ subdir('gin')
+ subdir('index')
+ subdir('injection_points')
+-- 
+2.43.0
+

@@ -326,6 +326,32 @@ typedef struct TableAmRoutine
 
 
 	/* ------------------------------------------------------------------------
+	 * Reloption parsing.
+	 * ------------------------------------------------------------------------
+	 */
+
+	/*
+	 * Parse and validate the relation's reloptions, returning the bytea to be
+	 * stored in rd_options.  Optional; if NULL, the standard heap parser is
+	 * used and rd_options is a StdRdOptions.  See the "Table Access Method
+	 * Options" section of the documentation.
+	 */
+	bytea	   *(*amoptions) (Datum reloptions, bool validate);
+
+	/*
+	 * Set this if amoptions is non-NULL and the struct it returns begins with
+	 * a StdRdOptions, in which case core code reads standard options such as
+	 * fillfactor straight out of rd_options, as it does for heap.  The AM
+	 * must then register every StdRdOptions option for its own kind and list
+	 * it in its parse table, which add_std_reloptions_to_kind() does, so that
+	 * each field gets its default when the user doesn't set it;
+	 * build_reloptions() leaves unlisted fields zeroed, which is not a valid
+	 * default for all of them.  Ignored if amoptions is NULL.
+	 */
+	bool		has_std_options_prefix;
+
+
+	/* ------------------------------------------------------------------------
 	 * Slot related callbacks.
 	 * ------------------------------------------------------------------------
 	 */
@@ -878,6 +904,16 @@ typedef struct TableAmRoutine
 										   SampleScanState *scanstate,
 										   TupleTableSlot *slot);
 
+
+	/*
+	 * Parse this AM's relation options (CREATE TABLE ... USING am WITH
+	 * (...)). Called with the raw reloptions text[] datum; NULL means the
+	 * heap defaults apply (AMs without custom options). Mirrors how index
+	 * AMs own their amoptions. [core-allowlist 2026-11-20: table AMs
+	 * cannot carry custom WITH-options otherwise — extractRelOptions
+	 * dispatches every plain relation to heap_reloptions by relkind.]
+	 */
+	bytea	   *(*relation_reloptions) (Datum reloptions, bool validate);
 } TableAmRoutine;
 
 

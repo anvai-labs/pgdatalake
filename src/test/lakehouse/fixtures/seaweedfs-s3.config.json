@@ -1,0 +1,28 @@
+{
+  "identities": [
+    {
+      "name": "lakehouse-test",
+      "credentials": [
+        {
+          "accessKey": "lakehouse-test",
+          "secretKey": "lakehouse-test-password"
+        }
+      ],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    },
+    {
+      "name": "lakehouse-reader",
+      "credentials": [
+        {
+          "accessKey": "lakehouse-reader",
+          "secretKey": "lakehouse-reader-password"
+        }
+      ],
+      "actions": ["Read", "List"]
+    },
+    {
+      "name": "anonymous",
+      "actions": []
+    }
+  ]
+}

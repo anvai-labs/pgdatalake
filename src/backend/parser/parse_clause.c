@@ -22,6 +22,7 @@
 #include "catalog/catalog.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_amproc.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
@@ -46,6 +47,7 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+#include "utils/timestamp.h"
 
 
 static int	extractRemainingColumns(ParseState *pstate,
@@ -391,6 +393,102 @@ transformJoinOnClause(ParseState *pstate, JoinExpr *j, List *namespace)
 }
 
 /*
+ * transformLakehouseSnapshot --- resolve the raw lakehouse time-travel
+ * clause (RangeVar.lakehouse_snapshot, a DefElem whose defname selects the
+ * selector kind) into the canonical selector string carried on the RTE.
+ *
+ * Only plain constants are accepted: the pin must be stable across planning
+ * and rule storage, and resolving the timestamp here (via timestamptz_in)
+ * fails fast at parse time and stores an absolute epoch-ms value, so a
+ * stored view's meaning does not drift with the session timezone.
+ *
+ * lakehouse time travel (specs/lakehouse/04-sql.md §3).
+ */
+static char *
+transformLakehouseSnapshot(ParseState *pstate, Node *raw)
+{
+	DefElem    *def = (DefElem *) raw;
+	Node	   *arg;
+	A_Const    *con;
+
+	if (!IsA(raw, DefElem) || def->arg == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("lakehouse time travel clause requires a constant literal")));
+
+	/* allow one explicit cast around the constant ('...'::timestamptz) */
+	arg = def->arg;
+	if (IsA(arg, TypeCast))
+		arg = ((TypeCast *) arg)->arg;
+
+	if (!IsA(arg, A_Const))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("lakehouse time travel clause requires a constant literal"),
+				 parser_errposition(pstate, def->location)));
+	con = (A_Const *) arg;
+
+	if (strcmp(def->defname, "timestamp") == 0)
+	{
+		TimestampTz ts;
+		int64		ms;
+
+		if (con->isnull || !IsA(&con->val, String))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("FOR TIMESTAMP AS OF requires a timestamp string literal"),
+					 parser_errposition(pstate, def->location)));
+		ts = DatumGetTimestampTz(DirectFunctionCall3(timestamptz_in,
+													 CStringGetDatum(strVal(&con->val)),
+													 ObjectIdGetDatum(InvalidOid),
+													 Int32GetDatum(-1)));
+		/* microseconds since 2000-01-01 -> epoch milliseconds (floor) */
+		ms = (ts >= 0 ? ts : ts - 999) / 1000 + 946684800000LL;
+		return psprintf("ts:" INT64_FORMAT, ms);
+	}
+	else if (strcmp(def->defname, "version") == 0)
+	{
+		if (IsA(&con->val, Integer))
+			return psprintf("id:%d", intVal(&con->val));
+
+		/*
+		 * ids beyond int32 lex as Float literals; they must still be integers
+		 * (pg_strtoint64_safe rejects 1.5 and friends)
+		 */
+		if (IsA(&con->val, Float))
+		{
+			ErrorSaveContext escontext = {T_ErrorSaveContext};
+			int64		id;
+
+			id = pg_strtoint64_safe(con->val.fval.fval, (Node *) &escontext);
+			if (escontext.error_occurred)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("FOR VERSION AS OF requires an integer snapshot id"),
+						 parser_errposition(pstate, def->location)));
+			return psprintf("id:" INT64_FORMAT, id);
+		}
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("FOR VERSION AS OF requires a snapshot id literal"),
+				 parser_errposition(pstate, def->location)));
+	}
+	else if (strcmp(def->defname, "tag") == 0)
+	{
+		if (con->isnull || !IsA(&con->val, String))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("FOR TAG AS OF requires a quoted tag or branch name"),
+					 parser_errposition(pstate, def->location)));
+		return psprintf("ref:%s", strVal(&con->val));
+	}
+
+	elog(ERROR, "unrecognized lakehouse time travel selector kind \"%s\"",
+		 def->defname);
+	return NULL;				/* not reachable */
+}
+
+/*
  * transformTableEntry --- transform a RangeVar (simple relation reference)
  */
 static ParseNamespaceItem *
@@ -398,6 +496,40 @@ transformTableEntry(ParseState *pstate, RangeVar *r)
 {
 	/* addRangeTableEntry does all the work */
 	return addRangeTableEntry(pstate, r, r->alias, r->inh, true);
+}
+
+/*
+ * applyLakehouseTimeTravel --- resolve the lakehouse time-travel clause(s)
+ * parsed in the locking-clause position (raw DefElem entries mixed into
+ * stmt->lockingClause, slice 19) into canonical selector strings pinned on
+ * every foreign-table RTE of this query level. Plain tables are unpinned;
+ * other FDWs ignore the pin. lakehouse time travel (specs/lakehouse/
+ * 04-sql.md §3).
+ */
+void
+applyLakehouseTimeTravel(ParseState *pstate, List *locking_clause)
+{
+	ListCell   *l;
+	ListCell   *lc;
+	char	   *selector = NULL;
+
+	foreach(l, locking_clause)
+	{
+		if (IsA(lfirst(l), DefElem))
+			selector = transformLakehouseSnapshot(pstate, lfirst(l));
+	}
+
+	if (selector == NULL)
+		return;
+
+	foreach(lc, pstate->p_rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+		if (rte->rtekind == RTE_RELATION &&
+			rte->relkind == RELKIND_FOREIGN_TABLE)
+			rte->lakehouse_snapshot = selector;
+	}
 }
 
 /*

@@ -1,0 +1,75 @@
+-- TDD anchor for M1 slice 11: the lakehouse foreign-data wrapper. A
+-- foreign table over a (unreachable) REST catalog is an ordinary pg_class
+-- row — the one-catalog visibility principle (00-goals #3) — and SELECT
+-- fails fast with a connection exception (doc 03 §5).
+CREATE EXTENSION lakehouse;
+
+-- the wrapper handler exists in the lakehouse schema
+SELECT p.oid::regprocedure
+FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'lakehouse' AND p.proname = 'lakehouse_fdw_handler';
+
+CREATE FOREIGN DATA WRAPPER lakehouse_wrapper
+    HANDLER lakehouse.lakehouse_fdw_handler;
+CREATE SERVER smoke_server FOREIGN DATA WRAPPER lakehouse_wrapper
+    OPTIONS (endpoint 'http://127.0.0.1:9', warehouse 'wh',
+             s3_endpoint 'http://s3:9000');
+
+-- credentials live in the USER MAPPING (13-review #6 authority model):
+-- server = transport, mapping = secrets, table = identity only
+CREATE USER MAPPING FOR CURRENT_USER SERVER smoke_server
+    OPTIONS (s3_access_key 'key', s3_secret_key 'secret');
+
+-- ordinary catalog row: relkind 'f', listed by \d-equivalent queries
+CREATE FOREIGN TABLE lakehouse_ft (
+    id bigint,
+    name text
+) SERVER smoke_server
+    OPTIONS (table 'analytics.events');
+
+SELECT c.relkind, n.nspname, c.relname
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relname = 'lakehouse_ft';
+SELECT count(*) AS in_information_schema
+FROM information_schema.foreign_tables
+WHERE foreign_table_name = 'lakehouse_ft';
+
+-- SELECT fails fast against the unreachable endpoint (08000), endpoint named
+DO $$
+DECLARE
+    msg text;
+    detail text;
+BEGIN
+    BEGIN
+        PERFORM * FROM lakehouse_ft;
+    EXCEPTION WHEN OTHERS THEN
+        msg := SQLSTATE;
+        detail := SQLERRM;
+    END;
+    RAISE NOTICE 'caught sqlstate=%', msg;
+    RAISE NOTICE 'endpoint_named=%', (position('127.0.0.1:9' in detail) > 0);
+END $$;
+
+-- catalog introspection of the wrapper/server/table linkage
+SELECT fs.srvname, f.ftoptions
+FROM pg_foreign_table f
+JOIN pg_class c ON c.oid = f.ftrelid
+JOIN pg_foreign_server fs ON fs.oid = f.ftserver
+WHERE c.relname = 'lakehouse_ft';
+
+-- slice 18: snapshot_id pin option is accepted at DDL time (live pinning
+-- verified against fixtures; regress keeps it deterministic)
+CREATE FOREIGN TABLE lakehouse_ft_pinned (
+    id bigint
+) SERVER smoke_server
+    OPTIONS (table 'ns.tbl', snapshot_id '8900085420583981988');
+SELECT f.ftoptions FROM pg_foreign_table f
+JOIN pg_class c ON c.oid = f.ftrelid
+WHERE c.relname = 'lakehouse_ft_pinned';
+DROP FOREIGN TABLE lakehouse_ft_pinned;
+
+DROP FOREIGN TABLE lakehouse_ft;
+DROP USER MAPPING FOR CURRENT_USER SERVER smoke_server;
+DROP SERVER smoke_server;
+DROP FOREIGN DATA WRAPPER lakehouse_wrapper;
+DROP EXTENSION lakehouse;

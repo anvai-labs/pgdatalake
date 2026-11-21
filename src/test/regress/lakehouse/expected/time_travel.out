@@ -1,0 +1,105 @@
+-- TDD anchor for M1 slice 19: lakehouse time travel — SELECT ... FOR
+-- TIMESTAMP/VERSION/TAG AS OF (specs/lakehouse/04-sql.md §3). The clause
+-- parses in the locking-clause position (the only place this FOR is
+-- unambiguous for LALR(1)) and pins every lakehouse foreign table of the
+-- SELECT. Live pinning against fixtures is exercised by the smoke
+-- transcript; here we verify the deterministic surface: parse-analysis
+-- validation, error cases, plain-table behavior, and rule-storage
+-- round-trip of the pin.
+CREATE EXTENSION lakehouse;
+CREATE FOREIGN DATA WRAPPER lakehouse_wrapper
+    HANDLER lakehouse.lakehouse_fdw_handler;
+CREATE SERVER smoke_server FOREIGN DATA WRAPPER lakehouse_wrapper
+    OPTIONS (endpoint 'http://127.0.0.1:9', warehouse 'wh',
+             s3_endpoint 'http://s3:9000');
+-- credentials on the user mapping (13-review #6 authority model)
+CREATE USER MAPPING FOR CURRENT_USER SERVER smoke_server
+    OPTIONS (s3_access_key 'key', s3_secret_key 'secret');
+CREATE FOREIGN TABLE lakehouse_ft (
+    id bigint,
+    name text
+) SERVER smoke_server
+    OPTIONS (table 'analytics.events');
+CREATE TABLE local_t (id bigint);
+INSERT INTO local_t VALUES (1), (2);
+-- parse-analysis validation: constants only
+SELECT count(*) FROM lakehouse_ft FOR TIMESTAMP AS OF now();
+ERROR:  lakehouse time travel clause requires a constant literal
+LINE 1: SELECT count(*) FROM lakehouse_ft FOR TIMESTAMP AS OF now();
+                                          ^
+SELECT count(*) FROM lakehouse_ft FOR TIMESTAMP AS OF 'not-a-timestamp';
+ERROR:  invalid input syntax for type timestamp with time zone: "not-a-timestamp"
+SELECT count(*) FROM lakehouse_ft FOR VERSION AS OF 'not-a-number';
+ERROR:  FOR VERSION AS OF requires a snapshot id literal
+LINE 1: SELECT count(*) FROM lakehouse_ft FOR VERSION AS OF 'not-a-n...
+                                          ^
+SELECT count(*) FROM lakehouse_ft FOR VERSION AS OF 1.5;
+ERROR:  FOR VERSION AS OF requires an integer snapshot id
+LINE 1: SELECT count(*) FROM lakehouse_ft FOR VERSION AS OF 1.5;
+                                          ^
+SELECT count(*) FROM lakehouse_ft FOR TAG AS OF 42;
+ERROR:  FOR TAG AS OF requires a quoted tag or branch name
+LINE 1: SELECT count(*) FROM lakehouse_ft FOR TAG AS OF 42;
+                                          ^
+-- the clause lives in the locking-clause position: WHERE comes first
+SELECT count(*) FROM lakehouse_ft WHERE id < 5 FOR TIMESTAMP AS OF '2026-01-01 00:00:00+00';
+ERROR:  lakehouse: could not plan scan with selector {"kind":"ts","value-ms":1767225600000}: storage config error: REST catalog HTTP error: error sending request for url (http://127.0.0.1:9/v1/config?warehouse=wh)
+-- not applicable to a bare VALUES statement
+VALUES (1), (2) FOR TIMESTAMP AS OF '2026-01-01 00:00:00+00';
+ERROR:  lakehouse time travel clause cannot be applied to VALUES
+-- the clause is a plain-select clause: a set-op continuation doesn't parse
+SELECT id FROM lakehouse_ft FOR TIMESTAMP AS OF '2026-01-01 00:00:00+00'
+UNION
+SELECT id FROM lakehouse_ft;
+ERROR:  syntax error at or near "UNION"
+LINE 2: UNION
+        ^
+-- plain tables are simply unpinned: no error, no effect
+SELECT count(*) FROM local_t FOR TIMESTAMP AS OF '2026-01-01 00:00:00+00';
+ count 
+-------
+     2
+(1 row)
+
+-- plain tables stay usable after a pin attempt in the same statement
+SELECT count(*) FROM local_t FOR VERSION AS OF 12345;
+ count 
+-------
+     2
+(1 row)
+
+-- FOR UPDATE and the lakehouse clause do not collide: FOR UPDATE still
+-- parses (and errors on a foreign table the usual way), and the lakehouse
+-- clause parses after WHERE
+BEGIN;
+SELECT id FROM local_t FOR UPDATE;
+ id 
+----
+  1
+  2
+(2 rows)
+
+ROLLBACK;
+-- the pin rides into stored rules: a view over a pinned foreign table
+-- keeps the selector (observed through the plan-time error, which names
+-- the selector — the endpoint is unreachable, so this is deterministic)
+CREATE VIEW lakehouse_ft_v AS
+    SELECT id FROM lakehouse_ft FOR VERSION AS OF 12345;
+SELECT count(*) FROM lakehouse_ft_v;
+ERROR:  lakehouse: could not plan scan with selector {"kind":"id","value":12345}: storage config error: REST catalog HTTP error: error sending request for url (http://127.0.0.1:9/v1/config?warehouse=wh)
+CREATE VIEW lakehouse_ft_ts_v AS
+    SELECT id FROM lakehouse_ft FOR TIMESTAMP AS OF '2026-01-01 00:00:00+00';
+SELECT count(*) FROM lakehouse_ft_ts_v;
+ERROR:  lakehouse: could not plan scan with selector {"kind":"ts","value-ms":1767225600000}: storage config error: REST catalog HTTP error: error sending request for url (http://127.0.0.1:9/v1/config?warehouse=wh)
+-- a view without the pin stays selector-free
+CREATE VIEW lakehouse_ft_plain_v AS
+    SELECT id FROM lakehouse_ft;
+SELECT count(*) FROM lakehouse_ft_plain_v;
+ERROR:  lakehouse: could not plan scan: storage config error: REST catalog HTTP error: error sending request for url (http://127.0.0.1:9/v1/config?warehouse=wh)
+DROP VIEW lakehouse_ft_v, lakehouse_ft_ts_v, lakehouse_ft_plain_v;
+DROP TABLE local_t;
+DROP FOREIGN TABLE lakehouse_ft;
+DROP USER MAPPING FOR CURRENT_USER SERVER smoke_server;
+DROP SERVER smoke_server;
+DROP FOREIGN DATA WRAPPER lakehouse_wrapper;
+DROP EXTENSION lakehouse;

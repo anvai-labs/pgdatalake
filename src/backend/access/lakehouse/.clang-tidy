@@ -1,0 +1,28 @@
+# clang-tidy profile for fork-authored lakehouse C code.
+#
+# Scope: only files authored by this fork (see specs/lakehouse/RULES.md §3 —
+# upstream and core-allowlist files keep upstream formatting untouched).
+#
+# Checks omitted deliberately because they fight PostgreSQL coding
+# conventions (single statements unbraced, short loop identifiers are
+# idiomatic upstream):
+#   readability-braces-around-statements, readability-identifier-length,
+#   readability-magic-numbers, readability-function-cognitive-complexity
+# insecureAPI.DeprecatedOrUnsafeBufferHandling: memcpy is the idiom across
+#   the PostgreSQL tree; buffer lengths are validated at each call site.
+# bugprone-easily-swappable-parameters: strong-typed params would deviate
+#   from the FFI surface defined by cbindgen output.
+#
+# Run via scripts/run_clang_tidy_lakehouse.sh (needs a built tree for
+# compile_commands + generated headers).
+---
+Checks: >
+  -*,
+  clang-analyzer-*,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  performance-*,
+  readability-duplicate-include,
+  modernize-macro-to-enum
+HeaderFilterRegex: src/backend/access/lakehouse/.*

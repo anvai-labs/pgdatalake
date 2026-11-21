@@ -1556,9 +1556,18 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt,
 
 	foreach(l, stmt->lockingClause)
 	{
+		/* lakehouse time travel pins are DefElems; handled below (slice 19) */
+		if (IsA(lfirst(l), DefElem))
+			continue;
 		transformLockingClause(pstate, qry,
 							   (LockingClause *) lfirst(l), false);
 	}
+
+	/*
+	 * lakehouse time travel (slice 19): pin this level's foreign-table RTEs
+	 * (RTEs are shared pointers, so this propagates into qry->rtable)
+	 */
+	applyLakehouseTimeTravel(pstate, stmt->lockingClause);
 
 	assign_query_collations(pstate, qry);
 
@@ -1766,6 +1775,11 @@ transformValuesClause(ParseState *pstate, SelectStmt *stmt)
 	qry->limitOption = stmt->limitOption;
 
 	if (stmt->lockingClause)
+	{
+		if (IsA(linitial(stmt->lockingClause), DefElem))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("lakehouse time travel clause cannot be applied to VALUES")));
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 		/*------
@@ -1773,6 +1787,7 @@ transformValuesClause(ParseState *pstate, SelectStmt *stmt)
 				 errmsg("%s cannot be applied to VALUES",
 						LCS_asString(((LockingClause *)
 									  linitial(stmt->lockingClause))->strength))));
+	}
 
 	qry->rtable = pstate->p_rtable;
 	qry->rteperminfos = pstate->p_rteperminfos;
@@ -1864,6 +1879,11 @@ transformSetOperationStmt(ParseState *pstate, SelectStmt *stmt)
 
 	/* We don't support FOR UPDATE/SHARE with set ops at the moment. */
 	if (lockingClause)
+	{
+		if (IsA(linitial(lockingClause), DefElem))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("lakehouse time travel clause is not allowed with UNION/INTERSECT/EXCEPT")));
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 		/*------
@@ -1871,6 +1891,7 @@ transformSetOperationStmt(ParseState *pstate, SelectStmt *stmt)
 				 errmsg("%s is not allowed with UNION/INTERSECT/EXCEPT",
 						LCS_asString(((LockingClause *)
 									  linitial(lockingClause))->strength))));
+	}
 
 	/* Process the WITH clause independently of all else */
 	if (withClause)

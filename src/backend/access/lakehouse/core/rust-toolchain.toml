@@ -1,0 +1,6 @@
+# Pin the Rust toolchain for pgdatalake-core (specs/lakehouse/12-roadmap.md M0:
+# "cargo toolchain pinned"). Bump deliberately, in a commit that notes it.
+[toolchain]
+channel = "1.100.0"
+profile = "default"
+components = ["clippy", "rustfmt"]

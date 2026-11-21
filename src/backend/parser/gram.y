@@ -552,6 +552,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <ielem>	index_elem index_elem_options
 %type <selem>	stats_param
 %type <node>	table_ref
+%type <node>	lakehouse_time_travel opt_lakehouse_time_travel
 %type <jexpr>	joined_table
 %type <range>	relation_expr
 %type <range>	extended_relation_expr
@@ -794,8 +795,8 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	START STATEMENT STATISTICS STDIN STDOUT STORAGE STORED STRICT_P STRING_P STRIP_P
 	SUBSCRIPTION SUBSTRING SUPPORT SYMMETRIC SYSID SYSTEM_P SYSTEM_USER
 
-	TABLE TABLES TABLESAMPLE TABLESPACE TARGET TEMP TEMPLATE TEMPORARY TEXT_P THEN
-	TIES TIME TIMESTAMP TO TRAILING TRANSACTION TRANSFORM
+	TABLE TABLES TABLESAMPLE TABLESPACE TAG TARGET TEMP TEMPLATE TEMPORARY TEXT_P
+	THEN TIES TIME TIMESTAMP TO TRAILING TRANSACTION TRANSFORM
 	TREAT TRIGGER TRIM TRUE_P
 	TRUNCATE TRUSTED TYPE_P TYPES_P
 
@@ -13803,6 +13804,13 @@ having_clause:
 for_locking_clause:
 			for_locking_items						{ $$ = $1; }
 			| FOR READ ONLY							{ $$ = NIL; }
+			/* lakehouse time travel (slice 19): FOR TIMESTAMP/VERSION/TAG
+			 * AS OF rides in the locking-clause position — the only spot
+			 * where this FOR is unambiguous for LALR(1) (table_ref cannot
+			 * own a FOR-prefixed rule without conflicting with FOR UPDATE).
+			 * The pin applies to every lakehouse foreign table of the
+			 * SELECT; consumers must skip DefElem list entries. */
+			| lakehouse_time_travel					{ $$ = list_make1($1); }
 		;
 
 opt_for_locking_clause:
@@ -14115,6 +14123,28 @@ alias_clause:
 
 opt_alias_clause: alias_clause						{ $$ = $1; }
 			| /*EMPTY*/								{ $$ = NULL; }
+		;
+
+/*
+ * lakehouse time travel (specs/lakehouse/04-sql.md §3): attach
+ * FOR TIMESTAMP AS OF / FOR VERSION AS OF / FOR TAG AS OF to a RangeVar.
+ * The value is captured as a raw DefElem (defname = selector kind); the
+ * constant-only restriction is enforced in transformTableEntry so the
+ * error carries parse context.
+ */
+lakehouse_time_travel:
+			FOR TIMESTAMP AS OF a_expr
+				{
+					$$ = (Node *) makeDefElem("timestamp", $5, @1);
+				}
+			| FOR VERSION_P AS OF a_expr
+				{
+					$$ = (Node *) makeDefElem("version", $5, @1);
+				}
+			| FOR TAG AS OF a_expr
+				{
+					$$ = (Node *) makeDefElem("tag", $5, @1);
+				}
 		;
 
 /*
@@ -18360,6 +18390,7 @@ unreserved_keyword:
 			| SYSTEM_P
 			| TABLES
 			| TABLESPACE
+			| TAG
 			| TARGET
 			| TEMP
 			| TEMPLATE

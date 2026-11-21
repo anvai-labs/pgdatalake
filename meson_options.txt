@@ -218,3 +218,12 @@ option('ZSTD', type: 'string', value: 'zstd',
 
 option('ZIC', type: 'string', value: 'zic',
   description: 'Path to zic binary, when cross-compiling')
+
+# Format-generic lakehouse storage engine support (specs/lakehouse). Builds
+# the pgdatalake-core Rust static library and the lakehouse extension module
+# (Iceberg is the first FORMAT layer). 'auto' silently disables when the Rust
+# toolchain is unavailable.
+option('datalake',
+       type: 'combo', choices: ['auto', 'enabled', 'disabled'],
+       value: 'auto',
+       description: 'Lakehouse storage engine support (open table formats)')

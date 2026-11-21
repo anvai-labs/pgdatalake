@@ -1281,6 +1281,14 @@ typedef struct RangeTblEntry
 	bool		inFromCl pg_node_attr(query_jumble_ignore);
 	/* security barrier quals to apply, if any */
 	List	   *securityQuals pg_node_attr(query_jumble_ignore);
+
+	/*
+	 * lakehouse time-travel pin (FOR TIMESTAMP/VERSION/TAG AS OF), or NULL:
+	 * canonical selector string "ts:<epoch-ms>" / "id:<snapshot-id>" /
+	 * "ref:<name>" resolved by transformTableEntry from the raw clause in
+	 * RangeVar.lakehouse_snapshot. Read by the lakehouse FDW.
+	 */
+	char	   *lakehouse_snapshot pg_node_attr(query_jumble_ignore);
 } RangeTblEntry;
 
 /*
