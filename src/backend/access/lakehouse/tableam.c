@@ -2464,6 +2464,9 @@ lakehouse_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
  * DefineCustom*Variable — the seam Postgres provides; NO core edit
  * (RULES §3: the guc_tables.c allowlist entry is retired). */
 int			lakehouse_write_mode = 1;	/* enum: 1 = cow, 2 = staged */
+/* hard ceiling on both kB-denominated size knobs: 10GB (spec 15 P2) */
+#define LAKEHOUSE_MAX_SIZE_KB (10 * 1024 * 1024)
+
 int			lakehouse_target_file_size = 128 * 1024;	/* kB; SHOWs as 128MB */
 int			lakehouse_publish_max_lag = 30;		/* s */
 int			lakehouse_cache_max_bytes = 256 * 1024;		/* kB; SHOWs as 256MB */
@@ -2491,7 +2494,7 @@ _PG_init(void)
 							"Target size of one written data file; the writer rolls files at this threshold.",
 							NULL,
 							&lakehouse_target_file_size,
-							128 * 1024, 128, PG_INT32_MAX,
+							128 * 1024, 128, LAKEHOUSE_MAX_SIZE_KB,
 							PGC_USERSET,
 							GUC_UNIT_KB,
 							NULL, NULL, NULL);
@@ -2509,7 +2512,7 @@ _PG_init(void)
 							"Byte cap of the per-backend immutable-object read cache (spec 15 §6.2).",
 							NULL,
 							&lakehouse_cache_max_bytes,
-							256 * 1024, 0, PG_INT32_MAX,
+							256 * 1024, 0, LAKEHOUSE_MAX_SIZE_KB,
 							PGC_USERSET,
 							GUC_UNIT_KB,
 							NULL, NULL, NULL);

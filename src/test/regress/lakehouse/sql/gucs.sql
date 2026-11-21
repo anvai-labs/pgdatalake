@@ -37,3 +37,10 @@ SET lakehouse.write_mode = 'bogus';
 
 -- invalid numeric rejected loudly
 SET lakehouse.target_file_size = '0';
+
+-- hard ceiling: 10GB (10485760 kB) on both size knobs (spec 15 P2)
+SET lakehouse.target_file_size = '11GB';
+SET lakehouse.cache_max_bytes = '11GB';
+SET lakehouse.target_file_size = '10GB';
+SHOW lakehouse.target_file_size;
+RESET lakehouse.target_file_size;
