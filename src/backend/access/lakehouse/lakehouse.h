@@ -48,7 +48,7 @@ extern char *lakehouse_BuildSelectorJson(const char *sel);
  * ERRCODE_CONNECTION_EXCEPTION on failure — the FDW and the AM share the
  * same fail-fast contract (doc 03 §5).
  */
-extern ScanSession * lakehouse_OpenSession(LakehouseOptions *opts,
-										   const char *rte_selector);
+extern ScanSession *lakehouse_OpenSession(LakehouseOptions *opts,
+										  const char *rte_selector);
 
 #endif							/* LAKEHOUSE_H */

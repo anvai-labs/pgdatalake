@@ -107,6 +107,15 @@ outside the table, stop and redesign — or raise it in a spec revision first.
 
 - C code follows upstream postgres style exactly (`src/tools/pgindent/` before
   every commit touching C; `--build` with typedefs file regenerated).
+  **Enforced locally by the `.githooks/pre-commit` gate** (activate once:
+  `git config core.hooksPath .githooks`) — it aborts commits whose staged
+  lakehouse C is not pgindent-clean (via `scripts/pgindent_lakehouse.sh`,
+  which supplies the fork typedefs that plain pgindent lacks and repairs
+  the known UTF-8 string-literal mangling) or whose staged Rust fails
+  `cargo fmt`/`clippy` workspace lints (pedantic). Verification only, never
+  auto-rewrite; `--no-verify` is the emergency bypass. CI re-checks the
+  Rust side; the C side has no CI formatter — the local gate IS the
+  enforcement.
 - Rust code: `cargo fmt`, `cargo clippy -D warnings` on
   `pgdatalake-core`; `#![forbid(unsafe_code)]` everywhere except the single
   `ffi.rs` boundary module; no panics across the FFI boundary — every exported
