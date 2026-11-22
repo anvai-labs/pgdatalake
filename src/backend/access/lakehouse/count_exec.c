@@ -51,6 +51,14 @@ extern Oid	lakehouse_am_oid(void);
 
 static planner_hook_type prev_planner_hook = NULL;
 
+/*
+ * RECURSION GUARD: the fallback path runs SELECT count(*) over the very
+ * relation the hook rewrites; without this flag the inner query would be
+ * rewritten into managed_count() again — for a table whose proof gate
+ * PERMANENTLY fails (published segments) that is an infinite loop.
+ */
+static bool count_exec_in_fallback = false;
+
 static Oid	lh_am_oid_cache = InvalidOid;
 
 static bool
@@ -197,7 +205,7 @@ lakehouse_count_exec_planner(Query *parse, const char *query_string,
 	Oid			relid = InvalidOid;
 
 	elog(DEBUG1, "lakehouse count_exec: hook entered");
-	if (managed_count_wanted(parse, &relid))
+	if (!count_exec_in_fallback && managed_count_wanted(parse, &relid))
 	{
 		elog(DEBUG1, "lakehouse count_exec: rewriting count(*) relid %u",
 			 (unsigned) relid);
@@ -223,6 +231,8 @@ install_lakehouse_count_exec(void)
  * script): re-evaluated per execution, so prepared plans stay fresh.
  * SECURITY INVOKER: the caller's permissions and RLS apply.
  */
+static void count_exec_run_ordinary(Oid relid, int64 *result);
+
 PG_FUNCTION_INFO_V1(lakehouse_managed_count);
 
 Datum
@@ -230,6 +240,8 @@ lakehouse_managed_count(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
 	AclResult	aclresult;
+	int64		ord_result;
+	int			ret_dummy = 0;
 	int			ret;
 	int64		result = 0;
 	bool		from_ledger = false;
@@ -301,18 +313,51 @@ lakehouse_managed_count(PG_FUNCTION_ARGS)
 		PG_RETURN_INT64(result);
 
 ordinary_fallback:
+
+	/*
+	 * Run the ordinary aggregate with the rewrite SUPPRESSED: the SPI count
+	 * replans, and without the guard the hook would rewrite it straight back
+	 * into managed_count(). Error-safe: an ereport inside the SPI call
+	 * longjmps past the reset, so PG_TRY restores the flag.
+	 */
+	count_exec_in_fallback = true;
+	PG_TRY();
+	{
+		count_exec_run_ordinary(relid, &result);
+		count_exec_in_fallback = false;
+	}
+	PG_CATCH();
+	{
+		count_exec_in_fallback = false;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	PG_RETURN_INT64(result);
+}
+
+/*
+ * The ordinary aggregate as fallback: SELECT count(*) over the relation,
+ * executed via SPI with the invoking user's full executor semantics
+ * (permissions re-checked inside, RLS applied, inheritance included).
+ */
+static void
+count_exec_run_ordinary(Oid relid, int64 *result)
+{
+	int			ret;
+
 	SPI_connect();
 	PushActiveSnapshot(GetTransactionSnapshot());
 	{
 		char	   *nsp = get_namespace_name(get_rel_namespace(relid));
 		char	   *nm = get_rel_name(relid);
 
-		/* relation dropped between planning and execution: ordinary path */
+		/* relation dropped between planning and execution: zero */
 		if (nsp == NULL || nm == NULL)
 		{
 			PopActiveSnapshot();
 			SPI_finish();
-			PG_RETURN_INT64(0);
+			*result = 0;
+			return;
 		}
 		ret = SPI_execute(psprintf("SELECT count(*) FROM %s",
 								   quote_qualified_identifier(nsp, nm)),
@@ -322,10 +367,9 @@ ordinary_fallback:
 	{
 		bool		dummy;
 
-		result = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
-											 SPI_tuptable->tupdesc, 1, &dummy));
+		*result = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+											  SPI_tuptable->tupdesc, 1, &dummy));
 	}
 	PopActiveSnapshot();
 	SPI_finish();
-	PG_RETURN_INT64(result);
 }
