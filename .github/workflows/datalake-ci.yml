@@ -10,10 +10,9 @@
 # docker fixtures up.
 #
 # SMART PATH FILTERING (2026-11-21): a `changes` job classifies the diff and
-# gates the heavy jobs — docs/specs-only diffs run NO code jobs (docs-sentinel
-# covers spec hygiene); Rust-only diffs skip the native build; workflow-file
-# diffs still exercise the gates that live in them (so a broken step fails
-# its own PR, as #16 proved). workflow_dispatch forces everything.
+# gates the heavy jobs. The docs sentinel covers spec hygiene. Rust changes
+# also build the native binaries that link the Rust library. Workflow changes
+# exercise both code jobs and workflow_dispatch forces everything.
 
 name: datalake-ci
 
@@ -66,12 +65,11 @@ jobs:
             # test/audit AND the backend build, which links the staticlib)
             rust:
               - 'src/backend/access/lakehouse/core/**'
-            # Native/backend + tests + build wiring (C code, regress suites,
-            # fixtures, meson/Makefile) — anything the .so and suites cover
+            # Native sources, tests, and build wiring. Use positive patterns:
+            # paths-filter's default "some" treats a negation as an OR branch.
             native:
               - 'scripts/*shared_sources.py'
               - 'src/**'
-              - '!src/backend/access/lakehouse/core/**'
               - 'meson.build'
               - 'meson_options.txt'
               - 'src/backend/access/meson.build'

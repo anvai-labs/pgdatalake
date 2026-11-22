@@ -25,6 +25,7 @@ Usage:
       --dsn postgres://postgres@localhost:52021/postgres
 """
 import argparse
+import re
 import statistics
 import sys
 import time
@@ -253,7 +254,7 @@ def main():
     ap.add_argument("--timeout", type=int, default=1200,
                     help="per-run statement timeout (s)")
     ap.add_argument("--no-warmup", dest="warmup", action="store_false",
-                    help="skip the warmup run (measures genuinely cold)")
+                    help="skip the warmup run (cache state is uncontrolled)")
     # scan-suite knobs
     ap.add_argument("--force-regen", action="store_true",
                     help="regenerate the scan fixture even if one exists "
@@ -269,7 +270,36 @@ def main():
                          "tpcds_sf<N> so scales never collide (existing "
                          "M1 fixture lives in 'tpcds' at SF=10)")
     ap.add_argument("--queries", default=str(DEFAULT_QUERIES))
+    ap.add_argument("--oracle", help="independent pinned oracle JSON for qualified TPC-DS timings")
+    ap.add_argument("--receipt", help="output JSON receipt for the qualified run")
+    ap.add_argument("--fixture-schema", default="public", help="schema of pinned attachments")
+    ap.add_argument("--source-sha", help="40-digit Git revision of the build under test")
+    ap.add_argument("--package-sha256", help="64-digit digest of the package under test")
+    ap.add_argument("--configuration", help="non-secret host, catalog and storage configuration label")
+    ap.add_argument("--samples", type=int, default=5, help="measured attempts per qualified canary")
     args = ap.parse_args()
+
+    if args.oracle or args.receipt:
+        if args.suite != "tpcds" or not all((args.oracle, args.receipt, args.configuration,
+                                            args.source_sha, args.package_sha256)):
+            ap.error("qualification requires the TPC-DS suite, oracle, receipt, configuration and both build IDs")
+        if not re.fullmatch(r"[0-9a-f]{40}", args.source_sha) or not re.fullmatch(
+                r"[0-9a-f]{64}", args.package_sha256):
+            ap.error("build IDs must be canonical lowercase hex")
+        if args.samples < 1 or args.timeout < 1:
+            ap.error("samples and timeout must be positive")
+        if Path(args.oracle).resolve() == Path(args.receipt).resolve():
+            ap.error("receipt must be separate from the oracle")
+        from pinned_receipt import run_pinned
+
+        args.workload = "shipped_tpcds_canaries" if Path(args.queries).resolve() == DEFAULT_QUERIES \
+            else "custom_exploratory"
+        try:
+            passed = run_pinned(lambda: connect(args.dsn), args, TPCDS_QUERIES, psycopg2.Error)
+        except FileExistsError:
+            ap.error("receipt path already exists; choose a new file")
+        print(f"{'PASS' if passed else 'FAIL'}: {args.receipt}")
+        raise SystemExit(0 if passed else 1)
 
     conn = connect(args.dsn)
     cur = conn.cursor()
