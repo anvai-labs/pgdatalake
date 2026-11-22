@@ -80,6 +80,9 @@ def exercise(db, parent, child, prefix, route, enrolled):
             if method != "GET" or path != route:
                 return 404, [], b""
             case = state["case"]
+            if case == "warm-then-sibling" and len(catalog_requests) == 2:
+                state["warm_requests"] = len(object_requests)
+                case = "sibling-metadata"
             if case == "catalog-redirect":
                 return 307, [("Location", forbidden + route)], b""
             result = enrolled | {"config": {"s3.endpoint": forbidden, "s3.region": "wrong"}}
@@ -144,6 +147,24 @@ def exercise(db, parent, child, prefix, route, enrolled):
                     path.startswith(root_path + "/") for _, path in object_requests
                 ), object_requests
                 print(f"{name}: {len(object_requests)} scoped storage requests", flush=True)
+
+            state["case"] = "warm-then-sibling"
+            catalog_requests.clear()
+            object_requests.clear()
+            actual = sql(db, """
+                SET plan_cache_mode = force_generic_plan;
+                PREPARE warm AS SELECT array_agg(id ORDER BY id) FROM child_rows;
+                EXECUTE warm;
+                DO $check$ BEGIN
+                    EXECUTE 'EXECUTE warm';
+                    RAISE EXCEPTION 'reused plan accepted a sibling metadata path';
+                EXCEPTION WHEN insufficient_privilege THEN NULL; END $check$;
+            """)
+            assert actual == "{10,20,30}", actual
+            assert catalog_requests == [("GET", route)] * 2, catalog_requests
+            assert len(object_requests) == state["warm_requests"] > 0, object_requests
+            print("generic prepared scan warmed allowed objects, then refused sibling before IO",
+                  flush=True)
 
             for case, sqlstate, expect_metadata in (
                 ("sibling-metadata", "42501", False),
