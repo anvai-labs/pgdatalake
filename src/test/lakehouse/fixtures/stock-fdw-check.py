@@ -23,6 +23,49 @@ def trino(statement):
     return subprocess.check_output(trino_command(statement), text=True, timeout=90).strip()
 
 
+def check_view_mappings(db):
+    # The role DDL is transactional and db is unique per fixture run.
+    owner, reader = f"{db}_owner", f"{db}_reader"
+    actual = sql(db, f"""
+        BEGIN;
+        CREATE ROLE {owner};
+        CREATE ROLE {reader};
+        GRANT USAGE ON FOREIGN SERVER lake TO {owner}, {reader};
+        GRANT SELECT ON new_rows TO {owner}, {reader};
+        CREATE USER MAPPING FOR {owner} SERVER lake OPTIONS
+          (s3_access_key 'lakehouse-test', s3_secret_key 'lakehouse-test-password');
+        CREATE VIEW owner_rows AS SELECT id FROM new_rows;
+        ALTER VIEW owner_rows OWNER TO {owner};
+        CREATE VIEW invoker_rows WITH (security_invoker=true) AS SELECT id FROM new_rows;
+        ALTER VIEW invoker_rows OWNER TO {owner};
+        GRANT SELECT ON owner_rows, invoker_rows TO {reader};
+        SET LOCAL ROLE {reader};
+        SET LOCAL plan_cache_mode = force_generic_plan;
+        PREPARE from_owner AS SELECT array_agg(id ORDER BY id) FROM owner_rows;
+        PREPARE from_invoker AS SELECT array_agg(id ORDER BY id) FROM invoker_rows;
+        EXECUTE from_owner;
+        DO $check$ BEGIN
+            EXECUTE 'EXECUTE from_invoker';
+            RAISE EXCEPTION 'invoker read without its mapping';
+        EXCEPTION WHEN undefined_object THEN NULL; END $check$;
+        RESET ROLE;
+        CREATE USER MAPPING FOR {reader} SERVER lake OPTIONS
+          (s3_access_key 'lakehouse-test', s3_secret_key 'lakehouse-test-password');
+        SET LOCAL ROLE {reader};
+        EXECUTE from_invoker;
+        RESET ROLE;
+        DROP USER MAPPING FOR {owner} SERVER lake;
+        SET LOCAL ROLE {reader};
+        DO $check$ BEGIN
+            EXECUTE 'EXECUTE from_owner';
+            RAISE EXCEPTION 'owner view retained a dropped mapping';
+        EXCEPTION WHEN undefined_object THEN NULL; END $check$;
+        EXECUTE from_invoker;
+        ROLLBACK;
+    """)
+    assert actual.splitlines() == ["{10,20,30}"] * 3, actual
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--receipt", type=Path, help="write evidence from this successful run")
@@ -97,6 +140,7 @@ def main():
                     assert actual == reference, (database, pin, actual, reference)
                 snapshots.append({"snapshot_id": str(pin), "rows": [int(r) for r in actual.splitlines()]})
                 print(f"snapshot={pin} rows={expected} stock/restore/Trino=equal", flush=True)
+            check_view_mappings(db)
             for statement in ("INSERT INTO new_rows VALUES (42)", "UPDATE new_rows SET id=42",
                               "DELETE FROM new_rows"):
                 sql(db, statement, error="0A000")
@@ -123,7 +167,8 @@ def main():
             "platform": f"{platform.system().lower()}-{platform.machine()}",
             "server_version_num": server_version, "extension_version": extension_version,
             "passed": ["published_serial_scan", "snapshot_id_option", "v2_position_delete",
-                       "prepared_ref_refresh", "schema_restore", "foreign_dml_rejected"],
+                       "prepared_ref_refresh", "schema_restore", "foreign_dml_rejected",
+                       "view_mapping_roles"],
             "parent": snapshots[0], "child": snapshots[1],
         }
         example_path = (Path(__file__).resolve().parents[4]

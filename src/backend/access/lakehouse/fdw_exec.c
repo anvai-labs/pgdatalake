@@ -56,7 +56,8 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 
 	tupdesc = RelationGetDescr(rel);
 
-	ExtractOptions(RelationGetRelid(rel), &opts);
+	ExtractOptions(RelationGetRelid(rel),
+				   ((ForeignScan *) node->ss.ps.plan)->checkAsUser, &opts);
 
 	state = (LakehouseExecState *) palloc0(sizeof(LakehouseExecState));
 	state->natts = tupdesc->natts;

@@ -270,7 +270,7 @@ lakehouse_fdw_handler(PG_FUNCTION_ARGS)
  * level == Postgres schema).
  */
 void
-ExtractOptions(Oid foreigntableid, LakehouseOptions *opts)
+ExtractOptions(Oid foreigntableid, Oid checkAsUser, LakehouseOptions *opts)
 {
 	ForeignServer *server;
 	ForeignTable *table;
@@ -311,8 +311,9 @@ ExtractOptions(Oid foreigntableid, LakehouseOptions *opts)
 									LOPT_TABLE);
 	}
 
-	/* credentials: the user mapping for the effective (invoking) user */
-	um = GetUserMapping(GetUserId(), server->serverid);
+	/* Core supplies the view owner where its privileges apply. */
+	um = GetUserMapping(OidIsValid(checkAsUser) ? checkAsUser : GetUserId(),
+						server->serverid);
 	foreach(lc, um->options)
 	{
 		DefElem    *def = (DefElem *) lfirst(lc);

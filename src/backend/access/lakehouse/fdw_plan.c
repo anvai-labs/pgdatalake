@@ -39,6 +39,7 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "optimizer/optimizer.h"
+#include "optimizer/cost.h"
 #include "utils/json.h"
 
 #include "lakehouse_fdw.h"
@@ -70,22 +71,13 @@ void
 lakehouse_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 							Oid foreigntableid)
 {
-	LakehouseOptions opts;
-	ScanSession *session;
-	uint64		task_count;
-	double		total_rows = 0;
-
-	ExtractOptions(foreigntableid, &opts);
-	/* query-level time travel pin (slice 19) */
-	session = lakehouse_OpenSession(&opts, query_snapshot_selector(root, baserel));
-	task_count = pg_datalake_scan_task_count(session);
-	for (uint64 i = 0; i < task_count; i++)
-		total_rows += (double) pg_datalake_scan_task_rows(session, i);
-	pg_datalake_scan_free(session);
-
-	/* estimates; actual rows are known only after execution */
-	baserel->rows = clamp_row_est(total_rows);
-	baserel->pages = (BlockNumber) clamp_row_est(total_rows / 200.0 + 10.0);
+	/*
+	 * ExecutorStart checks relation permissions before opening the scan.
+	 * Keep planning local, including plans for views. Use catalog statistics
+	 * when available and otherwise retain core's foreign-table estimate.
+	 */
+	if (baserel->tuples >= 0)
+		set_baserel_size_estimates(root, baserel);
 }
 
 void
