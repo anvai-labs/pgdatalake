@@ -8,6 +8,7 @@
 -- This test runs OFFLINE on purpose: the ledger lives in Postgres, so a
 -- staged-serve scan works against the dead endpoint below.
 CREATE EXTENSION IF NOT EXISTS lakehouse;
+ALTER EXTENSION lakehouse UPDATE; -- managed_count (v1.3)
 SELECT lakehouse.version();
 
 SET lakehouse.write_mode = 'staged';
@@ -24,8 +25,9 @@ SELECT lakehouse.attach_table('cnt_elide'::regclass, 'analytics.cnt_elide', 'ce_
 
 INSERT INTO cnt_elide SELECT g, 'e-'||g FROM generate_series(1, 5) g;
 
--- no plan-time Const rewrite: the plan must be a real aggregate over a
--- scan (retains the rtable -> permission checks), never a bare Result
+-- execution-time successor (spec 16): the plan is a bare Result whose
+-- target is the volatile lakehouse.managed_count(relid) call — the ONLY
+-- plan input is the relation descriptor; NO count literal may appear
 EXPLAIN (VERBOSE, COSTS OFF) SELECT count(*) FROM cnt_elide;
 SELECT count(*) AS exact FROM cnt_elide;
 

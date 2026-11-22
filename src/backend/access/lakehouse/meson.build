@@ -42,6 +42,7 @@ lakehouse_sources = files(
   'fdw_plan.c',
   'fdw_exec.c',
   'publisher.c',
+  'count_exec.c',
   'batch_fill.c',
 )
 
@@ -67,7 +68,8 @@ lakehouse = shared_module('lakehouse',
 install_data(
   ['lakehouse.control', 'lakehouse--1.0.sql',
    'lakehouse--1.1.sql', 'lakehouse--1.0--1.1.sql',
-   'lakehouse--1.2.sql', 'lakehouse--1.1--1.2.sql'],
+   'lakehouse--1.2.sql', 'lakehouse--1.1--1.2.sql',
+   'lakehouse--1.3.sql', 'lakehouse--1.2--1.3.sql'],
   install_dir: dir_data_extension,
 )
 
