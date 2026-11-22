@@ -86,3 +86,10 @@ Keep calculator inputs, currency and price date in each qualification receipt.
 Promote rate assumptions only after checking provider invoices or equivalent
 SKU counters on the advertised deployment profile. A local S3-compatible
 fixture qualifies request behavior and supplies model inputs. [Google Cloud storage pricing](https://cloud.google.com/storage/pricing) · [Azure Data Lake pricing](https://azure.microsoft.com/en-in/pricing/details/storage/data-lake/)
+
+For a proposed larger read window, compare saved request charges against added
+retrieval and transfer charges at the same pin. The request savings are
+`avoided_billed_requests × rate_per_request`. The added byte charges are
+`extra_billed_bytes × (retrieval_rate_per_byte + transfer_rate_per_byte)`.
+Keep the conservative window if a larger one misses the byte, memory or
+first-row latency gate, even when request charges would fall.
