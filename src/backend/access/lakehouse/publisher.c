@@ -12,9 +12,11 @@
 #include "commands/defrem.h"
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
 #include "pgstat.h"
 #include "postmaster/bgworker.h"
 #include "executor/spi.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "libpq/pqsignal.h"
 #include "storage/ipc.h"
@@ -27,6 +29,24 @@
 #include "pg_datalake_core.h"
 
 
+
+/*
+ * Extension 1.3 has no binding column. Hold the ledger lock to the end
+ * of the transaction so an upgrade cannot change the eligibility rule
+ * between discovery/selection and the update.
+ */
+static const char *
+legacy_segment_filter(void)
+{
+	Relation	segments;
+	bool		has_binding;
+
+	segments = table_openrv(makeRangeVar("lakehouse", "lakehouse_delta_segments", -1),
+							AccessShareLock);
+	has_binding = get_attnum(RelationGetRelid(segments), "authority_id") != InvalidAttrNumber;
+	table_close(segments, NoLock);
+	return has_binding ? " AND authority_id IS NULL" : "";
+}
 
 void
 register_publisher_worker(void)
@@ -148,9 +168,9 @@ lakehouse_publisher_main(Datum main_arg)
 		SPI_connect();
 		PG_TRY();
 		{
-			ret = SPI_execute("SELECT DISTINCT relid FROM"
-							  " lakehouse.lakehouse_delta_segments"
-							  " WHERE NOT published", true, 0);
+			ret = SPI_execute(psprintf("SELECT DISTINCT relid FROM"
+									   " lakehouse.lakehouse_delta_segments"
+									   " WHERE NOT published%s", legacy_segment_filter()), true, 0);
 			if (ret == SPI_OK_SELECT && SPI_processed > 0)
 			{
 				/*
@@ -262,11 +282,6 @@ pg_lakehouse_publish_staged(PG_FUNCTION_ARGS)
 
 	rel = table_open(relid, AccessShareLock);
 	entry = get_write_entry(rel);
-	open_write_session(entry, RelationGetDescr(rel));
-	if (entry->ws == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_IO_ERROR),
-				 errmsg("lakehouse: publisher could not open a write session")));
 
 	SPI_connect();
 	PushActiveSnapshot(GetTransactionSnapshot());
@@ -291,21 +306,24 @@ pg_lakehouse_publish_staged(PG_FUNCTION_ARGS)
 						 "SELECT seg_id, payload FROM"
 						 " lakehouse.lakehouse_delta_segments"
 						 " WHERE relid = %u AND NOT published"
-						 " ORDER BY seg_id", (unsigned) relid);
+						 "%s ORDER BY seg_id FOR UPDATE", (unsigned) relid,
+						 legacy_segment_filter());
 		ret = SPI_execute(sql.data, false, 0);
 		if (ret != SPI_OK_SELECT)
 			ereport(ERROR,
 					(errcode(ERRCODE_IO_ERROR),
 					 errmsg("lakehouse: publisher could not read delta segments")));
 
+		if (SPI_processed > 0)
+			open_write_session(entry, RelationGetDescr(rel));
+
 		/*
-		 * DURABLE CLAIM (spec 16): capture the EXACT segment set now. The old
-		 * code selected unbounded and flipped with a blanket "WHERE relid =
-		 * %u AND NOT published" — a concurrent INSERT's segment landing
-		 * between selection and flip was marked published WITHOUT its rows
-		 * ever being emitted (silent loss). The claim is what is emitted AND
-		 * what is flipped; anything else stays unpublished for the next
-		 * cycle.
+		 * Capture the exact legacy segment set in this backend. The old code
+		 * selected unbounded and flipped with a blanket "WHERE relid = %u AND
+		 * NOT published" — a concurrent INSERT's segment landing between
+		 * selection and flip was marked published WITHOUT its rows ever being
+		 * emitted (silent loss). The claim is what is emitted AND what is
+		 * flipped; anything else stays unpublished for the next cycle.
 		 */
 		claimed = (int64 *) palloc(sizeof(int64) *
 								   (SPI_processed > 0 ? SPI_processed : 1));
