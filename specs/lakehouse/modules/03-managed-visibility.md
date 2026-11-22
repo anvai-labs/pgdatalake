@@ -55,6 +55,37 @@ return consistency_error
 
 The statement's own earlier commands follow the same visibility rules. An explicit historical published read uses the requested pin directly. A managed COUNT shortcut must produce the same multiplicity as the resolved scan.
 
+#### Membership and visibility seam
+
+The catalog-side proof supplies candidates in certified ancestry order for the
+enrolled authority, table UUID, ref and local source lineage. Each candidate
+carries an exact pin and either a complete included segment set or an explicit
+unknown result. Completeness includes prior capture generations in that
+lineage and source transactions the PostgreSQL reader cannot see. A provider
+can assert an empty set only with proof of absence within a protected retention
+horizon. Scope mismatch stops selection. Unknown membership or retention loss
+permits trying an earlier candidate only when its proof is complete.
+
+The PostgreSQL-side observation holds the statement's original MVCC snapshot
+and enumerates visible segment IDs with retained payload. Publication completion
+can become visible at a different time from source INSERT. Compare the two
+immutable identity sets before decoding or emitting rows. Reuse the selected
+pin and overlay IDs for aliases, rescans and COUNT. Preserve separate own-command
+visibility and require the complete vector for joins before output. Returning a
+partial result would be a different consistency contract.
+
+The [live decision fixture](../../../src/test/lakehouse/fixtures/managed-cut-check.py)
+uses ordinary INSERT, two held PostgreSQL snapshots and Trino's exact parent and
+child rows. One batch contains the same value in two committed segments. The
+middle snapshot must use the parent and its one visible segment. The fresh
+snapshot suppresses both overlays on the published child, including before it
+can see local completion. The fixture injects membership and simulates completion
+as separate inputs to the decision oracle. A live acceptance test must replace
+them with verified worker receipts, derive candidate ancestry from the enrolled
+authority, and exercise the real bound TableAM scan. The fixture currently
+asserts the bound SQL gate `0A000`. Its held snapshots exercise the visibility
+oracle and leave product Repeatable Read support unqualified.
+
 - Run the managed overlay vectors with a fake published view and ledger membership responses. Verify older base/new ledger, new base/stale ledger, future operation and unknown-membership cases. Assert exact rows, including duplicates.
 - Run `mixed-visibility-claim` through pin selection and ordinary SQL scans. Two segments share one verified publication. A reader between their source commits falls back to the retained parent and adds just its visible segment. Dropping that parent gives an explicit consistency error. A reader after both commits can use the published pin directly.
 - SQL regression for 65 relations, nested SAVEPOINT rollback, prepared plans, ordinary roles/RLS, mode change, relid reuse and catalog outage. Isolate a provably empty offline case to exercise staged reads during an outage.
