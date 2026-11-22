@@ -242,6 +242,15 @@ Therefore:
 | DELETE/UPDATE via DV (doc 14 V3, merge-on-read) | **yes** (second phase) | DV blobs are also file-scoped but their publish is ADDITIVE (delete-file manifest entry), same commutativity as appends; the V3 machinery lands first |
 | MERGE | decomposes per doc 07 §3 → follows the two rows above |
 
+**Superseded decision on deferred mutation.** [Doc 18](18-anvai-lake-dml.md#5-read-rules-mvcc-and-conflict-handling)
+requires stable row-version identity, durable operation membership and
+writer coordination before enabling staged UPDATE or DELETE. Emitting
+a DV adds a delete representation while still targeting a physical file
+version. A competing rewrite or delete can invalidate that target.
+Append retries also require compatible table identity, schema/spec and
+durable reconciliation of unknown outcomes. These conditions supersede
+the commutativity assumptions above and apply to the R4 rollout gate.
+
 Consequence: staged mode's biggest win (INSERT throughput, P1/P2/P4 for
 bulk loads) lands first with the least semantic risk; UPDATE/DELETE
 coalescing arrives with V3 DVs, where the publisher can merge MANY

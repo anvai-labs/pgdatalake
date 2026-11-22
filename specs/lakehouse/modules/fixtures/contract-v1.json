@@ -1,0 +1,132 @@
+{
+  "version": 1,
+  "managed_overlay": {
+    "table_uuid": "1a4ab09e-b9b2-4f98-8757-ba8dd81ab93a",
+    "ref": "main",
+    "operation": {"id": "op-append-20", "segments": [7], "row_ids": [20]},
+    "cases": [
+      {
+        "id": "old-base-new-ledger",
+        "snapshot_id": 100,
+        "base_row_ids": [10],
+        "operation_pg_visible": true,
+        "ledger_status": "published",
+        "membership": "absent",
+        "expected": {"status": "rows", "row_ids": [10, 20]}
+      },
+      {
+        "id": "new-base-stale-ledger",
+        "snapshot_id": 101,
+        "base_row_ids": [10, 20],
+        "operation_pg_visible": true,
+        "ledger_status": "pending",
+        "membership": "included",
+        "expected": {"status": "rows", "row_ids": [10, 20]}
+      },
+      {
+        "id": "future-operation-no-compatible-pin",
+        "snapshot_id": 101,
+        "base_row_ids": [10, 20],
+        "operation_pg_visible": false,
+        "ledger_status": "published",
+        "membership": "included",
+        "expected": {"status": "incompatible_pin"}
+      },
+      {
+        "id": "unknown-membership-no-compatible-pin",
+        "snapshot_id": 101,
+        "base_row_ids": [10, 20],
+        "operation_pg_visible": true,
+        "ledger_status": "pending",
+        "membership": "unknown",
+        "expected": {"status": "unproven_membership"}
+      }
+    ]
+  },
+  "mixed_visibility_claim": {
+    "id": "mixed-visibility-claim",
+    "publication_id": "op-batch-7-8",
+    "segments": [{"id": 7, "row_ids": [20]}, {"id": 8, "row_ids": [20]}],
+    "pins": [
+      {"id": 101, "base_row_ids": [10, 20, 20], "included_segments": [7, 8]},
+      {"id": 100, "base_row_ids": [10], "included_segments": []}
+    ],
+    "cases": [
+      {"visible_segments": [7], "candidate_pins": [101, 100], "expected": {"pin": 100, "row_ids": [10, 20]}},
+      {"visible_segments": [7], "candidate_pins": [101], "expected": {"status": "incompatible_pin"}},
+      {"visible_segments": [7, 8], "candidate_pins": [101, 100], "expected": {"pin": 101, "row_ids": [10, 20, 20]}}
+    ]
+  },
+  "publish_reply_lost": {
+    "id": "publish-reply-lost",
+    "table_uuid": "1a4ab09e-b9b2-4f98-8757-ba8dd81ab93a",
+    "ref": "main",
+    "operation_id": "op-append-20",
+    "initial_snapshot_id": 100,
+    "claimed_segment_ids": [7],
+    "steps": [
+      {"action": "submit", "remote_effect": "commit", "result": "unknown", "committed_snapshot_id": 101},
+      {"action": "add_local_segment", "segment_id": 8},
+      {"action": "restart"},
+      {"action": "lookup", "result": "committed", "snapshot_id": 101}
+    ],
+    "expected": {
+      "submit_count": 1,
+      "published_snapshot_id": 101,
+      "completed_segment_ids": [7],
+      "pending_segment_ids": [8]
+    }
+  },
+  "publish_recovery_cases": {
+    "setup_from": "publish_reply_lost",
+    "cases": [
+      {
+        "id": "late-accept-after-empty-lookup",
+        "steps": [
+          {"action": "submit", "attempt": 1, "expected_parent": 100, "remote_effect": "defer", "result": "unknown"},
+          {"action": "takeover"},
+          {"action": "lookup", "result": "no_evidence", "head": 100},
+          {"action": "checkpoint", "expected": {"sent_parents": [100], "accepted_for_operation": 0, "completed_segment_ids": [], "receipt_snapshot": null, "next": "lookup_only"}},
+          {"action": "deliver_deferred", "attempt": 1, "committed_snapshot_id": 101},
+          {"action": "lookup", "result": "committed", "snapshot_id": 101},
+          {"action": "checkpoint", "expected": {"sent_parents": [100], "accepted_for_operation": 1, "completed_segment_ids": [7], "receipt_snapshot": 101, "next": "complete"}}
+        ]
+      },
+      {
+        "id": "crash-before-socket-write",
+        "steps": [
+          {"action": "crash_after_durable_send_intent", "attempt": 1, "expected_parent": 100},
+          {"action": "takeover"},
+          {"action": "lookup", "result": "no_evidence", "head": 100},
+          {"action": "checkpoint", "expected": {"sent_parents": [], "accepted_for_operation": 0, "completed_segment_ids": [], "receipt_snapshot": null, "next": "lookup_only"}}
+        ]
+      },
+      {
+        "id": "replan-after-definite-rejection",
+        "steps": [
+          {"action": "external_compatible_append", "snapshot_id": 101},
+          {"action": "submit", "attempt": 1, "expected_parent": 100, "remote_effect": "none", "result": "rejected"},
+          {"action": "checkpoint", "expected": {"sent_parents": [100], "accepted_for_operation": 0, "completed_segment_ids": [], "receipt_snapshot": null, "next": "prepare_same_claim"}},
+          {"action": "submit", "attempt": 2, "expected_parent": 101, "remote_effect": "commit", "result": "committed", "committed_snapshot_id": 102},
+          {"action": "checkpoint", "expected": {"sent_parents": [100, 101], "accepted_for_operation": 1, "completed_segment_ids": [7], "receipt_snapshot": 102, "next": "complete"}}
+        ]
+      }
+    ]
+  },
+  "cow_delete_safe": {
+    "id": "cow-delete-safe",
+    "base_snapshot_id": 200,
+    "file_id": "file-a",
+    "physical_row_ids": [10, 20, 30],
+    "already_deleted_ordinals": [1],
+    "mutation_deleted_ordinals": [2],
+    "expected_reader_ordinals": [0, 2],
+    "expected_rewrite_row_ids": [10],
+    "concurrent_delete_change": {
+      "next_snapshot_id": 201,
+      "data_file_still_live": true,
+      "already_deleted_ordinals": [0, 1],
+      "initial_profile_expected": "conflict"
+    }
+  }
+}

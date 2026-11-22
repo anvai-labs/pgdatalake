@@ -7,6 +7,18 @@ Use the [milestone TDD and smoke protocol](10-testing.md#milestone-tdd-and-smoke
 for each acceptance gate. The [progress tracker](PROGRESS.md) describes
 what has landed and which evidence the current candidate still needs.
 
+The [DML qualification gates](18-anvai-lake-dml.md#7-milestones-and-gates)
+define the ordering for external reads, staged append, direct corrections,
+and selective deferred mutations. The
+[competitive pilot plan](19-anvai-lake-positioning.md#4-pilot-and-benchmark-gates)
+adds stock installation, heap CDC, and independent consumer checks before
+claiming broader parity.
+
+Use the [module briefs](modules/README.md) to plan implementation slices and
+parallel work on short-lived changes. The
+[shared contracts](modules/00-integration-contracts.md) and fixture vectors
+define the seam tests that must pass before production wiring.
+
 ## M0 — Repo & build foundation (days) — DONE 2026-11-19, tag `milestone/m0`
 - [x] `main` as fork base (upstream `master` at fork creation `61f6021b110`,
       merge-synced with upstream per RULES §1 amendment)

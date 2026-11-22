@@ -1,6 +1,6 @@
 # Lakehouse progress and release gates
 
-**Reviewed on 2026-11-21 at `perf-release` `eb8e3602179`. Production qualification is on hold.** The original review is the 2026-11-20 baseline. The [reassessment](16-release-reassessment-and-scale.md) maps all eight findings to current code and acceptance tests. Update this tracker and the handoff whenever a slice lands. Give each milestone its own smoke and measurement receipt.
+**Reconciled against `lakehouse-dev` at `5b31b230680`, including PRs #30 and #36. Production qualification is on hold.** The original review is the 2026-11-20 baseline. The [reassessment](16-release-reassessment-and-scale.md) records the eight findings and earlier measurements. Start implementation branches with the [delivery order and dependencies](modules/README.md#delivery-order-and-dependencies). Give each milestone its own smoke and measurement receipt.
 
 ## What changed since the original review
 
@@ -24,12 +24,13 @@
 
 ## Evidence and next queue
 
+- **Implementation briefs.** The [module index](modules/README.md) assigns
+  ownership and independent tests for the next wave. Land the shared contract
+  and fixture vectors first, then qualify each provider with its consumer.
+- **M2 publisher, design reviewed 2026-11-21 against `5b31b230680`.** The [staged recovery slice](modules/04a-publisher-recovery.md) defines the first red test and the proof required after a lost catalog reply. The exact-ID update is implemented. Durable send intent, lookup on takeover and the new crash smoke remain pending. The existing successful-append smoke covers a different gate.
+
 - **Local baseline.** 118 Rust tests passed and one manual benchmark was ignored. A clean assertion-enabled native build passed 243 upstream regression subtests and all 11 lakehouse SQL groups. Fork CI passed on PRs #27 and #28. See the [review receipts](16-release-reassessment-and-scale.md#evidence).
-<<<<<<< HEAD
-- **First.** Regress COUNT against prepared-plan reuse, deletes and ordinary query permission semantics. **Done 2026-11-21 (gate):** both plan-time COUNT elisions are off the build (managed hook deleted, FDW upper path unwired); `count_elision.sql` now pins prepared-plan freshness, relation permission checks and the offline staged-serve fallback. **Also done (capture):** the 65-staged-relations bulk regression landed; the pre-commit collector no longer silently drops entry 65+ (`staged_insert.sql`). Remaining in First: publisher durable claims + remote reconciliation. Land correctness fixes before reporting optimization numbers.
-=======
-- **First.** Regress COUNT against prepared-plan reuse, deletes and ordinary query permission semantics. Regress staged capture across 65 relations and publisher failure between local and remote decisions. **Capture done 2026-11-21:** the 65-staged-relations bulk regression landed; the pre-commit collector no longer silently drops entry 65+ (`staged_insert.sql`). Publisher durable claims + remote reconciliation remain open. Land correctness fixes before reporting optimization numbers.
->>>>>>> da649682cfe (lakehouse: fix silent staged-capture loss past 64 relations (spec 16 blocker 2))
+- **First.** The 65-relation capture regression landed. Managed COUNT now executes at runtime and guards SPI fallback against recursion. Its base-and-overlay proof still needs qualification. FDW COUNT remains gated. The publisher serializes same-relation attempts and marks exact segment IDs. Durable claims, unknown-commit reconciliation and consistent managed reads remain open. The next changes are the local visibility model and publisher state machine, plus a fail-closed COW guard for delete-bearing inputs.
 - **Second.** Qualify row-group laziness, bounded and cancelable I/O, cache scope, and byte/memory counters. Land the remote positive smoke and result-digest runner in CI.
 - **Third.** Profile SF10 and one concurrency workload. Use the measured time split to decide between fewer planning calls, batching an exact aggregate, or improving a join/rescan path. Keep page-index work independent.
 - **Milestone completion.** Follow the [TDD and smoke protocol](10-testing.md#milestone-tdd-and-smoke-receipts) and record PASS, FAIL, or NOT RUN against each named gate.

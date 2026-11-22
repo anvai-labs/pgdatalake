@@ -1,6 +1,6 @@
 /*-------------------------------------------------------------------------
  *
- * lakehouse_core.c
+ * lakehouse_sql.c
  *		C glue for pgdatalake-core, the Rust core of the format-generic
  *		lakehouse storage engine (specs/lakehouse/01-architecture.md,
  *		decision D2). Iceberg is the first FORMAT layer inside the core.
