@@ -26,6 +26,7 @@ parquet = { version = "60", default-features = false, features = ["arrow", "snap
 arrow = { version = "60", default-features = false }
 tokio = { version = "1", default-features = false, features = ["rt"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+ring = "0.17"
 roaring = "0.12.0"
 
 [dev-dependencies]

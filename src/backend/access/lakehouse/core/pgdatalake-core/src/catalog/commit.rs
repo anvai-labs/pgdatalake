@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::metadata::Snapshot;
+use super::metadata::{FormatVersion, Snapshot, TableMetadata};
 use super::rest::{RestCatalog, RestError};
 use super::types::LoadTableResult;
 
@@ -137,6 +137,83 @@ struct CommitTableRequest<'a> {
     updates: &'a [TableUpdate],
 }
 
+/// Stable identity from the durable PostgreSQL claim.
+#[derive(Clone, Copy)]
+pub struct PublicationIdentity {
+    pub operation_id: uuid::Uuid,
+    pub table_uuid: uuid::Uuid,
+    pub input_digest: [u8; 32],
+}
+
+const OPERATION_ID_KEY: &str = "pgdatalake.operation-id";
+const INPUT_DIGEST_KEY: &str = "pgdatalake.input-sha256";
+const HEX: &[u8] = b"0123456789abcdef";
+
+/// An immutable append request associated with its original catalog client
+/// and route. Store its request digest in the ledger before consuming it.
+pub struct PreparedPublication<'a> {
+    catalog: &'a RestCatalog,
+    prefix: Option<String>,
+    url: String,
+    payload: Vec<u8>,
+    expected_parent: Option<i64>,
+    snapshot_id: i64,
+}
+
+impl PreparedPublication<'_> {
+    #[must_use]
+    pub fn expected_parent(&self) -> Option<i64> {
+        self.expected_parent
+    }
+
+    #[must_use]
+    pub fn snapshot_id(&self) -> i64 {
+        self.snapshot_id
+    }
+
+    #[must_use]
+    pub fn request_body(&self) -> &[u8] {
+        &self.payload
+    }
+
+    #[must_use]
+    pub fn request_digest(&self) -> [u8; 32] {
+        let digest = ring::digest::digest(&ring::digest::SHA256, &self.payload);
+        let mut result = [0; 32];
+        result.copy_from_slice(digest.as_ref());
+        result
+    }
+
+    /// Submit after the durable send fence authorizes this exact digest.
+    /// Consumes the proposal and sends without retries or redirect handling.
+    pub fn submit(self) -> Result<CommitTableResponse, RestError> {
+        if self
+            .catalog
+            .prefix
+            .lock()
+            .expect("prefix mutex poisoned")
+            .as_ref()
+            != self.prefix.as_ref()
+        {
+            return Err(RestError::Http(
+                "catalog route changed after append preparation".into(),
+            ));
+        }
+        self.catalog.post_commit_payload(&self.url, self.payload)
+    }
+}
+
+fn serialize_commit(
+    requirements: &[TableRequirement],
+    updates: &[TableUpdate],
+) -> Result<Vec<u8>, RestError> {
+    serde_json::to_vec(&CommitTableRequest {
+        requirements,
+        updates,
+    })
+    .map_err(|e| RestError::Http(format!("commitTable serialize: {e}")))
+}
+
 /// Tolerant map decoder: Lakekeeper sends explicit `"config": null` /
 /// `"metadata": null` in commitTable responses (v3-first in-band metadata);
 /// serde's `default` alone rejects explicit nulls.
@@ -177,6 +254,120 @@ struct ErrorDetail {
 }
 
 impl RestCatalog {
+    /// Package the writer's immutable append snapshot for a bound v2 table
+    /// on main. Preparation performs no network calls or catalog mutations.
+    pub fn prepare_staged_append(
+        &self,
+        namespace: &[&str],
+        table: &str,
+        base: &TableMetadata,
+        mut snapshot: Snapshot,
+        identity: PublicationIdentity,
+    ) -> Result<PreparedPublication<'_>, RestError> {
+        if base.table_uuid != identity.table_uuid {
+            return Err(RestError::Conflict(
+                "staged append table UUID changed".into(),
+            ));
+        }
+        let main = base.refs.get("main");
+        let expected_parent = base.current_snapshot_id;
+        if main.map(|reference| reference.snapshot_id) != expected_parent
+            || main.is_some_and(|reference| reference.kind != "branch")
+            || expected_parent.is_some_and(|parent| parent <= 0 || base.snapshot(parent).is_none())
+        {
+            return Err(RestError::Conflict(
+                "staged append has no verified main pin".into(),
+            ));
+        }
+        let spec = base
+            .default_partition_spec_id
+            .and_then(|spec_id| base.partition_spec(spec_id));
+        let Some(spec) = spec.filter(|spec| spec.fields.is_empty()) else {
+            return Err(RestError::Decode(
+                "staged append requires a known unpartitioned spec".into(),
+            ));
+        };
+        if base.format_version != FormatVersion::V2 || base.current_schema().is_none() {
+            return Err(RestError::Decode(
+                "staged append requires a known v2 schema".into(),
+            ));
+        }
+        let manifest_is_scoped = snapshot
+            .manifest_list
+            .strip_prefix(base.location.trim_end_matches('/'))
+            .and_then(|path| path.strip_prefix("/metadata/"))
+            .is_some_and(|key| {
+                key.split('/').all(|component| {
+                    !matches!(component, "" | "." | "..")
+                        && component.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
+                        })
+                })
+            });
+        let expected_sequence = base.last_sequence_number.unwrap_or(0).checked_add(1);
+        if snapshot.parent_snapshot_id != expected_parent
+            || snapshot.schema_id != Some(base.current_schema_id)
+            || snapshot.snapshot_id <= 0
+            || base.snapshot(snapshot.snapshot_id).is_some()
+            || expected_sequence != snapshot.sequence_number
+            || snapshot.sequence_number.is_none()
+            || snapshot.first_row_id.is_some()
+            || !manifest_is_scoped
+            || snapshot.summary.get("operation").map(String::as_str) != Some("append")
+        {
+            return Err(RestError::Conflict(
+                "prepared snapshot does not match the staged append base".into(),
+            ));
+        }
+
+        let mut input_hex = String::with_capacity(64);
+        for byte in identity.input_digest {
+            input_hex.push(char::from(HEX[usize::from(byte >> 4)]));
+            input_hex.push(char::from(HEX[usize::from(byte & 15)]));
+        }
+        snapshot
+            .summary
+            .insert(OPERATION_ID_KEY.into(), identity.operation_id.to_string());
+        snapshot.summary.insert(INPUT_DIGEST_KEY.into(), input_hex);
+        let snapshot_id = snapshot.snapshot_id;
+        let requirements = [
+            TableRequirement::AssertTableUUID {
+                uuid: identity.table_uuid,
+            },
+            TableRequirement::AssertRefSnapshotId {
+                r#ref: "main".into(),
+                snapshot_id: expected_parent,
+            },
+            TableRequirement::AssertCurrentSchemaId {
+                current_schema_id: base.current_schema_id,
+            },
+            TableRequirement::AssertDefaultSpecId {
+                default_spec_id: i64::from(spec.spec_id),
+            },
+        ];
+        let updates = [
+            TableUpdate::AddSnapshot { snapshot },
+            TableUpdate::SetSnapshotRef {
+                ref_name: "main".into(),
+                kind: RefKind::Branch,
+                snapshot_id,
+                min_snapshots_to_keep: main
+                    .and_then(|reference| reference.min_snapshots_to_keep)
+                    .map(i64::from),
+                max_snapshot_age_ms: main.and_then(|reference| reference.max_snapshot_age_ms),
+            },
+        ];
+        let prefix = self.prefix.lock().expect("prefix mutex poisoned").clone();
+        Ok(PreparedPublication {
+            catalog: self,
+            url: self.commit_url(namespace, table, prefix.as_deref()),
+            prefix,
+            expected_parent,
+            snapshot_id,
+            payload: serialize_commit(&requirements, &updates)?,
+        })
+    }
+
     /// Send one commit proposal. Only a 409 carrying a catalog requirement
     /// failure permits replanning. Ambiguous outcomes require reconciliation.
     pub fn commit_table(
@@ -187,32 +378,36 @@ impl RestCatalog {
         updates: &[TableUpdate],
     ) -> Result<CommitTableResponse, RestError> {
         let prefix = self.prefix.lock().expect("prefix mutex poisoned").clone();
+        let url = self.commit_url(namespace, table, prefix.as_deref());
+        self.post_commit_payload(&url, serialize_commit(requirements, updates)?)
+    }
+
+    fn commit_url(&self, namespace: &[&str], table: &str, prefix: Option<&str>) -> String {
         let ns = namespace
             .iter()
             .map(|c| urlencoding::encode(c))
             .collect::<Vec<_>>()
             .join("%1F");
-        // Same route as loadTable; the method (POST) selects commitTable
-        // per the REST spec.
-        let url = format!(
+        format!(
             "{}/v1{}/namespaces/{ns}/tables/{}",
             self.endpoint,
-            prefix.as_ref().map_or_default(|p| format!("/{p}")),
+            prefix.map_or_default(|p| format!("/{p}")),
             urlencoding::encode(table),
-        );
-        let body = CommitTableRequest {
-            requirements,
-            updates,
-        };
-        let payload = serde_json::to_vec(&body)
-            .map_err(|e| RestError::Http(format!("commitTable serialize: {e}")))?;
+        )
+    }
+
+    fn post_commit_payload(
+        &self,
+        url: &str,
+        payload: Vec<u8>,
+    ) -> Result<CommitTableResponse, RestError> {
         let token = self
             .tokens
             .token()
             .map_err(|e| RestError::Http(format!("token provider: {e}")))?;
         let resp = self
             .commit_client()?
-            .post(&url)
+            .post(url)
             .bearer_auth(token)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(payload)
@@ -243,7 +438,7 @@ impl RestCatalog {
         if !status.is_success() {
             return Err(RestError::Http(format!(
                 "POST {} -> {status}",
-                super::rest::redact_url(&url)
+                super::rest::redact_url(url)
             )));
         }
         resp.json()
@@ -556,6 +751,141 @@ mod tests {
         assert_eq!(worker.join().unwrap(), 1);
         assert_eq!(observed.metadata.unwrap().current_snapshot_id, Some(101));
         assert!(matches!(result, Err(RestError::CommitStateUnknown(_))));
+    }
+
+    #[test]
+    fn prepared_append_sends_exact_bytes_once() {
+        let mock = Mock::new(vec![(504, "")]);
+        let catalog = mock.catalog();
+        let mut loaded = load_result(100).metadata.unwrap();
+        loaded
+            .partition_specs
+            .push(crate::catalog::metadata::PartitionSpec {
+                spec_id: 0,
+                fields: vec![],
+            });
+        let operation = uuid::Uuid::from_u128(39);
+        let identity = PublicationIdentity {
+            operation_id: operation,
+            table_uuid: loaded.table_uuid,
+            input_digest: [0xab; 32],
+        };
+        let mut proposed = snap(101, Some(100));
+        proposed.sequence_number = Some(2);
+        let prepared = catalog
+            .prepare_staged_append(
+                &["my ns", "nested"],
+                "my table",
+                &loaded,
+                proposed,
+                identity,
+            )
+            .unwrap();
+        assert_eq!(mock.requests().len(), 0);
+        assert_eq!(prepared.expected_parent(), Some(100));
+        assert_eq!(prepared.snapshot_id(), 101);
+        let body = prepared.request_body().to_vec();
+        assert_eq!(
+            prepared.request_digest().as_slice(),
+            ring::digest::digest(&ring::digest::SHA256, &body).as_ref()
+        );
+        let result = prepared.submit();
+        mock.join();
+        assert!(matches!(result, Err(RestError::CommitStateUnknown(_))));
+        let received = mock.requests();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].0, "POST");
+        assert!(received[0]
+            .1
+            .ends_with("/namespaces/my%20ns%1Fnested/tables/my%20table"));
+        assert_eq!(received[0].2.as_bytes(), body);
+        let wire: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            wire["requirements"][0]["uuid"],
+            identity.table_uuid.to_string()
+        );
+        assert_eq!(wire["requirements"][1]["snapshot-id"], 100);
+        assert_eq!(wire["requirements"][2]["type"], "assert-current-schema-id");
+        assert_eq!(wire["requirements"][3]["type"], "assert-default-spec-id");
+        assert_eq!(
+            wire["updates"][0]["snapshot"]["summary"]["pgdatalake.operation-id"],
+            operation.to_string()
+        );
+        assert_eq!(
+            wire["updates"][0]["snapshot"]["summary"]["pgdatalake.input-sha256"],
+            "ab".repeat(32)
+        );
+        assert_eq!(wire["updates"][1]["snapshot-id"], 101);
+    }
+
+    #[test]
+    fn prepared_append_rejects_wrong_binding_and_keeps_an_empty_main_pin() {
+        let mock = Mock::new(vec![]);
+        let catalog = mock.catalog();
+        let mut loaded = load_result(100).metadata.unwrap();
+        loaded
+            .partition_specs
+            .push(crate::catalog::metadata::PartitionSpec {
+                spec_id: 0,
+                fields: vec![],
+            });
+        let mut identity = PublicationIdentity {
+            operation_id: uuid::Uuid::from_u128(40),
+            table_uuid: uuid::Uuid::from_u128(1),
+            input_digest: [0; 32],
+        };
+        assert!(matches!(
+            catalog.prepare_staged_append(&["ns"], "t", &loaded, snap(101, Some(100)), identity),
+            Err(RestError::Conflict(_))
+        ));
+        identity.table_uuid = loaded.table_uuid;
+        let mut proposed = snap(101, Some(100));
+        proposed.sequence_number = Some(2);
+        for malformed in [
+            Snapshot {
+                parent_snapshot_id: Some(99),
+                ..proposed.clone()
+            },
+            Snapshot {
+                schema_id: Some(2),
+                ..proposed.clone()
+            },
+            Snapshot {
+                manifest_list: "s3://other/table/metadata/foreign.avro".into(),
+                ..proposed.clone()
+            },
+            Snapshot {
+                manifest_list: "s3://w/t/metadata/../other.avro".into(),
+                ..proposed
+            },
+        ] {
+            assert!(catalog
+                .prepare_staged_append(&["ns"], "t", &loaded, malformed, identity)
+                .is_err());
+        }
+        loaded.refs.get_mut("main").unwrap().snapshot_id = 99;
+        assert!(catalog
+            .prepare_staged_append(&["ns"], "t", &loaded, snap(101, Some(100)), identity)
+            .is_err());
+        loaded.snapshots.clear();
+        loaded.refs.clear();
+        loaded.current_snapshot_id = None;
+        loaded.last_sequence_number = Some(0);
+        let prepared = catalog
+            .prepare_staged_append(&["ns"], "t", &loaded, snap(101, None), identity)
+            .unwrap();
+        assert_eq!(prepared.expected_parent(), None);
+        let body: serde_json::Value = serde_json::from_slice(prepared.request_body()).unwrap();
+        assert_eq!(
+            body["requirements"][1]["snapshot-id"],
+            serde_json::Value::Null
+        );
+        assert!(body["requirements"][1].get("snapshot-id").is_some());
+        // A route change invalidates the original scope before network dispatch.
+        *catalog.prefix.lock().unwrap() = Some("another-warehouse".into());
+        assert!(matches!(prepared.submit(), Err(RestError::Http(_))));
+        mock.join();
+        assert_eq!(mock.requests().len(), 0);
     }
 
     /// A server failure after dispatch leaves the result unresolved.
