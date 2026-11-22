@@ -33,17 +33,20 @@
 #include "utils/array.h"
 #include "utils/datum.h"
 #include "nodes/miscnodes.h"
+#include "catalog/dependency.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_am.h"
 #include "foreign/foreign.h"
 #include "commands/defrem.h"
+#include "commands/extension.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/storage_xlog.h"
 #include "catalog/storage.h"
 #include "commands/vacuum.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
+#include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "utils/acl.h"
 #include "storage/smgr.h"
@@ -54,6 +57,7 @@
 #include "postmaster/bgworker.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
+#include "storage/lmgr.h"
 #include "tcop/tcopprot.h"
 #include "utils/rel.h"
 #include "utils/builtins.h"
@@ -70,6 +74,122 @@
 
 #include "batch_fill.h"
 #include "lakehouse_tableam.h"
+
+/*
+ * The 1.7 tables are optional. When present, only the extension-owned,
+ * permanent heap tables can supply capture policy or receive elevated writes.
+ */
+static Oid
+capture_table_owner(const char *name, bool missing_ok)
+{
+	Oid			namespace_id = get_namespace_oid("lakehouse", false);
+	Oid			table_id = get_relname_relid(name, namespace_id);
+	Oid			extension_id;
+	HeapTuple	tuple;
+	Form_pg_class form;
+	Oid			owner;
+
+	if (missing_ok && !OidIsValid(table_id))
+		return InvalidOid;
+
+	extension_id = get_extension_oid("lakehouse", false);
+	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(table_id));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "lakehouse capture table %s is missing", name);
+	form = (Form_pg_class) GETSTRUCT(tuple);
+	if (form->relkind != RELKIND_RELATION ||
+		form->relpersistence != RELPERSISTENCE_PERMANENT ||
+		form->relam != HEAP_TABLE_AM_OID ||
+		getExtensionOfObject(RelationRelationId, table_id) != extension_id)
+		elog(ERROR, "invalid lakehouse capture table %s", name);
+	owner = form->relowner;
+	ReleaseSysCache(tuple);
+	return owner;
+}
+
+/*
+ * All callers hold a lock on the managed relation that conflicts with an
+ * operator transition. Read current policy even under REPEATABLE READ.
+ * Callers that don't need the active ID can also detect an inactive slot.
+ */
+static bool
+lookup_capture_binding(Oid relid, pg_uuid_t *binding_id)
+{
+	Oid			owner = capture_table_owner("managed_capture_state", true);
+	Oid			user;
+	int			sec_context;
+	bool		required = false;
+
+	if (!OidIsValid(owner))
+		return false;
+
+	GetUserIdAndSecContext(&user, &sec_context);
+	SPI_connect();
+	PushActiveSnapshot(GetLatestSnapshot());
+	PG_TRY();
+	{
+		Oid			argtype = OIDOID;
+		Datum		arg = ObjectIdGetDatum(relid);
+		int			ret;
+		const char *sql;
+
+		SetUserIdAndSecContext(owner, sec_context | SECURITY_LOCAL_USERID_CHANGE |
+							   SECURITY_RESTRICTED_OPERATION);
+
+		if (binding_id == NULL)
+			sql = "SELECT 1 FROM lakehouse.managed_capture_state"
+				" WHERE relid OPERATOR(pg_catalog.=) $1";
+		else
+			sql = "SELECT b.binding_id,"
+				" b.source_columns OPERATOR(pg_catalog.=) lakehouse.capture_source_columns($1)"
+				" FROM lakehouse.managed_capture_state s"
+				" LEFT JOIN lakehouse.managed_capture_bindings b"
+				" ON b.binding_id OPERATOR(pg_catalog.=) s.active_binding_id"
+				" WHERE s.relid OPERATOR(pg_catalog.=) $1";
+		ret = SPI_execute_with_args(sql, 1, &argtype, &arg, NULL, true, 1);
+		if (ret != SPI_OK_SELECT)
+			elog(ERROR, "could not read lakehouse capture binding");
+		if (SPI_processed == 1)
+		{
+			required = true;
+			if (binding_id != NULL)
+			{
+				bool		isnull;
+				Datum		id = SPI_getbinval(SPI_tuptable->vals[0],
+											   SPI_tuptable->tupdesc, 1, &isnull);
+
+				if (isnull)
+					ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("managed capture binding is inactive")));
+				memcpy(binding_id, DatumGetUUIDP(id), sizeof(*binding_id));
+				id = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull);
+				if (isnull || !DatumGetBool(id))
+					ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("managed capture source schema changed"),
+							 errhint("Re-enroll the table against a verified Iceberg schema.")));
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		SetUserIdAndSecContext(user, sec_context);
+	}
+	PG_END_TRY();
+	PopActiveSnapshot();
+	SPI_finish();
+	return required;
+}
+
+void
+lakehouse_check_capture_read(Oid relid)
+{
+	if (lookup_capture_binding(relid, NULL))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("bound managed capture does not support table scans")));
+}
 
 /* ---------------- identity catalog lookup ---------------- */
 
@@ -1171,7 +1291,35 @@ get_write_entry(Relation rel)
 	LakehouseWriteEntry *entry;
 	bool		found;
 	Oid			relid = RelationGetRelid(rel);
+	pg_uuid_t	binding_id;
+	bool		bound;
 
+	entry = lakehouse_find_write_entry(relid);
+	if (entry != NULL)
+	{
+		/*
+		 * An aborted savepoint can release the original relation lock and
+		 * discard its rows. Recheck before reusing the empty entry.
+		 */
+		if (entry->staged_rows == 0)
+		{
+			bound = lookup_capture_binding(relid, &binding_id);
+			if (entry->bound_capture != bound ||
+				(bound && memcmp(&entry->binding_id, &binding_id, sizeof(binding_id)) != 0))
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("managed capture binding changed within the transaction")));
+		}
+		return entry;
+	}
+
+	/*
+	 * A rejected enrollment must not leave an entry behind after savepoint
+	 * abort.
+	 */
+	bound = lookup_capture_binding(relid, &binding_id);
+	if (bound)
+		pfree(build_schema_json(RelationGetDescr(rel)));
 	if (write_entries == NULL)
 	{
 		HASHCTL		ctl;
@@ -1253,11 +1401,16 @@ get_write_entry(Relation rel)
 				? wm_opts.write_mode
 				: lakehouse_write_mode;
 		}
-		if (!ExtractManagedIdentity(relid, &entry->opts))
-			entry->have_identity = entry->have_identity;
-		else if (!entry->have_identity)
+		entry->bound_capture = bound;
+		if (bound)
+		{
+			entry->binding_id = binding_id;
+			entry->write_mode = LAKEHOUSE_WRITE_MODE_STAGED;
+			entry->checked_layout_cid = InvalidCommandId;
+		}
+		else if (ExtractManagedIdentity(relid, &entry->opts))
 			entry->have_identity = true;
-		if (!entry->have_identity)
+		if (!bound && !entry->have_identity)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("managed table %s has no lakehouse identity",
@@ -1307,6 +1460,21 @@ get_write_entry(Relation rel)
 		}
 	}
 	return entry;
+}
+
+PG_FUNCTION_INFO_V1(lakehouse_capture_check_legacy_write);
+
+Datum
+lakehouse_capture_check_legacy_write(PG_FUNCTION_ARGS)
+{
+	LakehouseWriteEntry *entry = lakehouse_find_write_entry(PG_GETARG_OID(0));
+
+	/* The operator already holds AccessExclusiveLock on the target. */
+	if (entry != NULL && entry->ws != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot require bound capture in a transaction with a legacy write session")));
+	PG_RETURN_VOID();
 }
 
 /* ---------------- COW tombstone plumbing (slice 28) ---------------- */
@@ -1669,6 +1837,7 @@ lakehouse_scan_begin(Relation rel, Snapshot snapshot,
 {
 	LakehouseTableScanDesc scan;
 
+	lakehouse_check_capture_read(RelationGetRelid(rel));
 	if (pscan != NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -2041,6 +2210,10 @@ open_write_session(LakehouseWriteEntry *entry, TupleDesc tupdesc)
 {
 	char		errbuf[1024];
 
+	if (entry->bound_capture)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("bound managed capture only supports staged inserts")));
 	if (entry->ws != NULL)
 		return;
 	errbuf[0] = '\0';
@@ -2150,7 +2323,27 @@ static void
 stage_slot(LakehouseWriteEntry *entry, TupleTableSlot *slot, TupleDesc tupdesc)
 {
 	int			j;
-	MemoryContext old = MemoryContextSwitchTo(entry->mcxt);
+	MemoryContext old;
+
+	if (entry->bound_capture)
+	{
+		CommandId	cid = GetCurrentCommandId(false);
+
+		/*
+		 * DDL in a later command can replace the relation descriptor inside
+		 * this transaction. Compare the layouts before interpreting any Datum
+		 * with the transaction's saved descriptor.
+		 */
+		if ((entry->checked_layout_cid != cid || entry->natts != tupdesc->natts ||
+			 TupleDescGetVersion(entry->tupdesc) != TupleDescGetVersion(tupdesc)) &&
+			!equalRowTypes(entry->tupdesc, tupdesc))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("managed capture source schema changed within the transaction")));
+		entry->checked_layout_cid = cid;
+	}
+
+	old = MemoryContextSwitchTo(entry->mcxt);
 
 	if (entry->staged_rows == 0)
 	{
@@ -2266,6 +2459,64 @@ capture_tombstone(Relation rel, ItemPointer tid)
 }
 
 /*
+ * Run one parameterized insert as the validated ledger owner, after all
+ * datum conversion has completed under the writer's ordinary permissions.
+ * Admission and the final binding check share the INSERT's relation lock.
+ */
+static void
+insert_bound_capture(LakehouseWriteEntry *entry, StringInfo payload)
+{
+	char	   *utf8 = pg_server_to_any(payload->data, payload->len, PG_UTF8);
+	int			length = utf8 == payload->data ? payload->len : strlen(utf8);
+	Oid			argtypes[] = {OIDOID, BYTEAOID, INT4OID, UUIDOID};
+	Datum		values[] = {
+		ObjectIdGetDatum(entry->relid),
+		PointerGetDatum(cstring_to_text_with_len(utf8, length)),
+		Int32GetDatum((int32) entry->staged_rows),
+		UUIDPGetDatum(&entry->binding_id),
+	};
+	Oid			owner = capture_table_owner("lakehouse_delta_segments", false);
+	Oid			user;
+	int			sec_context;
+
+	if (utf8 != payload->data)
+		pfree(utf8);
+	GetUserIdAndSecContext(&user, &sec_context);
+	SPI_connect();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	PG_TRY();
+	{
+		int			ret;
+
+		SetUserIdAndSecContext(owner, sec_context | SECURITY_LOCAL_USERID_CHANGE |
+							   SECURITY_RESTRICTED_OPERATION);
+		ret = SPI_execute_with_args(
+									"INSERT INTO lakehouse.lakehouse_delta_segments"
+									" (relid, payload, row_count, capture_binding_id, authority_id, table_uuid)"
+									" SELECT $1, $2, $3, $4, b.authority_id, b.table_uuid"
+									" FROM lakehouse.managed_capture_state s"
+									" JOIN lakehouse.managed_capture_bindings b"
+									" ON b.binding_id OPERATOR(pg_catalog.=) s.active_binding_id"
+									" WHERE s.relid OPERATOR(pg_catalog.=) $1 AND s.active_binding_id OPERATOR(pg_catalog.=) $4"
+									" AND b.source_columns OPERATOR(pg_catalog.=) lakehouse.capture_source_columns($1)",
+									lengthof(argtypes), argtypes, values, NULL, false, 0);
+		if (ret != SPI_OK_INSERT)
+			elog(ERROR, "could not write to lakehouse capture ledger");
+		if (SPI_processed != 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("managed capture binding or source schema changed before commit")));
+	}
+	PG_FINALLY();
+	{
+		SetUserIdAndSecContext(user, sec_context);
+	}
+	PG_END_TRY();
+	PopActiveSnapshot();
+	SPI_finish();
+}
+
+/*
  * staged_capture_segment (P3 core, D1-rev): serialize this entry's
  * staged rows as ONE JSON payload (array of the write path's typed
  * row-JSON) and INSERT it into lakehouse.lakehouse_delta_segments via
@@ -2282,6 +2533,18 @@ staged_capture_segment(LakehouseWriteEntry *entry)
 	bool		first_row = true;
 	int			ret;
 	TupleDesc	tupdesc = entry->tupdesc;
+
+	if (entry->bound_capture)
+	{
+		pg_uuid_t	binding_id;
+
+		LockRelationOid(entry->relid, RowExclusiveLock);
+		if (!lookup_capture_binding(entry->relid, &binding_id) ||
+			memcmp(&entry->binding_id, &binding_id, sizeof(binding_id)) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("managed capture binding changed before commit")));
+	}
 
 	initStringInfo(&payload);
 	appendStringInfoChar(&payload, '[');
@@ -2315,6 +2578,13 @@ staged_capture_segment(LakehouseWriteEntry *entry)
 		first_row = false;
 	}
 	appendStringInfoChar(&payload, ']');
+
+	if (entry->bound_capture)
+	{
+		insert_bound_capture(entry, &payload);
+		pfree(payload.data);
+		return;
+	}
 
 	/*
 	 * INSERT inside the committing transaction: WAL-fsync at commit makes the
@@ -3126,6 +3396,10 @@ lakehouse_create_remote(PG_FUNCTION_ARGS)
 
 	/* reuse the entry machinery for identity resolution + schema build */
 	entry = get_write_entry(rel);
+	if (entry->bound_capture)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("bound managed capture requires an existing remote table")));
 	schema_json = build_schema_json(RelationGetDescr(rel));
 
 	errbuf[0] = '\0';

@@ -126,6 +126,10 @@ pub(super) struct RetainedPublication {
 }
 
 impl AuthorizedPublication<'_> {
+    pub(crate) fn matches_retained_request(self) -> bool {
+        self.decode().is_some()
+    }
+
     pub(super) fn decode(self) -> Option<RetainedPublication> {
         if self.request_body.len() > MAX_STAGED_REQUEST_BYTES
             || sha256(self.request_body) != self.request_digest

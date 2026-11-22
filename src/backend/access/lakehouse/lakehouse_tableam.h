@@ -10,6 +10,7 @@
 #include "postgres.h"
 #include "nodes/primnodes.h"
 #include "utils/relcache.h"
+#include "utils/uuid.h"
 #include "lakehouse.h"
 
 typedef struct LakehouseTombFile
@@ -86,6 +87,9 @@ typedef struct LakehouseWriteEntry
 	/* identity, resolved at first insert */
 	LakehouseOptions opts;
 	bool		have_identity;
+	bool		bound_capture;
+	pg_uuid_t	binding_id;
+	CommandId	checked_layout_cid;
 
 	/*
 	 * COW tombstones (slice 28): linear scan over AFFECTED FILES (small:
@@ -121,6 +125,7 @@ lakehouse_commit_errcode(LakehouseWriteEntry *entry)
 
 extern Oid	lakehouse_am_oid(void);
 extern void install_lakehouse_count_exec(void);
+extern void lakehouse_check_capture_read(Oid relid);
 extern LakehouseWriteEntry *lakehouse_find_write_entry(Oid relid);
 extern LakehouseWriteEntry *get_write_entry(Relation rel);
 extern void open_write_session(LakehouseWriteEntry *entry, TupleDesc tupdesc);

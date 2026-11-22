@@ -77,24 +77,38 @@ A failed preparation can leave unreferenced files, including if the store return
 ## Bound-provider crash smoke
 
 The CI smoke pre-enrolls one disposable Lakekeeper table and inserts bound
-segments directly into the fixture's PostgreSQL ledger. A test worker joins the
-existing Rust batch writer, preparation and single-submit adapters with the SQL
-claim and send authorization. Before forwarding the one POST, the loopback
-gateway checks that its exact body matches the stored intent and that PostgreSQL
-has flushed its commit WAL. After Lakekeeper accepts the append, the driver
-captures the next segment, terminates the sender with its reply still held, and
-restarts the disposable PostgreSQL cluster immediately.
+segments directly into the fixture ledger. A Rust operation driver takes one
+already claimed operation and scoped ledger and catalog adapters. It reloads
+the claim and attempt after acquiring the generation, verifies the exact
+captured member digest, and prepares only when no send reservation exists.
+It calls the SQL send fence in a standalone transaction before consuming
+the single-submit proposal. After authorization, every later invocation
+verifies the retained proposal using lookup only.
 
-A replacement first sees a deliberately stale catalog response and leaves the
-receipt unresolved. Fresh catalog and object evidence then finalize segment 7.
-The smoke checks that a second recovery changes zero completion records, segment
-8 remains independently claimable, and Trino reads exactly `[10]` and
-`[10, 20]` at the parent and accepted pins. The harness records one POST and
-the observed restart and verification times on each run. [Test worker](../../../src/backend/access/lakehouse/core/pgdatalake-core/examples/bound_publication_fixture.rs) · [Crash smoke](../../../src/test/lakehouse/fixtures/bound-publication-restart.py)
+The smoke exercises two accepted appends with separate ledgers. In each
+case the gateway checks that the exact POST body matches the stored intent
+and that PostgreSQL flushed the intent commit. It captures a later segment
+while the gateway holds the reply. One case terminates the sender at this
+barrier. The other returns HTTP 504 and checks the worker reports
+`dispatch_unknown`. Both immediately restart the disposable PostgreSQL cluster.
 
-The fixture qualifies the provider integration for explicitly bound rows on a
-single retained volume. Production worker scheduling, ordinary bound SQL
-capture, two-source overlay visibility, and failover remain separate gates.
+A transient catalog failure before authorization is reported as
+`prepare_unsent` and leaves no send intent. After restart,
+`lookup_unavailable` and `acceptance_unproved` leave the original intent
+reserved. Fresh catalog and object evidence finalize only the original
+segment. Replaying completion makes no catalog request and changes no
+completion record. The later segment remains independently claimable, and
+Trino reads exactly `[10]` and `[10, 20]` at the parent and accepted pins.
+Each case records the pins, request counts and observed restart and
+verification times. [Operation driver](../../../src/backend/access/lakehouse/core/pgdatalake-core/src/publication_worker.rs) · [Fixture adapters](../../../src/backend/access/lakehouse/core/pgdatalake-core/examples/bound_publication_fixture.rs) · [Crash smoke](../../../src/test/lakehouse/fixtures/bound-publication-restart.py)
+
+The same smoke accepts the managed capture fixture adapter via
+`--capture-adapter PATH.sql`. This mode stages rows using ordinary TableAM
+`INSERT` as a low-privilege writer, asserts no catalog request during
+capture, and uses the returned segment IDs and binding provenance as the
+publication inputs. Both modes have an explicitly enrolled fixture target.
+Native worker scheduling, compatible-pin overlay visibility and failover
+have independent gates.
 
 ## When a second append is safe
 

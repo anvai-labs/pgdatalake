@@ -30,6 +30,7 @@
 #include "catalog/pg_type.h"
 #include "parser/parse_func.h"
 #include "executor/spi.h"
+#include "storage/lmgr.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "nodes/parsenodes.h"
@@ -236,6 +237,9 @@ lakehouse_managed_count(PG_FUNCTION_ARGS)
 	aclresult = pg_class_aclcheck(relid, GetUserId(), ACL_SELECT);
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, OBJECT_TABLE, get_rel_name(relid));
+
+	LockRelationOid(relid, AccessShareLock);
+	lakehouse_check_capture_read(relid);
 
 	/*
 	 * The ledger receives staged rows at pre-commit. A backend with write
