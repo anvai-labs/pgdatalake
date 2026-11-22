@@ -67,6 +67,107 @@ query_snapshot_selector(PlannerInfo *root, RelOptInfo *baserel)
 #endif
 }
 
+/*
+ * Reentry guard for the execution-time COUNT fallback: the SPI ordinary
+ * aggregate replans, and without this flag the hook would attach the
+ * one-row path to the INNER query too — a proof that fails permanently
+ * (offline endpoint) would recurse (the managed twin landed this guard
+ * in the COUNT successor review).
+ */
+bool		lakehouse_fdw_count_in_fallback = false;
+
+/*
+ * Trivial count(*) over exactly one foreign base relation of ours: the
+ * builtin identity (F_COUNT_), single star aggregate, no quals/joins/
+ * grouping/having/window/distinct/limit-offset. The shape checks mirror
+ * the managed successor (count_exec.c) — keep both in sync.
+ */
+static bool
+fdw_count_wanted(PlannerInfo *root, RelOptInfo *input_rel,
+				 RangeTblEntry **rte_out)
+{
+	Query	   *parse = root->parse;
+	TargetEntry *te;
+	Aggref	   *agg;
+	RangeTblEntry *rte;
+
+	if (parse->commandType != CMD_SELECT || parse->hasWindowFuncs ||
+		parse->hasTargetSRFs || parse->setOperations ||
+		parse->groupClause || parse->groupingSets || parse->havingQual ||
+		parse->distinctClause || parse->limitOffset != NULL)
+		return false;
+	if (list_length(parse->targetList) != 1)
+		return false;
+	te = linitial_node(TargetEntry, parse->targetList);
+	if (te->resjunk || !IsA(te->expr, Aggref))
+		return false;
+	agg = (Aggref *) te->expr;
+	if (agg->aggfnoid != F_COUNT_ ||
+		agg->aggdistinct != NIL || agg->aggfilter != NULL ||
+		agg->aggorder != NIL || agg->args != NIL)
+		return false;
+	if (input_rel->reloptkind != RELOPT_BASEREL ||
+		input_rel->rtekind != RTE_RELATION || input_rel->relid == 0)
+		return false;
+	rte = root->simple_rte_array[input_rel->relid];
+	if (rte->rtekind != RTE_RELATION ||
+		rte->relkind != RELKIND_FOREIGN_TABLE)
+		return false;
+	if (input_rel->baserestrictinfo != NIL || input_rel->joininfo != NIL)
+		return false;
+	if (parse->jointree && parse->jointree->quals != NULL)
+		return false;
+	if (rte_out != NULL)
+		*rte_out = rte;
+	return true;
+}
+
+/*
+ * Execution-time COUNT successor (spec 16; reinstates the shape of the
+ * gated-off plan-time elision WITHOUT its defects): a one-row upper
+ * ForeignPath whose fdw_private carries ONLY a descriptor — marker,
+ * selector, foreign table OID. No count is embedded in the plan, so a
+ * prepared statement cannot serve a stale total. Begin resolves the
+ * CURRENT snapshot, re-proves delete eligibility, and computes the sum
+ * from manifest record_counts; an unprovable answer falls back to the
+ * ordinary aggregate via SPI (guard above). Default EXPLAIN opens zero
+ * data objects: nothing is contacted at plan time.
+ */
+void
+lakehouse_GetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
+							   RelOptInfo *input_rel, RelOptInfo *output_rel,
+							   void *extra)
+{
+	ForeignPath *path;
+	ForeignPath *best;
+	RangeTblEntry *rte;
+	const char *selector;
+
+	if (lakehouse_fdw_count_in_fallback)
+		return;
+	if (stage != UPPERREL_GROUP_AGG)
+		return;
+	if (!fdw_count_wanted(root, input_rel, &rte))
+		return;
+	best = (ForeignPath *) input_rel->cheapest_total_path;
+	if (best == NULL || !IsA(best, ForeignPath))
+		return;
+
+	selector = query_snapshot_selector(root, input_rel);
+	path = create_foreignscan_path(root, output_rel,
+								   create_empty_pathtarget(),
+								   1 /* rows: exactly one answer */ ,
+								   0, 0.0 /* startup */ ,
+								   10.0 /* total: manifest sum, cached */ ,
+								   NIL, NULL, NULL,
+								   NIL /* fdw_restrictinfo */ ,
+								   list_make3(makeString("count_exec"),
+											  makeString(pstrdup(selector)),
+											  makeString(psprintf("%u",
+																  (unsigned) rte->relid))));
+	add_path(output_rel, &path->path);
+}
+
 void
 lakehouse_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 							Oid foreigntableid)

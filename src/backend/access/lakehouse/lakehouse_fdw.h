@@ -72,7 +72,21 @@ typedef struct LakehouseExecState
 	LakehouseBatchMap *maps;	/* per visible attribute */
 	Datum	   *row_values;		/* reused per row */
 	bool	   *row_nulls;
+
+	/*
+	 * Execution-time COUNT (spec 16 successor): one-row upper scan whose
+	 * answer is resolved in Begin — manifest sum when the delete-free proof
+	 * holds on the current snapshot, the ordinary-aggregate fallback
+	 * otherwise.
+	 */
+	bool		count_exec;
+	bool		count_done;
+	bool		count_from_manifest;
+	int64		count_value;
 } LakehouseExecState;
+
+/* fdw_exec.c — set while the ordinary-aggregate fallback replans */
+extern bool lakehouse_fdw_count_in_fallback;
 
 /* fdw.c */
 extern void ExtractOptions(Oid foreigntableid, Oid checkAsUser, LakehouseOptions *opts);
@@ -82,6 +96,11 @@ extern void lakehouse_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 										Oid foreigntableid);
 extern void lakehouse_GetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
 									  Oid foreigntableid);
+extern void lakehouse_GetForeignUpperPaths(PlannerInfo *root,
+										   UpperRelationKind stage,
+										   RelOptInfo *input_rel,
+										   RelOptInfo *output_rel,
+										   void *extra);
 extern ForeignScan *lakehouse_GetForeignPlan(PlannerInfo *root,
 											 RelOptInfo *baserel,
 											 Oid foreigntableid,

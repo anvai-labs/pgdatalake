@@ -7,6 +7,9 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/table.h"
+#include "executor/spi.h"
+#include "utils/snapmgr.h"
 #include "catalog/pg_collation_d.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
@@ -45,6 +48,100 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 	TupleDesc	tupdesc;
 	StringInfoData proj;
 	bool		first_col = true;
+
+	/*
+	 * Execution-time COUNT (spec 16 successor): detect the descriptor-only
+	 * one-row upper plan and resolve EVERYTHING here — current snapshot,
+	 * delete eligibility, manifest sum — with the ordinary aggregate as the
+	 * fallback. Iterate only yields the stored answer.
+	 */
+	{
+		ForeignScan *fscan = (ForeignScan *) node->ss.ps.plan;
+
+		if (fscan != NULL && fscan->fdw_private != NIL &&
+			list_length(fscan->fdw_private) == 3 &&
+			strcmp(strVal(linitial(fscan->fdw_private)),
+				   "count_exec") == 0)
+		{
+			char	   *sel = strVal(lsecond(fscan->fdw_private));
+			Oid			ftid = (Oid) strtoul(strVal(lthird(fscan->fdw_private)),
+											 NULL, 10);
+			bool		proved = false;
+			uint64		n;
+			ScanSession *session;
+			Relation	tmpl;
+			TupleDesc	tdesc;
+			char	   *nsp;
+			char	   *nm;
+
+			state = (LakehouseExecState *) palloc0(sizeof(LakehouseExecState));
+			state->count_exec = true;
+
+			ExtractOptions(ftid, &state->opts);
+			session = lakehouse_OpenSession(&state->opts,
+											sel[0] != '\0' ? sel : NULL);
+			if (session != NULL && !pg_datalake_scan_has_deletes(session))
+			{
+				n = pg_datalake_scan_task_count(session);
+				for (uint64 i = 0; i < n; i++)
+					state->count_value +=
+						(int64) pg_datalake_scan_task_rows(session, i);
+				state->count_from_manifest = true;
+				proved = true;
+				pg_datalake_scan_free(session);
+			}
+			else if (session != NULL)
+				pg_datalake_scan_free(session);
+
+			if (!proved)
+			{
+				/*
+				 * FALLBACK: the ordinary aggregate over the foreign table,
+				 * via SPI with full executor semantics (the base FT RTE stays
+				 * in the planned rtable, so ExecCheckRTPerms already enforced
+				 * SELECT as the invoker before we got here). The reentry
+				 * guard keeps the planner from attaching this path to the
+				 * inner query (see fdw_plan.c).
+				 */
+				tmpl = table_open(ftid, AccessShareLock);
+				nsp = get_namespace_name(RelationGetNamespace(tmpl));
+				nm = pstrdup(RelationGetRelationName(tmpl));
+				table_close(tmpl, AccessShareLock);
+
+				lakehouse_fdw_count_in_fallback = true;
+				PG_TRY();
+				{
+					SPI_connect();
+					PushActiveSnapshot(GetTransactionSnapshot());
+					if (SPI_execute(psprintf("SELECT count(*) FROM %s",
+											 quote_qualified_identifier(nsp,
+																		nm)),
+									true, 0) == SPI_OK_SELECT &&
+						SPI_processed == 1)
+					{
+						bool		dummy;
+
+						state->count_value =
+							DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+														SPI_tuptable->tupdesc,
+														1, &dummy));
+					}
+					PopActiveSnapshot();
+					SPI_finish();
+					lakehouse_fdw_count_in_fallback = false;
+				}
+				PG_CATCH();
+				{
+					lakehouse_fdw_count_in_fallback = false;
+					PG_RE_THROW();
+				}
+				PG_END_TRY();
+			}
+
+			node->fdw_state = state;
+			return;
+		}
+	}
 
 	/*
 	 * COUNT(*) elision (spec 15 §6.6) is GATED OFF (spec 16, "COUNT must be
@@ -159,6 +256,26 @@ lakehouse_IterateForeignScan(ForeignScanState *node)
 	LakehouseExecState *state = (LakehouseExecState *) node->fdw_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 	TupleDesc	tupdesc = node->ss.ss_currentRelation->rd_att;
+
+	/*
+	 * Execution-time COUNT (spec 16 successor): the answer was resolved in
+	 * Begin (manifest sum or the ordinary-aggregate fallback); yield it
+	 * exactly once, then EOF.
+	 */
+	if (state->count_exec)
+	{
+		if (state->count_done)
+		{
+			ExecClearTuple(slot);
+			return NULL;
+		}
+		ExecClearTuple(slot);
+		slot->tts_values[0] = Int64GetDatum(state->count_value);
+		slot->tts_isnull[0] = false;
+		ExecStoreVirtualTuple(slot);
+		state->count_done = true;
+		return slot;
+	}
 
 	for (;;)
 	{
@@ -330,6 +447,17 @@ lakehouse_ExplainForeignScan(ForeignScanState *node, ExplainState *es)
 
 	if (state == NULL)
 		return;
+	if (state->count_exec)
+	{
+		ExplainPropertyText("Lakehouse count",
+							state->count_from_manifest
+							? "computed at execution from manifest "
+							"record_counts (delete-free snapshot "
+							"re-proved; no data files read)"
+							: "ordinary aggregate fallback (proof "
+							"failed)", es);
+		return;
+	}
 	for (uint64 i = 0; i < state->task_count; i++)
 		rows += (uint64) pg_datalake_scan_task_rows(state->session, i);
 
@@ -363,6 +491,12 @@ void
 lakehouse_ReScanForeignScan(ForeignScanState *node)
 {
 	LakehouseExecState *state = (LakehouseExecState *) node->fdw_state;
+
+	if (state->count_exec)
+	{
+		state->count_done = false;
+		return;
+	}
 
 	/*
 	 * Rewind only: the planned session is REUSED. Merge/NestLoop join inner
