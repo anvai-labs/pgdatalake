@@ -9,6 +9,12 @@
 3. Classify commit outcomes and provide operation lookup to the publisher. A verified successful result includes the UUID/ref and committed snapshot. A CAS rejection means the caller can replan against a fresh verified base. A failed connection after the commit may have been accepted yields unknown. Reconcile the exact operation marker on the intended table/ref or report insufficient evidence.
 4. Qualify Lakekeeper first. Stage Glue/EMR, Unity and Snowflake in per-profile changes. Publish a capability table for format version, auth, create/load/commit, credential refresh, object access and operation evidence. Fail an unverified capability before making mutations.
 
+## Prepared staged append
+
+The Rust catalog provider packages a writer-produced append snapshot into one immutable REST request. It uses the claim's table UUID, operation UUID and input digest, plus validated Iceberg v2 metadata for an unpartitioned table on `main`. The request asserts table UUID, exact branch head (explicit null for an empty ref), schema ID and default spec ID. It carries the operation UUID and lowercase member digest as `pgdatalake.operation-id` and `pgdatalake.input-sha256` in the snapshot summary.
+
+Preparation returns the exact bytes, their SHA-256 digest, expected parent and proposed snapshot ID without contacting the catalog. The prepared value can be consumed by one `submit` call on its original client and route. A route-prefix change fails before dispatch. The common POST helper disables transport replay and redirects. The worker must commit send authorization for the exact digest before submitting. Claim capture, proposal retention and acceptance lookup belong to their respective delivery slices. Unknown outcomes still require positive catalog evidence before finalization. [Local send fence](04a-publisher-recovery.md#send-intent-and-receipts-in-extension-15)
+
 ## Independent test package
 
 The commit transport now sends one POST per attempt and recognizes a requirement rejection from the typed catalog response. Redirects, ambiguous gateway failures and unusable success replies surface as unknown. Append planning can still retry a proven conflict. Durable operation markers and lookup on takeover remain delivery items. [Catalog implementation and fault tests](../../../src/backend/access/lakehouse/core/pgdatalake-core/src/catalog/commit.rs)

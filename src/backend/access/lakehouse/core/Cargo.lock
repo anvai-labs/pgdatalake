@@ -1571,6 +1571,7 @@ dependencies = [
  "object_store",
  "parquet",
  "reqwest 0.12.28",
+ "ring",
  "roaring",
  "serde",
  "serde_json",
