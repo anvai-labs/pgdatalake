@@ -9,10 +9,7 @@ what has landed and which evidence the current candidate still needs.
 
 The [DML qualification gates](18-anvai-lake-dml.md#7-milestones-and-gates)
 define the ordering for external reads, staged append, direct corrections,
-and selective deferred mutations. The
-[competitive pilot plan](19-anvai-lake-positioning.md#4-pilot-and-benchmark-gates)
-adds stock installation, heap CDC, and independent consumer checks before
-claiming broader parity.
+and selective deferred mutations. The [core release gates](modules/08a-core-release-gates.md) add stock installation, tenant scope and independent consumer checks.
 
 Use the [module briefs](modules/README.md) to plan implementation slices and
 parallel work on short-lived changes. The

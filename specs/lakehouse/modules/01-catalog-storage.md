@@ -1,5 +1,7 @@
 # Anvai Lake catalog and storage module
 
+Use the [per-cloud adapter contracts](09-cloud-profiles.md) for authority, credential rotation, conditional creates and real-profile release tests.
+
 **Read** [shared contracts](00-integration-contracts.md). **Own** Rust `catalog/`, `storage.rs`, `cache.rs` and the remote table resolution/commit portions of `session.rs`. Reuse its existing client for Lakekeeper. The SQL package owns mapping selection, the reader owns interpretation of Iceberg files, and the publisher owns durable retry decisions.
 
 ## Implementation

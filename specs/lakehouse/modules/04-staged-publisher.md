@@ -6,7 +6,7 @@
 
 ## Implementation
 
-The scheduler considers size or oldest committed segment age. The initial target is 128 MiB per file with 32 MiB–4 GiB configurable bounds, and a separate default age target of 20 seconds with the proposed 5–300 second bounds. A time-triggered flush can emit a smaller file. Cap each claim by bytes, rows and segment count. Wake after commit and use a bounded periodic recovery scan. Do not hold a SQL transaction across unbounded network waits.
+The scheduler considers size or oldest committed segment age. The initial target is 128 MiB per file with 32 MiB–4 GiB configurable bounds, and a proposed 60-second default age target (experimental 20 seconds, proposed range 5–300 seconds). A time-triggered flush can emit a smaller file. Cap each claim by bytes, rows and segment count. Wake after commit and use a bounded periodic recovery scan. Do not hold a SQL transaction across unbounded network waits.
 
 | Persistent stage | Transition and rule |
 |---|---|
@@ -17,6 +17,14 @@ The scheduler considers size or oldest committed segment age. The initial target
 | Needs reconciliation | Hold pending rows and surface a receipt. Retry lookup under a bounded policy. Release rows only when an operator or verified catalog outcome resolves the state. |
 
 Lease expiry coordinates local work. Concurrent attempts must use the same claim identity and reconcile before a stale attempt can introduce duplicate effects. Gate profiles that cannot prove safe handling after loss of a reply. Engine visibility attaches to a catalog snapshot, not worker completion time.
+
+## Eligibility, small files and backpressure
+
+Measure file rollover in encoded output bytes. Measure eligibility using a separately bounded pending payload byte estimate and elapsed age of the oldest committed member. Calibrate the estimate against actual encoded Parquet bytes. Use the client COMMIT acknowledgement timestamp for external measurement; an enqueue or transaction-start time cannot certify it. Persist due work and rebuild eligibility from the ledger after restart. Reject zero for a new age setting or explicitly migrate it to disabled with bounded scheduling. The current 30-second `publish_max_lag` is a poll interval.
+
+Under the simplifying assumption of steady **encoded** flow at 0.1 MiB/s, a time-only 20-second flush produces about 2 MiB and 4,320 publishes/day per continuously active table. At 60 seconds it produces 6 MiB and 1,440/day. At 8 MiB/s a 128 MiB target fills in 16 seconds. These are models assuming one file/flush and immediate service. A 32 MiB setting controls desired rollover, never a minimum legal time-triggered file. Gate a 4 GiB setting on measured streaming memory and multipart limits. A 60-second eligibility target leaves no processing margin for a 60-second end-to-end p95 on quiet tables; evaluate the latter only with a shorter age budget and known upload/catalog/refresh conditions.
+
+Apply per-tenant and global pending-byte, WAL/disk reserve and concurrency budgets. Reject new work before COMMIT once reserves are exhausted, retain acknowledged work, report oldest age and resume with hysteresis. Compaction must preserve row multiplicity and old pinned views. Protect unresolved objects, claims and overlay payloads from GC. Test a stalled catalog, rising small-file count, compaction and restart.
 
 ## Independent test package
 

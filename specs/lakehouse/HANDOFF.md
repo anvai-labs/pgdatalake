@@ -1,6 +1,6 @@
 # HANDOFF.md — State for the Next Session
 
-*Updated 2026-11-19. Working directory: `/home/vsingh/code/postgres`.*
+*Historical snapshot from 2026-11-19. See [current progress](PROGRESS.md) for the current repository and release state. Working directory: `/home/vsingh/code/postgres`.*
 
 ## What exists
 

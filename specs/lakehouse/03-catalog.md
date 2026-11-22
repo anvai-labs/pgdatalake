@@ -1,5 +1,7 @@
 # 03 — Iceberg Catalog Integrations
 
+The tier table below describes protocol design goals. Advertised operations require a [profile receipt](modules/09-cloud-profiles.md). For ambiguous commit outcomes use the [single-send recovery contract](modules/04a-publisher-recovery.md).
+
 The catalog is the source of truth for table existence, schema, and current
 snapshot. Postgres keeps only a **cache** of it (relcache entry per attached
 table), never authoritative metadata, with one exception: managed tables carry a
@@ -36,11 +38,9 @@ Implement the Iceberg REST openapi spec exactly:
   discriminate on `"type"` (`assert-table-uuid`, `assert-ref-snapshot-id` with
   `snapshot-id` ALWAYS present — null means "ref must not exist"), updates
   discriminate on `"action"` (`add-snapshot`, `set-snapshot-ref` with
-  `ref-name`/`type`/`snapshot-id`). 409 responses classify as the ONLY
-  retryable error class; the retry re-plans from a fresh loadTable (doc 07 §2),
-  bounded by `lakehouse.commit_retries`.
+  `ref-name`/`type`/`snapshot-id`). A typed definitive rejection permits a compatible replan under the attempt policy. An HTTP status alone cannot establish absence of an effect.
 - **Multi-table atomic commit**: `POST /v1/{ns}/transactions` (`CommitTransactionRequest`)
-  implemented for catalogs advertising support; on non-supporting catalogs, our
+  a future capability requiring a separate atomicity gate; on non-supporting catalogs, our
   cross-table commit strategy degrades per doc 07 §4 (staged sequential commits with
   a transaction journal in `pg_lakehouse_table`).
 - View endpoints, `registerTable`, plan-table endpoints: v2.
@@ -80,6 +80,6 @@ code paths.
 | Failure | Behavior |
 |---|---|
 | Catalog unreachable at plan time | ERROR (fail fast); retryable at executor via `lakehouse.commit_retries` only for commits |
-| Catalog unreachable at commit time | Transaction stays open, commit retried with backoff; on exhaustion → ERROR, staged files orphaned, cleaned by orphan GC |
+| Catalog unreachable at commit time | Ambiguous direct completion returns `40003`. A staged send with unknown disposition stays lookup-only; retain the intent and its objects |
 | Remote table deleted under us | `loadTable` 404 → rel marked invalid; SELECT errors `iceberg_table_dropped`, DDL hint to re-attach |
 | Schema drift by another engine | On next metadata load: if schema is *compatible* (additive), transparently adapted; if incompatible (type narrowed / column dropped that we use) → ERROR with diff printout |

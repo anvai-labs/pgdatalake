@@ -8,7 +8,7 @@ Start with external reads and staged append. Qualify direct copy-on-write (COW) 
 
 ## 1. Current state and release boundaries
 
-Source inspected on `work/count-and-pub-qualification` at `5b31b230680`. These are source findings and design requirements. The thought experiments below are proposed acceptance tests.
+Historical baseline at `5b31b230680`. At #45 the active staged scan still omits the published base and foreground capture still creates unbound segments. Durable writer, ledger and lookup providers now exist. The COW guard rejects delete-bearing source snapshots and moved source pins. The historical defect analysis below motivates the guard. The current release decisions and precise client outcomes are in the [receipt contract](modules/03a-client-receipts.md) and [core release gates](modules/08a-core-release-gates.md).
 
 | Capability | Current implementation | Release posture |
 |---|---|---|
