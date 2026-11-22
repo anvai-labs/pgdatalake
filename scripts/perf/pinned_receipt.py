@@ -5,13 +5,17 @@ import json
 import re
 import statistics
 import time
+from contextlib import closing
 from decimal import Decimal
 from pathlib import Path
+from uuid import UUID
 
 TPCDS_TABLES = {
     "catalog_sales", "customer", "date_dim", "item", "store", "store_returns",
     "store_sales", "web_sales",
 }
+SERVER_OPTIONS = {"endpoint", "warehouse", "catalog_prefix", "expected_table_uuid",
+                  "storage_root", "s3_endpoint", "s3_region"}
 
 
 def result_digest(rows):
@@ -42,7 +46,7 @@ def compare_result(expected, rows):
 def verify_attachments(expected, actual):
     for name, target in expected.items():
         if actual.get(name) != target:
-            raise ValueError(f"{name}: fixture attachment does not match the catalog locator and explicit pin")
+            raise ValueError(f"{name}: attachment differs from the oracle locator, pin or server binding")
 
 
 def summarize_samples(samples):
@@ -67,11 +71,17 @@ def load_oracle(path, query_names, query_dir):
         raise ValueError("Oracle must cover every shipped canary and its tables")
     for name, target in data["tables"].items():
         pin = target["snapshot_id"]
-        if (set(target) != {"table", "snapshot_id"} or not isinstance(target["table"], str)
+        if (set(target) != {"table", "snapshot_id", "server"} or not isinstance(target["table"], str)
                 or not target["table"].strip() or not isinstance(pin, str)
                 or not re.fullmatch(r"0|-?[1-9][0-9]{0,18}", pin)
                 or not -(2**63) <= int(pin) < 2**63):
             raise ValueError(f"{name}: expected a catalog locator and canonical Iceberg snapshot ID")
+        server = target["server"]
+        if (set(server) != SERVER_OPTIONS
+                or any(not isinstance(v, str) or (not v and k != "catalog_prefix")
+                       for k, v in server.items())
+                or str(UUID(server["expected_table_uuid"])) != server["expected_table_uuid"]):
+            raise ValueError(f"{name}: expected a canonical bound REST/S3 server")
     queries = {}
     for name, expected in data["queries"].items():
         raw = (Path(query_dir) / f"{name}.sql").read_bytes()
@@ -93,26 +103,28 @@ def preflight(cur, schema, tables, timeout):
         sql.Identifier(schema)))
     cur.execute("SELECT set_config('statement_timeout', %s, true)", (f"{timeout}s",))
 
-    # Hold relation locks across the canaries so ALTER FOREIGN TABLE cannot
-    # exchange a selector mid-run. LIMIT 0 opens no data scan.
+    # PREPARE parses and analyzes, taking relation locks without initializing
+    # an FDW executor. Deallocation leaves the locks held by this transaction.
     for name in sorted(tables):
-        cur.execute(sql.SQL("SELECT 1 FROM ONLY {} LIMIT 0").format(
+        cur.execute(sql.SQL("PREPARE pin_preflight AS SELECT 1 FROM ONLY {}").format(
             sql.Identifier(schema, name)))
+        cur.execute("DEALLOCATE pin_preflight")
     cur.execute("""
-        SELECT c.relname, options.option_name, options.option_value
+        SELECT c.relname, t.ftoptions, s.srvoptions
         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
         JOIN pg_foreign_table t ON t.ftrelid = c.oid
         JOIN pg_foreign_server s ON s.oid = t.ftserver
         JOIN pg_foreign_data_wrapper w ON w.oid = s.srvfdw
-        CROSS JOIN LATERAL pg_options_to_table(t.ftoptions) options
         WHERE n.nspname = %s AND c.relname = ANY(%s)
           AND NOT c.relhassubclass
           AND w.fdwhandler = 'lakehouse.lakehouse_fdw_handler()'::regprocedure
-          AND options.option_name IN ('table', 'snapshot_id')
     """, (schema, sorted(tables)))
     actual = {}
-    for name, option, value in cur.fetchall():
-        actual.setdefault(name, {})[option] = value
+    for name, table_options, server_options in cur.fetchall():
+        table = dict(option.split("=", 1) for option in table_options or [])
+        server = dict(option.split("=", 1) for option in server_options or [])
+        actual[name] = {"table": table.get("table"), "snapshot_id": table.get("snapshot_id"),
+                        "server": {key: server.get(key) for key in SERVER_OPTIONS}}
     verify_attachments(tables, actual)
 
 
@@ -133,22 +145,38 @@ def attempt(cur, query, expected):
         result = {"status": status,
                   "sqlstate": exc.pgcode, "elapsed_seconds": elapsed}
         if not cur.connection.closed:
-            cur.execute("ROLLBACK TO SAVEPOINT benchmark_attempt")
-            cur.execute("RELEASE SAVEPOINT benchmark_attempt")
+            try:
+                cur.execute("ROLLBACK TO SAVEPOINT benchmark_attempt")
+                cur.execute("RELEASE SAVEPOINT benchmark_attempt")
+            except Error as cleanup:
+                result["cleanup_error"] = {"sqlstate": cleanup.pgcode}
         return result
-    cur.execute("RELEASE SAVEPOINT benchmark_attempt")
-    result = compare_result(expected, rows)
+    try:
+        result = compare_result(expected, rows)
+    except (ValueError, TypeError) as exc:
+        result = {"status": "RESULT_ENCODING_ERROR", "detail": str(exc)}
+    try:
+        cur.execute("RELEASE SAVEPOINT benchmark_attempt")
+    except Error as cleanup:
+        result["observed_status"] = result["status"]
+        result["status"] = "CLEANUP_ERROR"
+        result["cleanup_error"] = {"sqlstate": cleanup.pgcode}
     result["elapsed_seconds"] = elapsed
     return result
 
 
-def run_pinned(conn, args, query_names):
-    from psycopg2 import Error
+def run_pinned(connect, args, query_names, database_error):
+    # Reserve a fresh destination even if loading the oracle or connecting fails.
+    with Path(args.receipt).open("x") as output:
+        return write_receipt(connect, args, query_names, database_error, output)
 
+
+def write_receipt(connect, args, query_names, database_error, output):
     receipt = {
         "version": 1, "status": "FAIL", "source_sha": args.source_sha,
         "package_sha256": args.package_sha256, "configuration": args.configuration,
         "cache_state": "after_warmup" if args.warmup else "uncontrolled_no_warmup",
+        "workload": args.workload,
         "fixture_schema": args.fixture_schema, "timeout_seconds": args.timeout,
         "requested_samples_per_query": args.samples,
         "queries": {name: {"status": "NOT RUN", "samples": []} for name in query_names},
@@ -156,8 +184,8 @@ def run_pinned(conn, args, query_names):
     try:
         oracle, queries = load_oracle(args.oracle, query_names, args.queries)
         receipt["oracle"] = oracle
-        conn.set_session(readonly=True, autocommit=False, isolation_level="READ COMMITTED")
-        with conn.cursor() as cur:
+        with closing(connect()) as conn, conn.cursor() as cur:
+            conn.set_session(readonly=True, autocommit=False, isolation_level="READ COMMITTED")
             preflight(cur, args.fixture_schema, oracle["tables"], args.timeout)
             cur.execute("SELECT version(), lakehouse.version(), current_setting('work_mem'), "
                         "current_setting('max_parallel_workers_per_gather'), current_setting('jit')")
@@ -182,12 +210,12 @@ def run_pinned(conn, args, query_names):
                     record["status"] = "PASS"
                 if conn.closed:
                     break
-            if all(q["status"] == "PASS" for q in receipt["queries"].values()):
-                receipt["status"] = "PASS"
-    except Error as exc:
+        if all(q["status"] == "PASS" for q in receipt["queries"].values()):
+            receipt["status"] = "PASS"
+    except database_error as exc:
         receipt["database_error"] = {"sqlstate": exc.pgcode}
     except (ValueError, TypeError, KeyError, OSError) as exc:
         receipt["validation_error"] = str(exc)
     finally:
-        Path(args.receipt).write_text(json.dumps(receipt, indent=2) + "\n")
+        output.write(json.dumps(receipt, indent=2) + "\n")
     return receipt["status"] == "PASS"

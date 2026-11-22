@@ -27,11 +27,12 @@ Only one change modifies the shared fixture vocabulary and CI integration while 
 The [canary runner](../../../scripts/perf/README.md#pinned-qualification-for-q1q3)
 accepts a trusted independent-engine oracle for the shipped TPC-DS q1–q3 SQL.
 The oracle records the dataset, engine version, eight table locators and
-explicit Iceberg snapshot IDs, exact result multiplicity, typed row digest and
-SQL hashes. Hold relation locks before inspecting the local attachments. Run
+explicit Iceberg snapshot IDs, bound REST/S3 server identities, exact result
+multiplicity, typed row digest and SQL hashes. Use PREPARE to hold relation locks
+before inspecting the local attachments without starting an FDW scan. Run
 against a fixed catalog/profile, server mapping and fixture schema. Validate
 every timed result against the same oracle. Keep raw elapsed samples and the
-first mismatch or SQLSTATE per query in the JSON output. Bind the surrounding
+first mismatch or SQLSTATE per query in a fresh JSON output file. Bind the surrounding
 deployment receipt to the supplied source SHA and package digest.
 
 Use the median after five verified samples and nearest-rank p95/p99 after 100.

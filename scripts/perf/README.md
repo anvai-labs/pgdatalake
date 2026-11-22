@@ -50,11 +50,15 @@ the user mapping (RULES §6). `tpcds/queries/` holds q1–q10 verbatim.
    snapshots. Use an isolated benchmark schema and keep the catalog authority,
    foreign servers, mappings and fixture DDL fixed during the run.
 2. Attach those tables in that schema with the exact `table` and `snapshot_id`
-   options from the reference run. Prepare an oracle JSON object with
+   options from the reference run. Use a bound REST/S3 server per table, with
+   the UUID and roots verified from independent enrollment. Prepare an oracle JSON object with
    `version: 1`, `reference_engine` and `dataset` strings, a `tables` map from
-   PostgreSQL table name to `{table, snapshot_id}`, and a `queries` map from
+   PostgreSQL table name to `{table, snapshot_id, server}`, and a `queries` map from
    `query1`, `query2` and `query3` to `{sql_sha256, row_count, sha256}`. Snapshot
-   IDs are canonical decimal strings. `sql_sha256` hashes the shipped query
+   IDs are canonical decimal strings. `server` contains `endpoint`, `warehouse`,
+   `catalog_prefix`, `expected_table_uuid`, `storage_root`, `s3_endpoint` and
+   `s3_region`, using the exact values of the [bound read profile](../../specs/lakehouse/modules/06b-scoped-read-handoff.md#bound-server-pilot).
+   Keep secrets and credential references out of the oracle. `sql_sha256` hashes the shipped query
    file bytes. Compute `row_count` and `sha256` from the reference result using
    `pinned_receipt.result_digest`. Pass row tuples with database integers,
    strings, `Decimal` for SQL numeric, and `None` for SQL null. The digest
@@ -74,7 +78,8 @@ python3 scripts/perf/lakehouse_perf.py --suite tpcds \
 ```
 
 The driver checks each attachment and the byte hash of each query before
-collecting samples. Each timed attempt includes SQL execution and client
+starting any scans. A custom `--queries` directory is recorded as exploratory.
+Choose a fresh receipt output path for each invocation. Each timed attempt includes SQL execution and client
 row materialization. Digest calculation is outside the timer. A mismatch,
 timeout or other failed attempt stays in the receipt and prevents a passing
 timing summary for that canary. The runner reports median after five matched

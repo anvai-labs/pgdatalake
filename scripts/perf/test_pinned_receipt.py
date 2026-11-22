@@ -4,12 +4,15 @@ import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from pinned_receipt import (
     TPCDS_TABLES,
     compare_result,
     load_oracle,
     result_digest,
+    run_pinned,
     summarize_samples,
     verify_attachments,
 )
@@ -49,9 +52,13 @@ class PinnedReceiptTest(unittest.TestCase):
             query_file.write_bytes(raw)
             oracle_file = directory / "oracle.json"
             row_count, digest = result_digest([(1,)])
+            server = {"endpoint": "http://127.0.0.1:8181/catalog", "warehouse": "fixture",
+                      "catalog_prefix": "", "expected_table_uuid": "b84bfbda-e52a-479c-afca-2718eac04df2",
+                      "storage_root": "s3://warehouse/sales", "s3_endpoint": "http://127.0.0.1:9000",
+                      "s3_region": "us-east-1"}
             oracle = {"version": 1, "dataset": "fixture", "reference_engine": "oracle",
-                      "tables": {name: {"table": "lake." + name, "snapshot_id": "9223372036854775807"}
-                                 for name in TPCDS_TABLES},
+                      "tables": {name: {"table": "lake." + name, "snapshot_id": "9223372036854775807",
+                                        "server": dict(server)} for name in TPCDS_TABLES},
                       "queries": {"query1": {"row_count": row_count, "sha256": digest,
                                              "sql_sha256": hashlib.sha256(raw).hexdigest()}}}
             oracle_file.write_text(json.dumps(oracle))
@@ -64,6 +71,30 @@ class PinnedReceiptTest(unittest.TestCase):
             oracle_file.write_text(json.dumps(oracle))
             with self.assertRaisesRegex(ValueError, "store: .*snapshot ID"):
                 load_oracle(oracle_file, ["query1"], directory)
+
+    def test_matching_rows_and_pin_cannot_substitute_catalog_authority(self):
+        target = {"table": "fixture.orders", "snapshot_id": "1", "server": {"endpoint": "primary"}}
+        actual = {**target, "server": {"endpoint": "other"}}
+        with self.assertRaisesRegex(ValueError, "orders"):
+            verify_attachments({"orders": target}, {"orders": actual})
+
+    def test_receipt_records_connection_failure_and_refuses_existing_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "receipt.json"
+            args = SimpleNamespace(receipt=output, source_sha="0" * 40, package_sha256="0" * 64,
+                                   configuration="fixture", warmup=False, fixture_schema="fixture",
+                                   workload="custom_exploratory",
+                                   timeout=1, samples=1, oracle="unused", queries="unused")
+            with patch("pinned_receipt.load_oracle", return_value=({}, {})):
+                def fail_connect():
+                    raise OSError("fixture database unavailable")
+
+                self.assertFalse(run_pinned(fail_connect, args, ["query1"], RuntimeError))
+                written = output.read_text()
+                self.assertEqual(json.loads(written)["status"], "FAIL")
+                with self.assertRaises(FileExistsError):
+                    run_pinned(fail_connect, args, ["query1"], RuntimeError)
+                self.assertEqual(output.read_text(), written)
 
     def test_percentiles_need_samples_and_no_failed_attempts(self):
         def samples(n):

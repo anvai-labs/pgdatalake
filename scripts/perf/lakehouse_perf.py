@@ -292,11 +292,12 @@ def main():
             ap.error("receipt must be separate from the oracle")
         from pinned_receipt import run_pinned
 
-        conn = connect(args.dsn)
+        args.workload = "shipped_tpcds_canaries" if Path(args.queries).resolve() == DEFAULT_QUERIES \
+            else "custom_exploratory"
         try:
-            passed = run_pinned(conn, args, TPCDS_QUERIES)
-        finally:
-            conn.close()
+            passed = run_pinned(lambda: connect(args.dsn), args, TPCDS_QUERIES, psycopg2.Error)
+        except FileExistsError:
+            ap.error("receipt path already exists; choose a new file")
         print(f"{'PASS' if passed else 'FAIL'}: {args.receipt}")
         raise SystemExit(0 if passed else 1)
 
