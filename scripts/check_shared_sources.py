@@ -5,13 +5,22 @@ drift silently changes one product's behavior. The shared set is read
 from stock/SHARED_SOURCES and cross-checked against the stock
 Makefile's OBJS, so the two lists cannot silently diverge. Comments are
 stripped before scanning; fork-only mechanisms (planner hook state, the
-managed ledger, tableam internals) must never appear.
+managed ledger, tableam internals) must never appear in stock-active
+code. The ACTUAL authority is the stock PG19 PGXS build itself; this
+guard is the cheap tripwire that runs on every push before that build.
+
+Run `--self-test` (wired into CI) to prove the guard still fails on a
+deliberate build-list mismatch, an empty manifest, a fork-only symbol
+in stock-active code, and a missing manifest entry.
 """
 import re
 import sys
 from pathlib import Path
 
-LAKE = Path(__file__).resolve().parents[1] / "src/backend/access/lakehouse"
+def lake_dir(root=None):
+    base = (Path(root).resolve() if root
+            else Path(__file__).resolve().parents[1])
+    return base / "src/backend/access/lakehouse"
 
 # token-level patterns, applied to comment-stripped source
 FORBIDDEN = [
@@ -56,13 +65,13 @@ def strip_fork_branches(text):
     return "\n".join(out)
 
 
-def shared_modules():
-    manifest = LAKE / "stock/SHARED_SOURCES"
+def shared_modules(lake):
+    manifest = lake / "stock/SHARED_SOURCES"
     shared = [l.strip() for l in manifest.read_text().splitlines()
               if l.strip() and not l.strip().startswith("#")]
     if not shared:
         raise SystemExit("shared-source contract: manifest is empty")
-    mk = (LAKE / "stock/Makefile").read_text()
+    mk = (lake / "stock/Makefile").read_text()
     objs = re.search(r"^OBJS\s*=\s*(.+)$", mk, re.M)
     if not objs:
         raise SystemExit("shared-source contract: no OBJS in stock Makefile")
@@ -78,8 +87,9 @@ def shared_modules():
     return shared
 
 
-def main():
-    shared = shared_modules()
+def main(root=None):
+    lake = lake_dir(root)
+    shared = shared_modules(lake)
     patterns = [
         (r"\blakehouse_snapshot\b", "fork-only RTE field"),
         (r"\blakehouse_tableam\.h\b|\blakehouse_tableam\b", "managed TableAM internals"),
@@ -89,7 +99,7 @@ def main():
     ]
     failures = []
     for name in shared:
-        path = LAKE / name
+        path = lake / name
         if not path.exists():
             raise SystemExit(f"shared-source contract: {name} not found")
         text = strip_comments(path.read_text(encoding="utf-8", errors="replace"))
@@ -105,5 +115,56 @@ def main():
     print(f"shared-source contract clean: {len(shared)} modules")
 
 
+def self_test():
+    """Prove each contract failure mode actually fires on a temp tree."""
+    import tempfile
+
+    def run_in(tmp, manifest_lines, objs, body):
+        base = tmp / "src/backend/access/lakehouse"
+        (base / "stock").mkdir(parents=True)
+        (base / "stock/SHARED_SOURCES").write_text(
+            "\n".join(manifest_lines) + "\n")
+        (base / "stock/Makefile").write_text("OBJS = %s\n" % objs)
+        for name in manifest_lines:
+            if name.startswith("#") or not name.strip():
+                continue
+            if body is not None:
+                (base / name).write_text(body)
+        import subprocess
+        r = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()),
+             "--root", str(tmp)],
+            capture_output=True, text=True)
+        return r.returncode
+
+    cases = [
+        ("obbs/manifest mismatch fails", 1,
+         ["fdw.c"], "fdw.o fdw_plan.o", "int main(void){return 0;}"),
+        ("empty manifest fails", 1,
+         ["# nothing"], "fdw.o", "int main(void){return 0;}"),
+        ("fork symbol in stock-active code fails", 1,
+         ["fdw.c"], "fdw.o",
+         "void f(void *r) { (void) ((RangeTblEntry *) r)->lakehouse_snapshot; }"),
+        ("fork symbol inside guarded #else branch passes", 0,
+         ["fdw.c"], "fdw.o",
+         "#ifdef LAKEHOUSE_STOCK_FDW\nreturn NULL;\n#else\n"
+         "return rte->lakehouse_snapshot;\n#endif\n"),
+        ("missing manifest entry fails loudly", 1,
+         ["gone.c"], "gone.o", None),
+    ]
+    for name, want, manifest, objs, body in cases:
+        with tempfile.TemporaryDirectory() as td:
+            got = run_in(Path(td), manifest, objs, body)
+        if got != want:
+            raise SystemExit(f"self-test FAILED: {name} "
+                             f"(want exit {want}, got {got})")
+    print(f"self-test clean: {len(cases)} failure modes fire correctly")
+
+
 if __name__ == "__main__":
-    main()
+    args = sys.argv[1:]
+    if "--self-test" in args:
+        self_test()
+    else:
+        root = args[args.index("--root") + 1] if "--root" in args else None
+        main(root)
