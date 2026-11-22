@@ -158,5 +158,35 @@ class ServiceContractVectors(unittest.TestCase):
                 self.assertEqual(check["expect"], result)
 
 
+class ScopedReadVectors(unittest.TestCase):
+    def test_exact_pin_resolver_model(self):
+        """Model the provider boundary before connecting it to PG privilege checks and I/O."""
+        vectors = json.loads(FIXTURE.with_name("scoped-read-v1.json").read_text())
+        self.assertEqual(vectors["version"], 1)
+        grant = vectors["grant"]
+        cases = vectors["cases"]
+        self.assertEqual(len(cases), len({case["id"] for case in cases}))
+        for case in cases:
+            with self.subTest(case=case["id"]):
+                session = case.get("session_role", grant["mapping_role"])
+                role = case.get("check_as_role", session)
+                catalog_calls = 0
+                if not case.get("select_granted", True) or role != grant["mapping_role"]:
+                    status = "denied"
+                elif case.get("available_generation", grant["generation"]) != grant["generation"]:
+                    status = "changed_binding"
+                else:
+                    catalog_calls += 1
+                    state = case.get("catalog_state", "available")
+                    if state != "available":
+                        status = {"replacement": "changed_binding", "pin_absent": "pin_unavailable",
+                                  "unavailable": "unavailable"}[state]
+                    elif case.get("object_scope", "within_both_roots") != "within_both_roots":
+                        status = "denied"
+                    else:
+                        status = "pin"
+                self.assertEqual((status, catalog_calls), (case["expect_core"], case["catalog_calls"]))
+
+
 if __name__ == "__main__":
     unittest.main()
