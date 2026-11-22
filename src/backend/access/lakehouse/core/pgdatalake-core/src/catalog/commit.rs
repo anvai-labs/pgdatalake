@@ -148,6 +148,8 @@ pub struct PublicationIdentity {
 const OPERATION_ID_KEY: &str = "pgdatalake.operation-id";
 const INPUT_DIGEST_KEY: &str = "pgdatalake.input-sha256";
 const HEX: &[u8] = b"0123456789abcdef";
+// lakehouse.authorize_publication_send persists the exact request.
+const MAX_STAGED_REQUEST_BYTES: usize = 64 * 1024;
 
 /// An immutable append request associated with its original catalog client
 /// and route. Store its request digest in the ledger before consuming it.
@@ -292,6 +294,18 @@ impl RestCatalog {
                 "staged append requires a known v2 schema".into(),
             ));
         }
+        let location = reqwest::Url::parse(&base.location)
+            .map_err(|_| RestError::Decode("invalid staged append storage location".into()))?;
+        if !location.username().is_empty()
+            || location.password().is_some()
+            || location.query().is_some()
+            || location.fragment().is_some()
+        {
+            return Err(RestError::Decode(
+                "staged append storage location must be free of credentials, queries and fragments"
+                    .into(),
+            ));
+        }
         let manifest_is_scoped = snapshot
             .manifest_list
             .strip_prefix(base.location.trim_end_matches('/'))
@@ -357,6 +371,12 @@ impl RestCatalog {
                 max_snapshot_age_ms: main.and_then(|reference| reference.max_snapshot_age_ms),
             },
         ];
+        let payload = serialize_commit(&requirements, &updates)?;
+        if payload.len() > MAX_STAGED_REQUEST_BYTES {
+            return Err(RestError::Decode(
+                "staged append request exceeds 64 KiB".into(),
+            ));
+        }
         let prefix = self.prefix.lock().expect("prefix mutex poisoned").clone();
         Ok(PreparedPublication {
             catalog: self,
@@ -364,7 +384,7 @@ impl RestCatalog {
             prefix,
             expected_parent,
             snapshot_id,
-            payload: serialize_commit(&requirements, &updates)?,
+            payload,
         })
     }
 
@@ -816,6 +836,41 @@ mod tests {
             "ab".repeat(32)
         );
         assert_eq!(wire["updates"][1]["snapshot-id"], 101);
+    }
+
+    #[test]
+    fn prepared_append_rejects_unretainable_requests() {
+        let mock = Mock::new(vec![]);
+        let catalog = mock.catalog();
+        let mut loaded = load_result(100).metadata.unwrap();
+        loaded
+            .partition_specs
+            .push(crate::catalog::metadata::PartitionSpec {
+                spec_id: 0,
+                fields: vec![],
+            });
+        let identity = PublicationIdentity {
+            operation_id: uuid::Uuid::from_u128(42),
+            table_uuid: loaded.table_uuid,
+            input_digest: [0; 32],
+        };
+        let mut snapshot = snap(101, Some(100));
+        snapshot.sequence_number = Some(2);
+        let mut oversized = snapshot.clone();
+        oversized.summary.insert("extra".into(), " ".repeat(65536));
+        assert!(matches!(
+            catalog.prepare_staged_append(&["ns"], "t", &loaded, oversized, identity),
+            Err(RestError::Decode(_))
+        ));
+
+        loaded.location = "s3://user:password@w/t".into();
+        snapshot.manifest_list = format!("{}/metadata/snap.avro", loaded.location);
+        assert!(matches!(
+            catalog.prepare_staged_append(&["ns"], "t", &loaded, snapshot, identity),
+            Err(RestError::Decode(_))
+        ));
+        mock.join();
+        assert_eq!(mock.requests().len(), 0);
     }
 
     #[test]
