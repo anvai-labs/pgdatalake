@@ -355,7 +355,7 @@ pg_lakehouse_publish_staged(PG_FUNCTION_ARGS)
 			loc = pg_datalake_write_commit(entry->ws, 3, errbuf, sizeof(errbuf));
 			if (loc == NULL)
 				ereport(ERROR,
-						(errcode(ERRCODE_CONNECTION_EXCEPTION),
+						(errcode(lakehouse_commit_errcode(entry)),
 						 errmsg("lakehouse: publisher commit failed: %s", errbuf)));
 			snap_id = pg_datalake_write_last_snapshot_id(entry->ws);
 			pg_datalake_write_commit_result_free(loc);

@@ -97,6 +97,8 @@ pub struct RestCatalog {
     pub(crate) endpoint: String,
     pub(crate) tokens: Box<dyn TokenProvider>,
     pub(crate) inner: reqwest::blocking::Client,
+    // Reads follow approved redirects. Commit POSTs may be sent only once.
+    commit_client: std::sync::OnceLock<Result<reqwest::blocking::Client, String>>,
     /// Table-route prefix from the config response (`overrides.prefix` in
     /// the Iceberg REST spec); set via `with_prefix()` or `fetch_config()`.
     pub(crate) prefix: std::sync::Mutex<Option<String>>,
@@ -122,6 +124,7 @@ pub enum RestError {
     /// error class (doc 03 §5): `commit_with_retry` re-plans from a fresh
     /// loadTable; everything else aborts the transaction.
     Conflict(String),
+    CommitStateUnknown(String),
     Decode(String),
 }
 
@@ -133,6 +136,7 @@ impl std::fmt::Display for RestError {
             RestError::Conflict(m) => {
                 write!(f, "REST catalog commit conflict (stale base): {m}")
             }
+            RestError::CommitStateUnknown(m) => write!(f, "catalog commit outcome unknown: {m}"),
             RestError::Decode(m) => write!(f, "REST catalog decode error: {m}"),
         }
     }
@@ -145,6 +149,7 @@ impl RestCatalog {
         Ok(Self {
             endpoint: endpoint.trim_end_matches('/').to_string(),
             tokens,
+            commit_client: std::sync::OnceLock::new(),
             inner: reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .redirect(same_origin_redirect_policy())
@@ -152,6 +157,20 @@ impl RestCatalog {
                 .map_err(|e| RestError::Http(e.to_string()))?,
             prefix: std::sync::Mutex::new(None),
         })
+    }
+
+    pub(super) fn commit_client(&self) -> Result<&reqwest::blocking::Client, RestError> {
+        self.commit_client
+            .get_or_init(|| {
+                reqwest::blocking::Client::builder()
+                    .timeout(Duration::from_secs(30))
+                    .retry(reqwest::retry::never())
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .map_err(|e| e.to_string())
+            })
+            .as_ref()
+            .map_err(|e| RestError::Http(e.clone()))
     }
 
     /// Set the table-route prefix explicitly (normally stored automatically

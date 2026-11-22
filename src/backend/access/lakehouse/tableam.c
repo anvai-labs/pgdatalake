@@ -597,7 +597,7 @@ lakehouse_xact_callback(XactEvent event, void *arg)
 						loc = pg_datalake_write_commit(entry->ws, 3, errbuf, sizeof(errbuf));
 					if (loc == NULL)
 						ereport(ERROR,
-								(errcode(ERRCODE_CONNECTION_EXCEPTION),
+								(errcode(lakehouse_commit_errcode(entry)),
 								 errmsg("lakehouse: managed commit failed for %s: %s",
 										get_rel_name(entry->relid) ? get_rel_name(entry->relid) : "?",
 										errbuf)));
@@ -2192,6 +2192,16 @@ stage_slot(LakehouseWriteEntry *entry, TupleTableSlot *slot, TupleDesc tupdesc)
 	MemoryContextSwitchTo(old);
 }
 
+/* The raw COW rewrite and UPDATE's row-version fetch both need a delete-free base. */
+static void
+check_cow_scan(ScanSession * session)
+{
+	if (pg_datalake_scan_has_deletes(session))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("lakehouse: copy-on-write UPDATE/DELETE is unsupported on a snapshot with Iceberg deletes")));
+}
+
 /*
  * COW tombstone capture (slice 28): decode the scan-produced tid into
  * (base file, rowidx), record it + the file's DELETED-entry identity.
@@ -2214,6 +2224,7 @@ capture_tombstone(Relation rel, ItemPointer tid)
 				 errdetail("The tid was not produced by a live managed scan of this relation "
 						   "in this transaction (rows staged by an earlier INSERT in the same "
 						   "transaction are not yet addressable).")));
+	check_cow_scan(scan->session);
 	if (ItemPointerGetOffsetNumber(tid) == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -2243,6 +2254,10 @@ capture_tombstone(Relation rel, ItemPointer tid)
 							(unsigned long long) task_idx,
 							(long long) nrows)));
 		open_write_session(entry, entry->tupdesc);
+		if (!pg_datalake_write_matches_scan(entry->ws, scan->session))
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("lakehouse: copy-on-write source changed between scan and write")));
 		tf = tomb_file_get(entry, file, true);
 		tomb_file_add_row(entry, tf, rowidx);
 		tomb_file_note_meta(tf, nrows, size);
@@ -2558,6 +2573,7 @@ lakehouse_tuple_fetch_row_version(Relation rel, ItemPointer tid,
 						RelationGetRelationName(rel)),
 				 errdetail("The tid was not produced by a live managed scan of this relation "
 						   "in this transaction.")));
+	check_cow_scan(scan->session);
 	if (ItemPointerGetOffsetNumber(tid) == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),

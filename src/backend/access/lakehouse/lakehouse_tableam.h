@@ -105,6 +105,20 @@ typedef struct LakehouseWriteEntry
 } LakehouseWriteEntry;
 
 /* tableam.c — write-state machinery used by the publisher */
+static inline int
+lakehouse_commit_errcode(LakehouseWriteEntry *entry)
+{
+	switch (pg_datalake_write_last_commit_failure(entry->ws))
+	{
+		case PgDatalakeCommitFailure_Conflict:
+			return ERRCODE_T_R_SERIALIZATION_FAILURE;
+		case PgDatalakeCommitFailure_Unknown:
+			return ERRCODE_T_R_STATEMENT_COMPLETION_UNKNOWN;
+		default:
+			return ERRCODE_CONNECTION_EXCEPTION;
+	}
+}
+
 extern Oid	lakehouse_am_oid(void);
 extern void install_lakehouse_count_exec(void);
 extern LakehouseWriteEntry *get_write_entry(Relation rel);

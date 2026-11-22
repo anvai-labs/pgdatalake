@@ -12,6 +12,10 @@ window, and treating PostgreSQL SERIALIZABLE as cross-engine SSI. The older
 protocol and phase goals below record design history. Claims about active
 capabilities require the tests in doc 18.
 
+## Superseded
+
+2026-11-21. The original COW replan in sections 2 and 4 could resurrect a row when a new delete file left the data path intact. For the first write profile a source snapshot with Iceberg delete work raises `0A000`. A moved source or rejected overwrite precondition raises `40001`. An ambiguous remote commit raises `40003` and requires reconciliation. The legacy staged worker still needs durable send intent and restart lookup before it can safely recover from that outcome. [Mutation guard](modules/05-iceberg-mutations.md) · [Staged recovery](modules/04a-publisher-recovery.md)
+
 ## 1. Visibility model
 
 | Scope | Heap behavior | Iceberg behavior (managed & external) |

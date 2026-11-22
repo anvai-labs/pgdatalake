@@ -172,13 +172,13 @@ struct ErrorWire {
 #[derive(Deserialize)]
 struct ErrorDetail {
     message: String,
+    #[serde(rename = "type")]
+    kind: String,
 }
 
 impl RestCatalog {
-    /// commitTable (doc 03 §2 Commit): POST requirements + updates; a 409
-    /// (`CommitFailedException` — some requirement failed server-side)
-    /// classifies as `RestError::Conflict` so `commit_with_retry` can react
-    /// while other 4xx/5xx stay non-retryable.
+    /// Send one commit proposal. Only a 409 carrying a catalog requirement
+    /// failure permits replanning. Ambiguous outcomes require reconciliation.
     pub fn commit_table(
         &self,
         namespace: &[&str],
@@ -211,23 +211,34 @@ impl RestCatalog {
             .token()
             .map_err(|e| RestError::Http(format!("token provider: {e}")))?;
         let resp = self
-            .inner
+            .commit_client()?
             .post(&url)
             .bearer_auth(token)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(payload)
             .send()
-            .map_err(|e| RestError::Http(e.to_string()))?;
+            .map_err(|e| RestError::CommitStateUnknown(e.without_url().to_string()))?;
         let status = resp.status();
         if status == reqwest::StatusCode::CONFLICT {
-            // Extract the server's requirement-failure message (REST spec
-            // ErrorResponse shape; fall back to the raw body).
-            let text = resp.text().unwrap_or_default();
-            let msg = serde_json::from_str::<ErrorWire>(&text)
-                .ok()
-                .and_then(|e| e.error.map(|x| x.message))
-                .unwrap_or(text);
-            return Err(RestError::Conflict(msg));
+            if let Ok(ErrorWire {
+                error: Some(detail),
+            }) = resp.json::<ErrorWire>()
+            {
+                if detail.kind == "CommitFailedException" {
+                    return Err(RestError::Conflict(detail.message));
+                }
+            }
+            return Err(RestError::CommitStateUnknown(
+                "unrecognized HTTP 409 response".into(),
+            ));
+        }
+        if status.is_server_error()
+            || status.is_redirection()
+            || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        {
+            return Err(RestError::CommitStateUnknown(format!(
+                "commitTable returned {status}"
+            )));
         }
         if !status.is_success() {
             return Err(RestError::Http(format!(
@@ -235,15 +246,8 @@ impl RestCatalog {
                 super::rest::redact_url(&url)
             )));
         }
-        // read as text first: decode failures surface the body prefix in
-        // the error instead of an opaque reqwest message
-        let text = resp.text().unwrap_or_default();
-        serde_json::from_str(&text).map_err(|e| {
-            RestError::Decode(format!(
-                "commitTable response: {e}; body starts: {:?}",
-                text.chars().take(200).collect::<String>()
-            ))
-        })
+        resp.json()
+            .map_err(|e| RestError::CommitStateUnknown(e.without_url().to_string()))
     }
 
     /// Commit with bounded re-plan retry (doc 07 §2 step 3). On each
@@ -516,9 +520,47 @@ mod tests {
         }
     }
 
-    /// A 500 (catalog down / internal) is NOT a conflict: no retry, Http.
     #[test]
-    fn commit_table_500_is_http_not_conflict() {
+    fn accepted_commit_with_lost_reply_is_unknown() {
+        let server = std::sync::Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
+        let endpoint = format!("http://{}", server.server_addr());
+        let listener = server.clone();
+        let worker = std::thread::spawn(move || {
+            let mut head = 100;
+            let mut posts = 0;
+            for mut req in listener.incoming_requests() {
+                let response = if req.method() == &tiny_http::Method::Post {
+                    let body: serde_json::Value = serde_json::from_reader(req.as_reader()).unwrap();
+                    assert_eq!(body["requirements"][1]["snapshot-id"], head);
+                    head = body["updates"][0]["snapshot"]["snapshot-id"]
+                        .as_i64()
+                        .unwrap();
+                    posts += 1;
+                    // The catalog has installed the snapshot. Its gateway times out
+                    // before the caller receives the commit response.
+                    tiny_http::Response::from_string("").with_status_code(504)
+                } else {
+                    tiny_http::Response::from_string(
+                        serde_json::to_string(&load_result(head)).unwrap(),
+                    )
+                };
+                req.respond(response).unwrap();
+            }
+            posts
+        });
+        let catalog = RestCatalog::new(&endpoint, Box::new(StaticToken(String::new()))).unwrap();
+        let result =
+            catalog.commit_with_retry(&["ns"], "t", |t| Ok(append_plan(t)), 3, Duration::ZERO);
+        let observed = catalog.load_table(&["ns"], "t").unwrap();
+        server.unblock();
+        assert_eq!(worker.join().unwrap(), 1);
+        assert_eq!(observed.metadata.unwrap().current_snapshot_id, Some(101));
+        assert!(matches!(result, Err(RestError::CommitStateUnknown(_))));
+    }
+
+    /// A server failure after dispatch leaves the result unresolved.
+    #[test]
+    fn commit_table_500_is_unknown() {
         let mock = Mock::new(vec![(
             500,
             r#"{"error": {"message": "boom", "type": "RESTException", "code": 500}}"#,
@@ -529,7 +571,59 @@ mod tests {
             .commit_table(&["analytics"], "events", &requirements, &updates)
             .unwrap_err();
         mock.join();
-        assert!(matches!(err, RestError::Http(_)), "{err}");
+        assert!(matches!(err, RestError::CommitStateUnknown(_)), "{err}");
+    }
+
+    #[test]
+    fn unrecognized_conflict_response_is_unknown() {
+        let mock = Mock::new(vec![(409, "{}")]);
+        let (requirements, updates) = append_plan(&load_result(100));
+        let result = mock
+            .catalog()
+            .commit_table(&["ns"], "t", &requirements, &updates);
+        mock.join();
+        assert!(matches!(result, Err(RestError::CommitStateUnknown(_))));
+    }
+
+    #[test]
+    fn malformed_successful_commit_response_is_unknown() {
+        let mock = Mock::new(vec![(200, "{")]);
+        let (requirements, updates) = append_plan(&load_result(100));
+        let result = mock
+            .catalog()
+            .commit_table(&["ns"], "t", &requirements, &updates);
+        mock.join();
+        assert!(matches!(result, Err(RestError::CommitStateUnknown(_))));
+    }
+
+    #[test]
+    fn commit_does_not_follow_a_same_origin_redirect() {
+        let server = std::sync::Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
+        let endpoint = format!("http://{}", server.server_addr());
+        let listener = server.clone();
+        let worker = std::thread::spawn(move || {
+            let mut requests = 0;
+            for req in listener.incoming_requests() {
+                requests += 1;
+                let response = if requests == 1 {
+                    tiny_http::Response::from_string("")
+                        .with_status_code(307)
+                        .with_header(
+                            tiny_http::Header::from_bytes("Location", "/another-route").unwrap(),
+                        )
+                } else {
+                    tiny_http::Response::from_string(commit_ok_body())
+                };
+                req.respond(response).unwrap();
+            }
+            requests
+        });
+        let catalog = RestCatalog::new(&endpoint, Box::new(StaticToken(String::new()))).unwrap();
+        let (requirements, updates) = append_plan(&load_result(100));
+        let result = catalog.commit_table(&["ns"], "t", &requirements, &updates);
+        server.unblock();
+        assert_eq!(worker.join().unwrap(), 1);
+        assert!(matches!(result, Err(RestError::CommitStateUnknown(_))));
     }
 
     /// doc 07 §2 step 3: on conflict the commit RE-PLANS — reload gives a

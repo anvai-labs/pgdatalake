@@ -21,6 +21,7 @@ pub enum StorageError {
     /// writer won, or the object already exists. Distinct so callers react
     /// by TYPE, never by searching error strings for "409" (13-review #6).
     Conflict(String),
+    CommitStateUnknown(String),
 }
 
 impl std::fmt::Display for StorageError {
@@ -31,6 +32,7 @@ impl std::fmt::Display for StorageError {
             StorageError::Decode(m) => write!(f, "storage decode error: {m}"),
             StorageError::Config(m) => write!(f, "storage config error: {m}"),
             StorageError::Conflict(m) => write!(f, "storage conflict: {m}"),
+            StorageError::CommitStateUnknown(m) => write!(f, "catalog commit outcome unknown: {m}"),
         }
     }
 }

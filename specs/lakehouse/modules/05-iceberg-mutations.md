@@ -11,6 +11,8 @@
 
 ## Independent test package
 
+The first guard refuses the whole source snapshot when the scan plan contains delete work. A concurrent change to the source pin aborts the overwrite, including changes that preserve the target data path. The CI interop smoke exercises both rules through SQL and rereads the result in Trino. [Fixture](../../../src/test/lakehouse/fixtures/cow-delete-guard.sh)
+
 - Existing deleted row plus a separate target delete, then a change to the file's delete set with its data path still live. Use `cow-delete-safe`. Verify no resurrection and no change after a declined rewrite.
 - Two writes touching the same file, independent-file changes, abort after upload, table replacement and compatible append retry. Check exact historical and current row IDs with an independent reader.
 - Width/churn canaries report files/bytes rewritten, retained manifests and logical rows affected. Any future DV writer needs explicit lineage, maintenance, and cross-engine decode gates.
