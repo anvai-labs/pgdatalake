@@ -516,7 +516,9 @@ def main():
     adapter_path = (Path(__file__).with_name("managed-capture-binding-adapter.sql")
                     if args.provider else args.adapter)
     adapter = BASELINE_ADAPTER if baseline else adapter_path.read_text(encoding="utf-8")
-    sql("postgres", f"CREATE DATABASE {db}")
+    # The fixture compares decoded Unicode with jsonb. A C-locale initdb can
+    # default to SQL_ASCII, which cannot translate non-ASCII JSON escapes.
+    sql("postgres", f"CREATE DATABASE {db} TEMPLATE template0 ENCODING 'UTF8' LOCALE 'C'")
     try:
         with ThreadingHTTPServer(("127.0.0.1", 0), Recorder) as server:
             thread = threading.Thread(target=server.serve_forever)
