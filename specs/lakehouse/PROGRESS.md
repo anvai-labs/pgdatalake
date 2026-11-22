@@ -2,7 +2,7 @@
 
 **Product snapshot at merged `lakehouse-dev` revision `90518dca8cca37348dc5da64305f782b267a18d6` (PR #47).** The PG19.0 serial source-package smoke is implemented. Managed foreground binding, verified worker recovery and compatible base-plus-overlay reads remain open. The [illustrated product map](17-anvai-lake-product.md#two-packages-one-shared-reader) ties each claim to its test and shows the order of the next correctness gates. The assessment below retains the historical findings at PR #45 and the original [performance baseline](16-release-reassessment-and-scale.md).
 
-**Managed COUNT blocker.** On the 1.6 fork a prepared COUNT returned 1 after an uncommitted insert while the same backend scanned `[10,20]`. Both paths agreed on 1 after rollback. The [minimal SQL case and exit condition](modules/03-managed-visibility.md#first-red-case-for-managed-count) belong to the managed visibility owner. The stock reader remains read-only.
+**Managed COUNT and local writes.** On the PR #47 fork a prepared COUNT returned 1 while the same backend scanned `[10,20]`. The executor now takes the ordinary scan for relations with transaction-local write state. The SQL regression covers savepoint rollback, full rollback and commit with one reused generic plan. Compatible published-base and committed-overlay counts still need a membership proof. [Original reproducer and regression](modules/03-managed-visibility.md#first-red-case-for-managed-count)
 
 ## Stock read foundation following PR #46
 
