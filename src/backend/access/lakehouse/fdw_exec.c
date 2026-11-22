@@ -45,14 +45,15 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 	Relation	rel = node->ss.ss_currentRelation;
 	LakehouseOptions opts;
 	LakehouseExecState *state;
+	ForeignScan *fscan = (ForeignScan *) node->ss.ps.plan;
+	List	   *projection_attrs = NIL;
+	ListCell   *next_attr;
 	TupleDesc	tupdesc;
 	StringInfoData proj;
-	bool		first_col = true;
+	int			proj_col = 0;
 
 	/* An upper COUNT scan has no base relation or input tuple. */
 	{
-		ForeignScan *fscan = (ForeignScan *) node->ss.ps.plan;
-
 		if (fscan != NULL && fscan->fdw_private != NIL &&
 			list_length(fscan->fdw_private) == 3 &&
 			strcmp(strVal(linitial(fscan->fdw_private)),
@@ -92,25 +93,33 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 	state->batch_valid = false;
 
 	/*
-	 * projection: visible attribute names, in attribute order — a counted
-	 * JSON ARRAY, not comma-separated: column names may contain commas
-	 * (13-review #8b)
+	 * Attribute positions are in relation order. Use a JSON array for column
+	 * names, including those containing commas.
 	 */
+	if (list_length(fscan->fdw_private) == 3)
+		projection_attrs = lthird(fscan->fdw_private);
+	next_attr = list_head(projection_attrs);
 	initStringInfo(&proj);
 	appendStringInfoChar(&proj, '[');
 	for (int i = 0; i < tupdesc->natts; i++)
 	{
 		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+		bool		projected = projection_attrs == NIL;
 
-		if (attr->attisdropped)
+		if (next_attr != NULL && lfirst_int(next_attr) == i + 1)
+		{
+			projected = true;
+			next_attr = lnext(projection_attrs, next_attr);
+		}
+		if (attr->attisdropped || !projected)
 		{
 			state->slot_index[i] = -1;
 			continue;
 		}
-		if (!first_col)
+		if (proj_col > 0)
 			appendStringInfoChar(&proj, ',');
-		escape_json(&proj, NameStr(attr->attname)); /* emits its own quotes */
-		first_col = false;
+		escape_json(&proj, NameStr(attr->attname));
+		state->slot_index[i] = proj_col++;
 		getTypeInputInfo(attr->atttypid,
 						 &state->in_funcs[i].fn_oid,
 						 &state->typioparams[i]);
@@ -118,14 +127,6 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 	}
 	appendStringInfoChar(&proj, ']');
 
-	/* renumber projection columns (dropped slots don't occupy positions) */
-	{
-		int			proj_col = 0;
-
-		for (int i = 0; i < tupdesc->natts; i++)
-			if (state->slot_index[i] >= 0)
-				state->slot_index[i] = proj_col++;
-	}
 	state->projection_csv = proj.data;
 
 	/*
@@ -135,8 +136,6 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 	state->parallel = IsParallelWorker();
 	if (node->ss.ps.plan != NULL)
 	{
-		ForeignScan *fscan = (ForeignScan *) node->ss.ps.plan;
-
 		if (fscan->fdw_private != NIL)
 		{
 			char	   *pred_private = strVal(linitial(fscan->fdw_private));
