@@ -56,6 +56,7 @@ SELECT count(*) AS exact FROM cnt_elide;
 
 -- prepared plans stay FRESH across commits (spec 16 blocker 1: a generic
 -- prepared COUNT returned 2 before and after a committed third row)
+SET plan_cache_mode = force_generic_plan;
 PREPARE cnt_p AS SELECT count(*) FROM cnt_elide;
 EXECUTE cnt_p;
  count 
@@ -77,20 +78,55 @@ EXECUTE cnt_p;
      7
 (1 row)
 
-DEALLOCATE cnt_p;
--- savepoint rollback removes staged rows: the count must reflect pruning
+-- Compare the ordinary scan with the reused COUNT while rows are still
+-- backend-local, then check both subtransaction and transaction rollback.
 BEGIN;
 INSERT INTO cnt_elide VALUES (300, 'a');
 SAVEPOINT s1;
 INSERT INTO cnt_elide VALUES (400, 'b');
-ROLLBACK TO s1;
-COMMIT;
-SELECT count(*) AS after_savepoint_prune FROM cnt_elide;
- after_savepoint_prune 
------------------------
-                     8
+SELECT array_agg(id ORDER BY id) FROM cnt_elide;
+          array_agg          
+-----------------------------
+ {1,2,3,4,5,100,200,300,400}
 (1 row)
 
+EXECUTE cnt_p;
+ count 
+-------
+     9
+(1 row)
+
+ROLLBACK TO s1;
+EXECUTE cnt_p;
+ count 
+-------
+     8
+(1 row)
+
+ROLLBACK;
+EXECUTE cnt_p;
+ count 
+-------
+     7
+(1 row)
+
+BEGIN;
+INSERT INTO cnt_elide VALUES (300, 'a');
+EXECUTE cnt_p;
+ count 
+-------
+     8
+(1 row)
+
+COMMIT;
+EXECUTE cnt_p;
+ count 
+-------
+     8
+(1 row)
+
+DEALLOCATE cnt_p;
+RESET plan_cache_mode;
 -- permission semantics: a role without SELECT on the table must NOT be
 -- able to read its count (the gated-off hook answered from the ledger
 -- without any relation permission check)

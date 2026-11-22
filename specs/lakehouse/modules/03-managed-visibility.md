@@ -30,7 +30,9 @@ EXECUTE n;
 
 The scan observed `[10,20]` and `count(id) = 2`. The optimized COUNT returned **1** inside the transaction and **1** after rollback. Required results are **2** then **1**. The ledger sum is available for the committed row. The new row is still in backend-local staged capture until pre-commit. Recomputing the ledger sum at execution cannot see it. [Managed COUNT](../../../src/backend/access/lakehouse/managed_count.c) · [TableAM capture](../../../src/backend/access/lakehouse/tableam.c)
 
-First make the existing shortcut fall back to the ordinary aggregate whenever the backend has visible staged rows whose membership it cannot prove. In the regression compare the shortcut with the ordinary scan before and after a savepoint rollback, full rollback and commit. On a later committed read exercise reuse of the same prepared plan. An FDW successor can share a proof for the published pin. The managed caller must also account for this backend's writes and for the PostgreSQL-visible segments already included in the selected pin.
+The executor now falls back to the ordinary aggregate while this backend has write state for the relation. A read uses the same non-creating lookup as the TableAM scan. The generic-plan regression exercises seven committed rows and two new rows, a rollback to one new row, full rollback, another insert and commit. Expected counts are 9, 8, 7, 8 and 8. [Regression SQL](../../../src/test/regress/lakehouse/sql/count_elision.sql)
+
+An FDW successor can share a proof for the published pin. The managed caller must also account for this backend's writes and for the PostgreSQL-visible segments already included in the selected pin.
 
 ### Compatible published pin
 
