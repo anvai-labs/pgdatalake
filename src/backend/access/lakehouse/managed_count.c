@@ -256,11 +256,12 @@ lakehouse_managed_count(PG_FUNCTION_ARGS)
 		aclcheck_error(aclresult, OBJECT_TABLE, get_rel_name(relid));
 
 	/*
-	 * PROOF GATE: RLS in effect or inheritance children can make the ledger
-	 * sum wrong — fall back to the ordinary aggregate (SPI runs the real
-	 * executor semantics as this user).
+	 * The ledger receives staged rows at pre-commit. A backend with write
+	 * state for this relation must use the same overlay as a normal scan.
+	 * RLS and inherited rows also require the ordinary aggregate.
 	 */
-	if (check_enable_rls(relid, GetUserId(), false) != RLS_NONE ||
+	if (lakehouse_find_write_entry(relid) != NULL ||
+		check_enable_rls(relid, GetUserId(), false) != RLS_NONE ||
 		find_inheritance_children(relid, NoLock) != NIL)
 		goto ordinary_fallback;
 

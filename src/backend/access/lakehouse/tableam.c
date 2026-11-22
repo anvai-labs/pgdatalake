@@ -1156,6 +1156,15 @@ decode_lakehouse_reloptions(Relation rel, LakehouseOptions *opts)
 	return opts->table != NULL;
 }
 
+/* A read must not create transaction-local write state. */
+LakehouseWriteEntry *
+lakehouse_find_write_entry(Oid relid)
+{
+	if (write_entries == NULL)
+		return NULL;
+	return hash_search(write_entries, &relid, HASH_FIND, NULL);
+}
+
 LakehouseWriteEntry *
 get_write_entry(Relation rel)
 {
@@ -1708,15 +1717,7 @@ lakehouse_scan_begin(Relation rel, Snapshot snapshot,
 	lakehouse_scan_common_setup(scan, rel, NULL);
 	scan->row_in_task = 0;
 	scan->cur_task_path = NULL;
-	if (write_entries != NULL)
-	{
-		bool		found;
-
-		scan->entry = (LakehouseWriteEntry *)
-			hash_search(write_entries, &rel->rd_id, HASH_FIND, &found);
-		if (!found)
-			scan->entry = NULL;
-	}
+	scan->entry = lakehouse_find_write_entry(RelationGetRelid(rel));
 	register_scan_for_dml(RelationGetRelid(rel), scan);
 	return (TableScanDesc) scan;
 }
