@@ -1,8 +1,9 @@
 //! Scoped REST and S3 transport for an independently admitted v2 append.
 
-use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{collections::HashSet, sync::Arc};
 
+use object_store::aws::{AwsCredential, AwsCredentialProvider};
 use uuid::Uuid;
 
 use crate::catalog::commit::{validate_staged_base, PreparedPublication};
@@ -22,6 +23,7 @@ use crate::writer::{parse_row_json, BatchWriter, WriteColumn};
 
 /// Immutable target facts provided by trusted enrollment, independently of
 /// the catalog response. Each worker gets the original descriptor on replay.
+#[derive(Clone, PartialEq, Eq)]
 pub struct PublicationTarget {
     pub binding: PublicationBindingIdentity,
     pub table_uuid: Uuid,
@@ -35,6 +37,66 @@ pub struct PublicationTarget {
     pub table_name: String,
     pub object_endpoint: String,
     pub s3_region: String,
+}
+
+/// The operator resolves separate authority for an admitted send and for
+/// read-only verification of the binding that was retained with an intent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PublicationPurpose {
+    Send,
+    Lookup,
+}
+
+/// An independently resolved, in-memory credential bundle for one target.
+/// The resolver sets the earliest expiry of the two credentials and grant.
+pub struct PublicationCredentials {
+    pub target: PublicationTarget,
+    pub purpose: PublicationPurpose,
+    pub expires_at: SystemTime,
+    pub catalog_bearer: String,
+    pub objects: AwsCredential,
+}
+
+struct PublicationBearer {
+    value: String,
+    expires_at: SystemTime,
+}
+
+impl TokenProvider for PublicationBearer {
+    fn token(&self) -> Result<String, RestError> {
+        if SystemTime::now() >= self.expires_at {
+            return Err(RestError::Http(
+                "publication catalog credential expired".into(),
+            ));
+        }
+        Ok(self.value.clone())
+    }
+}
+
+struct PublicationS3Credentials {
+    credential: Arc<AwsCredential>,
+    expires_at: SystemTime,
+}
+
+impl std::fmt::Debug for PublicationS3Credentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PublicationS3Credentials")
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::CredentialProvider for PublicationS3Credentials {
+    type Credential = AwsCredential;
+
+    async fn get_credential(&self) -> object_store::Result<Arc<AwsCredential>> {
+        if SystemTime::now() >= self.expires_at {
+            return Err(object_store::Error::Generic {
+                store: "scoped S3",
+                source: "publication storage credential expired".into(),
+            });
+        }
+        Ok(self.credential.clone())
+    }
 }
 
 /// Resource limits for one admitted append. The SQL scheduler must also
@@ -51,6 +113,8 @@ pub struct ScopedPublisher {
     root: S3ReadRoot,
     catalog: RestCatalog,
     objects: S3Options,
+    s3_credentials: AwsCredentialProvider,
+    purpose: PublicationPurpose,
     columns: Vec<(String, IcebergType)>,
     limits: PublicationLimits,
 }
@@ -71,12 +135,19 @@ impl ScopedPublisher {
     /// The caller supplies the source PostgreSQL column order and types.
     pub fn new(
         target: PublicationTarget,
-        tokens: Box<dyn TokenProvider>,
-        access_key: String,
-        secret_key: String,
+        purpose: PublicationPurpose,
+        credentials: PublicationCredentials,
         columns: Vec<(String, IcebergType)>,
         limits: PublicationLimits,
     ) -> Result<Self, StorageError> {
+        if target != credentials.target
+            || purpose != credentials.purpose
+            || SystemTime::now() >= credentials.expires_at
+        {
+            return Err(StorageError::ReadDenied(
+                "publication credentials differ from the approved target or purpose, or have expired".into(),
+            ));
+        }
         if target.binding.binding_generation <= 0
             || target.table_uuid.is_nil()
             || target.binding.authority_id.is_nil()
@@ -94,8 +165,16 @@ impl ScopedPublisher {
                 .s3_region
                 .bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-            || access_key.is_empty()
-            || secret_key.is_empty()
+            || credentials.catalog_bearer.is_empty()
+            || !credentials
+                .catalog_bearer
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic())
+            || credentials.objects.key_id.is_empty()
+            || credentials.objects.secret_key.is_empty()
+            || credentials.objects.token.as_ref().is_some_and(|token| {
+                token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_graphic())
+            })
             || columns.is_empty()
             || limits.captured_bytes == 0
             || limits.captured_rows == 0
@@ -111,7 +190,10 @@ impl ScopedPublisher {
             .map_err(|_| StorageError::Config("publication requires a canonical S3 root".into()))?;
         let mut catalog = RestCatalog::new_scoped(
             &canonical_endpoint(&target.catalog_endpoint, false)?,
-            tokens,
+            Box::new(PublicationBearer {
+                value: credentials.catalog_bearer,
+                expires_at: credentials.expires_at,
+            }),
         )
         .map_err(|error| StorageError::Config(error.to_string()))?;
         if !target.catalog_prefix.is_empty() {
@@ -120,18 +202,37 @@ impl ScopedPublisher {
         let objects = S3Options {
             endpoint: Some(canonical_endpoint(&target.object_endpoint, true)?),
             region: Some(target.s3_region.clone()),
-            access_key_id: Some(access_key),
-            secret_access_key: Some(secret_key),
-            path_style: true,
+            ..S3Options::default()
         };
         Ok(Self {
             target,
             root,
             catalog,
             objects,
+            s3_credentials: Arc::new(PublicationS3Credentials {
+                credential: Arc::new(credentials.objects),
+                expires_at: credentials.expires_at,
+            }),
+            purpose,
             columns,
             limits,
         })
+    }
+
+    fn open_object(&self, location: &Location) -> Result<StorageIo, StorageError> {
+        StorageIo::open_bound_s3_with_credentials(
+            location,
+            &self.objects,
+            Some(self.s3_credentials.clone()),
+        )
+    }
+
+    fn open_scoped_object(&self, uri: &str) -> Result<(StorageIo, String), StorageError> {
+        let location = self.root.object_location(uri)?;
+        let Location::S3 { key, .. } = &location else {
+            unreachable!("validated S3 root");
+        };
+        Ok((self.open_object(&location)?, key.clone()))
     }
 
     fn check_claim(&self, claim: &PublicationClaim) -> Result<(), RestError> {
@@ -264,6 +365,11 @@ impl PublicationCatalog for ScopedPublisher {
         claim: &PublicationClaim,
         members: &[CapturedMember],
     ) -> Result<PreparedPublication<'_>, StorageError> {
+        if self.purpose != PublicationPurpose::Send {
+            return Err(StorageError::ReadDenied(
+                "lookup credentials cannot prepare a publication".into(),
+            ));
+        }
         self.check_claim(claim).map_err(storage_error)?;
         let base = self
             .target_metadata(self.load().map_err(storage_error)?)
@@ -283,7 +389,7 @@ impl PublicationCatalog for ScopedPublisher {
                     "base manifest list is outside the enrolled table".into(),
                 ));
             }
-            let (io, key) = self.root.open(path, &self.objects)?;
+            let (io, key) = self.open_scoped_object(path)?;
             let manifests = crate::manifest::parse_manifest_list(&io.get_bytes_bounded(
                 &key,
                 self.limits.manifest_bytes,
@@ -305,7 +411,7 @@ impl PublicationCatalog for ScopedPublisher {
         let Location::S3 { bucket, key } = &location else {
             unreachable!("validated S3 root");
         };
-        let io = StorageIo::open_bound_s3(&location, &self.objects)?;
+        let io = self.open_object(&location)?;
         let file = writer.write_file(&io, &format!("{key}/data"), 0)?;
         let snapshot_id = ((Uuid::new_v4().as_u128() >> 64) as i64) & i64::MAX;
         let written = write_bounded_snapshot(
@@ -352,6 +458,11 @@ impl PublicationCatalog for ScopedPublisher {
         claim: &PublicationClaim,
         intent: AuthorizedPublication<'_>,
     ) -> Result<PublicationLookup, RestError> {
+        if self.purpose != PublicationPurpose::Lookup {
+            return Err(RestError::Http(
+                "publication lookup requires separate read credentials".into(),
+            ));
+        }
         self.check_claim(claim)?;
         if intent.identity.operation_id != claim.identity.operation_id
             || intent.identity.input_digest != claim.identity.input_digest
@@ -372,8 +483,7 @@ impl PublicationCatalog for ScopedPublisher {
         let base = self.target_metadata(loaded)?;
         match retained.verify(&base, |path| {
             let (io, key) = self
-                .root
-                .open(path, &self.objects)
+                .open_scoped_object(path)
                 .map_err(storage_error_to_rest)?;
             io.sha256_bounded(
                 &key,

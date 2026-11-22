@@ -6,7 +6,6 @@ use tiny_http::{Header, Method, Response, Server};
 
 use super::*;
 use crate::catalog::publication::{sha256, PublicationIdentity};
-use crate::catalog::rest::StaticToken;
 use crate::publication_worker::{ClaimState, RetainedAttempt};
 
 const ROUTE: &str = "/catalog/v1/enrolled/namespaces/nested%1Forders/tables/events";
@@ -37,11 +36,40 @@ fn target(endpoint: &str) -> PublicationTarget {
 }
 
 fn publisher(target: PublicationTarget) -> Result<ScopedPublisher, StorageError> {
+    publisher_for(target, PublicationPurpose::Send)
+}
+
+fn publisher_for(
+    target: PublicationTarget,
+    purpose: PublicationPurpose,
+) -> Result<ScopedPublisher, StorageError> {
+    let (bearer, key, token) = match purpose {
+        PublicationPurpose::Send => ("catalog-token", "enrolled-key", "send-session"),
+        PublicationPurpose::Lookup => ("lookup-token", "lookup-key", "lookup-session"),
+    };
+    let credentials = PublicationCredentials {
+        target: target.clone(),
+        purpose,
+        expires_at: SystemTime::now() + Duration::from_secs(60),
+        catalog_bearer: bearer.into(),
+        objects: AwsCredential {
+            key_id: key.into(),
+            secret_key: "fixture-secret".into(),
+            token: Some(token.into()),
+        },
+    };
+    publisher_with_credentials(target, purpose, credentials)
+}
+
+fn publisher_with_credentials(
+    target: PublicationTarget,
+    purpose: PublicationPurpose,
+    credentials: PublicationCredentials,
+) -> Result<ScopedPublisher, StorageError> {
     ScopedPublisher::new(
         target,
-        Box::new(StaticToken("catalog-token".into())),
-        "enrolled-key".into(),
-        "enrolled-secret".into(),
+        purpose,
+        credentials,
         vec![("id".into(), IcebergType::Long)],
         PublicationLimits {
             captured_bytes: 1024,
@@ -50,6 +78,86 @@ fn publisher(target: PublicationTarget) -> Result<ScopedPublisher, StorageError>
             manifest_timeout: Duration::from_secs(3),
         },
     )
+}
+
+#[test]
+fn credential_admission_blocks_wrong_scope_purpose_and_expiry_without_io() {
+    let remote = FakeProviders::start();
+    let expected = target(&remote.endpoint());
+    let credentials = |scope, purpose, expires_at| PublicationCredentials {
+        target: scope,
+        purpose,
+        expires_at,
+        catalog_bearer: "fixture-bearer".into(),
+        objects: object_store::aws::AwsCredential {
+            key_id: "fixture-key".into(),
+            secret_key: "fixture-secret".into(),
+            token: Some("fixture-session".into()),
+        },
+    };
+    let now = SystemTime::now();
+    let future = now + Duration::from_secs(30);
+    let mut sibling = target(&remote.endpoint());
+    sibling.table_root.push_str("-old");
+    for supplied in [
+        credentials(sibling, PublicationPurpose::Send, future),
+        credentials(
+            target(&remote.endpoint()),
+            PublicationPurpose::Lookup,
+            future,
+        ),
+        credentials(target(&remote.endpoint()), PublicationPurpose::Send, now),
+    ] {
+        let result =
+            publisher_with_credentials(expected.clone(), PublicationPurpose::Send, supplied);
+        assert!(matches!(result, Err(StorageError::ReadDenied(_))));
+    }
+    let lookup = publisher_with_credentials(
+        expected,
+        PublicationPurpose::Lookup,
+        credentials(
+            target(&remote.endpoint()),
+            PublicationPurpose::Lookup,
+            future,
+        ),
+    )
+    .unwrap();
+    assert!(matches!(
+        lookup.prepare(&claim(), &[member()]),
+        Err(StorageError::ReadDenied(_))
+    ));
+    let state = remote.state.lock().unwrap();
+    assert!(
+        state.reads.is_empty()
+            && state.posts.is_empty()
+            && state.object_reads.is_empty()
+            && state.object_writes.is_empty()
+    );
+}
+
+#[test]
+fn expired_credentials_are_refused_at_request_signing() {
+    let catalog = PublicationBearer {
+        value: "fixture-bearer".into(),
+        expires_at: UNIX_EPOCH,
+    };
+    assert!(catalog.token().is_err());
+
+    let storage = PublicationS3Credentials {
+        credential: Arc::new(AwsCredential {
+            key_id: "fixture-key".into(),
+            secret_key: "fixture-secret".into(),
+            token: Some("fixture-token".into()),
+        }),
+        expires_at: UNIX_EPOCH,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    assert!(runtime
+        .block_on(object_store::CredentialProvider::get_credential(&storage))
+        .is_err());
+    assert_eq!(format!("{storage:?}"), "PublicationS3Credentials");
 }
 
 fn claim() -> PublicationClaim {
@@ -158,7 +266,10 @@ impl FakeProviders {
                 let empty = || Response::from_data(Vec::new());
                 let response = match (req.method(), path.as_str()) {
                     (&Method::Get, ROUTE) => {
-                        assert_eq!(auth, "Bearer catalog-token");
+                        assert!(matches!(
+                            auth,
+                            "Bearer catalog-token" | "Bearer lookup-token"
+                        ));
                         state.reads.push(path);
                         if state.catalog_redirect {
                             redirect()
@@ -184,7 +295,12 @@ impl FakeProviders {
                         }
                     }
                     (&Method::Put, _) if path.starts_with(OBJECT_PATH) => {
-                        assert!(auth.contains("Credential=enrolled-key/"), "{auth}");
+                        assert!(auth.contains("Credential=enrolled-key/"));
+                        assert!(req
+                            .headers()
+                            .iter()
+                            .any(|h| h.field.equiv("x-amz-security-token")
+                                && h.value.as_str() == "send-session"));
                         assert!(req
                             .headers()
                             .iter()
@@ -196,7 +312,17 @@ impl FakeProviders {
                         empty().with_header(header("ETag", "\"created\""))
                     }
                     (&Method::Get, _) if path.starts_with(OBJECT_PATH) => {
-                        assert!(auth.contains("Credential=enrolled-key/"), "{auth}");
+                        let (key, token) = if path == PARENT_PATH {
+                            ("Credential=enrolled-key/", "send-session")
+                        } else {
+                            ("Credential=lookup-key/", "lookup-session")
+                        };
+                        assert!(auth.contains(key));
+                        assert!(req
+                            .headers()
+                            .iter()
+                            .any(|h| h.field.equiv("x-amz-security-token")
+                                && h.value.as_str() == token));
                         state.object_reads.push(path.clone());
                         if state.object_redirect {
                             redirect()
@@ -335,6 +461,7 @@ fn refuses_route_changes_and_redirects() {
 fn one_pinned_post_and_read_only_exact_recovery() {
     let remote = FakeProviders::start();
     let publisher = publisher(target(&remote.endpoint())).unwrap();
+    let verifier = publisher_for(target(&remote.endpoint()), PublicationPurpose::Lookup).unwrap();
     let mut claim = claim();
     let prepared = publisher.prepare(&claim, &[member()]).unwrap();
     let body = prepared.request_body().to_vec();
@@ -353,8 +480,9 @@ fn one_pinned_post_and_read_only_exact_recovery() {
         request_digest: intent.request_digest,
         request_body: Some(body.clone()),
     });
+    assert!(publisher.lookup(&claim, intent).is_err());
     assert_eq!(
-        publisher.lookup(&claim, intent).unwrap(),
+        verifier.lookup(&claim, intent).unwrap(),
         PublicationLookup::Unresolved
     );
     assert!(matches!(
@@ -381,7 +509,7 @@ fn one_pinned_post_and_read_only_exact_recovery() {
         md["refs"]["main"]["snapshot-id"] = json!(later_snapshot);
     }
     assert_eq!(
-        publisher.lookup(&claim, intent).unwrap(),
+        verifier.lookup(&claim, intent).unwrap(),
         PublicationLookup::Accepted {
             snapshot_id: snapshot
         }
@@ -389,7 +517,7 @@ fn one_pinned_post_and_read_only_exact_recovery() {
 
     let mut stale = claim;
     stale.binding.as_mut().unwrap().binding_generation += 1;
-    assert!(publisher.lookup(&stale, intent).is_err());
+    assert!(verifier.lookup(&stale, intent).is_err());
 
     let state = remote.state.lock().unwrap();
     assert_eq!(state.reads, vec![ROUTE; 3]);

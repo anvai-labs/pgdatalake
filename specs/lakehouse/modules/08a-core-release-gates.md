@@ -29,6 +29,8 @@ commit POST, one WAL-flushed intent with the original bytes, exact independent
 rows at both pins, and an unaffected later segment. Replaying a completed
 operation preserves the receipt and issues zero catalog requests.
 
+Purpose-specific credentials are a dependency of the native scheduler. Before provider I/O refuse a valid bundle for a sibling binding or the wrong purpose, and refuse expired credentials. The recorder distinguishes catalog bearer purpose, SigV4 key and session-token headers, object writes and catalog POSTs. Repeat on a real scoped issuer before publishing a cloud profile. [Credential handoff](04b-scoped-send-admission.md#credential-handoff)
+
 A separate lookup-only wake on an unsent operation must leave the owner generation unchanged and issue zero catalog requests. Withhold PostgreSQL's success reply after its real authorization commit and restart. Observe **zero catalog commit POSTs**, the original source and intent WAL commits, identical retained bytes, the reserved first member, the later pending member and Trino's unchanged parent. The joined fixture exercises these checks with the Rust driver. The native scheduler must reproduce them using independently resolved credentials. [Worker contract](04b-scoped-send-admission.md#native-worker-integration)
 
 The fixture trusts a disposable operator's explicit enrollment facts. Extension 1.8 validates member scope and checks the active grant at the send fence in the joined fixture. Production enablement still requires the native scheduler, actual credential resolution and a deployment-specific zero-forbidden-request drill. The managed read overlay and promoted-primary

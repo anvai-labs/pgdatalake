@@ -111,13 +111,19 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
     stale_head = threading.Event()
     unavailable = threading.Event()
     posts, lookups, errors = [], [], []
-    requests = []
+    requests, catalog_auth = [], []
     revoke_after_acceptance = admitted_transport and reply_loss == "http_504"
     next_operation = str(uuid.uuid4())
 
     class CatalogGateway(BaseHTTPRequestHandler):
         def do_GET(self):
             requests.append(self.path)
+            if admitted_transport:
+                bearer = self.headers.get("Authorization")
+                catalog_auth.append(("GET", bearer))
+                if bearer not in ("Bearer fixture-send", "Bearer fixture-lookup"):
+                    self.send_error(403, "fixture requires purpose-specific catalog credentials")
+                    return
             if self.path == route:
                 lookups.append(stale_head.is_set())
                 if unavailable.is_set():
@@ -136,6 +142,12 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
                 return
             payload = self.rfile.read(int(self.headers["Content-Length"]))
             posts.append(payload)
+            if admitted_transport:
+                bearer = self.headers.get("Authorization")
+                catalog_auth.append(("POST", bearer))
+                if bearer != "Bearer fixture-send":
+                    self.send_error(403, "fixture lookup credentials cannot commit")
+                    return
             if reply_loss == "authorization_ack":
                 self.send_error(409, "authorization reply was withheld; no POST is permitted")
                 return
@@ -330,6 +342,7 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
             # Unavailable and then stale evidence each leave the intent reserved
             # without another POST or local completion.
             expected_posts = 0 if lost_authorization else 1
+            restart_requests = len(catalog_auth)
             unavailable.set()
             assert drive(lookup_only=admitted_transport) == "hold lookup_unavailable"
             assert len(posts) == expected_posts
@@ -355,6 +368,7 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
                     f"{first}|f|\n{late}|f|")
                 sql(db, managed_claim(next_operation, late), error="40001")
                 assert not posts and set(requests) == {route}
+                assert catalog_auth[restart_requests:] == [("GET", "Bearer fixture-lookup")] * 3
                 assert set(trino(snaps).splitlines()) == initial_snapshots
                 _, _, head = enrolled_metadata(namespace)
                 assert head["current-snapshot-id"] == parent
@@ -365,6 +379,7 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
                     "parent": str(parent), "proposed": str(proposed_snapshot), "trino_rows": [int(rows)],
                     "reserved_member": first, "later_pending": late, "catalog_posts": len(posts),
                     "catalog_gets": len(lookups), "lookup_outcome": "acceptance_unproved",
+                    "recovery_gets_with_lookup_grant": len(catalog_auth) - restart_requests,
                     "source_commit_lsn": retained["source_commit_lsn"], "intent_commit_lsn": retained["intent_commit_lsn"],
                     "body_sha256": retained["digest"], "intent_generation": retained["owner_generation"],
                     "recovery_generation": generation, "samples": 1, "restart_ms": round(restart_ms, 1),
@@ -405,6 +420,7 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
             assert trino(f"SELECT id FROM {table} FOR VERSION AS OF {proposed_snapshot} ORDER BY id") == "10\n20"
             if admitted_transport:
                 assert set(requests) == {route}, requests
+                assert catalog_auth[restart_requests:] == [("GET", "Bearer fixture-lookup")] * 3
             capture_source = "seeded" if capture_adapter is None else "ordinary_sql"
             transport = "admitted" if admitted_transport else "legacy_fixture"
             print(f"bound worker: capture={capture_source} transport={transport} reply_loss={reply_loss} "

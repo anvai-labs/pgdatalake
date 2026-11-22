@@ -218,22 +218,31 @@ impl object_store::client::HttpConnector for ScopedS3Connector {
 
 impl StorageIo {
     pub fn open(loc: &Location, s3: Option<&S3Options>) -> Result<Self, StorageError> {
-        Self::open_inner(loc, s3, false)
+        Self::open_inner(loc, s3, false, None)
     }
 
     pub(crate) fn open_bound_s3(loc: &Location, s3: &S3Options) -> Result<Self, StorageError> {
+        Self::open_bound_s3_with_credentials(loc, s3, None)
+    }
+
+    pub(crate) fn open_bound_s3_with_credentials(
+        loc: &Location,
+        s3: &S3Options,
+        credentials: Option<object_store::aws::AwsCredentialProvider>,
+    ) -> Result<Self, StorageError> {
         if !matches!(loc, Location::S3 { .. }) || s3.endpoint.is_none() || s3.region.is_none() {
             return Err(StorageError::Config(
                 "bound S3 access requires explicit transport".into(),
             ));
         }
-        Self::open_inner(loc, Some(s3), true)
+        Self::open_inner(loc, Some(s3), true, credentials)
     }
 
     fn open_inner(
         loc: &Location,
         s3: Option<&S3Options>,
         scoped: bool,
+        credentials: Option<object_store::aws::AwsCredentialProvider>,
     ) -> Result<Self, StorageError> {
         let store: Box<dyn ObjectStore> = match loc {
             Location::Local { root } => open_local_store(root, local_stores_allowed())?,
@@ -241,29 +250,26 @@ impl StorageIo {
                 let opts = s3.ok_or_else(|| {
                     StorageError::Config("s3 location requires S3Options".to_string())
                 })?;
-                // 13-review #6: ambient cloud credential fallback is
-                // removed — no static keys means a loud config error
-                // (pointing at the user mapping), never an IMDS probe.
-                let (Some(ak), Some(sk)) = (&opts.access_key_id, &opts.secret_access_key) else {
+                let mut b = object_store::aws::AmazonS3Builder::new()
+                    .with_bucket_name(bucket)
+                    .with_allow_http(s3_allow_http(opts.endpoint.as_deref()));
+                if let Some(credentials) = credentials {
+                    b = b.with_credentials(credentials);
+                } else if let (Some(ak), Some(sk)) = (&opts.access_key_id, &opts.secret_access_key)
+                {
+                    b = b.with_access_key_id(ak).with_secret_access_key(sk);
+                } else {
                     return Err(StorageError::Config(
                         "static S3 credentials missing: set s3_access_key/s3_secret_key \
                          on the user mapping (ambient cloud-credential fallback is disabled)"
                             .into(),
                     ));
-                };
-                let mut b = object_store::aws::AmazonS3Builder::new()
-                    .with_bucket_name(bucket)
-                    .with_allow_http(s3_allow_http(opts.endpoint.as_deref()))
-                    .with_access_key_id(ak)
-                    .with_secret_access_key(sk);
+                }
                 if let Some(ep) = &opts.endpoint {
                     b = b.with_endpoint(ep);
                 }
                 if let Some(r) = &opts.region {
                     b = b.with_region(r);
-                }
-                if let (Some(k), Some(sec)) = (&opts.access_key_id, &opts.secret_access_key) {
-                    b = b.with_access_key_id(k).with_secret_access_key(sec);
                 }
                 if scoped {
                     b = b
