@@ -30,6 +30,6 @@ $(header) $(archive) &: $(shell find $(lake_dir)/core/pgdatalake-core/src -name 
     $(lake_dir)/core/Cargo.lock $(lake_dir)/core/cbindgen.toml \
     $(lake_dir)/core/rust-toolchain.toml $(lake_dir)/rust_build.py
 	mkdir -p "$(rust_dir)"
-	env -u MAKEFLAGS python3 "$(lake_dir)/rust_build.py" --manifest-dir "$(lake_dir)/core" \
+	env -u MAKEFLAGS -u MFLAGS python3 "$(lake_dir)/rust_build.py" --manifest-dir "$(lake_dir)/core" \
 	    --target-dir "$(abspath $(CARGO_TARGET_DIR))" --out-dir "$(rust_dir)"
 	@touch "$(header)" "$(archive)"
