@@ -13,6 +13,9 @@
 
 Fixed IDs are fixture symbols. On live catalogs record the concrete UUID, ref, actual parent/child IDs and external query pin at every step. Compare sorted typed multisets, including duplicates. Record zero, one and rejected/ambiguous POSTs at the transport boundary. Preserve a terminal outcome for every offered query. Capture SHA, package digest, PG major, toolchain, config, versions, connection/role, bytes, sample count, raw times, p95/p99 or insufficient samples. Separate observation, hypothesis and release objective. Real provider evidence applies only to its tested combination. Retain existing [smoke receipt format](../10-testing.md#milestone-tdd-and-smoke-receipts).
 
+Qualification also records the request/byte trade-off and publication cadence
+against the [I/O and publication cost gates](08b-io-cost.md).
+
 ### Joined managed capture and recovery fixture
 
 The native fork CI job exercises [ordinary capture enrollment](03b-managed-capture-binding.md)
