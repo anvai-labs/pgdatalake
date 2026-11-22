@@ -209,7 +209,14 @@ jobs:
           initdb -D "$PGHOST/data" -A trust -U "$PGUSER" --no-locale
           pg_ctl -D "$PGHOST/data" -l "$PGHOST/server.log" -o "-k $PGHOST -p $PGPORT -c listen_addresses=''" -w start
           trap 'pg_ctl -D "$PGHOST/data" -m fast -w stop' EXIT
-          python3 src/test/lakehouse/fixtures/stock-fdw-check.py
+          python3 src/test/lakehouse/fixtures/stock-fdw-check.py --receipt "$RUNNER_TEMP/stock-reader.json"
+
+      - name: Retain stock reader smoke evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: stock-reader-receipt
+          path: ${{ runner.temp }}/stock-reader.json
+          if-no-files-found: error
 
       - name: Upload test logs on failure
         if: failure()

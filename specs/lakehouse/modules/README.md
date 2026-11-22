@@ -17,6 +17,8 @@ Start with the module you are implementing and [the shared contracts](00-integra
 
 ### Contracts for independent work
 
+The [core-to-operator handoff](10-downstream-handoff.md) assigns a producer, consumer, failure owner and joint test to each cross-repository seam. Start parallel development with its stock-reader receipt and exact consumer decision cases.
+
 | Independently owned slice | Freeze with these consumers | First integration gate |
 |---|---|---|
 | 01 cloud adapters, with a maintainer per AWS/Azure/GCP storage API | 02 supplies exact-pin read inputs, 05 supplies immutable object descriptors, 08 checks scope and request counts. [Cloud profiles](09-cloud-profiles.md) | Start with one Lakekeeper read profile. Qualify each real store and catalog/auth combination separately. |

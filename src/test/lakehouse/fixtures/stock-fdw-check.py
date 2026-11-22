@@ -1,7 +1,11 @@
 """Exercise the read-only package on a disposable stock PostgreSQL 19 cluster."""
 
+import argparse
+import hashlib
 import json
 import os
+from pathlib import Path
+import platform
 import shlex
 import subprocess
 import time
@@ -20,15 +24,24 @@ def trino(statement):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--receipt", type=Path, help="write evidence from this successful run")
+    output = parser.parse_args().receipt
+    if not __debug__:
+        raise RuntimeError("the smoke requires Python assertions")
+    if output is not None and output.exists():
+        raise FileExistsError(output)
     started = time.monotonic()
     db = "stock_" + uuid.uuid4().hex
     restored = db + "_restore"
     table = f"iceberg.{db}.events"
-    assert int(sql("postgres", "SHOW server_version_num")) // 10000 == 19
+    server_version = int(sql("postgres", "SHOW server_version_num"))
+    assert server_version // 10000 == 19
     sql("postgres", f"CREATE DATABASE {db}")
     try:
         sql(db, "CREATE EXTENSION lakehouse")
-        assert sql(db, "SELECT extversion FROM pg_extension WHERE extname='lakehouse'") == "1.0-fdw"
+        extension_version = sql(db, "SELECT extversion FROM pg_extension WHERE extname='lakehouse'")
+        assert extension_version == "1.0-fdw"
         assert sql(db, "SELECT count(*) FROM pg_am WHERE amname='lakehouse'") == "0"
         assert sql(db, "SELECT to_regclass('lakehouse.lakehouse_delta_segments') IS NULL") == "t"
         sql("postgres", f"CREATE DATABASE {restored}")
@@ -74,6 +87,7 @@ def main():
             assert not plan[0]["Plan"]["Parallel Aware"], plan
             dump = subprocess.check_output(["pg_dump", "--schema-only", db], text=True)
             sql(restored, dump)
+            snapshots = []
             for name, pin, expected in (("old_rows", parent, [10, 20, 20, 30]),
                                         ("new_rows", child, [10, 20, 30])):
                 reference = trino(f"SELECT id FROM {table} FOR VERSION AS OF {pin} ORDER BY id")
@@ -81,6 +95,7 @@ def main():
                 for database in (db, restored):
                     actual = sql(database, f"SELECT id FROM {name} ORDER BY id")
                     assert actual == reference, (database, pin, actual, reference)
+                snapshots.append({"snapshot_id": str(pin), "rows": [int(r) for r in actual.splitlines()]})
                 print(f"snapshot={pin} rows={expected} stock/restore/Trino=equal", flush=True)
             for statement in ("INSERT INTO new_rows VALUES (42)", "UPDATE new_rows SET id=42",
                               "DELETE FROM new_rows"):
@@ -92,6 +107,36 @@ def main():
         sql("postgres", f"DROP DATABASE IF EXISTS {restored}")
         sql("postgres", f"DROP DATABASE {db}")
 
+    if output is not None:
+        # Hash the module from the fixture server's installation. Run in a clean
+        # checkout and disposable prefix; this is a smoke receipt, not provenance.
+        libdir = sql("postgres", "SELECT setting FROM pg_config WHERE name='PKGLIBDIR'")
+        module = Path(libdir) / "anvai_lake_fdw.so"
+        with module.open("rb") as artifact:
+            digest = hashlib.file_digest(artifact, "sha256").hexdigest()
+        core_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True,
+                                           cwd=Path(__file__).resolve().parent).strip()
+        receipt = {
+            "contract_major": 1, "contract_minor": 0,
+            "profile": "stock-pg19-lakekeeper-seaweedfs-trino-v2",
+            "core_sha": core_sha, "module_sha256": digest,
+            "platform": f"{platform.system().lower()}-{platform.machine()}",
+            "server_version_num": server_version, "extension_version": extension_version,
+            "passed": ["published_serial_scan", "snapshot_id_option", "v2_position_delete",
+                       "prepared_ref_refresh", "schema_restore", "foreign_dml_rejected"],
+            "parent": snapshots[0], "child": snapshots[1],
+        }
+        example_path = (Path(__file__).resolve().parents[4]
+                        / "specs/lakehouse/modules/fixtures/stock-reader-v1.json")
+        example = json.loads(example_path.read_text())["receipt"]
+        for key in ("contract_major", "profile", "extension_version"):
+            assert receipt[key] == example[key], key
+        assert set(example) <= receipt.keys()
+        assert set(example["passed"]) <= set(receipt["passed"])
+        for pin in ("parent", "child"):
+            assert receipt[pin]["rows"] == example[pin]["rows"]
+        with output.open("x", encoding="utf-8") as stream:
+            stream.write(json.dumps(receipt, indent=2) + "\n")
     print(f"Stock smoke completed in {time.monotonic() - started:.2f}s", flush=True)
 
 
