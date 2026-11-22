@@ -1,0 +1,37 @@
+---
+config:
+  theme: base
+  htmlLabels: false
+  deterministicIds: true
+  deterministicIDSeed: anvai-product
+  themeVariables:
+    fontFamily: "DejaVu Sans, sans-serif"
+    fontSize: "16px"
+    lineColor: "#41566c"
+    edgeLabelBackground: "#ffffff"
+    primaryTextColor: "#142b41"
+  flowchart:
+    htmlLabels: false
+    nodeSpacing: 28
+    rankSpacing: 32
+    curve: linear
+---
+flowchart TB
+    accTitle: Anvai Lake public database packages and state
+    accDescr: Stock and fork packages share PostgreSQL C scan code and Rust. The stock serial reader reached a live two-pin smoke. Only the fork has managed capture. The catalog selects the Iceberg state and the object store holds its files.
+    stock["Stock PostgreSQL 19.0<br/>PGXS · read-only FDW<br/>Live serial read smoke"]:::tested
+    fork["Source-patched PostgreSQL<br/>FDW + managed TableAM<br/>Native time-travel syntax"]:::code
+    reader["Shared PostgreSQL C scan code<br/>SQL slots and typed batch ABI"]:::code
+    pg["Managed state in PostgreSQL<br/>Staged rows · ledger · WAL"]:::code
+    core["pgdatalake-core · Rust<br/>REST catalog · manifest planning<br/>Parquet reads and delete application"]:::code
+    catalog["REST catalog<br/>Resolves table, ref and metadata location"]:::code
+    store["Object store<br/>Iceberg metadata, manifests,<br/>data files and delete files"]:::code
+    stock --> reader
+    fork --> reader
+    fork --> pg
+    reader --> core
+    core -->|resolve| catalog
+    core -->|fetch bytes| store
+    classDef code fill:#e5eff7,stroke:#365c78,color:#102f46
+    classDef tested fill:#e0f3e9,stroke:#246b50,color:#164332
+    classDef gate fill:#fff2d7,stroke:#906221,color:#51370f,stroke-dasharray:5 3
