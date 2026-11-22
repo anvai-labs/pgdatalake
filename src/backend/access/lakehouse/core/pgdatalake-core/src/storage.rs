@@ -190,11 +190,11 @@ pub struct StorageIo {
 }
 
 // object_store's default connector follows redirects. An explicit endpoint
-// is an authority boundary for bound reads, including on cache misses.
+// is an authority boundary for scoped reads and writes.
 #[derive(Debug)]
-struct BoundReadConnector;
+struct ScopedS3Connector;
 
-impl object_store::client::HttpConnector for BoundReadConnector {
+impl object_store::client::HttpConnector for ScopedS3Connector {
     fn connect(
         &self,
         _: &object_store::ClientOptions,
@@ -209,7 +209,7 @@ impl object_store::client::HttpConnector for BoundReadConnector {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|source| object_store::Error::Generic {
-                store: "bound S3 read",
+                store: "scoped S3",
                 source: Box::new(source),
             })?;
         Ok(object_store::client::HttpClient::new(client))
@@ -224,7 +224,7 @@ impl StorageIo {
     pub(crate) fn open_bound_s3(loc: &Location, s3: &S3Options) -> Result<Self, StorageError> {
         if !matches!(loc, Location::S3 { .. }) || s3.endpoint.is_none() || s3.region.is_none() {
             return Err(StorageError::Config(
-                "bound reads require explicit S3 transport".into(),
+                "bound S3 access requires explicit transport".into(),
             ));
         }
         Self::open_inner(loc, Some(s3), true)
@@ -233,7 +233,7 @@ impl StorageIo {
     fn open_inner(
         loc: &Location,
         s3: Option<&S3Options>,
-        bound_read: bool,
+        scoped: bool,
     ) -> Result<Self, StorageError> {
         let store: Box<dyn ObjectStore> = match loc {
             Location::Local { root } => open_local_store(root, local_stores_allowed())?,
@@ -265,10 +265,10 @@ impl StorageIo {
                 if let (Some(k), Some(sec)) = (&opts.access_key_id, &opts.secret_access_key) {
                     b = b.with_access_key_id(k).with_secret_access_key(sec);
                 }
-                if bound_read {
+                if scoped {
                     b = b
                         .with_virtual_hosted_style_request(false)
-                        .with_http_connector(BoundReadConnector);
+                        .with_http_connector(ScopedS3Connector);
                 }
                 Box::new(b.build().map_err(|e| StorageError::Config(e.to_string()))?)
             }

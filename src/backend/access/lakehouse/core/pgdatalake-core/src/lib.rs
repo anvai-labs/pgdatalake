@@ -17,6 +17,7 @@ pub mod catalog;
 pub mod ffi;
 pub mod manifest;
 pub mod parquet;
+pub mod publication_transport;
 pub mod publication_worker;
 pub mod puffin;
 mod read_binding;

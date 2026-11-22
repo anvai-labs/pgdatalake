@@ -5,12 +5,12 @@ import hashlib
 import http.client
 import json
 import os
-from pathlib import Path
 import subprocess
 import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 from publication_fixture import HDR, MEM, SEG, claim, sql
 
@@ -43,7 +43,7 @@ def enrolled_metadata(namespace):
     return route, body, json.loads(body)["metadata"]
 
 
-def run(db, namespace, data, worker, reply_loss, capture_adapter):
+def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_transport):
     table = f"iceberg.{namespace}.events"
     trino(f"CREATE TABLE {table} (id bigint) WITH (format_version=2); "
           f"INSERT INTO {table} VALUES 10")
@@ -67,6 +67,8 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter):
     unavailable = threading.Event()
     posts, lookups, errors = [], [], []
     requests = []
+    revoke_after_acceptance = admitted_transport and reply_loss == "http_504"
+    next_operation = str(uuid.uuid4())
 
     class CatalogGateway(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -108,7 +110,7 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter):
                 status, body = catalog_request(
                     "POST", self.path, payload, {"Content-Type": "application/json"})
                 assert 200 <= status < 300, (status, body)
-            except Exception as error:
+            except Exception as error:  # noqa: BLE001 - unblock the sender on any fixture failure
                 errors.append(error)
                 accepted.set()
                 self.send_error(500, "fixture rejected the first POST")
@@ -156,6 +158,12 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter):
                         'capture_catalog', '{incarnation}'::uuid, '{binding}'::uuid,
                         1::bigint, '{authority}'::uuid, '{remote}'::uuid, '{root}');
                 """)
+                if admitted_transport:
+                    prefix = route.split("/namespaces/", 1)[0].removeprefix("/catalog/v1").lstrip("/")
+                    sql(db, f"""
+                        ALTER EXTENSION lakehouse UPDATE TO '1.8';
+                        SELECT lakehouse.grant_publication_send('{binding}', '{prefix}', 'us-east-1');
+                    """)
 
             def capture(seed_id, value):
                 if capture_adapter is None:
@@ -185,18 +193,28 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter):
                 assert provenance == [binding, incarnation, 1], row
                 return seg_id
 
+            def managed_claim(op, seg_id):
+                return f"SELECT encode(lakehouse.claim_managed_publication('{op}', ARRAY[{seg_id}]::bigint[]), 'hex')"
+
+            def claim_member(op, seg_id):
+                if admitted_transport:
+                    return sql(db, managed_claim(op, seg_id))
+                return sql(db, claim(op, str(seg_id), "events", authority, remote))
+
             first = capture(7, 20)
-            input_digest = sql(db, claim(operation, str(first), "events", authority, remote))
+            input_digest = claim_member(operation, first)
             checkpoint = sql(db, "SELECT pg_current_wal_insert_lsn()")
-            request = json.dumps({
-                "database": db, "endpoint": endpoint,
-                "namespace": namespace, "operation_id": operation, "authority_id": authority,
-                "table_uuid": remote, "root": root,
-            })
+            worker_input = {"database": db, "operation_id": operation}
+            if admitted_transport:
+                worker_input["admitted_transport"] = True
+            else:
+                worker_input.update(endpoint=endpoint, namespace=namespace, authority_id=authority,
+                                    table_uuid=remote, root=root)
+            request = json.dumps(worker_input)
             # A transient failure before authorization leaves the claim
             # eligible for a new owner. This first pass reaches no POST.
             unavailable.set()
-            failed = subprocess.run([worker], input=request, text=True, timeout=25,
+            failed = subprocess.run([worker], check=False, input=request, text=True, timeout=25,
                                     capture_output=True)
             assert failed.returncode and "prepare_unsent" in failed.stderr, failed
             assert not posts
@@ -213,6 +231,11 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter):
                     assert sender.poll() is None, "sender exited before the lost-reply barrier"
                     late = capture(8, 30)
                     assert first != late
+                    if revoke_after_acceptance:
+                        # The unresolved operation holds the target reservation.
+                        # Its lookup will still use the retained scope after revoke.
+                        sql(db, managed_claim(next_operation, late), error="40001")
+                        sql(db, f"SELECT lakehouse.revoke_publication_send('{binding}')")
                     assert sql(db, f"SELECT count(*) FROM {HDR} WHERE verified_snapshot_id IS NOT NULL") == "0"
                     if reply_loss == "http_504":
                         release.set()
@@ -273,17 +296,27 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter):
                        f"WHERE operation_id='{operation}'") == f"{{{first}}}"
             assert sql(db, f"SELECT verified_snapshot_id FROM {HDR} WHERE operation_id='{operation}' "
                        f"AND encode(input_digest, 'hex')='{input_digest}'") == str(posted_snapshot)
-            next_operation = str(uuid.uuid4())
-            assert sql(db, claim(next_operation, str(late), "events", authority, remote)), "late row was not claimable"
+            if revoke_after_acceptance:
+                before = len(requests)
+                sql(db, managed_claim(next_operation, late), error="55000")
+                assert len(requests) == before and len(posts) == 1
+                assert sql(db, f"SELECT count(*) FROM {HDR} "
+                               f"WHERE operation_id='{next_operation}'") == "0"
+            else:
+                assert claim_member(next_operation, late), "late row was not claimable"
             assert set(trino(snaps).splitlines()) == initial_snapshots | {str(posted_snapshot)}
             assert trino(f"SELECT id FROM {table} FOR VERSION AS OF {parent} ORDER BY id") == "10"
             assert trino(f"SELECT id FROM {table} FOR VERSION AS OF {posted_snapshot} ORDER BY id") == "10\n20"
+            if admitted_transport:
+                assert set(requests) == {route}, requests
             capture_source = "seeded" if capture_adapter is None else "ordinary_sql"
-            print(f"bound worker: capture={capture_source} reply_loss={reply_loss} "
+            transport = "admitted" if admitted_transport else "legacy_fixture"
+            print(f"bound worker: capture={capture_source} transport={transport} reply_loss={reply_loss} "
                   f"base={parent} rows=[10], "
                   f"receipt={posted_snapshot} rows=[10,20], "
                   f"catalog_posts={len(posts)} catalog_gets={len(requests)-len(posts)} "
                   f"wal_intent_commit_flushed=true completed_members=[{first}] late_members_pending=[{late}] "
+                  f"send_grant_revoked={str(revoke_after_acceptance).lower()} "
                   f"restart_ms={restart_ms:.1f} verify_and_finalize_ms={recovery_ms:.1f} samples=1")
         finally:
             release.set()
@@ -297,7 +330,11 @@ def main():
     parser.add_argument("--worker", required=True, type=Path)
     parser.add_argument("--capture-adapter", type=Path,
                         help="use ordinary TableAM INSERT with the managed capture fixture adapter")
+    parser.add_argument("--admitted-transport", action="store_true",
+                        help="use the durable 1.8 claim and enrolled publisher transport")
     args = parser.parse_args()
+    if args.admitted_transport and args.capture_adapter is None:
+        parser.error("--admitted-transport requires --capture-adapter")
     if not __debug__:
         raise RuntimeError("the recovery smoke requires Python assertions")
     admin = os.getenv("PGDATABASE", "postgres")
@@ -310,7 +347,7 @@ def main():
         try:
             trino(f"CREATE SCHEMA iceberg.{name}")
             try:
-                run(name, name, data, worker, reply_loss, capture_adapter)
+                run(name, name, data, worker, reply_loss, capture_adapter, args.admitted_transport)
             finally:
                 trino(f"DROP TABLE IF EXISTS iceberg.{name}.events; DROP SCHEMA iceberg.{name}")
         finally:

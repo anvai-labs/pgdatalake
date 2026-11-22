@@ -98,6 +98,7 @@ pub struct RestCatalog {
     pub(crate) tokens: Box<dyn TokenProvider>,
     pub(crate) inner: reqwest::blocking::Client,
     // Reads follow approved redirects. Commit POSTs may be sent only once.
+    scoped: bool,
     commit_client: std::sync::OnceLock<Result<reqwest::blocking::Client, String>>,
     /// Table-route prefix from the config response (`overrides.prefix` in
     /// the Iceberg REST spec); set via `with_prefix()` or `fetch_config()`.
@@ -150,10 +151,11 @@ impl RestCatalog {
             endpoint,
             tokens,
             reqwest::blocking::Client::builder().redirect(same_origin_redirect_policy()),
+            false,
         )
     }
 
-    pub(crate) fn new_for_bound_read(
+    pub(crate) fn new_scoped(
         endpoint: &str,
         tokens: Box<dyn TokenProvider>,
     ) -> Result<Self, RestError> {
@@ -163,6 +165,7 @@ impl RestCatalog {
             reqwest::blocking::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .no_proxy(),
+            true,
         )
     }
 
@@ -170,10 +173,12 @@ impl RestCatalog {
         endpoint: &str,
         tokens: Box<dyn TokenProvider>,
         client: reqwest::blocking::ClientBuilder,
+        scoped: bool,
     ) -> Result<Self, RestError> {
         Ok(Self {
             endpoint: endpoint.trim_end_matches('/').to_string(),
             tokens,
+            scoped,
             commit_client: std::sync::OnceLock::new(),
             inner: client
                 .timeout(Duration::from_secs(30))
@@ -186,7 +191,13 @@ impl RestCatalog {
     pub(super) fn commit_client(&self) -> Result<&reqwest::blocking::Client, RestError> {
         self.commit_client
             .get_or_init(|| {
-                reqwest::blocking::Client::builder()
+                let client = reqwest::blocking::Client::builder();
+                let client = if self.scoped {
+                    client.no_proxy()
+                } else {
+                    client
+                };
+                client
                     .timeout(Duration::from_secs(30))
                     .retry(reqwest::retry::never())
                     .redirect(reqwest::redirect::Policy::none())

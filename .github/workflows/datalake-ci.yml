@@ -182,6 +182,7 @@ jobs:
           python3 src/test/lakehouse/fixtures/publication-claim-check.py --live --restart-fixture "$PGHOST/data"
           python3 src/test/lakehouse/fixtures/publication-intent-check.py --restart-fixture "$PGHOST/data"
           python3 src/test/lakehouse/fixtures/managed-capture-binding-check.py --provider --restart-fixture "$PGHOST/data"
+          python3 src/test/lakehouse/fixtures/publication-admission-check.py
           sh src/test/lakehouse/fixtures/cow-delete-guard.sh
           python3 src/test/lakehouse/fixtures/catalog-reply-loss-check.py
           COUNT_FORK_SMOKE=1 python3 src/test/lakehouse/fixtures/fdw-count-check.py
@@ -193,7 +194,8 @@ jobs:
           )
           python3 src/test/lakehouse/fixtures/bound-publication-restart.py \
             --restart-fixture "$PGHOST/data" --worker "$rust_target/release/examples/bound_publication_fixture" \
-            --capture-adapter "$PWD/src/test/lakehouse/fixtures/managed-capture-binding-adapter.sql"
+            --capture-adapter "$PWD/src/test/lakehouse/fixtures/managed-capture-binding-adapter.sql" \
+            --admitted-transport
           python3 src/test/lakehouse/fixtures/managed-cut-check.py --expect-runtime-red
 
       - name: Fetch unmodified PostgreSQL 19.0 for stock package qualification

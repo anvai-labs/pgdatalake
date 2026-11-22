@@ -120,9 +120,11 @@ struct RetainedRequest {
     updates: Vec<TableUpdate>,
 }
 
-pub(super) struct RetainedPublication {
+pub(crate) struct RetainedPublication {
     table_uuid: uuid::Uuid,
     proposed: Snapshot,
+    schema_id: i64,
+    spec_id: i64,
 }
 
 impl AuthorizedPublication<'_> {
@@ -130,7 +132,7 @@ impl AuthorizedPublication<'_> {
         self.decode().is_some()
     }
 
-    pub(super) fn decode(self) -> Option<RetainedPublication> {
+    pub(crate) fn decode(self) -> Option<RetainedPublication> {
         if self.request_body.len() > MAX_STAGED_REQUEST_BYTES
             || sha256(self.request_body) != self.request_digest
         {
@@ -143,7 +145,7 @@ impl AuthorizedPublication<'_> {
         let [TableRequirement::AssertTableUUID { uuid }, TableRequirement::AssertRefSnapshotId {
             r#ref,
             snapshot_id: parent,
-        }, TableRequirement::AssertCurrentSchemaId { current_schema_id }, TableRequirement::AssertDefaultSpecId { .. }] =
+        }, TableRequirement::AssertCurrentSchemaId { current_schema_id }, TableRequirement::AssertDefaultSpecId { default_spec_id }] =
             requirements.as_slice()
         else {
             return None;
@@ -179,12 +181,18 @@ impl AuthorizedPublication<'_> {
         Some(RetainedPublication {
             table_uuid: *uuid,
             proposed: snapshot.clone(),
+            schema_id: *current_schema_id,
+            spec_id: *default_spec_id,
         })
     }
 }
 
 impl RetainedPublication {
-    pub(super) fn verify<F>(
+    pub(crate) fn matches_schema_and_spec(&self, schema_id: i64, spec_id: i32) -> bool {
+        self.schema_id == schema_id && self.spec_id == i64::from(spec_id)
+    }
+
+    pub(crate) fn verify<F>(
         &self,
         md: &TableMetadata,
         read_manifest_digest: F,
