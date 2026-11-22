@@ -8,27 +8,155 @@ use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ProjectionMask;
 use parquet::errors::ParquetError;
+use parquet::file::metadata::ParquetMetaData;
 use parquet::file::reader::{ChunkReader, Length};
-use std::io::Read as StdRead;
+use std::io::{self, Read as StdRead};
+use std::ops::Range;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::cache::BlockCache;
 use crate::storage::{StorageError, StorageIo};
 
-/// P0b (spec 15 §6.3a): a parquet `ChunkReader` over ranged cache GETs.
-/// Every access — footer probe, metadata, projected column chunks — is a
-/// `(path, offset, len)` fetch through the immutable-path `BlockCache`, so
-/// a scan never downloads a whole file, unprojected columns are never
-/// fetched at all, and repeat scans of the same file are cache hits with
-/// zero new I/O. `open_all` (delete-file processing, small files) stays
-/// on whole-object reads and remains the byte-level oracle for tests.
-/// OWNED handles: parquet's `ChunkReader` consumers require 'static, so
-/// the io is a cloned `StorageIo` (Arc-cheap) and the cache is 'static
-/// (`global()`, or a leaked test-local instance).
+// A stream fetches one window at a time. It never speculates past the
+// projected column chunk. Exact page-body reads reuse any overlapping bytes
+// and fetch just the missing prefix or suffix.
+const PARQUET_READ_AHEAD: u64 = 8 * 1024;
+
+/// Parquet footer probes and page ranges use the same authorized storage
+/// handle and immutable-object cache. The additional read window is local
+/// to this reader and its page-header streams.
+#[derive(Clone)]
 struct RangedReader {
     io: StorageIo,
     cache: &'static BlockCache,
     key: String,
     len: u64,
+    ahead: Arc<ReadAhead>,
+}
+
+#[derive(Default)]
+struct ReadAhead {
+    projected_chunks: OnceLock<Vec<Range<u64>>>,
+    last: Mutex<Option<ReadWindow>>,
+}
+
+struct ReadWindow {
+    start: u64,
+    bytes: Bytes,
+}
+
+impl ReadWindow {
+    fn intersection(&self, range: Range<u64>) -> Option<(u64, Bytes)> {
+        let start = self.start.max(range.start);
+        let end = (self.start + self.bytes.len() as u64).min(range.end);
+        (start < end).then(|| {
+            (
+                start,
+                self.bytes
+                    .slice((start - self.start) as usize..(end - self.start) as usize),
+            )
+        })
+    }
+}
+
+impl RangedReader {
+    fn new(io: &StorageIo, cache: &'static BlockCache, key: &str, len: u64) -> Self {
+        Self {
+            io: io.clone(),
+            cache,
+            key: key.to_owned(),
+            len,
+            ahead: Arc::default(),
+        }
+    }
+
+    fn fetch(&self, range: Range<u64>) -> io::Result<Vec<u8>> {
+        let len = range.end - range.start;
+        let bytes = self
+            .cache
+            .get_range(&self.io, "", &self.key, range.start, len)
+            .map_err(io::Error::other)?;
+        if bytes.len() as u64 != len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "short Parquet object range",
+            ));
+        }
+        Ok(bytes)
+    }
+
+    fn fill_window(&self, range: Range<u64>) -> io::Result<Bytes> {
+        let mut last = self.ahead.last.lock().unwrap();
+        if let Some((start, overlap)) = last
+            .as_ref()
+            .and_then(|window| window.intersection(range.clone()))
+        {
+            return if start == range.start {
+                Ok(overlap)
+            } else {
+                self.fetch(range.start..start).map(Bytes::from)
+            };
+        }
+        let start = range.start;
+        let bytes = Bytes::from(self.fetch(range)?);
+        *last = Some(ReadWindow {
+            start,
+            bytes: bytes.clone(),
+        });
+        Ok(bytes)
+    }
+
+    fn chunk_end(&self, start: u64) -> Option<u64> {
+        let chunks = self.ahead.projected_chunks.get()?;
+        let index = chunks.partition_point(|chunk| chunk.start <= start);
+        index
+            .checked_sub(1)
+            .map(|i| chunks[i].end)
+            .filter(|end| start < *end)
+    }
+}
+
+/// Use column chunk extents from the existing footer. Keep exact reads if
+/// the extents cannot prove that a speculative read stays in one chunk.
+fn projected_chunks(
+    metadata: &ParquetMetaData,
+    projection: &ProjectionMask,
+    file_len: u64,
+) -> Vec<Range<u64>> {
+    let mut chunks = Vec::new();
+    for group in metadata.row_groups() {
+        for (index, column) in group.columns().iter().enumerate() {
+            if column.file_path().is_some() {
+                return Vec::new();
+            }
+            let offset = column
+                .dictionary_page_offset()
+                .unwrap_or_else(|| column.data_page_offset());
+            let (Ok(start), Ok(size)) = (
+                u64::try_from(offset),
+                u64::try_from(column.compressed_size()),
+            ) else {
+                return Vec::new();
+            };
+            let Some(end) = start.checked_add(size).filter(|end| *end <= file_len) else {
+                return Vec::new();
+            };
+            if start < end {
+                chunks.push((start..end, projection.leaf_included(index)));
+            }
+        }
+    }
+    chunks.sort_unstable_by_key(|(range, _)| range.start);
+    if chunks
+        .windows(2)
+        .any(|pair| pair[0].0.end > pair[1].0.start)
+    {
+        return Vec::new();
+    }
+    chunks
+        .into_iter()
+        .filter_map(|(range, included)| included.then_some(range))
+        .collect()
 }
 
 impl Length for RangedReader {
@@ -42,11 +170,10 @@ impl ChunkReader for RangedReader {
 
     fn get_read(&self, start: u64) -> parquet::errors::Result<Self::T> {
         Ok(RangedSeqRead {
-            io: self.io.clone(),
-            cache: self.cache,
-            key: self.key.clone(),
+            reader: self.clone(),
             pos: start,
-            len: self.len,
+            readahead_end: self.chunk_end(start),
+            buffer: Bytes::new(),
         })
     }
 
@@ -54,38 +181,79 @@ impl ChunkReader for RangedReader {
         if length == 0 {
             return Ok(Bytes::new());
         }
-        let end = (start + length as u64).min(self.len);
-        let bytes = self
-            .cache
-            .get_range(&self.io, "", &self.key, start, end - start)
-            .map_err(|e| ParquetError::General(e.to_string()))?;
-        Ok(Bytes::from(bytes))
+        let end = start
+            .checked_add(length as u64)
+            .filter(|end| *end <= self.len)
+            .ok_or_else(|| ParquetError::EOF("Parquet object range is outside the file".into()))?;
+        let overlap = self
+            .ahead
+            .last
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|window| window.intersection(start..end));
+        let fetch = |range| {
+            self.fetch(range)
+                .map_err(|e| ParquetError::External(Box::new(e)))
+        };
+        let Some((buffer_start, bytes)) = overlap else {
+            return fetch(start..end).map(Bytes::from);
+        };
+        if bytes.len() == length {
+            return Ok(bytes);
+        }
+        let buffer_end = buffer_start + bytes.len() as u64;
+        let result = if buffer_start == start {
+            // Forward reads grow the existing suffix allocation by at most
+            // one window rather than allocating a second full page body.
+            let mut result = fetch(buffer_end..end)?;
+            let suffix_len = result.len();
+            result.reserve_exact(bytes.len());
+            result.resize(length, 0);
+            result.copy_within(..suffix_len, bytes.len());
+            result[..bytes.len()].copy_from_slice(&bytes);
+            result
+        } else if buffer_end == end {
+            let mut result = fetch(start..buffer_start)?;
+            result.reserve_exact(bytes.len());
+            result.extend_from_slice(&bytes);
+            result
+        } else {
+            // A strict interior overlap would require two allocations and
+            // two GETs. One exact GET repeats at most the small window.
+            fetch(start..end)?
+        };
+        Ok(Bytes::from(result))
     }
 }
 
-/// Sequential view over `[pos, file_end)` built on ranged cache GETs.
-/// Owns its handles (independent of the &self borrow).
 struct RangedSeqRead {
-    io: StorageIo,
-    cache: &'static BlockCache,
-    key: String,
+    reader: RangedReader,
     pos: u64,
-    len: u64,
+    readahead_end: Option<u64>,
+    buffer: Bytes,
 }
 
 impl StdRead for RangedSeqRead {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let want = (buf.len() as u64).min(self.len.saturating_sub(self.pos));
-        if want == 0 {
-            return Ok(0); // EOF
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() || self.pos >= self.reader.len {
+            return Ok(0);
         }
-        let bytes = self
-            .cache
-            .get_range(&self.io, "", &self.key, self.pos, want)
-            .map_err(std::io::Error::other)?;
-        self.pos += bytes.len() as u64;
-        buf[..bytes.len()].copy_from_slice(&bytes);
-        Ok(bytes.len())
+        if self.buffer.is_empty() {
+            self.buffer = if let Some(end) = self.readahead_end.filter(|end| self.pos < *end) {
+                let end = self.pos + PARQUET_READ_AHEAD.min(end - self.pos);
+                self.reader.fill_window(self.pos..end)?
+            } else {
+                // The chunk boundary clips speculation only. A reader
+                // remains a sequential view through the end of the file.
+                let end = self.pos + (buf.len() as u64).min(self.reader.len - self.pos);
+                Bytes::from(self.reader.fetch(self.pos..end)?)
+            };
+        }
+        let count = buf.len().min(self.buffer.len());
+        buf[..count].copy_from_slice(&self.buffer.split_to(count));
+        self.pos += count as u64;
+        Ok(count)
     }
 }
 
@@ -392,13 +560,8 @@ impl ParquetRows {
         // reader materializes — the whole-file get_bytes this used to do
         // fetched every column of every row group regardless.
         let file_len = io.stat_len(key)?;
-        let ranged = RangedReader {
-            io: io.clone(),
-            cache,
-            key: key.to_string(),
-            len: file_len,
-        };
-        let builder = ParquetRecordBatchReaderBuilder::try_new(ranged)
+        let ranged = RangedReader::new(io, cache, key, file_len);
+        let builder = ParquetRecordBatchReaderBuilder::try_new(ranged.clone())
             .map_err(|e| StorageError::Decode(format!("parquet open: {e}")))?;
         let arrow_schema = builder.schema().clone();
 
@@ -459,6 +622,8 @@ impl ParquetRows {
         // positions WITHIN the read set.
         let proj_mask =
             ProjectionMask::roots(builder.parquet_schema(), read_field_indices.iter().copied());
+        let chunks = projected_chunks(builder.metadata(), &proj_mask, file_len);
+        let _ = ranged.ahead.projected_chunks.set(chunks);
         let builder = builder.with_projection(proj_mask);
 
         // P0b3: the reader is stored LAZILY — row groups decode on demand
@@ -1783,5 +1948,275 @@ mod pos_delete_applicability_tests {
             .map(|i| (i, names[i as usize].clone()))
             .collect();
         assert_eq!(got, want, "ranged rows differ from the whole-file oracle");
+    }
+
+    // Use an HTTP provider so wire requests are counted, including failed
+    // reads and requests whose cache behavior has no effect on network I/O.
+    struct RangeFixture {
+        server: std::sync::Arc<tiny_http::Server>,
+        worker: Option<std::thread::JoinHandle<()>>,
+        ranges: std::sync::Arc<std::sync::Mutex<Vec<std::ops::Range<usize>>>>,
+        fail_next: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        io: StorageIo,
+    }
+
+    impl RangeFixture {
+        fn new(payload: Vec<u8>) -> Self {
+            let server = std::sync::Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
+            let ranges = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let fail_next = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let listener = server.clone();
+            let requests = ranges.clone();
+            let fail = fail_next.clone();
+            let worker = std::thread::spawn(move || {
+                let etag = tiny_http::Header::from_bytes("ETag", "\"fixture\"").unwrap();
+                let last_modified =
+                    tiny_http::Header::from_bytes("Last-Modified", "Sat, 21 Nov 2026 14:00:00 GMT")
+                        .unwrap();
+                for req in listener.incoming_requests() {
+                    assert_eq!(req.url(), "/fixture/data");
+                    let reply = if req.method() == &tiny_http::Method::Head {
+                        tiny_http::Response::from_data(payload.clone())
+                    } else {
+                        assert_eq!(req.method(), &tiny_http::Method::Get);
+                        let (start, end) = req
+                            .headers()
+                            .iter()
+                            .find(|h| h.field.equiv("Range"))
+                            .unwrap()
+                            .value
+                            .as_str()
+                            .strip_prefix("bytes=")
+                            .unwrap()
+                            .split_once('-')
+                            .unwrap();
+                        let start: usize = start.parse().unwrap();
+                        let end = end.parse::<usize>().unwrap() + 1;
+                        requests.lock().unwrap().push(start..end);
+                        assert!(start < end && end <= payload.len());
+                        if fail.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                            tiny_http::Response::from_data(Vec::new()).with_status_code(403)
+                        } else {
+                            tiny_http::Response::from_data(payload[start..end].to_vec())
+                                .with_status_code(206)
+                                .with_header(
+                                    tiny_http::Header::from_bytes(
+                                        "Content-Range",
+                                        format!("bytes {start}-{}/{}", end - 1, payload.len()),
+                                    )
+                                    .unwrap(),
+                                )
+                        }
+                    };
+                    req.respond(
+                        reply
+                            .with_chunked_threshold(usize::MAX)
+                            .with_header(etag.clone())
+                            .with_header(last_modified.clone()),
+                    )
+                    .unwrap();
+                }
+            });
+            let io = StorageIo::open_bound_s3(
+                &crate::storage::Location::S3 {
+                    bucket: "fixture".into(),
+                    key: "data".into(),
+                },
+                &crate::storage::S3Options {
+                    endpoint: Some(format!("http://{}", server.server_addr())),
+                    region: Some("us-east-1".into()),
+                    access_key_id: Some("test-key".into()),
+                    secret_access_key: Some("test-secret".into()),
+                    path_style: true,
+                },
+            )
+            .unwrap();
+            Self {
+                server,
+                worker: Some(worker),
+                ranges,
+                fail_next,
+                io,
+            }
+        }
+
+        fn ranges(&self) -> Vec<std::ops::Range<usize>> {
+            self.ranges.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for RangeFixture {
+        fn drop(&mut self) {
+            self.server.unblock();
+            self.worker.take().unwrap().join().unwrap();
+        }
+    }
+
+    #[test]
+    fn projected_pages_coalesce_without_fetching_the_adjacent_column() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::file::properties::WriterProperties;
+        use std::sync::Arc;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("pad", DataType::Utf8, false),
+        ]));
+        let ids = (0..256).collect::<Vec<i64>>();
+        let pad = (0..256).map(|id| format!("{id:0>512}")).collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids.clone())),
+                Arc::new(StringArray::from(pad)),
+            ],
+        )
+        .unwrap();
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(64))
+            .set_data_page_row_count_limit(8)
+            .set_write_batch_size(8)
+            .set_dictionary_enabled(false)
+            .build();
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(Vec::new(), schema, Some(properties)).unwrap();
+        writer.write(&batch).unwrap();
+        let data = writer.into_inner().unwrap();
+        let metadata =
+            ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(&data)).unwrap();
+        let mut unprojected = Vec::new();
+        let mut projected = Vec::new();
+        for group in metadata.metadata().row_groups() {
+            let bounds = |index| {
+                let (start, len) = group.column(index).byte_range();
+                start as usize..(start + len) as usize
+            };
+            projected.push(bounds(0));
+            unprojected.push(bounds(1));
+        }
+        let fixture = RangeFixture::new(data);
+        let cache = Box::leak(Box::new(BlockCache::new(128 << 10)));
+        let mut rows =
+            ParquetRows::open_internal(&fixture.io, "data", &["id"], RowDeletes::default(), cache)
+                .unwrap();
+        let mut got = Vec::new();
+        while rows.next() {
+            got.push(rows.value(0));
+        }
+        assert_eq!(
+            got,
+            ids.into_iter().map(CellValue::Int64).collect::<Vec<_>>()
+        );
+        let ranges = fixture.ranges();
+        let gets = ranges.len();
+        let bytes: usize = ranges.iter().map(std::ops::Range::len).sum();
+        let tiny_gets = ranges.iter().filter(|range| range.len() <= 4).count();
+        eprintln!("projection wire sample gets={gets} bytes={bytes} tiny_gets={tiny_gets}");
+        let data_ranges = ranges
+            .iter()
+            .filter(|range| {
+                projected
+                    .iter()
+                    .any(|chunk| range.start < chunk.end && chunk.start < range.end)
+            })
+            .collect::<Vec<_>>();
+        let actual: usize = data_ranges.iter().map(|range| range.len()).sum();
+        let expected: usize = projected.iter().map(std::ops::Range::len).sum();
+        assert_eq!(actual, expected, "duplicate or missing projected bytes");
+        assert!(!ranges.iter().any(|range| unprojected
+            .iter()
+            .any(|chunk| range.start < chunk.end && chunk.start < range.end)));
+        assert!(
+            data_ranges.len() <= projected.len(),
+            "expected one GET per small projected chunk, saw {} for {} chunks",
+            data_ranges.len(),
+            projected.len()
+        );
+    }
+
+    #[test]
+    fn range_window_resumes_and_shares_bytes_after_the_stream_is_dropped() {
+        let start = 8;
+        let window_end = start + PARQUET_READ_AHEAD as usize;
+        let chunk_end = window_end + 1024;
+        let file_end = chunk_end + 12;
+        let data: Vec<u8> = (0..file_end)
+            .map(|position| (position % 127) as u8)
+            .collect();
+        let fixture = RangeFixture::new(data.clone());
+        let cache = Box::leak(Box::new(BlockCache::new(0)));
+        let reader = RangedReader::new(&fixture.io, cache, "data", file_end as u64);
+        reader
+            .ahead
+            .projected_chunks
+            .set(std::iter::once(start as u64..chunk_end as u64).collect())
+            .unwrap();
+
+        let unused = reader.get_read(start as u64).unwrap();
+        drop(unused);
+        assert_eq!(fixture.ranges().len(), 0);
+
+        let mut header = reader.get_read(start as u64).unwrap();
+        let mut byte = [0];
+        fixture
+            .fail_next
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(header.read(&mut byte).is_err());
+        header.read_exact(&mut byte).unwrap();
+        assert_eq!(byte[0], data[start]);
+        drop(header);
+
+        let mut resumed = reader.get_read((start + 1) as u64).unwrap();
+        resumed.read_exact(&mut byte).unwrap();
+        assert_eq!(byte[0], data[start + 1]);
+        drop(resumed);
+
+        let body_start = start + 3;
+        let body_end = window_end + 32;
+        assert_eq!(
+            reader
+                .get_bytes(body_start as u64, body_end - body_start)
+                .unwrap()[..],
+            data[body_start..body_end]
+        );
+        assert_eq!(
+            fixture.ranges(),
+            vec![start..window_end, start..window_end, window_end..body_end],
+            "failed requests may retry, a successful buffered prefix must not be fetched again"
+        );
+
+        let mut tail = reader.get_read((chunk_end - 3) as u64).unwrap();
+        let mut buf = [0; 10];
+        assert_eq!(tail.read(&mut buf).unwrap(), 3);
+        assert_eq!(&buf[..3], &data[chunk_end - 3..chunk_end]);
+        assert_eq!(tail.read(&mut buf[..5]).unwrap(), 5);
+        assert_eq!(&buf[..5], &data[chunk_end..chunk_end + 5]);
+        assert_eq!(tail.read(&mut buf).unwrap(), 7);
+        assert_eq!(&buf[..7], &data[chunk_end + 5..file_end]);
+        assert_eq!(tail.read(&mut buf).unwrap(), 0);
+        // A request enclosing the full window uses one exact range rather
+        // than two large fragments. The stream can still use the old window.
+        assert_eq!(reader.get_bytes(0, file_end).unwrap()[..], data[..]);
+        let mut eof = reader.get_read((file_end - 2) as u64).unwrap();
+        assert_eq!(eof.read(&mut buf).unwrap(), 2);
+        assert_eq!(eof.read(&mut buf).unwrap(), 0);
+        assert_eq!(&buf[..2], &data[file_end - 2..file_end]);
+        assert!(reader.get_bytes((file_end - 1) as u64, 2).is_err());
+        assert!(reader.get_bytes(u64::MAX, 2).is_err());
+        assert_eq!(
+            fixture.ranges(),
+            vec![
+                start..window_end,
+                start..window_end,
+                window_end..body_end,
+                chunk_end - 3..chunk_end,
+                chunk_end..chunk_end + 5,
+                chunk_end + 5..file_end,
+                0..file_end,
+                file_end - 2..file_end,
+            ]
+        );
     }
 }
