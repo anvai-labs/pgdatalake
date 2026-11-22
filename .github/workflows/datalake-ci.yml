@@ -24,6 +24,7 @@ on:
       - 'src/backend/access/lakehouse/**'
       - 'src/test/lakehouse/**'
       - 'src/test/regress/lakehouse/**'
+      - 'scripts/*shared_sources.py'
       - 'meson.build'
       - 'meson_options.txt'
       - 'src/backend/access/meson.build'
@@ -52,6 +53,10 @@ jobs:
       workflow: ${{ steps.filter.outputs.workflow }}
     steps:
       - uses: actions/checkout@v4
+      - name: Check shared source list and guard regression cases
+        run: |
+          python3 scripts/check_shared_sources.py --check-list
+          python3 scripts/check_shared_sources.py --self-test
       - name: Classify changed paths
         uses: dorny/paths-filter@v3
         id: filter
@@ -64,6 +69,7 @@ jobs:
             # Native/backend + tests + build wiring (C code, regress suites,
             # fixtures, meson/Makefile) — anything the .so and suites cover
             native:
+              - 'scripts/*shared_sources.py'
               - 'src/**'
               - '!src/backend/access/lakehouse/core/**'
               - 'meson.build'
@@ -180,9 +186,6 @@ jobs:
           sh src/test/lakehouse/fixtures/cow-delete-guard.sh
           python3 src/test/lakehouse/fixtures/catalog-reply-loss-check.py
 
-      - name: Shared-source contract guard (stock-safe modules stay fork-free)
-        run: python3 scripts/check_shared_sources.py
-
       - name: Fetch unmodified PostgreSQL 19.0 for stock package qualification
         uses: actions/checkout@v4
         with:
@@ -202,7 +205,7 @@ jobs:
             make -s install
           )
           make -j4 -C src/backend/access/lakehouse/stock PG_CONFIG="$prefix/bin/pg_config" CARGO_TARGET_DIR="$PWD/build/src/backend/access/lakehouse/rust-target"
-          make -C src/backend/access/lakehouse/stock PG_CONFIG="$prefix/bin/pg_config" install
+          make -C src/backend/access/lakehouse/stock PG_CONFIG="$prefix/bin/pg_config" check-shared-sources install
 
       - name: Stock FDW pins, external position deletes and dump/restore
         run: |

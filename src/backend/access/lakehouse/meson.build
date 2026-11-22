@@ -35,15 +35,12 @@ pg_datalake_core_dep = declare_dependency(
 
 # --- lakehouse extension module --------------------------------------------
 
-lakehouse_sources = files(
-  'lakehouse_sql.c',
+# The stock PGXS package compiles the same reader sources.
+lakehouse_sources = files(fs.read('stock/SHARED_SOURCES').split())
+lakehouse_sources += files(
   'tableam.c',
-  'fdw.c',
-  'fdw_plan.c',
-  'fdw_exec.c',
   'publisher.c',
   'managed_count.c',
-  'batch_fill.c',
 )
 
 if host_system == 'windows'
