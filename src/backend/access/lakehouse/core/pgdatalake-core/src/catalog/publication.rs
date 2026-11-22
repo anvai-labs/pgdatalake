@@ -73,6 +73,35 @@ pub struct AuthorizedPublication<'a> {
     pub request_body: &'a [u8],
 }
 
+/// Storage scope resolved independently of returned catalog metadata.
+pub struct PublicationStorage<'a> {
+    pub table_root: &'a str,
+    pub s3: &'a crate::storage::S3Options,
+    pub max_bytes: u64,
+    pub read_timeout: std::time::Duration,
+}
+
+impl PublicationStorage<'_> {
+    fn digest(&self, location: &str) -> Result<[u8; 32], RestError> {
+        use crate::storage::StorageError;
+        if !scoped_manifest_location(self.table_root, location) {
+            return Err(RestError::Decode(
+                "manifest list falls outside the bound table root".into(),
+            ));
+        }
+        let read = || {
+            let (io, key) = crate::scan::open_for(location, Some(self.s3))?;
+            io.sha256_bounded(&key, self.max_bytes, self.read_timeout)
+        };
+        read().map_err(|err| match err {
+            StorageError::NotFound(_) => RestError::NotFound("manifest list is unavailable".into()),
+            StorageError::Decode(message) => RestError::Decode(message),
+            StorageError::Config(message) | StorageError::Http(message) => RestError::Http(message),
+            _ => RestError::Http("manifest-list verification failed".into()),
+        })
+    }
+}
+
 /// A lookup can only prove acceptance. Unresolved state permits lookup
 /// again and never authorizes another POST.
 #[derive(Debug, PartialEq, Eq)]
@@ -210,10 +239,26 @@ impl RetainedPublication {
 }
 
 impl RestCatalog {
+    /// Check catalog acceptance using a fresh, scoped, bounded manifest read.
+    pub fn lookup_staged_append_on_storage(
+        &self,
+        namespace: &[&str],
+        table: &str,
+        authorization: AuthorizedPublication<'_>,
+        storage: &PublicationStorage<'_>,
+    ) -> Result<PublicationLookup, RestError> {
+        match self.lookup_staged_append(namespace, table, authorization, |location| {
+            storage.digest(location)
+        }) {
+            Err(RestError::NotFound(_)) => Ok(PublicationLookup::Unresolved),
+            result => result,
+        }
+    }
+
     /// Resolve from a fresh catalog read and a fresh, scoped object digest.
     /// The object callback must apply the catalog authority's I/O bounds
     /// and verify the expected object against that authority.
-    pub fn lookup_staged_append<F>(
+    pub(crate) fn lookup_staged_append<F>(
         &self,
         namespace: &[&str],
         table: &str,

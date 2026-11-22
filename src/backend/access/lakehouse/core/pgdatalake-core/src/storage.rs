@@ -315,6 +315,81 @@ impl StorageIo {
         }
     }
 
+    /// Hash a complete object without retaining its contents or using the scan
+    /// cache. A ranged request bounds I/O and a deadline covers retries and
+    /// streaming the response. The result must represent the entire object.
+    pub(crate) fn sha256_bounded(
+        &self,
+        key: &str,
+        max_bytes: u64,
+        deadline: std::time::Duration,
+    ) -> Result<[u8; 32], StorageError> {
+        use object_store::{GetOptions, GetRange};
+        let Some(probe_end) = max_bytes.checked_add(1).filter(|_| max_bytes > 0) else {
+            return Err(StorageError::Config(
+                "invalid object digest byte limit".into(),
+            ));
+        };
+        if deadline.is_zero() {
+            return Err(StorageError::Config(
+                "invalid object digest deadline".into(),
+            ));
+        }
+        let path = Self::full_path(key);
+        let options = GetOptions {
+            range: Some(GetRange::Bounded(0..probe_end)),
+            ..Default::default()
+        };
+        runtime().block_on(async {
+            tokio::time::timeout(deadline, async {
+                let result =
+                    self.store
+                        .get_opts(&path, options)
+                        .await
+                        .map_err(|error| match error {
+                            object_store::Error::NotFound { .. } => {
+                                StorageError::NotFound("manifest list is unavailable".into())
+                            }
+                            _ => StorageError::Http("could not read manifest list".into()),
+                        })?;
+                let expected = result.meta.size;
+                if expected > max_bytes {
+                    return Err(StorageError::Config(
+                        "manifest list exceeds the object digest byte limit".into(),
+                    ));
+                }
+                if result.range != (0..expected) {
+                    return Err(StorageError::Decode(
+                        "manifest list response is incomplete".into(),
+                    ));
+                }
+                let mut stream = result.into_stream();
+                let mut remaining = expected;
+                let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
+                while let Some(chunk) =
+                    std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await
+                {
+                    let chunk = chunk
+                        .map_err(|_| StorageError::Http("could not stream manifest list".into()))?;
+                    remaining = remaining.checked_sub(chunk.len() as u64).ok_or_else(|| {
+                        StorageError::Decode("manifest list exceeds its reported size".into())
+                    })?;
+                    hasher.update(&chunk);
+                }
+                if remaining != 0 {
+                    return Err(StorageError::Decode(
+                        "manifest list response is truncated".into(),
+                    ));
+                }
+                let mut digest = [0; 32];
+                digest.copy_from_slice(hasher.finish().as_ref());
+                Ok(digest)
+            })
+            .await
+            .map_err(|_| StorageError::Http("manifest list read deadline exceeded".into()))?
+        })
+    }
+
     /// PUT one object (used by later write-path slices; exposed now so the
     /// fixture example can verify the roundtrip).
     #[allow(dead_code)]
@@ -503,6 +578,94 @@ mod tests {
             md.format_version,
             crate::catalog::metadata::FormatVersion::V3
         );
+    }
+
+    #[test]
+    fn bounded_digest_reads_the_exact_object() {
+        test_allow_local_stores();
+        let dir = tempfile::tempdir().unwrap();
+        let location = Location::Local {
+            root: dir.path().display().to_string(),
+        };
+        let io = StorageIo::open(&location, None).unwrap();
+        let bytes = vec![0x7a; 32 * 1024];
+        io.put_bytes("manifest.avro", bytes.clone()).unwrap();
+        let budget = std::time::Duration::from_secs(2);
+        assert_eq!(
+            io.sha256_bounded("manifest.avro", 32768, budget).unwrap(),
+            crate::catalog::publication::sha256(&bytes)
+        );
+        assert!(matches!(
+            io.sha256_bounded("manifest.avro", 32767, budget),
+            Err(StorageError::Config(_))
+        ));
+        assert!(matches!(
+            io.sha256_bounded("missing.avro", 32768, budget),
+            Err(StorageError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn bounded_digest_reads_one_s3_range_and_enforces_its_deadline() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", server.server_addr());
+        let (release, held) = std::sync::mpsc::channel();
+        let responder = std::thread::spawn(move || {
+            let receive = || {
+                let request = server
+                    .recv_timeout(std::time::Duration::from_secs(4))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(request.method(), &tiny_http::Method::Get);
+                let range = request
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.equiv("Range"))
+                    .unwrap();
+                assert_eq!(range.value.as_str(), "bytes=0-64");
+                request
+            };
+            let mut response =
+                tiny_http::Response::from_string("full object").with_status_code(206);
+            for (name, value) in [
+                ("Content-Range", "bytes 0-10/11"),
+                ("ETag", "\"abc\""),
+                ("Last-Modified", "Sat, 21 Nov 2026 14:00:00 GMT"),
+            ] {
+                response.add_header(tiny_http::Header::from_bytes(name, value).unwrap());
+            }
+            receive().respond(response).unwrap();
+            let request = receive();
+            held.recv_timeout(std::time::Duration::from_secs(4))
+                .unwrap();
+            drop(request);
+        });
+        let io = StorageIo::open(
+            &Location::S3 {
+                bucket: "fixture".into(),
+                key: "t".into(),
+            },
+            Some(&S3Options {
+                endpoint: Some(endpoint),
+                region: Some("us-east-1".into()),
+                access_key_id: Some("test".into()),
+                secret_access_key: Some("test".into()),
+                path_style: true,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            io.sha256_bounded("manifest.avro", 64, std::time::Duration::from_secs(3))
+                .unwrap(),
+            crate::catalog::publication::sha256(b"full object")
+        );
+        let started = std::time::Instant::now();
+        let result = io.sha256_bounded("manifest.avro", 64, std::time::Duration::from_millis(500));
+        let elapsed = started.elapsed();
+        release.send(()).unwrap();
+        responder.join().unwrap();
+        assert!(matches!(result, Err(StorageError::Http(message)) if message.contains("deadline")));
+        eprintln!("manifest-list S3 fixture: 1 ranged GET per lookup, stalled read {elapsed:?}, budget 500 ms");
     }
 
     /// A missing object is a `NotFound`, distinct from transport errors
