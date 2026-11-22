@@ -564,6 +564,32 @@ pub fn write_snapshot(
     new_files: &[NewDataFile],
     params: SnapshotParams,
 ) -> Result<WrittenSnapshot, StorageError> {
+    write_snapshot_impl(io, location, new_files, params, None)
+}
+
+pub(crate) fn write_bounded_snapshot(
+    io: &StorageIo,
+    location: &str,
+    new_files: &[NewDataFile],
+    params: SnapshotParams,
+    manifest_list_max_bytes: u64,
+) -> Result<WrittenSnapshot, StorageError> {
+    write_snapshot_impl(
+        io,
+        location,
+        new_files,
+        params,
+        Some(manifest_list_max_bytes),
+    )
+}
+
+fn write_snapshot_impl(
+    io: &StorageIo,
+    location: &str,
+    new_files: &[NewDataFile],
+    params: SnapshotParams,
+    manifest_list_max_bytes: Option<u64>,
+) -> Result<WrittenSnapshot, StorageError> {
     let SnapshotParams {
         snapshot_id,
         timestamp_ms,
@@ -579,7 +605,10 @@ pub fn write_snapshot(
             "write path: no data files in snapshot (empty commits are a no-op)".into(),
         ));
     }
-    let sequence = last_sequence_number.unwrap_or(0) + 1;
+    let sequence = last_sequence_number
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| StorageError::Config("Iceberg snapshot sequence overflow".into()))?;
     let loc = location.trim_end_matches('/').to_string();
 
     // StorageIo key semantics: S3 keys are relative to the BUCKET (the
@@ -638,7 +667,7 @@ pub fn write_snapshot(
                 .map(|e| e.data_file.record_count)
                 .sum();
             let new_rel = format!("metadata/{}-rn0.avro", Uuid::new_v4());
-            io.put_bytes(&keyed(new_rel.clone()), new_bytes.clone())?;
+            io.put_bytes_new(&keyed(new_rel.clone()), new_bytes.clone())?;
             rewritten.push(crate::manifest::ManifestListEntry {
                 manifest_path: format!("{loc}/{new_rel}"),
                 manifest_length: new_bytes.len() as i64,
@@ -664,15 +693,15 @@ pub fn write_snapshot(
     let mut data_manifest_keys: Vec<String> = Vec::new();
     let mut list_entries = carried;
     let carried_len = list_entries.len();
-    if !new_files.is_empty() {
+    let new_manifest = if new_files.is_empty() {
+        None
+    } else {
         let manifest_bytes = build_manifest_bytes(new_files, &[], snapshot_id, sequence)?;
         let manifest_key = keyed(format!(
             "metadata/{}-{}-m0.avro",
             snapshot_id,
             Uuid::new_v4()
         ));
-        io.put_bytes(&manifest_key, manifest_bytes.clone())?;
-        data_manifest_keys.push(manifest_key.clone());
         let manifest_path = format!(
             "{loc}/{}",
             manifest_key
@@ -695,17 +724,27 @@ pub fn write_snapshot(
             min_sequence_number: Some(sequence),
         };
         list_entries.push(list_entry);
-    }
+        Some((manifest_key, manifest_bytes))
+    };
     if list_entries.is_empty() {
         return Err(StorageError::Config(
             "write path: snapshot would reference no manifests (empty commit)".into(),
         ));
     }
     let list_bytes = build_manifest_list_bytes(&list_entries)?;
+    if manifest_list_max_bytes.is_some_and(|limit| list_bytes.len() as u64 > limit) {
+        return Err(StorageError::Config(
+            "prepared manifest list exceeds its byte limit".into(),
+        ));
+    }
+    if let Some((key, bytes)) = new_manifest {
+        io.put_bytes_new(&key, bytes)?;
+        data_manifest_keys.push(key);
+    }
     let list_rel = format!("metadata/snap-{}-0-{}.avro", snapshot_id, Uuid::new_v4());
     let list_key = keyed(list_rel.clone());
     let manifest_list_digest = crate::catalog::publication::sha256(&list_bytes);
-    io.put_bytes(&list_key, list_bytes)?;
+    io.put_bytes_new(&list_key, list_bytes)?;
 
     // summary per the spec's snapshot summary keys (writers may add more);
     // any deletion flips the operation to overwrite (Iceberg convention:

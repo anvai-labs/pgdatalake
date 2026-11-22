@@ -64,6 +64,14 @@ The [intent smoke](../../../src/test/lakehouse/fixtures/publication-intent-check
 
 The [catalog lookup provider](01-catalog-storage.md#acceptance-lookup-for-a-retained-proposal) holds an attempt when it cannot prove positive acceptance. The HTTP test first sees the old head, delivers the original POST, loses the reply and checks that the next lookup verifies the introducing snapshot under a later head. No definitive rejection transition is implied by a missing marker.
 
+## Prepare immutable writer output
+
+The writer stages append-only files with create-only PUTs and passes their data descriptors and the verified writer pin to `CatalogClient::prepare_staged_append`. This Rust entry point reloads the bound catalog route and checks the UUID, `main` head, sequence, schema, spec, base manifest-list URI and table root against the writer pin. A moved pin fails before new metadata uploads. Unique nonempty file descriptors must be under the bound data directory.
+
+The parent manifest list is read with the object byte budget and deadline used by recovery. Preparation carries the parent's data and delete manifest references forward within the bound metadata root. The new list must fit the same budget before its new manifests are uploaded. New Parquet files, manifests and lists use conditional create at their generated keys. A collision leaves the existing object intact. The writer seals the new list and returns the exact CAS request, which the worker can authorize and submit separately.
+
+A failed preparation can leave unreferenced files, including if the store returns an uncertain PUT result. Proposed objects must survive recovery and cleanup while a send is unresolved. Automatic orphan reclamation remains a separate gate. This provider consumes a verified binding and an in-band Iceberg v2 pin. Binding enrollment, foreground capture and publisher orchestration remain dependencies.
+
 ## When a second append is safe
 
 | Evidence | Decision |

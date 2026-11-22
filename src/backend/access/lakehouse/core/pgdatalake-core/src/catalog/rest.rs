@@ -191,6 +191,15 @@ impl RestCatalog {
         table: &str,
     ) -> Result<super::types::LoadTableResult, RestError> {
         let prefix = self.prefix.lock().expect("prefix mutex poisoned").clone();
+        self.load_table_at_prefix(namespace, table, prefix.as_deref())
+    }
+
+    pub(crate) fn load_table_at_prefix(
+        &self,
+        namespace: &[&str],
+        table: &str,
+        prefix: Option<&str>,
+    ) -> Result<super::types::LoadTableResult, RestError> {
         let ns = namespace
             .iter()
             .map(|c| urlencoding::encode(c))
@@ -200,7 +209,7 @@ impl RestCatalog {
         let url = format!(
             "{}/v1{}/namespaces/{ns}/tables/{}",
             self.endpoint,
-            prefix.as_ref().map_or_default(|p| format!("/{p}")),
+            prefix.map_or_default(|p| format!("/{p}")),
             urlencoding::encode(table),
         );
         let resp = self
