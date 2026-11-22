@@ -19,33 +19,36 @@ against the remote catalog at next refresh.
 
 The [catalog profile roadmap](modules/09-cloud-profiles.md#catalog-expansion-after-lakekeeper) assigns ownership, distinct profiles and promotion tests. The [Iceberg REST specification](https://iceberg.apache.org/rest-catalog-spec/) is the protocol baseline.
 
-## 2. REST catalog conformance (the big one)
+## 2. REST catalog operation contracts
 
-Implement the Iceberg REST openapi spec exactly:
+For each supported operation, follow the Iceberg REST OpenAPI wire contract and
+qualify the operation against the enrolled provider.
 
 - Where the profile uses `GET /v1/config`, allowlist the returned configuration fields.
   Keep the operator-enrolled authority, expected UUID, permitted ref and storage roots
   authoritative. The bound Lakekeeper pilot uses a preconfigured route and storage
   settings. A profile that vends credentials needs an explicit trust and expiry contract.
-- OAuth2 client credentials flow (`/v1/oauth/tokens`) with proactive refresh at
-  80% of token TTL; also accept bearer tokens, SigV4 signing (AWS REST profiles),
-  and Azure Entra tokens (Polaris-on-ADLS deployments).
+- For OAuth2, enroll the provider's token endpoint and audience separately from
+  the catalog route. Scope refresh to the original principal and deadline. Treat
+  the deprecated catalog `/v1/oauth/tokens` route as provider-specific
+  compatibility. Qualify bearer tokens, SigV4 (AWS) and Entra tokens (Azure) in
+  their respective profiles.
 - Namespace ops: `listNamespaces`, `createNamespace` (map to Postgres schemas on
   managed side: one Iceberg namespace = one schema, enforced 1:1 at attach time).
 - Table ops: `loadTable` (returns `metadata_location` + config), `createTable`,
   `renameTable`, `dropTable` (with purge semantics flag), `reportMetrics`.
-- **Commit**: `commitTable` with `requirements` (AssertRefSnapshotId,
-  AssertTableUUID, AssertSchemaUUID…) — every requirement type implemented, since
-  this is our optimistic-concurrency instrument (doc 07). Wire contract
+- **Commit**: bind each enabled `commitTable` operation to the requirements that
+  fence its assumptions, such as `assert-table-uuid`, `assert-ref-snapshot-id`
+  and `assert-current-schema-id` when an operation requires a schema fence. Wire contract
   (verified against pyiceberg 0.12, the interop oracle): requirements
   discriminate on `"type"` (`assert-table-uuid`, `assert-ref-snapshot-id` with
   `snapshot-id` ALWAYS present — null means "ref must not exist"), updates
   discriminate on `"action"` (`add-snapshot`, `set-snapshot-ref` with
   `ref-name`/`type`/`snapshot-id`). A typed definitive rejection permits a compatible replan under the attempt policy. An HTTP status alone cannot establish absence of an effect.
-- **Multi-table atomic commit**: `POST /v1/{ns}/transactions` (`CommitTransactionRequest`)
-  a future capability requiring a separate atomicity gate; on non-supporting catalogs, our
-  cross-table commit strategy degrades per doc 07 §4 (staged sequential commits with
-  a transaction journal in `pg_lakehouse_table`).
+- **Multi-table atomic commit**: `POST /v1/{prefix}/transactions/commit`
+  (`CommitTransactionRequest`) is a future capability requiring a separate
+  atomicity gate. Sequential publication can expose intermediate states across
+  tables. Each table's receipt covers that table's publication only.
 - View endpoints, `registerTable`, plan-table endpoints: v2.
 
 Treat route selection, required headers, credential mode and operation
