@@ -28,7 +28,17 @@ INSERT INTO cnt_elide SELECT g, 'e-'||g FROM generate_series(1, 5) g;
 -- execution-time successor (spec 16): the plan is a bare Result whose
 -- target is the volatile lakehouse.managed_count(relid) call — the ONLY
 -- plan input is the relation descriptor; NO count literal may appear
-EXPLAIN (VERBOSE, COSTS OFF) SELECT count(*) FROM cnt_elide;
+DO $plan$
+DECLARE
+    plan json;
+BEGIN
+    EXECUTE 'EXPLAIN (VERBOSE, FORMAT JSON) SELECT count(*) FROM cnt_elide' INTO plan;
+    IF plan #>> '{0,Plan,Node Type}' IS DISTINCT FROM 'Result'
+       OR plan #>> '{0,Plan,Output,0}' IS DISTINCT FROM
+          format('lakehouse.managed_count(%L::oid)', 'cnt_elide'::regclass::oid) THEN
+        RAISE EXCEPTION 'unexpected managed COUNT plan: %', plan;
+    END IF;
+END $plan$;
 SELECT count(*) AS exact FROM cnt_elide;
 
 -- prepared plans stay FRESH across commits (spec 16 blocker 1: a generic

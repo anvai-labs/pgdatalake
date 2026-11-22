@@ -31,7 +31,10 @@ SELECT attname, format_type(atttypid, atttypmod) AS typ
  staged_at             | timestamp with time zone
  published             | boolean
  published_snapshot_id | bigint
-(8 rows)
+ authority_id          | uuid
+ table_uuid            | uuid
+ payload_digest        | bytea
+(11 rows)
 
 -- PUBLIC may not touch it
 SELECT has_table_privilege('public',
