@@ -88,8 +88,6 @@ typedef struct LakehouseExecState
 	Oid			count_ftid;
 } LakehouseExecState;
 
-/* fdw_exec.c — set while the ordinary-aggregate fallback replans */
-extern bool lakehouse_fdw_count_in_fallback;
 extern bool lakehouse_trivial_count_shape(Query *parse);
 
 /* fdw.c */

@@ -68,15 +68,6 @@ query_snapshot_selector(PlannerInfo *root, RelOptInfo *baserel)
 }
 
 /*
- * Reentry guard for the execution-time COUNT fallback: the SPI ordinary
- * aggregate replans, and without this flag the hook would attach the
- * one-row path to the INNER query too — a proof that fails permanently
- * (offline endpoint) would recurse (the managed twin landed this guard
- * in the COUNT successor review).
- */
-bool		lakehouse_fdw_count_in_fallback = false;
-
-/*
  * Trivial count(*) over exactly one foreign base relation of ours: the
  * builtin identity (F_COUNT_), single star aggregate, no quals/joins/
  * grouping/having/window/distinct/limit-offset. The shape checks mirror
@@ -131,15 +122,8 @@ fdw_count_wanted(PlannerInfo *root, RelOptInfo *input_rel,
 }
 
 /*
- * Execution-time COUNT successor (spec 16; reinstates the shape of the
- * gated-off plan-time elision WITHOUT its defects): a one-row upper
- * ForeignPath whose fdw_private carries ONLY a descriptor — marker,
- * selector, foreign table OID. No count is embedded in the plan, so a
- * prepared statement cannot serve a stale total. Begin resolves the
- * CURRENT snapshot, re-proves delete eligibility, and computes the sum
- * from manifest record_counts; an unprovable answer falls back to the
- * ordinary aggregate via SPI (guard above). Default EXPLAIN opens zero
- * data objects: nothing is contacted at plan time.
+ * Offer a descriptor-only path for the single COUNT result. Resolve the
+ * authorized snapshot and compute the count on first tuple demand.
  */
 void
 lakehouse_GetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
@@ -152,8 +136,6 @@ lakehouse_GetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 	const char *selector;
 	PathTarget *target;
 
-	if (lakehouse_fdw_count_in_fallback)
-		return;
 	if (stage != UPPERREL_GROUP_AGG)
 		return;
 	if (!fdw_count_wanted(root, input_rel, &rte))
@@ -561,23 +543,16 @@ lakehouse_GetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 	Relation	tmpl_rel;
 
 	/*
-	 * UPPER REL (execution-time COUNT): pass the descriptor through and hand
-	 * the executor a real one-column int8 scan tlist (an INDEX_VAR over our
-	 * slot) — never fall through to base-scan descriptor construction,
-	 * which has no base relation here. The plan carries NO count value.
+	 * Describe the aggregate emitted in the scan slot. setrefs matches the
+	 * plan's Aggref to this expression and substitutes an INDEX_VAR.
 	 */
 	if (baserel->reloptkind == RELOPT_UPPER_REL)
 	{
-		Var		   *slot_col = makeVar(INDEX_VAR, 1, INT8OID, -1, InvalidOid, 0);
+		List	   *scan_tlist = make_tlist_from_pathtarget(best_path->path.pathtarget);
 
 		Assert(list_length(best_path->fdw_private) == 3);
-		return make_foreignscan(tlist,
-								list_make1(makeTargetEntry((Expr *) slot_col,
-														   1, NULL, false)),
-								0 /* scanrelid: no base relation */ ,
-								NIL,
-								best_path->fdw_private,
-								NIL, NIL, NULL);
+		return make_foreignscan(tlist, NIL, 0, NIL, best_path->fdw_private,
+								scan_tlist, NIL, NULL);
 	}
 
 	/*
