@@ -1,6 +1,6 @@
 # Core release contracts and milestone receipts
 
-**Owner** Qualification (08). Baseline `1acdf09f4f3fb90b7bfebb8bbe8b500c26ec967c`. The [fork CI](https://github.com/anvai-labs/pgdatalake/actions/runs/44987466812) passed native, Rust and live integration jobs. Direct COW and catalog reply-loss fixtures exercise running software. Modules 01/03/04 have separate tests for local WAL recovery, scoped catalog lookup and preparing real immutable Avro objects. Ordinary staged capture still inserts unbound segments, the legacy worker filters for them, and staged scans skip the published base. The following release gates are **NOT RUN** as complete customer journeys. [Current worker](../../../src/backend/access/lakehouse/publisher.c) · [Managed scan and capture](../../../src/backend/access/lakehouse/tableam.c)
+**Owner** Qualification (08). Core #61 exercises an ordinary scoped read on two tenant connections. #63–65 exercise bound SQL capture, durable send and recovery in a controlled worker fixture. #69 can validate governed observations from an external runner. The table lists the original failing case and the complete exit required for each customer journey. [Current dependency tracker](../PROGRESS.md#current-dependency-order)
 
 | Gate, owner and dependencies | Reproduce failure first | Required smoke after integration |
 |---|---|---|
@@ -28,10 +28,7 @@ commit POST, one WAL-flushed intent with the original bytes, exact independent
 rows at both pins, and an unaffected later segment. Replaying a completed
 operation preserves the receipt and issues zero catalog requests.
 
-The fixture trusts a disposable operator's explicit enrollment facts. Production
-enablement needs the native scheduler, durable scope resolved from each member's
-binding and generation, active grant enforcement at the send fence, and a
-zero-forbidden-request drill. The managed read overlay and promoted-primary
+The fixture trusts a disposable operator's explicit enrollment facts. Extension 1.8 validates member scope and checks the active grant at the send fence in the joined fixture. Production enablement still requires the native scheduler, actual credential resolution and a deployment-specific zero-forbidden-request drill. The managed read overlay and promoted-primary
 recovery each need their own release gate.
 
 **Safe parallel starts.** Stock packaging, scoped cloud reads, ledger enrollment and independent exact-row fixtures may start against the shared contract. Integrate the actual writer only after verified capture and local send durability. Enable managed reads only after membership and real worker receipts. Service routing may consume pinned reads independently of managed capture. Serialize SQL upgrade numbers, shared ABI/header exports and fixture semantic changes. Freeze a digest for each set of vectors; provider and consumer must pass the same digest before claiming integration.

@@ -212,7 +212,7 @@ jobs:
           (
             set -e
             cd build/stock-pg19-src
-            ./configure --prefix="$prefix" --without-icu --without-readline
+            ./configure --prefix="$prefix" --without-icu --without-readline --with-ssl=openssl
             make -s -j4
             make -s install
           )
@@ -229,7 +229,10 @@ jobs:
           trap 'pg_ctl -D "$PGHOST/data" -m fast -w stop' EXIT
           python3 src/test/lakehouse/fixtures/stock-fdw-check.py --receipt "$RUNNER_TEMP/stock-reader.json"
           python3 src/test/lakehouse/fixtures/fdw-count-check.py
-          python3 src/test/lakehouse/fixtures/scoped-read-check.py
+          set -o pipefail
+          src/test/lakehouse/fixtures/stock-scoped-tls.sh | tee "$RUNNER_TEMP/stock-scoped.log"
+          jq -Rsc '[split("\n")[] | fromjson? | objects | del(.mapping_key,.catalog_token)]' \
+            "$RUNNER_TEMP/stock-scoped.log" > "$RUNNER_TEMP/stock-scoped-tls.json"
 
       - name: Collect installed stock package for downstream tests
         run: |
@@ -251,7 +254,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: stock-reader-receipt
-          path: ${{ runner.temp }}/stock-reader.json
+          path: |
+            ${{ runner.temp }}/stock-reader.json
+            ${{ runner.temp }}/stock-scoped-tls.json
           if-no-files-found: error
           retention-days: 7
 
