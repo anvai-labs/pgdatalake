@@ -660,7 +660,7 @@ impl BatchWriter {
             flush_id,
             seq
         );
-        io.put_bytes(&key, bytes)?;
+        io.put_bytes_new(&key, bytes)?;
         Ok(WrittenFile {
             key,
             record_count: rows as i64,

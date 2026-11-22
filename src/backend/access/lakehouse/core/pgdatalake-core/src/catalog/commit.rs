@@ -174,6 +174,10 @@ impl PreparedPublication<'_> {
         sha256(&self.payload)
     }
 
+    pub(crate) fn route_prefix(&self) -> Option<&str> {
+        self.prefix.as_deref()
+    }
+
     /// Submit after the durable send fence authorizes this exact digest.
     /// Consumes the proposal and sends without retries or redirect handling.
     pub fn submit(self) -> Result<CommitTableResponse, RestError> {
@@ -243,6 +247,41 @@ struct ErrorDetail {
     kind: String,
 }
 
+pub(crate) fn validate_staged_base(
+    base: &TableMetadata,
+    table_uuid: uuid::Uuid,
+) -> Result<i32, RestError> {
+    if base.table_uuid != table_uuid {
+        return Err(RestError::Conflict(
+            "staged append table UUID changed".into(),
+        ));
+    }
+    let main = base.refs.get("main");
+    let expected_parent = base.current_snapshot_id;
+    if main.map(|reference| reference.snapshot_id) != expected_parent
+        || main.is_some_and(|reference| reference.kind != "branch")
+        || expected_parent.is_some_and(|parent| parent <= 0 || base.snapshot(parent).is_none())
+    {
+        return Err(RestError::Conflict(
+            "staged append has no verified main pin".into(),
+        ));
+    }
+    let spec = base
+        .default_partition_spec_id
+        .and_then(|spec_id| base.partition_spec(spec_id));
+    let Some(spec) = spec.filter(|spec| spec.fields.is_empty()) else {
+        return Err(RestError::Decode(
+            "staged append requires a known unpartitioned spec".into(),
+        ));
+    };
+    if base.format_version != FormatVersion::V2 || base.current_schema().is_none() {
+        return Err(RestError::Decode(
+            "staged append requires a known v2 schema".into(),
+        ));
+    }
+    Ok(spec.spec_id)
+}
+
 impl RestCatalog {
     /// Package the writer's immutable append snapshot for a bound v2 table
     /// on main. Preparation performs no network calls or catalog mutations.
@@ -255,34 +294,9 @@ impl RestCatalog {
         identity: PublicationIdentity,
         manifest_list_digest: [u8; 32],
     ) -> Result<PreparedPublication<'_>, RestError> {
-        if base.table_uuid != identity.table_uuid {
-            return Err(RestError::Conflict(
-                "staged append table UUID changed".into(),
-            ));
-        }
+        let spec_id = validate_staged_base(base, identity.table_uuid)?;
         let main = base.refs.get("main");
         let expected_parent = base.current_snapshot_id;
-        if main.map(|reference| reference.snapshot_id) != expected_parent
-            || main.is_some_and(|reference| reference.kind != "branch")
-            || expected_parent.is_some_and(|parent| parent <= 0 || base.snapshot(parent).is_none())
-        {
-            return Err(RestError::Conflict(
-                "staged append has no verified main pin".into(),
-            ));
-        }
-        let spec = base
-            .default_partition_spec_id
-            .and_then(|spec_id| base.partition_spec(spec_id));
-        let Some(spec) = spec.filter(|spec| spec.fields.is_empty()) else {
-            return Err(RestError::Decode(
-                "staged append requires a known unpartitioned spec".into(),
-            ));
-        };
-        if base.format_version != FormatVersion::V2 || base.current_schema().is_none() {
-            return Err(RestError::Decode(
-                "staged append requires a known v2 schema".into(),
-            ));
-        }
         if !scoped_manifest_location(&base.location, &snapshot.manifest_list) {
             return Err(RestError::Decode(
                 "staged append manifest list is outside a valid table metadata location".into(),
@@ -326,7 +340,7 @@ impl RestCatalog {
                 current_schema_id: base.current_schema_id,
             },
             TableRequirement::AssertDefaultSpecId {
-                default_spec_id: i64::from(spec.spec_id),
+                default_spec_id: i64::from(spec_id),
             },
         ];
         let updates = [

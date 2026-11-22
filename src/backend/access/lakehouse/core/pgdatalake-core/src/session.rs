@@ -178,6 +178,138 @@ impl CatalogClient {
         })
     }
 
+    /// Build one staged append from a verified writer pin and create-only
+    /// data files. The worker authorizes the returned bytes separately.
+    pub fn prepare_staged_append(
+        &self,
+        st: &TableWriteState,
+        namespace: &[&str],
+        table: &str,
+        new_files: &[crate::snapshot_write::NewDataFile],
+        identity: crate::catalog::publication::PublicationIdentity,
+        manifest_budget: (u64, std::time::Duration),
+    ) -> Result<crate::catalog::commit::PreparedPublication<'_>, crate::storage::StorageError> {
+        use crate::catalog::commit::validate_staged_base;
+        use crate::catalog::publication::{scoped_manifest_location, scoped_object_location};
+        use crate::catalog::rest::RestError;
+        use crate::snapshot_write::{write_bounded_snapshot, SnapshotParams};
+        use crate::storage::{StorageError, StorageIo};
+
+        let (max_bytes, timeout) = manifest_budget;
+        if new_files.is_empty() || max_bytes == 0 || max_bytes == u64::MAX || timeout.is_zero() {
+            return Err(StorageError::Config(
+                "staged append requires files and a manifest budget".into(),
+            ));
+        }
+        let mut file_paths = std::collections::HashSet::with_capacity(new_files.len());
+        for file in new_files {
+            if !scoped_object_location(&st.location, &file.file_path, "/data/")
+                || !file_paths.insert(&file.file_path)
+                || file.record_count <= 0
+                || file.file_size_in_bytes <= 0
+            {
+                return Err(StorageError::Config(
+                    "invalid staged append data file".into(),
+                ));
+            }
+        }
+
+        let map_error = |error| match error {
+            RestError::Conflict(message) => StorageError::Conflict(message),
+            other => StorageError::Config(other.to_string()),
+        };
+        let prefix = self
+            .rest
+            .prefix
+            .lock()
+            .expect("prefix mutex poisoned")
+            .clone();
+        let loaded = self
+            .rest
+            .load_table_at_prefix(namespace, table, prefix.as_deref())
+            .map_err(map_error)?;
+
+        let base = loaded.metadata.ok_or_else(|| {
+            StorageError::Config("staged append requires in-band table metadata".into())
+        })?;
+        let spec_id = validate_staged_base(&base, identity.table_uuid).map_err(map_error)?;
+        let base_list = base
+            .current_snapshot()
+            .map(|snapshot| snapshot.manifest_list.as_str());
+        if st.table_uuid != base.table_uuid
+            || st.location.trim_end_matches('/') != base.location.trim_end_matches('/')
+            || st.base_snapshot_id != base.current_snapshot_id
+            || st.last_sequence_number != base.last_sequence_number
+            || st.base_manifest_list.as_deref() != base_list
+            || st.schema_id != Some(base.current_schema_id)
+            || st.partition_spec_id != spec_id
+        {
+            return Err(StorageError::Conflict(
+                "staged append writer pin changed".into(),
+            ));
+        }
+        let carried_manifests = if let Some(path) = base_list {
+            if !scoped_manifest_location(&st.location, path) {
+                return Err(StorageError::Decode(
+                    "base manifest list is outside the bound table".into(),
+                ));
+            }
+            let (io, key) = crate::scan::open_for(path, Some(&st.s3))?;
+            let manifests = crate::manifest::parse_manifest_list(
+                &io.get_bytes_bounded(&key, max_bytes, timeout)?,
+            )?;
+            if manifests
+                .iter()
+                .any(|manifest| !scoped_manifest_location(&st.location, &manifest.manifest_path))
+            {
+                return Err(StorageError::Decode(
+                    "carried manifest is outside the bound table".into(),
+                ));
+            }
+            manifests
+        } else {
+            Vec::new()
+        };
+        let location = crate::storage::parse_location(&st.location)?;
+        let io = StorageIo::open(&location, Some(&st.s3))?;
+        let snapshot_id = ((uuid::Uuid::new_v4().as_u128() >> 64) as i64) & i64::MAX;
+        let written = write_bounded_snapshot(
+            &io,
+            &st.location,
+            new_files,
+            SnapshotParams {
+                snapshot_id,
+                timestamp_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |elapsed| elapsed.as_millis() as i64),
+                parent_snapshot_id: st.base_snapshot_id,
+                last_sequence_number: st.last_sequence_number,
+                schema_id: st.schema_id,
+                partition_spec_id: spec_id,
+                carried_manifests,
+                deleted_files: Vec::new(),
+            },
+            max_bytes,
+        )?;
+        let prepared = self
+            .rest
+            .prepare_staged_append(
+                namespace,
+                table,
+                &base,
+                written.snapshot,
+                identity,
+                written.manifest_list_digest,
+            )
+            .map_err(map_error)?;
+        if prepared.route_prefix() != prefix.as_deref() {
+            return Err(StorageError::Conflict(
+                "catalog route changed during staged preparation".into(),
+            ));
+        }
+        Ok(prepared)
+    }
+
     /// Flush + assemble + COMMIT an append snapshot (doc 07 §2 steps 1-3,
     /// rebuilt per 13-implementation-review blocker #2): EVERY attempt
     /// reloads metadata, binds the requirement to the ORIGINAL table
@@ -455,6 +587,148 @@ mod tests {
     /// against an in-process mock catalog serving config + loadTable, with
     /// the metadata on a local store — no network beyond the loopback mock
     /// (doc 10 §1).
+    #[test]
+    fn prepares_real_manifests_without_publishing_or_rebasing() {
+        use crate::catalog::metadata::{PartitionSpec, SnapshotRef, TableMetadata};
+        use crate::catalog::publication::PublicationIdentity;
+        use crate::snapshot_write::{write_snapshot, NewDataFile, SnapshotParams};
+
+        crate::storage::test_allow_local_stores();
+        let dir = tempfile::tempdir().unwrap();
+        let location = format!("file://{}", dir.path().display());
+        let loc = crate::storage::parse_location(&location).unwrap();
+        let io = crate::storage::StorageIo::open(&loc, None).unwrap();
+        let mut batch = crate::writer::BatchWriter::new(vec![crate::writer::WriteColumn {
+            name: "id".into(),
+            ty: crate::catalog::metadata::IcebergType::Long,
+            field_id: Some(1),
+        }])
+        .unwrap();
+        let mut files = Vec::new();
+        for id in [10, 20] {
+            batch.push(&[crate::parquet::CellValue::Int64(id)]).unwrap();
+            let written = batch.write_file(&io, "data", files.len()).unwrap();
+            files.push(NewDataFile {
+                file_path: format!("{location}/{}", written.key),
+                record_count: written.record_count,
+                file_size_in_bytes: written.file_size_in_bytes,
+                ..Default::default()
+            });
+        }
+        let base = write_snapshot(
+            &io,
+            &location,
+            &files[..1],
+            SnapshotParams {
+                snapshot_id: 100,
+                timestamp_ms: 1,
+                parent_snapshot_id: None,
+                last_sequence_number: None,
+                schema_id: Some(0),
+                partition_spec_id: 0,
+                carried_manifests: vec![],
+                deleted_files: vec![],
+            },
+        )
+        .unwrap()
+        .snapshot;
+        let mut metadata: TableMetadata = serde_json::from_value(serde_json::json!({
+            "format-version": 2, "table-uuid": uuid::Uuid::from_u128(1), "location": location,
+            "current-schema-id": 0, "schemas": [{"type": "struct", "schema-id": 0, "fields": []}],
+            "current-snapshot-id": 100, "last-sequence-number": 1,
+        }))
+        .unwrap();
+        metadata.partition_specs.push(PartitionSpec {
+            spec_id: 0,
+            fields: vec![],
+        });
+        metadata.default_partition_spec_id = Some(0);
+        metadata.refs.insert(
+            "main".into(),
+            SnapshotRef {
+                snapshot_id: 100,
+                kind: "branch".into(),
+                min_snapshots_to_keep: None,
+                max_snapshot_age_ms: None,
+            },
+        );
+        metadata.snapshots.push(base.clone());
+        let mut st = TableWriteState {
+            table_uuid: metadata.table_uuid,
+            base_snapshot_id: Some(100),
+            last_sequence_number: Some(1),
+            base_manifest_list: Some(base.manifest_list.clone()),
+            location: location.clone(),
+            schema_id: Some(0),
+            partition_spec_id: 0,
+            s3: S3Options::default(),
+            field_ids: std::collections::BTreeMap::new(),
+        };
+        let identity = PublicationIdentity {
+            operation_id: uuid::Uuid::from_u128(2),
+            table_uuid: metadata.table_uuid,
+            input_digest: [7; 32],
+        };
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", server.server_addr());
+        let worker = std::thread::spawn(move || {
+            let body =
+                serde_json::json!({"metadata-location": "", "metadata": metadata}).to_string();
+            for _ in 0..3 {
+                let req = server
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(req.method(), &tiny_http::Method::Get);
+                req.respond(tiny_http::Response::from_string(body.clone()))
+                    .unwrap();
+            }
+        });
+        let client = CatalogClient::new(&endpoint, "", "", &S3ClientOptions::default()).unwrap();
+        let budget = (1 << 20, std::time::Duration::from_secs(3));
+        let prepared = client
+            .prepare_staged_append(&st, &["ns"], "t", &files[1..], identity, budget)
+            .unwrap();
+        let wire: serde_json::Value = serde_json::from_slice(prepared.request_body()).unwrap();
+        let manifest = wire["updates"][0]["snapshot"]["manifest-list"]
+            .as_str()
+            .unwrap();
+        let persisted = io
+            .get_bytes(manifest.strip_prefix(&format!("{location}/")).unwrap())
+            .unwrap();
+        let carried = crate::manifest::parse_manifest_list(&persisted).unwrap();
+        assert_eq!(carried.len(), 2);
+        assert_eq!(carried[0].added_snapshot_id, 100);
+        assert_eq!(carried[1].added_snapshot_id, prepared.snapshot_id());
+        assert_eq!(prepared.expected_parent(), Some(100));
+
+        let metadata_dir = dir.path().join("metadata");
+        let before = std::fs::read_dir(&metadata_dir).unwrap().count();
+        let base_bytes = io
+            .get_bytes(
+                base.manifest_list
+                    .strip_prefix(&format!("{location}/"))
+                    .unwrap(),
+            )
+            .unwrap()
+            .len() as u64;
+        assert!(matches!(
+            client.prepare_staged_append(&st, &["ns"], "t", &files[1..], identity,
+                (base_bytes, budget.1)),
+            Err(crate::storage::StorageError::Config(message))
+                if message.contains("prepared manifest list exceeds")
+        ));
+        assert_eq!(std::fs::read_dir(&metadata_dir).unwrap().count(), before);
+
+        st.base_snapshot_id = Some(99);
+        assert!(matches!(
+            client.prepare_staged_append(&st, &["ns"], "t", &files[1..], identity, budget),
+            Err(crate::storage::StorageError::Conflict(_))
+        ));
+        assert_eq!(std::fs::read_dir(metadata_dir).unwrap().count(), before);
+        worker.join().unwrap();
+    }
+
     #[test]
     fn scan_table_walks_config_loadtable_metadata_plan() {
         use apache_avro::{Schema as AvroSchema, Writer};

@@ -30,7 +30,11 @@ pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
     result
 }
 
-pub(super) fn scoped_manifest_location(root: &str, manifest: &str) -> bool {
+pub(crate) fn scoped_manifest_location(root: &str, manifest: &str) -> bool {
+    scoped_object_location(root, manifest, "/metadata/")
+}
+
+pub(crate) fn scoped_object_location(root: &str, object: &str, directory: &str) -> bool {
     let Ok(root_url) = reqwest::Url::parse(root) else {
         return false;
     };
@@ -41,9 +45,9 @@ pub(super) fn scoped_manifest_location(root: &str, manifest: &str) -> bool {
     {
         return false;
     }
-    manifest
+    object
         .strip_prefix(root.trim_end_matches('/'))
-        .and_then(|path| path.strip_prefix("/metadata/"))
+        .and_then(|path| path.strip_prefix(directory))
         .is_some_and(|key| {
             key.split('/').all(|component| {
                 !matches!(component, "" | "." | "..")

@@ -315,15 +315,42 @@ impl StorageIo {
         }
     }
 
-    /// Hash a complete object without retaining its contents or using the scan
-    /// cache. A ranged request bounds I/O and a deadline covers retries and
-    /// streaming the response. The result must represent the entire object.
+    /// Hash a complete object without retaining its contents or using the scan cache.
     pub(crate) fn sha256_bounded(
         &self,
         key: &str,
         max_bytes: u64,
         deadline: std::time::Duration,
     ) -> Result<[u8; 32], StorageError> {
+        let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
+        self.stream_bounded(key, max_bytes, deadline, |chunk| hasher.update(chunk))?;
+        let mut digest = [0; 32];
+        digest.copy_from_slice(hasher.finish().as_ref());
+        Ok(digest)
+    }
+
+    /// Read the complete body for the manifest decoder, using the same range
+    /// and deadline as reconciliation.
+    pub(crate) fn get_bytes_bounded(
+        &self,
+        key: &str,
+        max_bytes: u64,
+        deadline: std::time::Duration,
+    ) -> Result<Vec<u8>, StorageError> {
+        let mut bytes = Vec::new();
+        self.stream_bounded(key, max_bytes, deadline, |chunk| {
+            bytes.extend_from_slice(chunk);
+        })?;
+        Ok(bytes)
+    }
+
+    fn stream_bounded(
+        &self,
+        key: &str,
+        max_bytes: u64,
+        deadline: std::time::Duration,
+        mut consume: impl FnMut(&[u8]),
+    ) -> Result<(), StorageError> {
         use object_store::{GetOptions, GetRange};
         let Some(probe_end) = max_bytes.checked_add(1).filter(|_| max_bytes > 0) else {
             return Err(StorageError::Config(
@@ -365,7 +392,6 @@ impl StorageIo {
                 }
                 let mut stream = result.into_stream();
                 let mut remaining = expected;
-                let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
                 while let Some(chunk) =
                     std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await
                 {
@@ -374,20 +400,42 @@ impl StorageIo {
                     remaining = remaining.checked_sub(chunk.len() as u64).ok_or_else(|| {
                         StorageError::Decode("manifest list exceeds its reported size".into())
                     })?;
-                    hasher.update(&chunk);
+                    consume(&chunk);
                 }
                 if remaining != 0 {
                     return Err(StorageError::Decode(
                         "manifest list response is truncated".into(),
                     ));
                 }
-                let mut digest = [0; 32];
-                digest.copy_from_slice(hasher.finish().as_ref());
-                Ok(digest)
+                Ok(())
             })
             .await
             .map_err(|_| StorageError::Http("manifest list read deadline exceeded".into()))?
         })
+    }
+
+    /// Atomically create an object. A key collision never replaces existing
+    /// bytes, including when storage retries a write whose reply was lost.
+    pub(crate) fn put_bytes_new(&self, key: &str, data: Vec<u8>) -> Result<(), StorageError> {
+        use object_store::{PutMode, PutOptions};
+        let path = Self::full_path(key);
+        let options = PutOptions {
+            mode: PutMode::Create,
+            ..Default::default()
+        };
+        runtime()
+            .block_on(
+                self.store
+                    .put_opts(&path, PutPayload::from_bytes(data.into()), options),
+            )
+            .map_err(|error| match error {
+                object_store::Error::AlreadyExists { .. }
+                | object_store::Error::Precondition { .. } => {
+                    StorageError::Conflict("immutable object key already exists".into())
+                }
+                other => StorageError::Http(other.to_string()),
+            })?;
+        Ok(())
     }
 
     /// PUT one object (used by later write-path slices; exposed now so the
@@ -578,6 +626,23 @@ mod tests {
             md.format_version,
             crate::catalog::metadata::FormatVersion::V3
         );
+    }
+
+    #[test]
+    fn create_only_put_keeps_original_object() {
+        test_allow_local_stores();
+        let dir = tempfile::tempdir().unwrap();
+        let location = Location::Local {
+            root: dir.path().display().to_string(),
+        };
+        let io = StorageIo::open(&location, None).unwrap();
+        io.put_bytes_new("metadata/manifest.avro", b"original".to_vec())
+            .unwrap();
+        assert!(matches!(
+            io.put_bytes_new("metadata/manifest.avro", b"replacement".to_vec()),
+            Err(StorageError::Conflict(_))
+        ));
+        assert_eq!(io.get_bytes("metadata/manifest.avro").unwrap(), b"original");
     }
 
     #[test]
