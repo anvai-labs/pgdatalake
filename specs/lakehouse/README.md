@@ -59,19 +59,20 @@ and [shared contracts](modules/00-integration-contracts.md).
 | [16-release-reassessment-and-scale.md](16-release-reassessment-and-scale.md) | Current review status, release gates, and scalable execution design |
 | [17-anvai-lake-product.md](17-anvai-lake-product.md) | Product packaging, adoption, and publication latency |
 | [18-anvai-lake-dml.md](18-anvai-lake-dml.md) | DML UX, delete formats, MVCC, and cross-engine visibility gates |
-| [19-anvai-lake-positioning.md](19-anvai-lake-positioning.md) | Competitive baseline, parity, differentiation, and pilot benchmarks |
+| [Core release contracts](modules/06a-release-contract.md) | Self-hosting, versioned artifacts and downstream compatibility |
+| [Cloud profiles](modules/09-cloud-profiles.md) | AWS, Azure and Google Cloud data-plane contracts and independent qualification |
 | [13-implementation-review.md](13-implementation-review.md) | FDW and managed Iceberg release blockers, verified findings, and implementation acceptance tests |
 | [RULES.md](RULES.md) | Fork discipline: branching, upstream sync, patch rules, code style |
 | [HANDOFF.md](HANDOFF.md) | State snapshot for the next working session |
 
 ## Status
 
-- 2026-11-19: fork created (private repo `anvai-labs/pgdatalake`), specs drafted at
+- 2026-11-19: fork created (`anvai-labs/pgdatalake`, now public), specs drafted at
   PostgreSQL master `61f6021b110` (PG 20 dev, `CATALOG_VERSION_NO 202611121`).
 - 2026-11-19: **naming generalized** — core `pgdatalake-core`, SQL surface
   `lakehouse` (`USING lakehouse FORMAT iceberg`); specs renamed from
   `specs/iceberg/` to `specs/lakehouse/` before M1 starts, to avoid a sweeping
   rename later. Upstream baseline: `make check` 243/243 green on master.
-- M0 in progress: meson `-Ddatalake` feature, `pgdatalake-core` Rust workspace,
+- Historical M0 plan: meson `-Ddatalake` feature, `pgdatalake-core` Rust workspace,
   `lakehouse` extension with `lakehouse.version()`, docker fixtures, CI.
   Start at [12-roadmap.md](12-roadmap.md) M0.

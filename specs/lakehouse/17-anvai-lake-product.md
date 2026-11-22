@@ -1,35 +1,14 @@
-# Anvai Lake product, adoption, and publication proposal
+# Anvai Lake core product and publication contract
 
-**Decision draft for the destination branch.** The footprint figures were checked on `work/count-and-pub-qualification` at `5b31b230680`, which contains PRs #30 and #36. This proposal supplies the product and publication contracts for the next qualification run.
+**Reviewed at merged revision `1acdf09f4f3fb90b7bfebb8bbe8b500c26ec967c` (#45).** Start with a read-only FDW on one released PostgreSQL major and one qualified Iceberg v2 catalog/storage profile. Managed append on a dedicated always-on primary follows verified worker recovery and base-plus-overlay reads. PostgreSQL heap with CDC is the candidate for applications requiring frequent UPDATE/DELETE and ordinary constraints. The [release gates](modules/08a-core-release-gates.md) distinguish provider and customer evidence.
 
-## 1. Brand and positioning
+## 1. Names and interfaces
 
-Use **Anvai Lake** as the product name under **AnvaiOps** (`anvaiops.com`). Use **Iceberg access and publishing for PostgreSQL** as the descriptor. “Lakehouse” describes an architecture buyers already recognize, and the existing SQL name serves a different purpose. Keep `pgdatalake` as the repository and engineering project, and keep `CREATE EXTENSION lakehouse`, `USING lakehouse`, the FDW handler and `lakehouse.*` configuration stable. Customers should see two modes of one product, **external access** and **managed publishing**. Describe PostgreSQL-managed staging and vendor-managed Iceberg tables explicitly, since “managed” can refer to either side.
-
-| Candidate | Use |
-|---|---|
-| **Anvai Lake** | Preferred public brand. Short, ties to AnvaiOps, and leaves room for future formats. |
-| **Anvai Lakehouse** | Descriptive, with heavier overlap in industry vocabulary. Use “lakehouse” in explanatory copy. |
-| **pgdatalake** | Keep for the repo and technical discoverability. It describes the category and carries less product identity. |
-| **lakehouse** | Keep as the installed SQL identifier. Prefer namespaced packaging and a clear compatibility matrix over a rename that breaks DDL, upgrades, GUCs or dump/restore. |
-
-The checkout's remote is `anvai-labs/pgdatalake`; use the official organization spelling in public links. Treat the brand as proposed until domain/package availability and trademark clearance are checked. `pg_lake` is an existing product in the same category, including writable Iceberg tables. Differentiate with the visibility boundary, recovery evidence, and supported catalog profiles. [pg_lake Iceberg capabilities](https://github.com/Snowflake-Labs/pg_lake/blob/main/docs/iceberg-tables.md) · [PostgreSQL trademark policy](https://www.postgresql.org/about/policies/trademarks/)
-
-Proposed copy after qualification:
-
-> Use PostgreSQL to query Iceberg on your existing catalog. Publish PostgreSQL application data to the same Iceberg tables for Spark and other supported engines.
-
-The deployment checklist must name the PostgreSQL build or extension package, compatible catalog and authentication method, storage access, and the publication mode. The managed publisher runs where PostgreSQL runs. External engines connect through the catalog and storage.
-
-Use the [DML visibility contract](18-anvai-lake-dml.md)
-for claims about updates, deletes and isolation. The
-[competitive review](19-anvai-lake-positioning.md) adds heap CDC as a
-candidate adoption path for customers who need low-latency PostgreSQL DML
-on their existing deployment.
+Use **Anvai Lake** for the product, **AnvaiOps** for the company and **pgdatalake** for the core repository. Preserve the `lakehouse` extension, SQL schema, AM, GUCs and `pg_datalake_*` ABI names. Self-hosting includes scoped cloud access, safe recovery and receipt verification. Operators consume the same [release contract](modules/06a-release-contract.md). [AWS, Azure and Google Cloud data-plane profiles](modules/09-cloud-profiles.md)
 
 ## 2. How much of PostgreSQL is forked?
 
-This is an **extension-first, source-patched PostgreSQL distribution** today. Against the common base `207b5293b8d`, the implementation under `src/backend/access/lakehouse/` is 69 changed files and roughly 27.4k inserted lines, including dependency, build and test-fixture material. Outside it and outside `src/test/`, 20 production source/header/build files under `src/` change by **+609/−42** after excluding patch rejects. The whole diff also includes docs, workflows and related tooling. Four tracked `.rej` files are patch debris and should be removed in the branch cleanup after convergence. Count locked dependency lines and generated/fixture artifacts separately when measuring fork maintenance.
+The original PR #30/#36 footprint below describes an **extension-first, source-patched PostgreSQL distribution**. At #45 the non-lakehouse production source/header delta remains 20 files and +609/−42 against the same upstream ancestor. Against the common base `207b5293b8d`, the implementation under `src/backend/access/lakehouse/` is 69 changed files and roughly 27.4k inserted lines, including dependency, build and test-fixture material. Outside it and outside `src/test/`, 20 production source/header/build files under `src/` change by **+609/−42** after excluding patch rejects. The whole diff also includes docs, workflows and related tooling. Four tracked `.rej` files are patch debris and should be removed in the branch cleanup after convergence. Count locked dependency lines and generated/fixture artifacts separately when measuring fork maintenance.
 
 | Surface | Current dependency | Packaging direction |
 |---|---|---|
@@ -54,7 +33,7 @@ Adopt one catalog as authority per physical table. Register aliases and consumer
 
 ## 4. Publication by size or age
 
-Retain the **32 MiB–4 GiB file target range, default 128 MiB**. A file target controls file rollover and layout. It is approximate when row-group boundaries or compression affect the result. Propose a separate effective per-table **`publish_max_delay`** with **5–300 seconds**, **20 seconds by default**, and a **60-second batching profile**. Resolve per-table settings over administrator defaults within validated bounds. The current `lakehouse.publish_max_lag` defaults to 30 seconds and controls the worker's sleep between cycles. Its current implementation does not enforce an age deadline. Keep its compatibility semantics until a versioned upgrade establishes how old values migrate to a scheduler tick or a new target.
+Retain the **32 MiB–4 GiB file target range, default 128 MiB**. A file target controls file rollover and layout. It is approximate when row-group boundaries or compression affect the result. Propose a separate effective per-table **`publish_max_delay`** with **5–300 seconds**, **60 seconds by default** and an **experimental 20-second profile**. Resolve per-table settings over administrator defaults within validated bounds. The current `lakehouse.publish_max_lag` defaults to 30 seconds and controls the worker's sleep between cycles. Its current implementation does not enforce an age deadline. Keep its compatibility semantics until a versioned upgrade establishes how old values migrate to a scheduler tick or a new target.
 
 **Schedule when either threshold is crossed.** Make a table eligible when its pending-work estimate reaches a configurable byte target or the oldest committed, unpublished segment reaches its effective max delay. Initially derive the byte target from the configured file target and measure the mapping from staged bytes to compressed output. Keep a separate cap on bytes, rows and segments in one claim. A timeout flush can produce a file smaller than 32 MiB. This makes low-volume latency independent of volume. Use maintenance compaction to control small-file debt.
 
@@ -69,24 +48,7 @@ Wake the scheduler when commits become visible, with a periodic fallback scan fo
 
 Expose pending bytes and segment counts, oldest committed segment age, due-to-start delay, files per commit, file-size distribution, queue throughput, retries, ambiguous commits and verified snapshot IDs. Record histograms for all four durations and report errors, timeouts and backlog separately. Keep table IDs in operator diagnostics where permissions permit, with low-cardinality aggregate metrics. For planning, evaluate the 20-second queue target and a **60-second p95 acknowledgment-to-catalog objective** on a declared healthy profile. Defer a 20-second end-to-end promise until load tests justify the budget across queueing, upload, commit verification and consumer refresh. Document observed capacity, batch sizes, network conditions and failure behavior with the figures.
 
-## 5. Addressable market and adoption friction
-
-Lead with **read access to existing Iceberg data from customer-operated PostgreSQL**. The first purchase or pilot can involve one read-only foreign table and persistent read-only access through the customer's existing policy. The next use case is **append-heavy application events and operational ELT**, where developers want PostgreSQL read-your-writes and analytics teams accept visible, measured publication lag. Catalog-first appends help customers requiring visibility before handing off to a downstream job. Cross-engine transaction consistency, arbitrary DML, and installation on hosted PostgreSQL increase adoption friction and need explicit delivery paths.
-
-Size this bottom-up. Deduplicate organizations appearing on multiple platforms. Segment by customer-operated PostgreSQL or a host that permits the required binary, active Iceberg tables and catalog, urgency of the access or publication need, and permission to connect both systems. Use qualified installs, pilot retention and validated willingness to pay to estimate conversion. Model paid accounts and annual contract value per segment. Count restricted managed PostgreSQL in the serviceable segment only after a provider-supported deployment or a separately designed external ingestion path exists. Treat ecosystem totals as discovery inputs. Track time to first query, coarse installation steps, privileges and credential setup, exact snapshot agreement, p95 catalog lag, consumer refresh cost, and operator time during failures.
-
-## 6. Catalog and marketplace sequence
-
-| Target | Integration and distribution path |
-|---|---|
-| **Lakekeeper** | Reference REST and portable smoke environment. Keep it for deterministic CI and use an independent Spark or Trino reader. |
-| **AWS Glue / EMR** | Prioritize a Glue REST + S3 profile with SigV4, IAM/Lake Formation and scoped storage credentials. Test with Spark on EMR or Glue. AWS Marketplace is a plausible first software channel for a customer-deployed container/Helm package, separately from the Glue integration and RDS extension availability. [Glue REST](https://docs.aws.amazon.com/glue/latest/dg/connect-glu-iceberg-rest.html) · [EMR Iceberg](https://docs.aws.amazon.com/emr/latest/ReleaseGuide/emr-iceberg.html) · [AWS Marketplace containers](https://docs.aws.amazon.com/marketplace/latest/userguide/container-product-getting-started.html) |
-| **Databricks Unity Catalog** | Qualify OAuth, credential vending and least privileges. Distinguish Unity-managed Iceberg with writable REST access from foreign Iceberg exposed read-only through that endpoint. Onboard a reference integration with a notebook or app demo, then evaluate Databricks partner distribution for the product artifact. [Unity REST access](https://docs.databricks.com/aws/en/external-access/iceberg) · [Databricks Marketplace](https://docs.databricks.com/aws/en/marketplace/) |
-| **Snowflake / Open Catalog** | Start with an external catalog through a catalog-linked database, or qualify Open Catalog directly. Test exact rows and refresh lag. A Marketplace listing has eligible product types and approval requirements. A Native or Connected App would be a separate integration and commercial deliverable. [Snowflake Iceberg access](https://docs.snowflake.com/en/collaboration/open-format-sharing-access-iceberg) · [Listing product types](https://docs.snowflake.com/en/collaboration/provider-listings-choose-product-type) |
-
-Use a common REST client plus catalog capability profiles. Validate create/load/commit, format version, credential vending, permission scope, and feature restrictions on each supported operation. Use a separate adapter where a catalog lacks an eligible REST profile and pilot demand warrants it. Capture cost and throughput for real profiles before announcing support. A working connector qualifies interoperability; a marketplace listing also needs packaging, onboarding, entitlement, support and vendor review.
-
-## 7. TDD and milestone gates
+## TDD and milestone gates
 
 | Slice | Red test, then implementation and smoke evidence |
 |---|---|

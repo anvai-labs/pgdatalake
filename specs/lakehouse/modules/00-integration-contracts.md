@@ -1,5 +1,7 @@
 # Shared module contracts
 
+The [write receipt contract](03a-client-receipts.md) adds customer write handles, selected-pin proof and timeout semantics. The [release manifest](06a-release-contract.md) versions those capabilities for downstream consumers. Both are proposed interfaces. Existing local ledger and Rust provider symbols retain their current meanings.
+
 These are version 1 implementation contracts for Anvai Lake. Names in the interface tables describe transferred information. An implementation can use existing structs and symbols when they carry the same semantics. Land shared interfaces and tests before a consumer depends on them. [Module ownership](README.md) · [DML and visibility policy](../18-anvai-lake-dml.md)
 
 ## Identity and inputs

@@ -1,5 +1,7 @@
 # Anvai Lake managed visibility and local ledger
 
+The [write handle and receipt contract](03a-client-receipts.md) specifies membership across batches, client-visible failures, rollback, multi-table reads and the failover durability gate.
+
 **Read** [shared contracts](00-integration-contracts.md) and [DML rules](../18-anvai-lake-dml.md#5-read-rules-mvcc-and-conflict-handling). **Own** the PostgreSQL snapshot/command rules, TableAM staged capture and overlay in `tableam.c`, and `managed_count.c`. Own local ledger schema and migrations through the shared SQL integration change. The publisher owns transitioning a publication claim. Catalog and reader supply immutable pinned results and operation membership.
 
 ## Implementation

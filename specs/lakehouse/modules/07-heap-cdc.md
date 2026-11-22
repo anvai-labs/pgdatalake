@@ -1,6 +1,6 @@
 # Anvai Lake heap CDC candidate
 
-**Read** [shared contracts](00-integration-contracts.md) and [competitive pilot criteria](../19-anvai-lake-positioning.md#4-pilot-and-benchmark-gates). **Own** decisions and tests for a candidate PostgreSQL heap ingestion connector and checkpoint store. The candidate can proceed independently of the fork or TableAM. Confirm catalog/writer dependencies before selecting a reusable upstream component. Choose the runtime and repository only after the first pilot evidence.
+**Read** [shared contracts](00-integration-contracts.md) and [core pilot gates](08a-core-release-gates.md). **Own** decisions and tests for a candidate PostgreSQL heap ingestion connector and checkpoint store. The candidate can proceed independently of the fork or TableAM. Confirm catalog/writer dependencies before selecting a reusable upstream component. Choose the runtime and repository only after the first pilot evidence.
 
 ## Implementation
 

@@ -1,6 +1,6 @@
 # Anvai Lake module specifications
 
-Start with the module you are implementing and [the shared contracts](00-integration-contracts.md). The product and rollout decisions remain in [Anvai Lake product](../17-anvai-lake-product.md), [DML](../18-anvai-lake-dml.md), and [positioning](../19-anvai-lake-positioning.md). Module specs own implementation decisions and tests. The shared contract owns interface semantics.
+Start with the module you are implementing and [the shared contracts](00-integration-contracts.md). The product and rollout decisions remain in [Anvai Lake product](../17-anvai-lake-product.md) and [DML](../18-anvai-lake-dml.md). Module specs own implementation decisions and tests. The shared contract owns interface semantics.
 
 | Work package | Read next | Primary source ownership | First independent delivery |
 |---|---|---|---|
@@ -14,6 +14,17 @@ Start with the module you are implementing and [the shared contracts](00-integra
 | Qualification | [08-qualification](08-qualification.md) | Fixtures, milestone smoke, CI orchestration and performance runner | Shared fixtures and a result/measurement receipt |
 
 ## Delivery order and dependencies
+
+### Contracts for independent work
+
+| Independently owned slice | Freeze with these consumers | First integration gate |
+|---|---|---|
+| 01 cloud adapters, with a maintainer per AWS/Azure/GCP storage API | 02 supplies exact-pin read inputs, 05 supplies immutable object descriptors, 08 checks scope and request counts. [Cloud profiles](09-cloud-profiles.md) | Start with one Lakekeeper read profile. Qualify each real store and catalog/auth combination separately. |
+| 03 capture and membership | 04 consumes bound segments and returns exact batch receipts. 06 maps a source handle to a bounded wait. [Receipt contract](03a-client-receipts.md) | Run ordinary SQL against 04 after recovery providers land. Test mixed-visibility duplicate rows, rollback and a fresh pooled connection. |
+| 06 stock packaging | 01 and 02 provide scoped reads and pins. Downstream operators consume a signed digest, version ranges and capabilities. [Release manifest](06a-release-contract.md) | Clean stock install and upgrade with independent pinned results. Can ship before managed publication. |
+| 08 conformance and fault fixtures | Every implementing owner runs the same versioned inputs. [Gate definitions](08a-core-release-gates.md) | Provider tests precede the live SQL/independent-engine smoke. Downstream deployment teams supply separate route, concurrency and failover receipts. |
+
+Public contributors can complete every core slice using this repository. Hosted deployment, pricing, placement and cloud fleet orchestration use the downstream artifact contract. Teams can build against fixtures concurrently. Land one coordinated change when two modules share an extension upgrade, ABI export, fixture version or interpretation of a receipt.
 
 Cut each delivery branch from the latest merged `origin/lakehouse-dev`. Modules are ownership boundaries. A branch can deliver one tested change across both sides of a boundary. The sequence below gives one team a serial path and identifies where another contributor can start against the same fixtures. [Branch rules](../RULES.md#1a-branch--promotion-discipline-amended-2026-11-20--the-binding-graph)
 

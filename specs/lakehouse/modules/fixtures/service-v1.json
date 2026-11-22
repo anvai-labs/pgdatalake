@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "receipt_at_pin": {
+    "receipt": {"tenant":"red", "table_uuid":"1a4ab09e-b9b2-4f98-8757-ba8dd81ab93a", "ref":"main", "introducing":"9007199254740993"},
+    "checks": [
+      {"id":"smaller-descendant", "tenant":"red", "table_uuid":"1a4ab09e-b9b2-4f98-8757-ba8dd81ab93a", "ref":"main", "selected":"17", "retained_parents":{"17":"9007199254740993"}, "expect":"included"},
+      {"id":"introducing-pin", "tenant":"red", "table_uuid":"1a4ab09e-b9b2-4f98-8757-ba8dd81ab93a", "ref":"main", "selected":"9007199254740993", "retained_parents":{}, "expect":"included"},
+      {"id":"rolled-back-head", "tenant":"red", "table_uuid":"1a4ab09e-b9b2-4f98-8757-ba8dd81ab93a", "ref":"main", "selected":"100", "retained_parents":{"100":null}, "expect":"outside_lineage"},
+      {"id":"expired-ancestor", "tenant":"red", "table_uuid":"1a4ab09e-b9b2-4f98-8757-ba8dd81ab93a", "ref":"main", "selected":"18", "retained_parents":{"18":"17"}, "expect":"insufficient_history"},
+      {"id":"replacement", "tenant":"red", "table_uuid":"f10e0980-bbd0-4615-8a77-d1a51e1663da", "ref":"main", "selected":"9007199254740993", "retained_parents":{}, "expect":"binding_changed"},
+      {"id":"other-branch", "tenant":"red", "table_uuid":"1a4ab09e-b9b2-4f98-8757-ba8dd81ab93a", "ref":"audit", "selected":"9007199254740993", "retained_parents":{}, "expect":"binding_changed"},
+      {"id":"other-tenant", "tenant":"blue", "table_uuid":"1a4ab09e-b9b2-4f98-8757-ba8dd81ab93a", "ref":"main", "selected":"17", "retained_parents":{}, "expect":"denied"}
+    ]
+  }
+}

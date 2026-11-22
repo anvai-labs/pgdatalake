@@ -1,5 +1,7 @@
 # 04 — Object Storage File IO: S3, ADLS Gen2, GCS, MinIO
 
+This is a design inventory. The [AWS, Azure and Google Cloud profiles](modules/09-cloud-profiles.md) specify release evidence, identity and create-only semantics for each API. The #45 core provides the S3/S3-compatible and test-local path; ADLS Gen2 and GCS are proposed adapters.
+
 All byte-level IO goes through one abstraction in `pgdatalake-core` backed by the
 `object_store` crate (Apache Arrow project, same engine behind DataFusion), with a
 Postgres-facing **IO context** so that every read/write runs under the right
@@ -12,14 +14,13 @@ cancel/die checks per batch for backend, per-task for bgworkers).
 |---|---|---|
 | `s3://` | S3 / MinIO / R2 / any S3-compatible | `s3://anvai-warehouse/tbl/data/…` |
 | `abfss://` | ADLS Gen2 (HNS) | `abfss://container@account.dfs.core.windows.net/tbl/…` |
-| `abfs://` | ADLS Gen2 (non-HNS fallback) | same |
+| `abfs://` | Outside the initial secure Azure profile | use an explicitly qualified secure endpoint |
 | `gs://` | GCS | `gs://anvai-warehouse/tbl/…` |
 | `file://` | local FS | MinIO on localhost, tests |
 
 S3 endpoint override (`lakehouse.s3.endpoint` per catalog option or GUC) is how MinIO
 and R2 are reached: `endpoint = 'http://minio.local:9000'`, `path_style_access =
-true` (required for MinIO). This makes MinIO a pure config difference — **the
-CI matrix runs the identical tests against MinIO that prod runs against S3**.
+true` (required for MinIO). Run the same conformance inputs on each supported endpoint. An S3-compatible fixture supplies protocol evidence; production S3 qualification also requires real AWS identity and storage tests.
 
 ## 2. Capability matrix
 
@@ -27,7 +28,7 @@ CI matrix runs the identical tests against MinIO that prod runs against S3**.
 |---|---|---|---|---|
 | Auth chains | env/IMDS/STS assume-role/web-identity/MinIO static | static/AssumeRole(minio) | Entra SDK chain (Managed Identity in Azure VMs, client-secret, workload-ID federation) | ADC/metadata-server/SA-key/impersonated SA |
 | Atomic rename | no (copy+delete emulation in catalogs only; we never rely on it) | no | no | no |
-| Conditional Put (`If-None-Match: *`) | yes | yes | yes (ETag) | yes (x-goog-if-generation) |
+| Conditional Put (`If-None-Match: *`) | yes | yes | yes (ETag) | yes (`ifGenerationMatch=0`) |
 | Multipart upload | yes | yes | yes (block upload) | yes (resumable session) |
 | Listing with prefix+delimiter | yes | yes | yes | yes |
 | Range reads | yes | yes | yes | yes |

@@ -1,5 +1,7 @@
 # Staged append recovery
 
+For a promoted or restored primary the [client and recovery contract](03a-client-receipts.md) adds the source-and-intent durability barrier. Local flush in extension 1.6 covers recovery of the original durable volume. Check the actual promoted candidate before permitting any new send.
+
 **Implementation slice for M2, proposed 2026-11-21.** Lakekeeper accepts a staged append, the reply is lost, and a second segment arrives. After restart, an external reader must see the original row once, the receipt must identify its snapshot, and the second segment must remain eligible. The first profile covers appends from one PostgreSQL ledger to a bound Iceberg table on `main`.
 
 ## Start with the failing test

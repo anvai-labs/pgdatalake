@@ -1,5 +1,7 @@
 # Anvai Lake integration qualification
 
+Start each new qualification run from the [core release gate matrix](08a-core-release-gates.md). It names the independent oracle, exact multiplicities, failure point and expected recovery evidence.
+
 **Read** [shared contracts](00-integration-contracts.md) and the [milestone smoke protocol](../10-testing.md#milestone-tdd-and-smoke-receipts). **Own** shared test fixtures, stateful catalog fake, deterministic barriers, CI orchestration, cold-room receipts and `scripts/perf/`. Each provider/consumer owns its own unit and SQL regression changes.
 
 ## Test layers

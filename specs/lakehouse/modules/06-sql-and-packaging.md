@@ -1,5 +1,7 @@
 # Anvai Lake SQL integration and stock package
 
+Implement the [artifact and capability handshake](06a-release-contract.md) and [SQL receipt semantics](03a-client-receipts.md) on the appropriate build flavor.
+
 **Read** [shared contracts](00-integration-contracts.md) and [packaging direction](../17-anvai-lake-product.md#2-how-much-of-postgresql-is-forked). **Own** `fdw.c`, `fdw_plan.c`, `fdw_exec.c`, `lakehouse_sql.c`, and package/build orchestration. The ledger owner defines its SQL tables. Any extension version or installed SQL change goes through the shared integration change. Reader and catalog modules own the underlying native behavior.
 
 ## Implementation

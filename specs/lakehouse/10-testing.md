@@ -1,5 +1,7 @@
 # 10 — Testing Strategy
 
+The [core release gates](modules/08a-core-release-gates.md) define the current milestone fixtures and distinguish merged provider tests, live integration and proposed release evidence.
+
 ## 1. Environment matrix
 
 | Tier | Stores | Catalogs | Runs where |

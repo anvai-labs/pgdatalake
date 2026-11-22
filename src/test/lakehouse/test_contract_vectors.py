@@ -123,5 +123,40 @@ class ContractVectors(unittest.TestCase):
         self.assertCountEqual(rows, vector["expected_rewrite_row_ids"])
 
 
+class ServiceContractVectors(unittest.TestCase):
+    """Example oracles for the proposed service interfaces, independent of any cloud."""
+
+    @classmethod
+    def setUpClass(cls):
+        path = FIXTURE.with_name("service-v1.json")
+        cls.vectors = json.loads(path.read_text(encoding="utf-8"))
+        if cls.vectors["version"] != 1:
+            raise ValueError("expected service contract version 1")
+
+    def test_receipt_at_selected_pin(self):
+        case = self.vectors["receipt_at_pin"]
+        receipt = case["receipt"]
+        for check in case["checks"]:
+            with self.subTest(check=check["id"]):
+                if check["tenant"] != receipt["tenant"]:
+                    result = "denied"
+                elif check["table_uuid"] != receipt["table_uuid"] or check["ref"] != receipt["ref"]:
+                    result = "binding_changed"
+                else:
+                    parents = check["retained_parents"]
+                    pin = check["selected"]
+                    seen = set()
+                    while pin in parents and pin not in seen and pin != receipt["introducing"]:
+                        seen.add(pin)
+                        pin = parents[pin]
+                    if pin == receipt["introducing"]:
+                        result = "included"
+                    elif pin is None:
+                        result = "outside_lineage"
+                    else:
+                        result = "insufficient_history"
+                self.assertEqual(check["expect"], result)
+
+
 if __name__ == "__main__":
     unittest.main()
