@@ -428,7 +428,7 @@ lakehouse_OpenSession(LakehouseOptions *opts, const char *rte_selector)
 					sqlstate = ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE;
 					break;
 				case ReadPinUnavailable:
-					sqlstate = ERRCODE_UNDEFINED_OBJECT;
+					sqlstate = ERRCODE_INVALID_PARAMETER_VALUE;
 					break;
 				case ReadUnsupported:
 					sqlstate = ERRCODE_FEATURE_NOT_SUPPORTED;

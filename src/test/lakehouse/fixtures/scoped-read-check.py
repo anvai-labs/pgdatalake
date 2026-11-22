@@ -187,7 +187,7 @@ def exercise(db, parent, child, prefix, route, enrolled):
             object_requests.clear()
             sql(db, "SELECT id FROM no_pin", error="0A000")
             assert not catalog_requests and not object_requests
-            sql(db, "SELECT id FROM absent_pin", error="42704")
+            sql(db, "SELECT id FROM absent_pin", error="22023")
             assert catalog_requests == [("GET", route)], catalog_requests
             assert object_requests == [("GET", metadata_path)], object_requests
 
