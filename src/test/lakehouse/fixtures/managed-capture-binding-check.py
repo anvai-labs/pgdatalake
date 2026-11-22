@@ -49,6 +49,11 @@ BASELINE_ADAPTER = """
         table_uuid uuid NOT NULL, storage_root text NOT NULL,
         revoked boolean NOT NULL DEFAULT false
     );
+    CREATE TABLE capture_fixture.bound_required (relid oid PRIMARY KEY);
+    CREATE FUNCTION capture_fixture.require_binding(target regclass)
+    RETURNS void LANGUAGE sql AS $$
+        INSERT INTO capture_fixture.bound_required VALUES (target);
+    $$;
     CREATE FUNCTION capture_fixture.enroll(
         target regclass, identity text, server_name text, incarnation uuid,
         binding uuid, generation bigint, authority uuid, remote_table uuid, storage_root text
@@ -218,25 +223,37 @@ def exercise(db, adapter, baseline, endpoint, requests, role):
     sql(db, claim(str(uuid.uuid4()), str(late), "events",
                   str(replacement.authority), str(replacement.table)), error="55000")
 
-    foreground("""
+    recreate = """
         DROP TABLE events;
         CREATE TABLE events (id bigint) USING lakehouse WITH (write_mode='staged');
+    """
+    # A reused name can still create an independent legacy relation.
+    foreground(recreate + """
+        SELECT lakehouse.attach_table('events', 'fixture.legacy_recreated', 'capture_catalog');
+        INSERT INTO events VALUES (61);
     """)
-    foreground("INSERT INTO events VALUES (60);", error="0A000")
-    assert seal([[60]]) is None
+    legacy_recreated = seal([[61]])
+    assert legacy_recreated and len(legacy_recreated) == 1
+    assert legacy_recreated[0][2:] == [False, [None] * 5], legacy_recreated
+
+    # A different new relation opts in before supplying its enrollment.
+    foreground(recreate + "SELECT capture_fixture.require_binding('events');")
     sql(db, f"GRANT INSERT ON events TO {role};")
+    # The mock only records opt-in. Baseline reports its old unattached error.
+    foreground(write("INSERT INTO events VALUES (60);"), error="0A000" if baseline else "55000")
+    assert seal([[60]]) is None
     recreated = Binding.create(uuid.uuid4(), 1, "replacement", authority,
                                table=replacement.table)
     enrolled(recreated)
     foreground(write("INSERT INTO events VALUES (70);"))
     require_capture("recreated-imprint", recreated, [[70]])
     assert (seal([[20], [20]]), seal([[30]])) == old_imprint
-    assert seal([[10]]) == legacy
+    assert seal([[10]]) == legacy and seal([[61]]) == legacy_recreated
     assert not requests
     captures = json.loads(sql(db, f"""
         SELECT jsonb_agg(convert_from(payload, 'UTF8')::jsonb ORDER BY seg_id) FROM {SEG};
     """))
-    expected = [[[10]], [[20], [20]], [[30]], [[50]], [[70]]]
+    expected = [[[10]], [[20], [20]], [[30]], [[50]], [[61]], [[70]]]
     if baseline:
         expected.insert(3, [[40]])
     assert captures == expected, captures
