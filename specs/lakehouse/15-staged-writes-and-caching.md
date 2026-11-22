@@ -375,6 +375,13 @@ NEW path). This is the structural reason caching here is safe where
 caching a mutable store is not: a cached byte range for path P is
 correct for P forever.
 
+The current implementation uses a bounded in-process cache. Remote cache
+entries are reusable by an open storage handle and its clones. Reopening
+requires storage authorization through a fresh read. Measure the additional
+cold reads before designing cross-handle reuse. The disk-cache proposal
+below requires its own authorization and version checks.
+[Read enrollment evidence](modules/06b-scoped-read-handoff.md#remote-byte-cache-authorization)
+
 - Scope: parquet data + puffin + avro metadata/manifest bytes fetched
   by `storage.rs get_bytes/ranged reads` (13-review #2's ranged reads
   are the prerequisite — implemented first if absent at build time).

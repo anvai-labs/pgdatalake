@@ -57,7 +57,7 @@ impl ChunkReader for RangedReader {
         let end = (start + length as u64).min(self.len);
         let bytes = self
             .cache
-            .get_range(&self.io, &self.io.scope_id, &self.key, start, end - start)
+            .get_range(&self.io, "", &self.key, start, end - start)
             .map_err(|e| ParquetError::General(e.to_string()))?;
         Ok(Bytes::from(bytes))
     }
@@ -81,7 +81,7 @@ impl StdRead for RangedSeqRead {
         }
         let bytes = self
             .cache
-            .get_range(&self.io, &self.io.scope_id, &self.key, self.pos, want)
+            .get_range(&self.io, "", &self.key, self.pos, want)
             .map_err(std::io::Error::other)?;
         self.pos += bytes.len() as u64;
         buf[..bytes.len()].copy_from_slice(&bytes);
