@@ -2,7 +2,7 @@
 
 ## Current dependency order
 
-Reviewed through public implementation PR #70 at `eccfa9013b9c5d491e69e242cfb50a70f07505c3`.
+The merged baseline for the recovery work below is public #71 at `0d0ece100d98cd0e37e57fc9efe36432cb82262a`.
 The first independently shippable path is a serial, read-only FDW on stock
 PG19.0. The managed writer and its visibility proof can advance separately.
 
@@ -10,8 +10,12 @@ PG19.0. The managed writer and its visibility proof can advance separately.
 |---|---|---|
 | Stock reader, 01/02/06 | #53 supplies execution-time FDW COUNT and same-pin fallback. #54/#58/#61 cover effective mapping, enrolled root, real SQL logins, rotation and revocation. #70 runs the [TLS smoke](../../src/test/lakehouse/fixtures/stock-scoped-tls.sh) for those reads and reconnect on verified PG-wire with SCRAM. | Qualify the deployed driver and trusted runtime against one actual catalog identity flow. Preserve ordinary/pinned count and denied-sibling controls. |
 | Governed tables, 01/02/06/08 | #67–69 define BI reuse, provider scope and a verifier for 12 positive SQL executions and six refusals. Current governed results come from synthetic evidence. | Implement and run one provider's protected plan on a real enrolled table. Require exact source pin, actual consumption, masks and distinct effective scopes. Only then qualify reuse and multiple readers. [Verifier](modules/06c-governed-published-read.md) |
-| Managed appends, 03/04 | #63/#65 join normal bound capture, locally durable intent, scoped send, one-POST recovery and original-member finalization on the fixture. #64 exercises compatible cuts with real PostgreSQL snapshots and an injected publication certificate. | Implement the scope-bound credential resolver and native ledger/scheduler adapters independently. Join them at the [two reply-loss barriers](modules/04b-scoped-send-admission.md#native-worker-integration). Feed its real receipts into the TableAM reader and compare old/intermediate/fresh views at the same pin. Qualify promotion separately. [Managed gates](modules/08a-core-release-gates.md) |
+| Managed appends, 03/04 | #63/#65 join normal bound capture, locally durable intent, scoped send, one-POST recovery and original-member finalization on the fixture. #64 exercises compatible cuts with real PostgreSQL snapshots and an injected publication certificate. | The Rust driver now accepts lookup-only wakes. The fixture proves zero commit POSTs for a lost local authorization reply and one for a lost remote acceptance reply. Implement the scope-bound resolver and native scheduler independently, then repeat the [two barriers](modules/04b-scoped-send-admission.md#native-worker-integration) through their actual adapters. Feed verified receipts into the TableAM reader and compare old/intermediate/fresh views at the same pin. Qualify promotion separately. [Managed gates](modules/08a-core-release-gates.md) |
 | Cost and expansion, 02/08/09 | #60 defines per-catalog profiles. #62 qualifies pinned benchmark digests. #66 reduces one projected canary from 4,719 to 16 data range GETs. | Diagnose the SF10 q1 timeout before a latency claim. Measure cold/warm dashboard completeness and spend on a qualified profile before selecting an elastic floor or enabling persistent reuse. [Cost evidence](modules/08b-io-cost.md) |
+
+### Managed recovery smoke at the #71 baseline plus the lookup-only driver
+
+In the local ordinary-INSERT fixture, the lost PostgreSQL reply left Trino at parent `8991556753635846896` with `[10]`. The candidate snapshot `3622891792842048566` never entered table history. The catalog recorder saw zero commit POSTs and five table GETs, including the deliberately unavailable and stale responses. Recovery advanced ownership from generation 2 to 5. Segment 1 remained reserved and segment 2 remained pending. PostgreSQL recovered the source and intent commits at `0/029C0428` and `0/029C2350` and retained identical request bytes. The other two local reply-loss cases observed one catalog POST apiece and verified exactly the first member. Each case is one correctness observation. These runs exercise the test ledger adapter and scoped Rust transport on a single primary.
 
 ## Historical findings through PR #52
 

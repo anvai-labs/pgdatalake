@@ -43,6 +43,51 @@ def enrolled_metadata(namespace):
     return route, body, json.loads(body)["metadata"]
 
 
+def disconnect_after_authorization(db):
+    # The nested CALL commits the real intent. The outer CALL never gets to
+    # send CommandComplete to libpq. Only this disposable database is changed.
+    sql(db, """
+        ALTER PROCEDURE lakehouse.authorize_publication_send(uuid,bigint,bytea,bigint,bigint,bytea,bytea)
+            RENAME TO fixture_authorize;
+        CREATE PROCEDURE lakehouse.authorize_publication_send(
+            op uuid, generation bigint, input_hash bytea, parent bigint, proposed bigint,
+            proposal_hash bytea, body bytea, OUT intent_xid xid)
+        LANGUAGE plpgsql AS $$
+        BEGIN
+            CALL lakehouse.fixture_authorize(op, generation, input_hash, parent, proposed,
+                                            proposal_hash, body, intent_xid);
+            PERFORM pg_terminate_backend(pg_backend_pid());
+            RAISE EXCEPTION 'fixture expected backend termination';
+        END $$;
+        REVOKE ALL ON PROCEDURE lakehouse.authorize_publication_send(uuid,bigint,bytea,bigint,bigint,bytea,bytea)
+            FROM PUBLIC;
+    """)
+
+
+def retained_intent(db, operation, first, start):
+    # Independently prove the source and intent commit records are within the
+    # flush horizon. Preserve the exact attempt across restart and takeover.
+    record = json.loads(sql(db, f"""
+        WITH wal AS (
+            SELECT xid, end_lsn FROM pg_get_wal_records_info('{start}', pg_current_wal_flush_lsn())
+            WHERE resource_manager = 'Transaction' AND record_type = 'COMMIT'
+        )
+        SELECT json_build_object('source_xid', s.xmin::text, 'intent_xid', a.xmin::text,
+            'source_commit_lsn', (SELECT end_lsn FROM wal WHERE xid = s.xmin),
+            'intent_commit_lsn', (SELECT end_lsn FROM wal WHERE xid = a.xmin),
+            'owner_generation', a.owner_generation, 'binding', a.capture_binding_id,
+            'expected_parent', a.expected_parent, 'proposed', a.proposed_snapshot_id,
+            'body', encode(a.proposal_body, 'hex'), 'digest', encode(a.proposal_digest, 'hex'))
+        FROM lakehouse.publication_attempts a JOIN {SEG} s ON s.seg_id = {first}
+        WHERE a.operation_id = '{operation}'
+    """))
+    assert record["source_commit_lsn"] and record["intent_commit_lsn"]
+    assert record["source_xid"] != record["intent_xid"]
+    body = bytes.fromhex(record["body"])
+    assert body and hashlib.sha256(body).hexdigest() == record["digest"]
+    return record
+
+
 def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_transport):
     table = f"iceberg.{namespace}.events"
     trino(f"CREATE TABLE {table} (id bigint) WITH (format_version=2); "
@@ -91,6 +136,9 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
                 return
             payload = self.rfile.read(int(self.headers["Content-Length"]))
             posts.append(payload)
+            if reply_loss == "authorization_ack":
+                self.send_error(409, "authorization reply was withheld; no POST is permitted")
+                return
             if len(posts) != 1:
                 self.send_error(409, "fixture saw a second POST")
                 return
@@ -201,9 +249,9 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
                     return sql(db, managed_claim(op, seg_id))
                 return sql(db, claim(op, str(seg_id), "events", authority, remote))
 
+            checkpoint = sql(db, "SELECT pg_current_wal_insert_lsn()")
             first = capture(7, 20)
             input_digest = claim_member(operation, first)
-            checkpoint = sql(db, "SELECT pg_current_wal_insert_lsn()")
             worker_input = {"database": db, "operation_id": operation}
             if admitted_transport:
                 worker_input["admitted_transport"] = True
@@ -214,6 +262,13 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
             # A transient failure before authorization leaves the claim
             # eligible for a new owner. This first pass reaches no POST.
             unavailable.set()
+            lookup_request = json.dumps(worker_input | {"lookup_only": True})
+            if admitted_transport:
+                before = len(requests)
+                probe = subprocess.run([worker], input=lookup_request, capture_output=True, text=True, timeout=25)
+                assert len(requests) == before, "lookup-only wake contacted the catalog for an unsent claim"
+                assert probe.returncode == 0 and probe.stdout.strip() == "no_retained_intent", probe
+                assert sql(db, f"SELECT owner_generation FROM {HDR} WHERE operation_id='{operation}'") == "0"
             failed = subprocess.run([worker], check=False, input=request, text=True, timeout=25,
                                     capture_output=True)
             assert failed.returncode and "prepare_unsent" in failed.stderr, failed
@@ -221,31 +276,42 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
             assert sql(db, "SELECT count(*) FROM lakehouse.publication_attempts") == "0"
             unavailable.clear()
 
-            with subprocess.Popen([worker], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  text=True) as sender:
-                try:
-                    sender.stdin.write(request)
-                    sender.stdin.close()
-                    assert accepted.wait(timeout=30), "the catalog never accepted the first POST"
-                    assert not errors, errors
-                    assert sender.poll() is None, "sender exited before the lost-reply barrier"
-                    late = capture(8, 30)
-                    assert first != late
-                    if revoke_after_acceptance:
-                        # The unresolved operation holds the target reservation.
-                        # Its lookup will still use the retained scope after revoke.
-                        sql(db, managed_claim(next_operation, late), error="40001")
-                        sql(db, f"SELECT lakehouse.revoke_publication_send('{binding}')")
-                    assert sql(db, f"SELECT count(*) FROM {HDR} WHERE verified_snapshot_id IS NOT NULL") == "0"
-                    if reply_loss == "http_504":
+            lost_authorization = reply_loss == "authorization_ack"
+            if lost_authorization:
+                disconnect_after_authorization(db)
+                failed = subprocess.run([worker], input=request, text=True, capture_output=True, timeout=30)
+                assert not posts, f"expected zero commit POSTs after lost authorization reply, saw {len(posts)}"
+                assert (failed.returncode and "authorization_unconfirmed" in failed.stderr
+                        and "terminating connection due to administrator command" in failed.stderr), failed
+                retained = retained_intent(db, operation, first, checkpoint)
+                assert retained["binding"] == binding and retained["expected_parent"] == parent
+                late = capture(8, 30)
+            else:
+                with subprocess.Popen([worker], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                      text=True) as sender:
+                    try:
+                        sender.stdin.write(request)
+                        sender.stdin.close()
+                        assert accepted.wait(timeout=30), "the catalog never accepted the first POST"
+                        assert not errors, errors
+                        assert sender.poll() is None, "sender exited before the lost-reply barrier"
+                        late = capture(8, 30)
+                        assert first != late
+                        if revoke_after_acceptance:
+                            # The unresolved operation holds the target reservation.
+                            # Its lookup will still use the retained scope after revoke.
+                            sql(db, managed_claim(next_operation, late), error="40001")
+                            sql(db, f"SELECT lakehouse.revoke_publication_send('{binding}')")
+                        assert sql(db, f"SELECT count(*) FROM {HDR} WHERE verified_snapshot_id IS NOT NULL") == "0"
+                        if reply_loss == "http_504":
+                            release.set()
+                            assert sender.wait(timeout=10) == 0
+                            assert sender.stdout.read().strip() == "hold dispatch_unknown"
+                    finally:
+                        if sender.poll() is None:
+                            sender.kill()
+                        sender.wait(timeout=10)
                         release.set()
-                        assert sender.wait(timeout=10) == 0
-                        assert sender.stdout.read().strip() == "hold dispatch_unknown"
-                finally:
-                    if sender.poll() is None:
-                        sender.kill()
-                    sender.wait(timeout=10)
-                    release.set()
 
             started = time.monotonic()
             subprocess.run([os.getenv("PG_CTL", "pg_ctl"), "restart", "-D", str(data),
@@ -253,29 +319,59 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
                            check=True, timeout=60)
             restart_ms = (time.monotonic() - started) * 1000
 
-            def drive():
-                return subprocess.check_output(
-                    [worker], input=request, text=True, timeout=25).strip()
+            def drive(*, lookup_only=False):
+                return subprocess.check_output([worker], input=lookup_request if lookup_only else request,
+                                               text=True, timeout=25).strip()
 
-            posted_snapshot = int(sql(db, f"""
+            proposed_snapshot = int(sql(db, f"""
                 SELECT proposed_snapshot_id FROM lakehouse.publication_attempts
                 WHERE operation_id='{operation}' AND expected_parent={parent}
             """))
             # Unavailable and then stale evidence each leave the intent reserved
             # without another POST or local completion.
+            expected_posts = 0 if lost_authorization else 1
             unavailable.set()
-            assert drive() == "hold lookup_unavailable"
-            assert len(posts) == 1
+            assert drive(lookup_only=admitted_transport) == "hold lookup_unavailable"
+            assert len(posts) == expected_posts
             unavailable.clear()
             stale_head.set()
             assert drive() == "hold acceptance_unproved"
-            assert len(posts) == 1
+            assert len(posts) == expected_posts
             assert lookups[-1] is True
             assert sql(db, f"SELECT count(*) FROM {SEG} WHERE published") == "0"
             assert sql(db, f"SELECT count(*) FROM {HDR} WHERE verified_snapshot_id IS NOT NULL") == "0"
             stale_head.clear()
+            if lost_authorization:
+                before = len(lookups)
+                assert drive(lookup_only=True) == "hold acceptance_unproved"
+                assert len(lookups) > before and not any(lookups[before:])
+                assert retained_intent(db, operation, first, checkpoint) == retained
+                assert proposed_snapshot == retained["proposed"] and proposed_snapshot != parent
+                generation = int(sql(db, f"SELECT owner_generation FROM {HDR} WHERE operation_id='{operation}' "
+                                         f"AND verified_snapshot_id IS NULL AND encode(input_digest,'hex')='{input_digest}'"))
+                assert generation > retained["owner_generation"]
+                assert sql(db, f"SELECT seg_id FROM {MEM} WHERE operation_id='{operation}'") == str(first)
+                assert sql(db, f"SELECT seg_id, published, published_snapshot_id FROM {SEG} ORDER BY seg_id") == (
+                    f"{first}|f|\n{late}|f|")
+                sql(db, managed_claim(next_operation, late), error="40001")
+                assert not posts and set(requests) == {route}
+                assert set(trino(snaps).splitlines()) == initial_snapshots
+                _, _, head = enrolled_metadata(namespace)
+                assert head["current-snapshot-id"] == parent
+                rows = trino(f"SELECT id FROM {table} FOR VERSION AS OF {parent} ORDER BY id")
+                assert rows == "10"
+                print(json.dumps({
+                    "case": "authorization_ack_lost", "table_uuid": remote, "operation_id": operation,
+                    "parent": str(parent), "proposed": str(proposed_snapshot), "trino_rows": [int(rows)],
+                    "reserved_member": first, "later_pending": late, "catalog_posts": len(posts),
+                    "catalog_gets": len(lookups), "lookup_outcome": "acceptance_unproved",
+                    "source_commit_lsn": retained["source_commit_lsn"], "intent_commit_lsn": retained["intent_commit_lsn"],
+                    "body_sha256": retained["digest"], "intent_generation": retained["owner_generation"],
+                    "recovery_generation": generation, "samples": 1, "restart_ms": round(restart_ms, 1),
+                }), flush=True)
+                return
             started = time.monotonic()
-            assert drive() == f"verified {posted_snapshot} 1"
+            assert drive(lookup_only=admitted_transport) == f"verified {proposed_snapshot} 1"
             recovery_ms = (time.monotonic() - started) * 1000
             assert lookups[-1] is False
             row_versions = f"""
@@ -284,18 +380,18 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
             """
             completed = sql(db, row_versions)
             before = len(requests)
-            assert drive() == f"complete {posted_snapshot}"
+            assert drive(lookup_only=admitted_transport) == f"complete {proposed_snapshot}"
             assert len(requests) == before
             assert sql(db, row_versions) == completed
             assert len(posts) == 1
-            assert posted_snapshot != parent
+            assert proposed_snapshot != parent
 
             assert sql(db, f"SELECT seg_id, published, published_snapshot_id "
-                       f"FROM {SEG} ORDER BY seg_id") == f"{first}|t|{posted_snapshot}\n{late}|f|"
+                       f"FROM {SEG} ORDER BY seg_id") == f"{first}|t|{proposed_snapshot}\n{late}|f|"
             assert sql(db, f"SELECT array_agg(seg_id ORDER BY seg_id) FROM {MEM} "
                        f"WHERE operation_id='{operation}'") == f"{{{first}}}"
             assert sql(db, f"SELECT verified_snapshot_id FROM {HDR} WHERE operation_id='{operation}' "
-                       f"AND encode(input_digest, 'hex')='{input_digest}'") == str(posted_snapshot)
+                       f"AND encode(input_digest, 'hex')='{input_digest}'") == str(proposed_snapshot)
             if revoke_after_acceptance:
                 before = len(requests)
                 sql(db, managed_claim(next_operation, late), error="55000")
@@ -304,16 +400,16 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
                                f"WHERE operation_id='{next_operation}'") == "0"
             else:
                 assert claim_member(next_operation, late), "late row was not claimable"
-            assert set(trino(snaps).splitlines()) == initial_snapshots | {str(posted_snapshot)}
+            assert set(trino(snaps).splitlines()) == initial_snapshots | {str(proposed_snapshot)}
             assert trino(f"SELECT id FROM {table} FOR VERSION AS OF {parent} ORDER BY id") == "10"
-            assert trino(f"SELECT id FROM {table} FOR VERSION AS OF {posted_snapshot} ORDER BY id") == "10\n20"
+            assert trino(f"SELECT id FROM {table} FOR VERSION AS OF {proposed_snapshot} ORDER BY id") == "10\n20"
             if admitted_transport:
                 assert set(requests) == {route}, requests
             capture_source = "seeded" if capture_adapter is None else "ordinary_sql"
             transport = "admitted" if admitted_transport else "legacy_fixture"
             print(f"bound worker: capture={capture_source} transport={transport} reply_loss={reply_loss} "
                   f"base={parent} rows=[10], "
-                  f"receipt={posted_snapshot} rows=[10,20], "
+                  f"receipt={proposed_snapshot} rows=[10,20], "
                   f"catalog_posts={len(posts)} catalog_gets={len(requests)-len(posts)} "
                   f"wal_intent_commit_flushed=true completed_members=[{first}] late_members_pending=[{late}] "
                   f"send_grant_revoked={str(revoke_after_acceptance).lower()} "
@@ -341,7 +437,10 @@ def main():
     data = args.restart_fixture.resolve()
     worker = args.worker.resolve()
     capture_adapter = args.capture_adapter.read_text(encoding="utf-8") if args.capture_adapter else None
-    for reply_loss in ("crash", "http_504"):
+    losses = ["crash", "http_504"]
+    if args.admitted_transport:
+        losses.append("authorization_ack")
+    for reply_loss in losses:
         name = "bound_publish_" + uuid.uuid4().hex[:12]
         sql(admin, f"CREATE DATABASE {name}")
         try:
