@@ -120,7 +120,7 @@ services:
   # or keep it running with `up -d trino`. Profiles off by default so the
   # regular fixture stack stays light.
   trino:
-    image: trinodb/trino:latest
+    image: trinodb/trino:484
     profiles: ["trino"]
     depends_on:
       lakekeeper:

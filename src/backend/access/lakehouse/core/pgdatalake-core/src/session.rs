@@ -186,11 +186,9 @@ impl CatalogClient {
     /// a fresh snapshot with a collision-resistant id, and never replays
     /// stale requirements. Fatal assembly errors abort without retry.
     /// `deleted` (M2 slice 28 COW): files this snapshot removes, emitted
-    /// as DELETED manifest entries (operation=overwrite). Every retry
-    /// attempt RE-VERIFIES each deleted path is still live in the fresh
-    /// base — a concurrent writer that rewrote the same file aborts the
-    /// commit (loud lost-update protection), never silently re-deletes
-    /// against a rewritten file.
+    /// as DELETED manifest entries. An overwrite requires the original
+    /// delete-free base and checks target file liveness. A ref conflict
+    /// returns to PostgreSQL so the caller can restart the transaction.
     pub fn commit_append(
         &self,
         st: &TableWriteState,
@@ -201,6 +199,9 @@ impl CatalogClient {
         retries: u32,
     ) -> Result<(String, i64), crate::storage::StorageError> {
         use crate::catalog::commit::{TableRequirement, TableUpdate};
+        use crate::catalog::rest::RestError;
+        use crate::storage::StorageError;
+
         let loc = crate::storage::parse_location(&st.location)?;
         let io = crate::storage::StorageIo::open(&loc, Some(&st.s3))?;
 
@@ -222,16 +223,27 @@ impl CatalogClient {
                         let (mio, mkey) =
                             crate::scan::open_for(&lt.metadata_location, Some(&st.s3))
                                 .map_err(|e| {
-                                    crate::catalog::rest::RestError::Http(e.to_string())
+                                    RestError::Http(e.to_string())
                                 })?;
                         md_owned =
                             crate::storage::fetch_metadata(&mio, &mkey).map_err(|e| {
-                                crate::catalog::rest::RestError::Http(e.to_string())
+                                RestError::Http(e.to_string())
                             })?;
                         &md_owned
                     };
                     let base_seq = md.last_sequence_number;
                     let parent = md.current_snapshot_id;
+                    if !deleted.is_empty()
+                        && (parent != st.base_snapshot_id
+                            || md.table_uuid != st.table_uuid
+                            || md.format_version != crate::catalog::metadata::FormatVersion::V2
+                            || Some(md.current_schema_id) != st.schema_id
+                            || md.default_partition_spec_id.unwrap_or(0) != st.partition_spec_id)
+                    {
+                        return Err(RestError::Conflict(
+                            "copy-on-write source snapshot or table definition changed".into(),
+                        ));
+                    }
                     let base_list = md.current_snapshot().map(|snap| snap.manifest_list.clone());
 
                     // blocker #1: carry the fresh base's live manifests
@@ -239,12 +251,12 @@ impl CatalogClient {
                         Some(path) => {
                             let (cio, ckey) =
                                 crate::scan::open_for(path, Some(&st.s3)).map_err(|e| {
-                                    crate::catalog::rest::RestError::Http(e.to_string())
+                                    RestError::Http(e.to_string())
                                 })?;
                             crate::manifest::parse_manifest_list(&cio.get_bytes(&ckey).map_err(
-                                |e| crate::catalog::rest::RestError::Http(e.to_string()),
+                                |e| RestError::Http(e.to_string()),
                             )?)
-                            .map_err(|e| crate::catalog::rest::RestError::Http(e.to_string()))?
+                            .map_err(|e| RestError::Http(e.to_string()))?
                         }
                         None => Vec::new(),
                     };
@@ -256,8 +268,13 @@ impl CatalogClient {
                     if !deleted.is_empty() {
                         let plan = crate::scan::plan_scan(md, None, Some(&st.s3), None)
                             .map_err(|e| {
-                                crate::catalog::rest::RestError::Http(e.to_string())
+                                RestError::Http(e.to_string())
                             })?;
+                        if !plan.delete_tasks.is_empty() {
+                            return Err(RestError::Conflict(
+                                "copy-on-write snapshot contains Iceberg deletes".into()
+                            ));
+                        }
                         let live: std::collections::HashSet<&str> = plan
                             .tasks
                             .iter()
@@ -265,7 +282,7 @@ impl CatalogClient {
                             .collect();
                         for d in deleted {
                             if !live.contains(d.file_path.as_str()) {
-                                return Err(crate::catalog::rest::RestError::Http(format!(
+                                return Err(RestError::Conflict(format!(
                                     "overwrite conflict: file {} is no longer live in the table's current snapshot (a concurrent writer removed or rewrote it); aborting to avoid a lost update",
                                     d.file_path
                                 )));
@@ -300,7 +317,7 @@ impl CatalogClient {
                             deleted_files: deleted.to_vec(),
                         },
                     )
-                    .map_err(|e| crate::catalog::rest::RestError::Http(e.to_string()))?;
+                    .map_err(|e| RestError::Http(e.to_string()))?;
                     last_generated_snapshot_id = snapshot_id;
 
                     let updates = vec![
@@ -315,23 +332,31 @@ impl CatalogClient {
                             max_snapshot_age_ms: None,
                         },
                     ];
-                    Ok((
-                        vec![
-                            TableRequirement::AssertTableUUID {
-                                uuid: st.table_uuid,
-                            },
-                            TableRequirement::AssertRefSnapshotId {
-                                r#ref: "main".into(),
-                                snapshot_id: parent,
-                            },
-                        ],
-                        updates,
-                    ))
+                    let mut requirements = vec![
+                        TableRequirement::AssertTableUUID { uuid: st.table_uuid },
+                        TableRequirement::AssertRefSnapshotId {
+                            r#ref: "main".into(),
+                            snapshot_id: parent,
+                        },
+                    ];
+                    if !deleted.is_empty() {
+                        requirements.push(TableRequirement::AssertCurrentSchemaId {
+                            current_schema_id: md.current_schema_id,
+                        });
+                        requirements.push(TableRequirement::AssertDefaultSpecId {
+                            default_spec_id: i64::from(st.partition_spec_id),
+                        });
+                    }
+                    Ok((requirements, updates))
                 },
-                retries,
+                if deleted.is_empty() { retries } else { 0 },
                 std::time::Duration::from_millis(50),
             )
-            .map_err(|e| crate::storage::StorageError::Config(e.to_string()))?;
+            .map_err(|e| match e {
+                RestError::Conflict(m) => StorageError::Conflict(m),
+                RestError::CommitStateUnknown(m) => StorageError::CommitStateUnknown(m),
+                other => StorageError::Config(other.to_string()),
+            })?;
         Ok((resp.metadata_location, last_generated_snapshot_id))
     }
 
@@ -696,6 +721,13 @@ mod tests {
         assert!(new_loc.contains("00002-x.metadata.json"));
 
         let body = handle.join().unwrap();
+        let request: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let requirements = request["requirements"].as_array().unwrap();
+        assert!(requirements.contains(
+            &serde_json::json!({"type":"assert-current-schema-id", "current-schema-id":0})
+        ));
+        assert!(requirements
+            .contains(&serde_json::json!({"type":"assert-default-spec-id", "default-spec-id":0})));
         assert!(
             body.contains(r#""operation":"overwrite""#)
                 || body.contains(r#""operation": "overwrite""#),
@@ -798,5 +830,61 @@ mod tests {
             "abort must name the conflict: {msg}"
         );
         handle.join().unwrap();
+    }
+
+    fn check_rejected_overwrite(source_snapshot: i64, expected_posts: usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let (location, data_path) = overwrite_fixture(dir.path(), true);
+        let metadata = overwrite_metadata_file(dir.path(), &location);
+        let server = std::sync::Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
+        let endpoint = format!("http://{}", server.server_addr());
+        let listener = server.clone();
+        let worker = std::thread::spawn(move || {
+            let mut posts = 0;
+            for req in listener.incoming_requests() {
+                let response = if req.method() == &tiny_http::Method::Post {
+                    posts += 1;
+                    tiny_http::Response::from_string(
+                        r#"{"error":{"type":"CommitFailedException","message":"stale ref"}}"#,
+                    )
+                    .with_status_code(409)
+                } else if req.url().contains("/v1/config") {
+                    tiny_http::Response::from_string(r#"{"defaults":{},"overrides":{}}"#)
+                } else {
+                    tiny_http::Response::from_string(
+                        serde_json::json!({"metadata-location": metadata}).to_string(),
+                    )
+                };
+                req.respond(response).unwrap();
+            }
+            posts
+        });
+        let client = CatalogClient::new(&endpoint, "wh", "", &S3ClientOptions::default()).unwrap();
+        let mut state = client.write_table_open(&["ns"], "t", &[]).unwrap();
+        state.base_snapshot_id = Some(source_snapshot);
+        let deleted = [crate::snapshot_write::DeletedDataFile {
+            file_path: data_path,
+            record_count: 3,
+            file_size_in_bytes: 4096,
+        }];
+        let result = client.commit_append(&state, &["ns"], "t", &[], &deleted, 3);
+        server.unblock();
+        assert_eq!(worker.join().unwrap(), expected_posts);
+        assert!(matches!(
+            result,
+            Err(crate::storage::StorageError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn overwrite_requires_its_original_base_even_when_file_survives() {
+        // Snapshot 42 still contains the source file selected at snapshot 41.
+        check_rejected_overwrite(41, 0);
+    }
+
+    #[test]
+    fn overwrite_does_not_resubmit_on_catalog_cas_conflict() {
+        // The base still matches during planning. The conflict occurs at POST.
+        check_rejected_overwrite(42, 1);
     }
 }

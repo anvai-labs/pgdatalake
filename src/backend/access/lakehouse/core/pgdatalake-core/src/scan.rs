@@ -24,6 +24,9 @@ pub struct ScanTask {
 /// A planned snapshot scan.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScanPlan {
+    pub table_uuid: uuid::Uuid,
+    pub schema_id: i64,
+    pub default_spec_id: i32,
     pub snapshot_id: i64,
     pub tasks: Vec<ScanTask>,
     /// Delete files (v2 position/equality deletes) surviving in the
@@ -425,6 +428,9 @@ pub fn plan_scan(
             // empty table (no snapshots at all): SELECT plans to zero tasks
             None => {
                 return Ok(ScanPlan {
+                    table_uuid: md.table_uuid,
+                    schema_id: md.current_schema_id,
+                    default_spec_id: md.default_partition_spec_id.unwrap_or(0),
                     snapshot_id: md.current_snapshot_id.unwrap_or_default(),
                     tasks: Vec::new(),
                     delete_tasks: Vec::new(),
@@ -556,6 +562,9 @@ pub fn plan_scan(
     }
 
     Ok(ScanPlan {
+        table_uuid: md.table_uuid,
+        schema_id: md.current_schema_id,
+        default_spec_id: md.default_partition_spec_id.unwrap_or(0),
         snapshot_id: snapshot.snapshot_id,
         tasks,
         delete_tasks,

@@ -163,6 +163,20 @@ jobs:
       - name: Lakehouse regress tests
         run: meson test -C build --suite lakehouse
 
+      - name: COW delete and concurrent-writer smoke with Trino
+        run: |
+          docker compose -f src/test/lakehouse/docker-compose.yml -p pgdatalake \
+            up --no-deps --wait --wait-timeout 240 trino
+          pg_bin="$PWD/build/tmp_install/usr/local/pgsql/bin"
+          export PATH="$pg_bin:$PATH"
+          export LD_LIBRARY_PATH="$("$pg_bin/pg_config" --libdir)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export PGHOST="$RUNNER_TEMP/cow-smoke" PGPORT=52592 PGUSER=postgres PGDATABASE=postgres
+          mkdir -m 700 "$PGHOST"
+          initdb -D "$PGHOST/data" -A trust -U "$PGUSER" --no-locale
+          pg_ctl -D "$PGHOST/data" -l "$PGHOST/server.log" -o "-k $PGHOST -p $PGPORT -c listen_addresses=''" -w start
+          trap 'pg_ctl -D "$PGHOST/data" -m fast -w stop' EXIT
+          sh src/test/lakehouse/fixtures/cow-delete-guard.sh
+
       - name: Upload test logs on failure
         if: failure()
         uses: actions/upload-artifact@v4

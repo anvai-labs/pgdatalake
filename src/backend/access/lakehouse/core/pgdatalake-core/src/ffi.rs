@@ -765,6 +765,16 @@ pub unsafe extern "C" fn pg_datalake_rows_close(rows: *mut RowsHandle) {
     }
 }
 
+/// Classification of the latest commit error for PostgreSQL callers.
+/// cbindgen:prefix-with-name=true
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub enum PgDatalakeCommitFailure {
+    Other,
+    Conflict,
+    Unknown,
+}
+
 /// An open managed-append write session (M2 slice 27b): accumulates rows
 /// into the slice-24 `BatchWriter` and flushes/commits via session.rs's
 /// write pipeline. Opaque handle owned by the C side.
@@ -791,6 +801,34 @@ pub struct WriteSession {
     last_avg_row_bytes: usize,
     /// snapshot id of the LAST successful commit (P4 ledger)
     last_snapshot_id: i64,
+    last_commit_failure: PgDatalakeCommitFailure,
+}
+
+/// Check that the row's source scan and the write session resolved the same COW base.
+///
+/// # Safety
+/// Both arguments must be NULL or live handles.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_write_matches_scan(
+    ws: *const WriteSession,
+    scan: *const ScanSession,
+) -> bool {
+    let (Some(ws), Some(scan)) = (unsafe { ws.as_ref() }, unsafe { scan.as_ref() }) else {
+        return false;
+    };
+    ws.state.table_uuid == scan.plan.table_uuid
+        && ws.state.base_snapshot_id == Some(scan.plan.snapshot_id)
+        && ws.state.schema_id == Some(scan.plan.schema_id)
+        && ws.state.partition_spec_id == scan.plan.default_spec_id
+}
+
+/// # Safety
+/// The argument must be NULL or a live write session following a failed commit.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_write_last_commit_failure(
+    ws: *const WriteSession,
+) -> PgDatalakeCommitFailure {
+    unsafe { ws.as_ref() }.map_or(PgDatalakeCommitFailure::Other, |w| w.last_commit_failure)
 }
 
 /// Open a write session. `schema_json` is `[{"name": ..., "type":
@@ -955,6 +993,7 @@ pub unsafe extern "C" fn pg_datalake_write_new(
         target_file_size_bytes: 0,
         last_avg_row_bytes: 64,
         last_snapshot_id: 0,
+        last_commit_failure: PgDatalakeCommitFailure::Other,
     });
     Box::into_raw(ws)
 }
@@ -1426,6 +1465,7 @@ unsafe fn commit_internal(
     err_buf: *mut c_char,
     err_len: usize,
 ) -> *mut c_char {
+    ws.last_commit_failure = PgDatalakeCommitFailure::Other;
     if !unsafe { pg_datalake_write_flush(ws, err_buf, err_len) } {
         return std::ptr::null_mut();
     }
@@ -1452,16 +1492,33 @@ unsafe fn commit_internal(
         Ok(Ok((loc, snap_id))) => {
             ws.last_snapshot_id = snap_id;
             ws.flushed.clear();
-            match std::ffi::CString::new(loc) {
-                Ok(c) => c.into_raw(),
-                Err(_) => std::ptr::null_mut(),
+            if let Ok(c) = std::ffi::CString::new(loc) {
+                c.into_raw()
+            } else {
+                ws.last_commit_failure = PgDatalakeCommitFailure::Unknown;
+                unsafe {
+                    set_err(
+                        err_buf,
+                        err_len,
+                        "invalid metadata location in commit response",
+                    );
+                }
+                std::ptr::null_mut()
             }
         }
         Ok(Err(e)) => {
+            ws.last_commit_failure = match &e {
+                crate::storage::StorageError::Conflict(_) => PgDatalakeCommitFailure::Conflict,
+                crate::storage::StorageError::CommitStateUnknown(_) => {
+                    PgDatalakeCommitFailure::Unknown
+                }
+                _ => PgDatalakeCommitFailure::Other,
+            };
             unsafe { set_err(err_buf, err_len, &format!("lakehouse commit: {e}")) };
             std::ptr::null_mut()
         }
         Err(panic) => {
+            ws.last_commit_failure = PgDatalakeCommitFailure::Unknown;
             let m = panic_message(&panic);
             unsafe { set_err(err_buf, err_len, &format!("lakehouse commit: {m}")) };
             std::ptr::null_mut()
@@ -1505,6 +1562,7 @@ pub unsafe extern "C" fn pg_datalake_write_commit_overwrite(
             })
             .collect(),
         Err(e) => {
+            ws.last_commit_failure = PgDatalakeCommitFailure::Other;
             unsafe {
                 set_err(
                     err_buf,
