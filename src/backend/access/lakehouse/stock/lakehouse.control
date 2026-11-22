@@ -1,0 +1,5 @@
+comment = 'Read-only Anvai Lake Iceberg foreign-data wrapper'
+default_version = '1.0-fdw'
+module_pathname = '$libdir/anvai_lake_fdw'
+schema = 'lakehouse'
+relocatable = false

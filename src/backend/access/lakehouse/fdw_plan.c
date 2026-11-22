@@ -55,20 +55,29 @@
  */
 
 
+/* The stock package uses the foreign table's snapshot_id option. */
+static const char *
+query_snapshot_selector(PlannerInfo *root, RelOptInfo *baserel)
+{
+#ifdef LAKEHOUSE_STOCK_FDW
+	return NULL;
+#else
+	return root->simple_rte_array[baserel->relid]->lakehouse_snapshot;
+#endif
+}
+
 void
 lakehouse_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 							Oid foreigntableid)
 {
 	LakehouseOptions opts;
 	ScanSession *session;
-	RangeTblEntry *rte;
 	uint64		task_count;
 	double		total_rows = 0;
 
 	ExtractOptions(foreigntableid, &opts);
 	/* query-level time travel pin (slice 19) */
-	rte = root->simple_rte_array[baserel->relid];
-	session = lakehouse_OpenSession(&opts, rte->lakehouse_snapshot);
+	session = lakehouse_OpenSession(&opts, query_snapshot_selector(root, baserel));
 	task_count = pg_datalake_scan_task_count(session);
 	for (uint64 i = 0; i < task_count; i++)
 		total_rows += (double) pg_datalake_scan_task_rows(session, i);
@@ -486,24 +495,12 @@ lakehouse_GetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 	 */
 	{
 		char	   *pred_private = pred_json ? pstrdup(pred_json) : pstrdup("");
-		RangeTblEntry *rte = root->simple_rte_array[baserel->relid];
-		char	   *sel_private;
+		const char *selector = query_snapshot_selector(root, baserel);
 
-		/*
-		 * slice 19: the query-level time travel pin rides in fdw_private
-		 * (plan -> executor) as the second element; empty string = none.
-		 */
-		sel_private = rte->lakehouse_snapshot
-			? pstrdup(rte->lakehouse_snapshot)
-			: pstrdup("");
-
-		/*
-		 * qpqual = ALL clauses: pruning is file-level conservative, the
-		 * executor enforces the exact per-row filter on top (doc 06 s4)
-		 */
+		/* Empty selector lets the foreign table's snapshot_id take effect. */
 		return make_foreignscan(tlist, scan_clauses, baserel->relid,
 								NIL, list_make2(makeString(pred_private),
-												makeString(sel_private)),
+												makeString(pstrdup(selector ? selector : ""))),
 								NIL, NIL, outer_plan);
 	}
 }

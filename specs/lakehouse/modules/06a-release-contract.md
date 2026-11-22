@@ -11,6 +11,8 @@
 
 A safety fix, snapshot proof or migration required to read a customer's own data belongs in core. The service calls the same documented contracts as a self-hoster. Catalog credentials available to a query cannot provision VMs. Installation, upgrades and support tests in core never reference private code, private CI secrets or an operator's infra state. Retain PostgreSQL and third-party copyright and license notices in distributed artifacts. Review the extension's own licensing and dependency notices before first independent binary distribution. [PostgreSQL license](https://www.postgresql.org/about/licence/)
 
+The first concrete exchange is the [stock smoke receipt](10-downstream-handoff.md#stock-reader-smoke-receipt-v1). A matching example makes a candidate eligible for a hosted test. Artifact provenance and production admission require additional evidence.
+
 ## Release manifest and consumer handshake
 
 Proposed mandatory manifest fields are `contract_major/minor`, core commit SHA, source and artifact digest (including platform/architecture), signer/builder identity, PostgreSQL major/build flavor, extension version and allowed upgrade predecessors, ledger/receipt schema versions, capability set, and version plus digest of fixtures and qualification receipts. Capabilities name the operation, catalog/auth, storage API and format/delete profile; absence means disabled. Wire snapshot IDs use lossless decimal strings. Keep local C/Rust ABI handles process-local. Expose stable SQL operations and sanitized result states to external consumers. Monitoring fields may be additive and optional.

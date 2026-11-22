@@ -33,7 +33,7 @@ def run(cmd):
     subprocess.run([str(c) for c in cmd], check=True, cwd=manifest_dir)
 
 
-run(['cargo', 'build', '--release',
+run(['cargo', 'build', '--locked', '--release',
      '--manifest-path', manifest_dir / 'Cargo.toml',
      '--target-dir', target_dir])
 

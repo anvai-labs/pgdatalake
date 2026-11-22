@@ -1,0 +1,41 @@
+{
+  "receipt": {
+    "contract_major": 1,
+    "contract_minor": 0,
+    "profile": "stock-pg19-lakekeeper-seaweedfs-trino-v2",
+    "core_sha": "1111111111111111111111111111111111111111",
+    "module_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+    "platform": "linux-x86_64",
+    "server_version_num": 190000,
+    "extension_version": "1.0-fdw",
+    "passed": ["published_serial_scan", "snapshot_id_option", "v2_position_delete", "prepared_ref_refresh", "schema_restore", "foreign_dml_rejected"],
+    "parent": {"snapshot_id": "9007199254740993", "rows": [10, 20, 20, 30]},
+    "child": {"snapshot_id": "17", "rows": [10, 20, 30]}
+  },
+  "request": {
+    "profile": "stock-pg19-lakekeeper-seaweedfs-trino-v2",
+    "core_sha": "1111111111111111111111111111111111111111",
+    "module_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+    "platform": "linux-x86_64",
+    "required": ["published_serial_scan", "snapshot_id_option", "v2_position_delete"]
+  },
+  "cases": [
+    {"id":"matching-source-smoke", "expect":"eligible_for_hosted_test"},
+    {"id":"new-optional-field", "receipt_patch":{"contract_minor":1,"optional_counter":4}, "expect":"eligible_for_hosted_test"},
+    {"id":"new-major", "receipt_patch":{"contract_major":2}, "expect":"unsupported_contract"},
+    {"id":"missing-receipt-version", "receipt_patch":{"contract_major":null}, "expect":"invalid_input"},
+    {"id":"different-binary", "request_patch":{"module_sha256":"3333333333333333333333333333333333333333333333333333333333333333"}, "expect":"build_mismatch"},
+    {"id":"different-source", "request_patch":{"core_sha":"3333333333333333333333333333333333333333"}, "expect":"build_mismatch"},
+    {"id":"cpu-family", "request_patch":{"platform":"linux-aarch64"}, "expect":"build_mismatch"},
+    {"id":"unsupported-cpu-on-both-sides", "request_patch":{"platform":"linux-aarch64"}, "receipt_patch":{"platform":"linux-aarch64"}, "expect":"build_mismatch"},
+    {"id":"wrong-postgres-major", "receipt_patch":{"server_version_num":200000}, "expect":"build_mismatch"},
+    {"id":"managed-extension", "receipt_patch":{"extension_version":"1.6"}, "expect":"build_mismatch"},
+    {"id":"other-storage-profile", "request_patch":{"profile":"real-aws-s3"}, "expect":"profile_mismatch"},
+    {"id":"managed-request", "request_patch":{"required":["managed_append"]}, "expect":"capability_missing"},
+    {"id":"extra-claim-cannot-enable-managed", "receipt_patch":{"passed":["managed_append"]}, "request_patch":{"required":["managed_append"]}, "expect":"capability_missing"},
+    {"id":"missing-pin-check", "receipt_patch":{"passed":["published_serial_scan"]}, "expect":"capability_missing"},
+    {"id":"duplicate-row-lost", "receipt_patch":{"parent":{"snapshot_id":"9007199254740993","rows":[10,20,30]}}, "expect":"invalid_evidence"},
+    {"id":"same-pin", "receipt_patch":{"child":{"snapshot_id":"9007199254740993","rows":[10,20,30]}}, "expect":"invalid_evidence"},
+    {"id":"lossy-id", "receipt_patch":{"child":{"snapshot_id":17,"rows":[10,20,30]}}, "expect":"invalid_evidence"}
+  ]
+}

@@ -2,6 +2,12 @@
 
 **Reviewed at merged `lakehouse-dev` revision `1acdf09f4f3fb90b7bfebb8bbe8b500c26ec967c` (PR #45).** The [post-merge fork CI](https://github.com/anvai-labs/pgdatalake/actions/runs/44987466812) passed. Stock FDW distribution, managed append recovery on the active worker, compatible reads and all hosted or real-cloud release profiles still need their own evidence. The [release gates](modules/08a-core-release-gates.md) and [module ownership and dependencies](modules/README.md) govern new work. The original review is the 2026-11-20 baseline. The [reassessment](16-release-reassessment-and-scale.md) records the eight findings and earlier measurements. Start implementation branches with the [delivery order and dependencies](modules/README.md#delivery-order-and-dependencies). Give each milestone its own smoke and measurement receipt.
 
+## Stock read foundation following PR #46
+
+Base `8ed4cbab0b0`. On upstream PG19.0 (`5c839a2a08b`), the original planner failed to compile at the fork-only RTE field; clean SQL installation returned `0A000`. The [PGXS source package](../../src/backend/access/lakehouse/stock/README.md) now installs and runs the read-only surface on that release. The fork's assertion build passed 243 upstream subtests and 11 lakehouse SQL groups. One final local stock smoke took 12.18 seconds including Trino DDL and cleanup. Stock PG, schema-only dump/restore and Trino returned exactly `[10,20,20,30]` at snapshot `184327008694008591` and `[10,20,30]` at `1130167751514016848`. This sample measures fixture duration. Query p95/p99 and deployment SLOs are unmeasured.
+
+**Next dependency for the hosted reader:** prove the permission-checking role and approved storage root at planning, execution and cache reuse, including owner/invoker views and a denied sibling tenant with zero forbidden object requests. Signed runtime artifacts, multi-node qualification and managed worker recovery remain open. Downstream services pin the interface specification. A service rollout requires a separate runtime artifact and evidence.
+
 ## What changed since the original review
 
 | Assessment | Evidence | Next action |

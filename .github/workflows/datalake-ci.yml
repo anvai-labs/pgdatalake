@@ -180,6 +180,61 @@ jobs:
           sh src/test/lakehouse/fixtures/cow-delete-guard.sh
           python3 src/test/lakehouse/fixtures/catalog-reply-loss-check.py
 
+      - name: Fetch unmodified PostgreSQL 19.0 for stock package qualification
+        uses: actions/checkout@v4
+        with:
+          repository: postgres/postgres
+          ref: 5c839a2a08b9b87a349be97371fac6c5a2873b10
+          path: build/stock-pg19-src
+          persist-credentials: false
+
+      - name: Build and install the stock PG19 FDW with upstream PGXS
+        run: |
+          prefix="$RUNNER_TEMP/stock-pg19"
+          (
+            set -e
+            cd build/stock-pg19-src
+            ./configure --prefix="$prefix" --without-icu --without-readline
+            make -s -j4
+            make -s install
+          )
+          make -j4 -C src/backend/access/lakehouse/stock PG_CONFIG="$prefix/bin/pg_config" CARGO_TARGET_DIR="$PWD/build/src/backend/access/lakehouse/rust-target"
+          make -C src/backend/access/lakehouse/stock PG_CONFIG="$prefix/bin/pg_config" install
+
+      - name: Stock FDW pins, external position deletes and dump/restore
+        run: |
+          export PATH="$RUNNER_TEMP/stock-pg19/bin:$PATH"
+          export PGHOST="$RUNNER_TEMP/stock-fdw-smoke" PGPORT=52593 PGUSER=postgres PGDATABASE=postgres
+          mkdir -m 700 "$PGHOST"
+          initdb -D "$PGHOST/data" -A trust -U "$PGUSER" --no-locale
+          pg_ctl -D "$PGHOST/data" -l "$PGHOST/server.log" -o "-k $PGHOST -p $PGPORT -c listen_addresses=''" -w start
+          trap 'pg_ctl -D "$PGHOST/data" -m fast -w stop' EXIT
+          python3 src/test/lakehouse/fixtures/stock-fdw-check.py --receipt "$RUNNER_TEMP/stock-reader.json"
+
+      - name: Collect installed stock package for downstream tests
+        run: |
+          pg_config="$RUNNER_TEMP/stock-pg19/bin/pg_config"
+          dest="$RUNNER_TEMP/stock-reader-test-package"
+          mkdir "$dest"
+          cp "$("$pg_config" --pkglibdir)/anvai_lake_fdw.so" "$dest/"
+          cp "$("$pg_config" --sharedir)/extension/"{lakehouse.control,lakehouse--1.0-fdw.sql} "$dest/"
+
+      - name: Retain stock package for downstream tests
+        uses: actions/upload-artifact@v4
+        with:
+          name: stock-reader-test-package
+          path: ${{ runner.temp }}/stock-reader-test-package/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Retain stock reader smoke evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: stock-reader-receipt
+          path: ${{ runner.temp }}/stock-reader.json
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Upload test logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
