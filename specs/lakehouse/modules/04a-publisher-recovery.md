@@ -94,8 +94,9 @@ Preparation validates the in-band metadata location, UUID, root, source
 columns, schema, spec and main pin before reading the bounded parent list
 or creating objects. It writes Parquet, a manifest and a manifest list as
 create-only objects under the enrolled root. The commit body uses the
-same selected parent and schema/spec requirements. The SQL admission
-and durable send authorization remain prerequisites for consuming it.
+same selected parent and schema/spec requirements. The joined 1.8 fixture
+obtains its target and send authorization through the
+[SQL admission provider](04b-scoped-send-admission.md).
 
 A replacement obtains the original retained descriptor, even after
 revocation. It checks the retained proposal's schema and spec against
