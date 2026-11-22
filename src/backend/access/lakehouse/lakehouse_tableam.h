@@ -106,6 +106,7 @@ typedef struct LakehouseWriteEntry
 
 /* tableam.c — write-state machinery used by the publisher */
 extern Oid	lakehouse_am_oid(void);
+extern void install_lakehouse_count_exec(void);
 extern LakehouseWriteEntry *get_write_entry(Relation rel);
 extern void open_write_session(LakehouseWriteEntry *entry, TupleDesc tupdesc);
 extern void register_publisher_worker(void);
