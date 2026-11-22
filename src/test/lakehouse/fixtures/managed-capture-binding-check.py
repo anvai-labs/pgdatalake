@@ -2,13 +2,18 @@
 
 import argparse
 import json
+import os
+import subprocess
 import threading
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
-from publication_fixture import MEM, SEG, claim, sql
+from publication_fixture import HDR, MEM, PSQL, SEG, claim, sql
 
 
 @dataclass(frozen=True)
@@ -26,12 +31,14 @@ class Binding:
         return cls(incarnation, generation, f"fixture.{name}", authority,
                    table or uuid.uuid4(), uuid.uuid4(), f"s3://fixture-bucket/{name}")
 
-    def enroll_sql(self):
+    def enroll_sql(self, *, provider=False):
+        function = "lakehouse.enroll_managed_capture" if provider else "capture_fixture.enroll"
+        schema_and_spec = ", 0, 0" if provider else ""
         return (
-            "SELECT capture_fixture.enroll('events'::regclass, "
+            f"SELECT {function}('events'::regclass, "
             f"'{self.identity}', 'capture_catalog', '{self.incarnation}'::uuid, "
             f"'{self.binding}'::uuid, {self.generation}::bigint, "
-            f"'{self.authority}'::uuid, '{self.table}'::uuid, '{self.root}');"
+            f"'{self.authority}'::uuid, '{self.table}'::uuid, '{self.root}'{schema_and_spec});"
         )
 
     def imprint(self):
@@ -84,7 +91,103 @@ EXPECTED_RED = [
 ]
 
 
-def exercise(db, adapter, baseline, endpoint, requests, role):
+def race_transition(db, role, staged, transition, release, retry=None):
+    with (
+        ThreadPoolExecutor(max_workers=1) as executor,
+        subprocess.Popen(PSQL + ["-d", db], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True) as writer,
+    ):
+        def send(statement):
+            writer.stdin.write(statement + "\n")
+            writer.stdin.flush()
+
+        try:
+            send(f"SET ROLE {role}; BEGIN; {staged} SELECT 'staged';")
+            assert writer.stdout.readline().strip() == "staged"
+            changer = executor.submit(sql, db, transition, app="capture_transition")
+            deadline = time.monotonic() + 10
+            while sql(db, """
+                SELECT count(*) FROM pg_stat_activity
+                WHERE datname = current_database() AND application_name = 'capture_transition'
+                  AND cardinality(pg_blocking_pids(pid)) = 1
+            """) != "1":
+                if changer.done():
+                    changer.result()
+                    raise AssertionError("transition completed before capture released its lock")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("managed capture transition did not wait for the writer")
+                time.sleep(0.05)
+            send(f"{release} SELECT 'released';")
+            assert writer.stdout.readline().strip() == "released"
+            changer.result(timeout=10)
+            _, error = writer.communicate(retry or "ROLLBACK;\n", timeout=10)
+            if retry:
+                assert writer.returncode and "ERROR:  55000:" in error, error
+            else:
+                assert writer.returncode == 0, error
+        finally:
+            if writer.poll() is None:
+                writer.terminate()
+
+
+def verify_restart(db, data):
+    before = {name: sql(db, f"SELECT to_jsonb(r) FROM {name} r ORDER BY 1")
+              for name in (SEG, HDR, MEM, "lakehouse.managed_capture_state",
+                           "lakehouse.managed_capture_bindings")}
+    data = data.resolve()
+    assert Path(sql(db, "SHOW data_directory")).resolve() == data
+    assert sql(db, "SHOW fsync") == "on"
+    assert sql(db, "SHOW synchronous_commit") == "on"
+    start = time.monotonic()
+    subprocess.run(
+        [os.getenv("PG_CTL", "pg_ctl"), "restart", "-D", str(data),
+         "-m", "immediate", "-w", "-l", str(data.parent / "capture-restart.log")],
+        check=True, timeout=60,
+    )
+    for name, prior in before.items():
+        assert sql(db, f"SELECT to_jsonb(r) FROM {name} r ORDER BY 1") == prior, name
+    print(f"capture WAL recovery preserved ledger and binding state in {time.monotonic() - start:.3f}s")
+
+
+def check_cow_cutover(db, requests, catalog_replies):
+    metadata_path = "/fixture-bucket/cow_events/metadata.json"
+    route = "/v1/namespaces/fixture/tables/cow_events"
+    catalog_replies.update({
+        ("GET", "/v1/config"): {"defaults": {}, "overrides": {}},
+        ("GET", route): {"metadata-location": f"s3:/{metadata_path}", "config": {}},
+        ("POST", route): {"metadata-location": f"s3:/{metadata_path}", "config": {}},
+        ("GET", metadata_path): {
+            "format-version": 2, "table-uuid": str(uuid.uuid4()),
+            "location": "s3://fixture-bucket/cow_events", "last-sequence-number": 0,
+            "current-schema-id": 0, "snapshots": [],
+            "schemas": [{"type": "struct", "schema-id": 0, "fields": [
+                {"id": 1, "name": "id", "required": False, "type": "long"},
+            ]}],
+        },
+    })
+    try:
+        result = subprocess.run(PSQL + ["-d", db], check=False, input="""
+            CREATE TABLE cow_events (id bigint) USING lakehouse WITH (write_mode='cow');
+            SELECT lakehouse.attach_table('cow_events', 'fixture.cow_events', 'capture_catalog');
+            ALTER USER MAPPING FOR CURRENT_USER SERVER capture_catalog
+                OPTIONS (ADD s3_access_key 'fixture', ADD s3_secret_key 'fixture');
+            BEGIN;
+            INSERT INTO cow_events VALUES (80);
+            SELECT lakehouse.require_managed_capture('cow_events');
+            COMMIT;
+        """, capture_output=True, text=True, timeout=35)
+        observed = [(method, urlsplit(path).path) for method, path in requests]
+        assert result.returncode and "ERROR:  55000:" in result.stderr, (result, observed)
+        assert observed == [("GET", "/v1/config"), ("GET", route), ("GET", metadata_path)], observed
+        assert sql(db, "SELECT count(*) FROM lakehouse.managed_capture_state "
+                       "WHERE relid = 'cow_events'::regclass") == "0"
+    finally:
+        catalog_replies.clear()
+        requests.clear()
+    print("legacy COW cutover refused after session open, before any catalog POST")
+
+
+def exercise(db, adapter, baseline, endpoint, requests, catalog_replies, role, restart_dir):
     sql(db, f"""
         CREATE EXTENSION lakehouse;
         CREATE SCHEMA capture_fixture;
@@ -99,7 +202,17 @@ def exercise(db, adapter, baseline, endpoint, requests, role):
         CREATE TABLE legacy (id bigint) USING lakehouse WITH (write_mode='staged');
         SELECT lakehouse.attach_table('legacy', 'fixture.legacy', 'capture_catalog');
     """)
+    assert sql(db, "SELECT extversion FROM pg_extension WHERE extname='lakehouse'") == "1.6"
     sql(db, adapter)
+    if not baseline:
+        assert sql(db, "SELECT extversion FROM pg_extension WHERE extname='lakehouse'") == "1.7"
+        sql(db, f"""
+            DROP USER MAPPING FOR {role} SERVER capture_catalog;
+            REVOKE USAGE ON FOREIGN SERVER capture_catalog FROM {role};
+            GRANT USAGE ON SCHEMA lakehouse TO {role};
+            GRANT SELECT ON events TO {role};
+        """)
+        check_cow_cutover(db, requests, catalog_replies)
     failed = []
 
     def check(gate, actual, expected):
@@ -146,8 +259,28 @@ def exercise(db, adapter, baseline, endpoint, requests, role):
     incarnation = uuid.uuid4()
     authority = uuid.uuid4()
     first = Binding.create(incarnation, 1, "events", authority)
+    if not baseline:
+        sql(db, f"SET ROLE {role}; SELECT lakehouse.require_managed_capture('events');", error="42501")
+        sql(db, f"SET ROLE {role}; {first.enroll_sql(provider=True)}", error="42501")
+        sql(db, "SELECT lakehouse.require_managed_capture('legacy');", error="55000")
     enrolled(first)
-    foreground(write("""
+    hostile_path = ""
+    if not baseline:
+        sql(db, f"""
+            CREATE SCHEMA capture_trap AUTHORIZATION {role};
+            SET ROLE {role};
+            CREATE FUNCTION capture_trap.trap(oid, oid) RETURNS bool LANGUAGE plpgsql AS $$
+            BEGIN
+                RAISE EXCEPTION 'capture executed a caller-defined operator';
+            END $$;
+            CREATE OPERATOR capture_trap.= (FUNCTION = capture_trap.trap, LEFTARG = oid, RIGHTARG = oid);
+        """)
+        hostile_path = "SET search_path = capture_trap, public, pg_catalog;"
+        foreground(write("SELECT id FROM events;"), error="0A000")
+        foreground(write("SELECT count(*) FROM events;"), error="0A000")
+        foreground(write(f"SELECT lakehouse.revoke_managed_capture('events', '{first.binding}', 1);"),
+                   error="42501")
+    foreground(write(hostile_path + """
         BEGIN; INSERT INTO events VALUES (20), (20);
         SAVEPOINT s; INSERT INTO events VALUES (98); ROLLBACK TO s; COMMIT;
         BEGIN; INSERT INTO events VALUES (99); ROLLBACK;
@@ -214,6 +347,22 @@ def exercise(db, adapter, baseline, endpoint, requests, role):
     else:
         foreground(write("INSERT INTO events VALUES (40);"), error="55000")
         assert seal([[40]]) is None
+        foreground(write(f"""
+            DO $$
+            BEGIN
+                BEGIN
+                    INSERT INTO events VALUES (40);
+                    RAISE EXCEPTION 'revoked capture succeeded';
+                EXCEPTION WHEN SQLSTATE '55000' THEN NULL;
+                END;
+                ASSERT current_user = '{role}';
+                BEGIN
+                    PERFORM seg_id FROM {SEG};
+                    RAISE EXCEPTION 'capture left the ledger role active';
+                EXCEPTION WHEN insufficient_privilege THEN NULL;
+                END;
+            END $$;
+        """))
 
     replacement = Binding.create(incarnation, 2, "replacement", authority)
     enrolled(replacement)
@@ -258,6 +407,66 @@ def exercise(db, adapter, baseline, endpoint, requests, role):
         expected.insert(3, [[40]])
     assert captures == expected, captures
     print(f"all retained payloads={captures!r}")
+
+    if not baseline:
+        def revoke(binding):
+            return f"SELECT capture_fixture.revoke('events', '{binding.binding}', {binding.generation});"
+
+        # A write and revocation in the same transaction must fail together.
+        foreground(f"BEGIN; INSERT INTO events VALUES (71); {revoke(recreated)} COMMIT;",
+                   error="55000")
+        assert seal([[71]]) is None
+        race_transition(db, role, "INSERT INTO events VALUES (72);", revoke(recreated), "COMMIT;")
+        require_capture("commit-before-revoke", recreated, [[72]])
+        foreground(write("INSERT INTO events VALUES (73);"), error="55000")
+
+        next_binding = Binding.create(recreated.incarnation, 2, "race_two", authority)
+        enrolled(next_binding)
+        final_binding = Binding.create(recreated.incarnation, 3, "race_three", authority)
+        race_transition(
+            db, role, "SAVEPOINT s; INSERT INTO events VALUES (74);",
+            f"BEGIN; {revoke(next_binding)} {final_binding.enroll_sql()} COMMIT;",
+            "ROLLBACK TO s;", "INSERT INTO events VALUES (75);\n",
+        )
+        assert seal([[74]]) is None and seal([[75]]) is None
+        foreground(write("INSERT INTO events VALUES (76);"))
+        require_capture("capture-after-savepoint-race", final_binding, [[76]])
+        print("capture races proved commit-before-revoke and stale-savepoint refusal")
+
+        # A second INSERT must refuse the new layout before touching the
+        # first INSERT's staged array. Rolling back the DDL restores it.
+        changed_slot = sql(db, r"""
+            BEGIN; INSERT INTO events VALUES (771);
+            SAVEPOINT s; ALTER TABLE events ADD COLUMN extra varchar(9);
+            \set ON_ERROR_STOP off
+            INSERT INTO events VALUES (772, 'drift');
+            \echo :SQLSTATE
+            \set ON_ERROR_STOP on
+            ROLLBACK TO s;
+            INSERT INTO events VALUES (773); COMMIT;
+        """)
+        assert changed_slot == "55000", changed_slot
+        require_capture("schema-savepoint", final_binding, [[771], [773]])
+        assert seal([[772, "drift"]]) is None
+        assert not requests, requests
+
+        # A changed source shape needs a fresh schema approval.
+        foreground("BEGIN; INSERT INTO events VALUES (77); "
+                   "ALTER TABLE events ADD COLUMN extra varchar(9); COMMIT;", error="55000")
+        assert seal([[77]]) is None
+        foreground("ALTER TABLE events ADD COLUMN extra varchar(9);")
+        foreground(write("INSERT INTO events VALUES (77, 'abc');"), error="55000")
+        assert seal([[77, "abc"]]) is None
+        sql(db, revoke(final_binding))
+        shaped_binding = Binding.create(recreated.incarnation, 4, "shaped", authority)
+        enrolled(shaped_binding)
+        foreground(write(r"INSERT INTO events VALUES (78, E'a\\bé');"))
+        require_capture("reenrolled-schema", shaped_binding, [[78, "a\\bé"]])
+        foreground("ALTER TABLE events ALTER COLUMN extra TYPE varchar(12);")
+        foreground(write("INSERT INTO events VALUES (77, 'abc');"), error="55000")
+        assert not requests, requests
+        if restart_dir:
+            verify_restart(db, restart_dir)
     return failed
 
 
@@ -266,18 +475,37 @@ def main():
     modes = parser.add_mutually_exclusive_group(required=True)
     modes.add_argument("--expect-baseline-red", action="store_true")
     modes.add_argument("--adapter", type=Path, metavar="SQL")
+    modes.add_argument("--provider", action="store_true")
+    parser.add_argument("--restart-fixture", type=Path, metavar="PGDATA")
     args = parser.parse_args()
+    if args.expect_baseline_red and args.restart_fixture:
+        parser.error("--restart-fixture requires the upgraded capture provider")
     if not __debug__:
         raise RuntimeError("the capture fixture requires Python assertions")
 
     suffix = uuid.uuid4().hex[:12]
     db, role = f"capture_fixture_{suffix}", f"capture_writer_{suffix}"
     requests = []
+    catalog_replies = {}
 
     class Recorder(BaseHTTPRequestHandler):
         def respond(self):
             requests.append((self.command, self.path))
-            self.send_error(503)
+            path = urlsplit(self.path).path
+            content = ({} if catalog_replies and self.command == "PUT"
+                       and path.startswith("/fixture-bucket/cow_events/")
+                       else catalog_replies.get((self.command, path)))
+            if content is None:
+                self.send_error(503)
+                return
+            body = json.dumps(content).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Last-Modified", self.date_time_string())
+            self.send_header("ETag", '"fixture"')
+            self.end_headers()
+            self.wfile.write(body)
 
         do_GET = do_HEAD = do_PUT = do_POST = respond
 
@@ -285,15 +513,20 @@ def main():
             pass
 
     baseline = args.expect_baseline_red
-    adapter = BASELINE_ADAPTER if baseline else args.adapter.read_text(encoding="utf-8")
-    sql("postgres", f"CREATE DATABASE {db}")
+    adapter_path = (Path(__file__).with_name("managed-capture-binding-adapter.sql")
+                    if args.provider else args.adapter)
+    adapter = BASELINE_ADAPTER if baseline else adapter_path.read_text(encoding="utf-8")
+    # The fixture compares decoded Unicode with jsonb. A C-locale initdb can
+    # default to SQL_ASCII, which cannot translate non-ASCII JSON escapes.
+    sql("postgres", f"CREATE DATABASE {db} TEMPLATE template0 ENCODING 'UTF8' LOCALE 'C'")
     try:
         with ThreadingHTTPServer(("127.0.0.1", 0), Recorder) as server:
             thread = threading.Thread(target=server.serve_forever)
             thread.start()
             try:
                 failed = exercise(db, adapter, baseline,
-                                  f"http://127.0.0.1:{server.server_port}", requests, role)
+                                  f"http://127.0.0.1:{server.server_port}", requests, catalog_replies, role,
+                                  args.restart_fixture)
             finally:
                 server.shutdown()
                 thread.join()

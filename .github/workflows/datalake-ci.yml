@@ -181,6 +181,7 @@ jobs:
           trap 'pg_ctl -D "$PGHOST/data" -m fast -w stop' EXIT
           python3 src/test/lakehouse/fixtures/publication-claim-check.py --live --restart-fixture "$PGHOST/data"
           python3 src/test/lakehouse/fixtures/publication-intent-check.py --restart-fixture "$PGHOST/data"
+          python3 src/test/lakehouse/fixtures/managed-capture-binding-check.py --provider --restart-fixture "$PGHOST/data"
           sh src/test/lakehouse/fixtures/cow-delete-guard.sh
           python3 src/test/lakehouse/fixtures/catalog-reply-loss-check.py
           COUNT_FORK_SMOKE=1 python3 src/test/lakehouse/fixtures/fdw-count-check.py
@@ -191,7 +192,8 @@ jobs:
             cargo build --locked --release --target-dir "$rust_target" --example bound_publication_fixture
           )
           python3 src/test/lakehouse/fixtures/bound-publication-restart.py \
-            --restart-fixture "$PGHOST/data" --worker "$rust_target/release/examples/bound_publication_fixture"
+            --restart-fixture "$PGHOST/data" --worker "$rust_target/release/examples/bound_publication_fixture" \
+            --capture-adapter "$PWD/src/test/lakehouse/fixtures/managed-capture-binding-adapter.sql"
 
       - name: Fetch unmodified PostgreSQL 19.0 for stock package qualification
         uses: actions/checkout@v4

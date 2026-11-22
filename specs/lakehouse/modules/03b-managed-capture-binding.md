@@ -1,6 +1,6 @@
 # Managed staged capture enrollment
 
-**Proposed capture contract.** The first profile covers append-only staged
+The first profile covers append-only staged
 TableAM writes to one enrolled Iceberg v2 table on `main`. The
 [provider crash smoke](04a-publisher-recovery.md#bound-provider-crash-smoke)
 starts with fixture rows already carrying a verified authority and Iceberg
@@ -34,6 +34,54 @@ enrolled attachment. Legacy rows stay legacy and require reconciliation
 before a cutover. The managed read merge across generations has its own
 [visibility gate](03-managed-visibility.md#compatible-published-pin).
 
+## Opt-in PostgreSQL provider
+
+Install extension 1.6 normally and run `ALTER EXTENSION lakehouse UPDATE TO
+'1.7'` to exercise bound capture. Installation still defaults to 1.6.
+There is no auto-enrollment or automatic adoption of existing segments.
+Use a permanent, nonpartitioned managed relation. The bound-required
+entry takes precedence over the session write mode and legacy attachment.
+
+The extension owner or administrator opts in with
+`lakehouse.require_managed_capture(regclass)`. An active binding can be
+installed directly with the following boundary. The operator verifies
+the supplied facts before calling it.
+
+```text
+lakehouse.enroll_managed_capture(target regclass, target_identity text,
+    server_name text, incarnation_id uuid, binding_id uuid, generation bigint,
+    authority_id uuid, table_uuid uuid, storage_root text, schema_id integer,
+    spec_id integer)
+lakehouse.revoke_managed_capture(target regclass, binding_id uuid, generation bigint)
+```
+
+Enrollment and revocation run at READ COMMITTED and take an exclusive
+lock on the managed relation. A concurrent writer keeps its relation lock
+through PostgreSQL commit. The commit inserts the original staged rows
+and binding reference in the same WAL-logged transaction. A writer whose
+savepoint released the lock must recheck the binding on its next insert.
+Admission returns `55000` if the same transaction already opened a legacy
+copy-on-write session for the relation.
+Stale or inactive bindings return `55000`. An ordinary writer needs its
+usual INSERT privilege and can commit without a foreign server grant or
+user mapping. The provider never reads user mapping secrets during capture.
+
+The provider stores the foreign server reference, its configured catalog
+and object endpoints, and the approved Iceberg identity and storage root.
+The source schema signature records column positions, names, types, type
+modifiers, collations, nullability and dropped column positions.
+Generated columns are outside this profile. A local signature change
+returns `55000` until the operator revokes the old generation and approves
+the new schema against Iceberg. The slot layout is checked when it changes
+within a transaction. The durable signature is checked on initial capture
+and before commit serialization. The stored payload is UTF-8 and its
+digest covers the exact bytes.
+
+The extension upgrade enables the local capture contract. Bound scans
+and COUNT return `0A000` pending the compatible-pin overlay. UPDATE,
+DELETE, and remote creation are outside this profile. Production
+publication and customer read-your-writes require their own gates.
+
 ## First executable red
 
 The [foreground binding fixture](../../../src/test/lakehouse/fixtures/managed-capture-binding-check.py)
@@ -61,7 +109,8 @@ red mode can run before the new provider exists.
 
 ## Candidate fixture adapter and acceptance
 
-Run the same fixture with `--adapter PATH.sql`. The adapter defines
+Run the same fixture with `--provider` to use the included PostgreSQL
+adapter, or supply `--adapter PATH.sql` to select another adapter. The adapter defines
 `capture_fixture.enroll`, `capture_fixture.revoke`,
 `capture_fixture.require_binding` and `capture_fixture.provenance` in the
 disposable database. The signatures in
@@ -86,10 +135,16 @@ fixture trigger or direct INSERT into the ledger.
 | Drop and recreate | Recreate the name as a legacy relation, attach it and commit value 61 with a NULL binding. Recreate again with explicit bound-required opt-in. Before enrollment it refuses value 60 with `55000`. Fresh enrollment can point at the same remote UUID and root as its predecessor. Value 70 carries a new binding ID and relation incarnation at generation 1. Prior ledger references remain intact. |
 | Request budget | The loopback recorders observe zero foreground requests after each successful enrollment. |
 
-Before connecting this cut to a production worker, add a deterministic
-two-transaction revocation race and exercise a savepoint abort with a
-concurrent reattach. Verify that acknowledgment order and the recorded
-binding agree. Then replace the two explicit ledger inserts in the
+The provider fixture observes two relation lock waits. It verifies a
+committed writer keeps the original binding and a savepoint-rolled-back
+writer cannot reuse it after a concurrent revoke and reattach. It also
+checks ordinary writer privileges, caller-chosen search path, and schema
+drift. Add `--restart-fixture PGDATA` against a disposable server to force
+an immediate shutdown and compare the recovered binding, claim, member,
+and payload rows. The restart check requires `fsync=on` and
+`synchronous_commit=on`.
+
+In the publication integration gate, replace the two explicit ledger inserts in the
 [bound-provider crash smoke](../../../src/test/lakehouse/fixtures/bound-publication-restart.py)
 with enrolled TableAM INSERTs, look up their generated segment IDs, and keep
 the existing one-POST, WAL, late segment and exact pinned row assertions.

@@ -13,4 +13,22 @@
 
 Fixed IDs are fixture symbols. On live catalogs record the concrete UUID, ref, actual parent/child IDs and external query pin at every step. Compare sorted typed multisets, including duplicates. Record zero, one and rejected/ambiguous POSTs at the transport boundary. Preserve a terminal outcome for every offered query. Capture SHA, package digest, PG major, toolchain, config, versions, connection/role, bytes, sample count, raw times, p95/p99 or insufficient samples. Separate observation, hypothesis and release objective. Real provider evidence applies only to its tested combination. Retain existing [smoke receipt format](../10-testing.md#milestone-tdd-and-smoke-receipts).
 
+### Joined managed capture and recovery fixture
+
+The native fork CI job exercises [ordinary capture enrollment](03b-managed-capture-binding.md)
+and the [durable send/recovery driver](04a-publisher-recovery.md) in one workflow.
+Use the opt-in extension upgrade and a low-privilege PostgreSQL writer. Source
+the claim members from ordinary SQL-generated segment IDs and payloads. Observe
+zero foreground catalog requests. Test both immediate termination after remote
+acceptance and a returned ambiguous failure. On recovery require one original
+commit POST, one WAL-flushed intent with the original bytes, exact independent
+rows at both pins, and an unaffected later segment. Replaying a completed
+operation preserves the receipt and issues zero catalog requests.
+
+The fixture trusts a disposable operator's explicit enrollment facts. Production
+enablement needs the native scheduler, durable scope resolved from each member's
+binding and generation, active grant enforcement at the send fence, and a
+zero-forbidden-request drill. The managed read overlay and promoted-primary
+recovery each need their own release gate.
+
 **Safe parallel starts.** Stock packaging, scoped cloud reads, ledger enrollment and independent exact-row fixtures may start against the shared contract. Integrate the actual writer only after verified capture and local send durability. Enable managed reads only after membership and real worker receipts. Service routing may consume pinned reads independently of managed capture. Serialize SQL upgrade numbers, shared ABI/header exports and fixture semantic changes. Freeze a digest for each set of vectors; provider and consumer must pass the same digest before claiming integration.

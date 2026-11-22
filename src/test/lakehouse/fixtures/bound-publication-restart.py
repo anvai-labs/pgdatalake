@@ -43,7 +43,7 @@ def enrolled_metadata(namespace):
     return route, body, json.loads(body)["metadata"]
 
 
-def run(db, namespace, data, worker):
+def run(db, namespace, data, worker, reply_loss, capture_adapter):
     table = f"iceberg.{namespace}.events"
     trino(f"CREATE TABLE {table} (id bigint) WITH (format_version=2); "
           f"INSERT INTO {table} VALUES 10")
@@ -54,31 +54,28 @@ def run(db, namespace, data, worker):
     initial_snapshots = set(trino(snaps).splitlines())
     assert str(parent) in initial_snapshots
 
-    def capture(seg, value):
-        sql(db, f"""
-            SET synchronous_commit TO local;
-            INSERT INTO {SEG} (seg_id, relid, payload, row_count, authority_id, table_uuid)
-            OVERRIDING SYSTEM VALUE VALUES ({seg}, 'events'::regclass, '[[{value}]]', 1,
-                                              '{authority}', '{remote}');
-        """)
-
-    sql(db, "CREATE EXTENSION lakehouse; CREATE EXTENSION pg_walinspect; "
-            "CREATE TABLE events (id bigint);")
+    binding, incarnation = str(uuid.uuid4()), str(uuid.uuid4())
+    role = f"{db}_writer"
+    root = metadata["location"].rstrip("/")
+    sql(db, "CREATE EXTENSION lakehouse; CREATE EXTENSION pg_walinspect;")
     assert Path(sql(db, "SHOW data_directory")).resolve() == data
     assert sql(db, "SHOW fsync") == "on"
     assert sql(db, "SHOW listen_addresses") == "", "fixture requires a socket-only cluster"
-    capture(7, 20)
-    input_digest = sql(db, claim(operation, "7", "events", authority, remote))
-    checkpoint = sql(db, "SELECT pg_current_wal_insert_lsn()")
     accepted = threading.Event()
     release = threading.Event()
     stale_head = threading.Event()
+    unavailable = threading.Event()
     posts, lookups, errors = [], [], []
+    requests = []
 
     class CatalogGateway(BaseHTTPRequestHandler):
         def do_GET(self):
+            requests.append(self.path)
             if self.path == route:
                 lookups.append(stale_head.is_set())
+                if unavailable.is_set():
+                    self.reply(503, b"")
+                    return
                 if stale_head.is_set():
                     self.reply(200, old_reply)
                     return
@@ -86,6 +83,7 @@ def run(db, namespace, data, worker):
             self.reply(status, body)
 
         def do_POST(self):
+            requests.append(self.path)
             if self.path != route:
                 self.send_error(404)
                 return
@@ -116,8 +114,9 @@ def run(db, namespace, data, worker):
                 self.send_error(500, "fixture rejected the first POST")
                 return
             accepted.set()
-            # Close without writing a reply. The client is terminated first.
-            release.wait(timeout=45)
+            if release.wait(timeout=45) and reply_loss == "http_504":
+                self.reply(504, b"")
+            # In the crash case the client has already been terminated.
 
         def reply(self, status, body):
             self.send_response(status)
@@ -133,20 +132,92 @@ def run(db, namespace, data, worker):
         server = threading.Thread(target=gateway.serve_forever)
         server.start()
         try:
+            endpoint = f"http://127.0.0.1:{gateway.server_port}/catalog"
+            if capture_adapter is None:
+                sql(db, "CREATE TABLE events (id bigint);")
+            else:
+                sql(db, f"""
+                    CREATE SCHEMA capture_fixture;
+                    CREATE SERVER capture_catalog FOREIGN DATA WRAPPER lakehouse_fdw OPTIONS
+                      (endpoint '{endpoint}', warehouse 'smoke', s3_endpoint 'http://127.0.0.1:9000');
+                    CREATE ROLE {role};
+                    GRANT USAGE ON FOREIGN SERVER capture_catalog TO {role};
+                    CREATE USER MAPPING FOR CURRENT_USER SERVER capture_catalog OPTIONS
+                      (s3_access_key 'lakehouse-test', s3_secret_key 'lakehouse-test-password');
+                    CREATE USER MAPPING FOR {role} SERVER capture_catalog OPTIONS
+                      (s3_access_key 'lakehouse-test', s3_secret_key 'lakehouse-test-password');
+                    CREATE TABLE events (id bigint) USING lakehouse WITH (write_mode='staged');
+                    GRANT INSERT ON events TO {role};
+                """)
+                sql(db, capture_adapter)
+                sql(db, f"""
+                    SELECT capture_fixture.require_binding('events'::regclass);
+                    SELECT capture_fixture.enroll('events'::regclass, '{namespace}.events',
+                        'capture_catalog', '{incarnation}'::uuid, '{binding}'::uuid,
+                        1::bigint, '{authority}'::uuid, '{remote}'::uuid, '{root}');
+                """)
+
+            def capture(seed_id, value):
+                if capture_adapter is None:
+                    sql(db, f"""
+                        SET synchronous_commit TO local;
+                        INSERT INTO {SEG} (seg_id, relid, payload, row_count, authority_id, table_uuid)
+                        OVERRIDING SYSTEM VALUE VALUES (
+                            {seed_id}, 'events'::regclass, '[[{value}]]', 1, '{authority}', '{remote}');
+                    """)
+                    return seed_id
+                before = len(requests)
+                sql(db, f"""
+                    SET synchronous_commit TO local;
+                    SET ROLE {role};
+                    INSERT INTO events VALUES ({value});
+                """)
+                assert len(requests) == before, "foreground capture made a catalog request"
+                row = json.loads(sql(db, f"""
+                    SELECT json_build_array(seg_id, capture_fixture.provenance(seg_id))
+                    FROM {SEG}
+                    WHERE relid='events'::regclass AND row_count=1
+                      AND convert_from(payload, 'UTF8')::jsonb = '[[{value}]]'::jsonb
+                      AND authority_id='{authority}' AND table_uuid='{remote}'
+                      AND payload_digest=sha256(payload) AND NOT published;
+                """))
+                seg_id, provenance = row
+                assert provenance == [binding, incarnation, 1], row
+                return seg_id
+
+            first = capture(7, 20)
+            input_digest = sql(db, claim(operation, str(first), "events", authority, remote))
+            checkpoint = sql(db, "SELECT pg_current_wal_insert_lsn()")
             request = json.dumps({
-                "database": db, "endpoint": f"http://127.0.0.1:{gateway.server_port}/catalog",
+                "database": db, "endpoint": endpoint,
                 "namespace": namespace, "operation_id": operation, "authority_id": authority,
-                "table_uuid": remote, "root": metadata["location"].rstrip("/"),
+                "table_uuid": remote, "root": root,
             })
-            with subprocess.Popen([worker, "send"], stdin=subprocess.PIPE, text=True) as sender:
+            # A transient failure before authorization leaves the claim
+            # eligible for a new owner. This first pass reaches no POST.
+            unavailable.set()
+            failed = subprocess.run([worker], input=request, text=True, timeout=25,
+                                    capture_output=True)
+            assert failed.returncode and "prepare_unsent" in failed.stderr, failed
+            assert not posts
+            assert sql(db, "SELECT count(*) FROM lakehouse.publication_attempts") == "0"
+            unavailable.clear()
+
+            with subprocess.Popen([worker], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  text=True) as sender:
                 try:
                     sender.stdin.write(request)
                     sender.stdin.close()
                     assert accepted.wait(timeout=30), "the catalog never accepted the first POST"
                     assert not errors, errors
                     assert sender.poll() is None, "sender exited before the lost-reply barrier"
-                    capture(8, 30)
+                    late = capture(8, 30)
+                    assert first != late
                     assert sql(db, f"SELECT count(*) FROM {HDR} WHERE verified_snapshot_id IS NOT NULL") == "0"
+                    if reply_loss == "http_504":
+                        release.set()
+                        assert sender.wait(timeout=10) == 0
+                        assert sender.stdout.read().strip() == "hold dispatch_unknown"
                 finally:
                     if sender.poll() is None:
                         sender.kill()
@@ -159,52 +230,60 @@ def run(db, namespace, data, worker):
                            check=True, timeout=60)
             restart_ms = (time.monotonic() - started) * 1000
 
-            def recover():
+            def drive():
                 return subprocess.check_output(
-                    [worker, "recover"], input=request, text=True, timeout=25).strip()
+                    [worker], input=request, text=True, timeout=25).strip()
 
             posted_snapshot = int(sql(db, f"""
                 SELECT proposed_snapshot_id FROM lakehouse.publication_attempts
                 WHERE operation_id='{operation}' AND expected_parent={parent}
             """))
-            # First take-over sees stale proof. It must hold the original
-            # intent and issue no second POST or local completion.
+            # Unavailable and then stale evidence each leave the intent reserved
+            # without another POST or local completion.
+            unavailable.set()
+            assert drive() == "hold lookup_unavailable"
+            assert len(posts) == 1
+            unavailable.clear()
             stale_head.set()
-            assert recover() == "hold"
+            assert drive() == "hold acceptance_unproved"
             assert len(posts) == 1
             assert lookups[-1] is True
             assert sql(db, f"SELECT count(*) FROM {SEG} WHERE published") == "0"
             assert sql(db, f"SELECT count(*) FROM {HDR} WHERE verified_snapshot_id IS NOT NULL") == "0"
             stale_head.clear()
             started = time.monotonic()
-            assert recover() == f"verified {posted_snapshot} 1"
+            assert drive() == f"verified {posted_snapshot} 1"
             recovery_ms = (time.monotonic() - started) * 1000
             assert lookups[-1] is False
             row_versions = f"""
                 SELECT xmin FROM {HDR} WHERE operation_id='{operation}';
-                SELECT xmin FROM {SEG} WHERE seg_id=7;
+                SELECT xmin FROM {SEG} WHERE seg_id={first};
             """
             completed = sql(db, row_versions)
-            before = (len(posts), len(lookups))
-            assert recover() == f"complete {posted_snapshot}"
-            assert (len(posts), len(lookups)) == before
+            before = len(requests)
+            assert drive() == f"complete {posted_snapshot}"
+            assert len(requests) == before
             assert sql(db, row_versions) == completed
             assert len(posts) == 1
             assert posted_snapshot != parent
 
             assert sql(db, f"SELECT seg_id, published, published_snapshot_id "
-                       f"FROM {SEG} ORDER BY seg_id") == f"7|t|{posted_snapshot}\n8|f|"
+                       f"FROM {SEG} ORDER BY seg_id") == f"{first}|t|{posted_snapshot}\n{late}|f|"
             assert sql(db, f"SELECT array_agg(seg_id ORDER BY seg_id) FROM {MEM} "
-                       f"WHERE operation_id='{operation}'") == "{7}"
+                       f"WHERE operation_id='{operation}'") == f"{{{first}}}"
             assert sql(db, f"SELECT verified_snapshot_id FROM {HDR} WHERE operation_id='{operation}' "
                        f"AND encode(input_digest, 'hex')='{input_digest}'") == str(posted_snapshot)
             next_operation = str(uuid.uuid4())
-            assert sql(db, claim(next_operation, "8", "events", authority, remote)), "late row was not claimable"
+            assert sql(db, claim(next_operation, str(late), "events", authority, remote)), "late row was not claimable"
             assert set(trino(snaps).splitlines()) == initial_snapshots | {str(posted_snapshot)}
             assert trino(f"SELECT id FROM {table} FOR VERSION AS OF {parent} ORDER BY id") == "10"
             assert trino(f"SELECT id FROM {table} FOR VERSION AS OF {posted_snapshot} ORDER BY id") == "10\n20"
-            print(f"bound providers: base={parent} rows=[10], receipt={posted_snapshot} rows=[10,20], "
-                  f"catalog_posts=1 wal_commits=1 completed_members=[7] late_members_pending=[8] "
+            capture_source = "seeded" if capture_adapter is None else "ordinary_sql"
+            print(f"bound worker: capture={capture_source} reply_loss={reply_loss} "
+                  f"base={parent} rows=[10], "
+                  f"receipt={posted_snapshot} rows=[10,20], "
+                  f"catalog_posts={len(posts)} catalog_gets={len(requests)-len(posts)} "
+                  f"wal_intent_commit_flushed=true completed_members=[{first}] late_members_pending=[{late}] "
                   f"restart_ms={restart_ms:.1f} verify_and_finalize_ms={recovery_ms:.1f} samples=1")
         finally:
             release.set()
@@ -216,20 +295,26 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--restart-fixture", required=True, type=Path, metavar="PGDATA")
     parser.add_argument("--worker", required=True, type=Path)
+    parser.add_argument("--capture-adapter", type=Path,
+                        help="use ordinary TableAM INSERT with the managed capture fixture adapter")
     args = parser.parse_args()
     if not __debug__:
         raise RuntimeError("the recovery smoke requires Python assertions")
     admin = os.getenv("PGDATABASE", "postgres")
-    name = "bound_publish_" + uuid.uuid4().hex[:12]
-    sql(admin, f"CREATE DATABASE {name}")
-    try:
-        trino(f"CREATE SCHEMA iceberg.{name}")
+    data = args.restart_fixture.resolve()
+    worker = args.worker.resolve()
+    capture_adapter = args.capture_adapter.read_text(encoding="utf-8") if args.capture_adapter else None
+    for reply_loss in ("crash", "http_504"):
+        name = "bound_publish_" + uuid.uuid4().hex[:12]
+        sql(admin, f"CREATE DATABASE {name}")
         try:
-            run(name, name, args.restart_fixture.resolve(), args.worker.resolve())
+            trino(f"CREATE SCHEMA iceberg.{name}")
+            try:
+                run(name, name, data, worker, reply_loss, capture_adapter)
+            finally:
+                trino(f"DROP TABLE IF EXISTS iceberg.{name}.events; DROP SCHEMA iceberg.{name}")
         finally:
-            trino(f"DROP TABLE IF EXISTS iceberg.{name}.events; DROP SCHEMA iceberg.{name}")
-    finally:
-        sql(admin, f"DROP DATABASE {name} WITH (FORCE)")
+            sql(admin, f"DROP DATABASE {name} WITH (FORCE); DROP ROLE IF EXISTS {name}_writer;")
 
 
 if __name__ == "__main__":
