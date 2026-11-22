@@ -2,6 +2,8 @@
 
 **Read** [shared contracts](00-integration-contracts.md). **Own** `scan.rs`, `manifest.rs`, `parquet.rs`, `puffin.rs`, reader-side Rust `ffi.rs` exports and `batch_fill.c`. The catalog module supplies a pin and authorized storage. FDW and TableAM derive required output/qual columns and own PostgreSQL slot lifetime.
 
+For repeated dashboard work, use the [shared published reader and BI reuse contract](02a-bi-reuse.md).
+
 ## Implementation
 
 1. Resolve fields and delete keys by Iceberg ID, including historical schema and per-manifest partition spec. Preserve requested SQL slot order. Empty output projection can still require delete keys and physical row ordinals.
