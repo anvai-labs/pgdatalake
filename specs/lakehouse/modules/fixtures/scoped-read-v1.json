@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "grant": {
+    "binding_id": "orders-a",
+    "generation": 7,
+    "mapping_role": "a_reader",
+    "table_uuid": "ea230505-d856-4ebe-9f70-09f007f68e4c",
+    "ref": "main"
+  },
+  "requested_pin": "9007199254740993",
+  "cases": [
+    {"id":"direct-exact-pin","expect_core":"pin","catalog_calls":1,"expect_consumer":"eligible_for_pinned_canary"},
+    {"id":"permitted-owner-view","session_role":"analyst","check_as_role":"a_reader","expect_core":"pin","catalog_calls":1,"expect_consumer":"eligible_for_pinned_canary"},
+    {"id":"invoker-view-without-mapping","session_role":"analyst","expect_core":"denied","catalog_calls":0,"expect_consumer":"denied"},
+    {"id":"view-caller-lacks-select","session_role":"analyst","check_as_role":"a_reader","select_granted":false,"expect_core":"denied","catalog_calls":0,"expect_consumer":"denied"},
+    {"id":"revoked-before-prepared-execute","available_generation":8,"expect_core":"changed_binding","catalog_calls":0,"expect_consumer":"changed_binding"},
+    {"id":"catalog-unavailable","catalog_state":"unavailable","expect_core":"unavailable","catalog_calls":1,"expect_consumer":"unavailable"},
+    {"id":"same-name-replaced-uuid","catalog_state":"replacement","expect_core":"changed_binding","catalog_calls":1,"expect_consumer":"changed_binding"},
+    {"id":"unsupported-resolver-profile","catalog_state":"unsupported","expect_core":"unsupported","catalog_calls":1,"expect_consumer":"unsupported"},
+    {"id":"revoked-when-catalog-fails","catalog_state":"unavailable","consumer_grant":null,"expect_core":"unavailable","catalog_calls":1,"expect_consumer":"denied"},
+    {"id":"pin-expired","catalog_state":"pin_absent","expect_core":"pin_unavailable","catalog_calls":1,"expect_consumer":"pin_unavailable"},
+    {"id":"sibling-root-on-warm-cache","object_scope":"sibling","cache_hit":true,"expect_core":"denied","catalog_calls":1,"expect_consumer":"denied"},
+    {"id":"operator-grant-revoked-after-resolve","consumer_grant":null,"expect_core":"pin","catalog_calls":1,"expect_consumer":"denied"},
+    {"id":"grant-rotated-after-resolve","consumer_grant_patch":{"generation":8},"expect_core":"pin","catalog_calls":1,"expect_consumer":"changed_binding"},
+    {"id":"same-name-sibling-grant","consumer_grant_patch":{"binding_id":"orders-b"},"expect_core":"pin","catalog_calls":1,"expect_consumer":"changed_binding"},
+    {"id":"reply-for-other-effective-role","reply_patch":{"mapping_role":"other_reader"},"expect_core":"pin","catalog_calls":1,"expect_consumer":"changed_binding"},
+    {"id":"reply-for-other-table","reply_patch":{"table_uuid":"cb728568-4aea-4379-bf94-14051cf52f06"},"expect_core":"pin","catalog_calls":1,"expect_consumer":"changed_binding"},
+    {"id":"reply-for-other-ref","reply_patch":{"ref":"audit"},"expect_core":"pin","catalog_calls":1,"expect_consumer":"changed_binding"},
+    {"id":"reply-for-different-pin","reply_patch":{"snapshot_id":"17"},"expect_core":"pin","catalog_calls":1,"expect_consumer":"pin_mismatch"},
+    {"id":"lossy-json-pin","reply_patch":{"snapshot_id":9007199254740993},"expect_core":"pin","catalog_calls":1,"expect_consumer":"invalid_evidence"},
+    {"id":"boolean-generation","reply_patch":{"generation":true},"expect_core":"pin","catalog_calls":1,"expect_consumer":"invalid_evidence"},
+    {"id":"unrecognized-status","reply_patch":{"status":"ok"},"expect_core":"pin","catalog_calls":1,"expect_consumer":"invalid_evidence"},
+    {"id":"new-contract-version","reply_patch":{"version":2},"expect_core":"pin","catalog_calls":1,"expect_consumer":"unsupported_contract"}
+  ]
+}
