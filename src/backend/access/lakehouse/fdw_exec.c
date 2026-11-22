@@ -294,8 +294,14 @@ lakehouse_IterateForeignScan(ForeignScanState *node)
 										 errmsg("lakehouse: row read failed in task %llu: %s",
 												(unsigned long long) state->current_task,
 												cell_err[0] != '\0' ? cell_err : "unknown error")));
+							/* PG19 input functions take writable strings. */
 							state->row_values[i] =
-								InputFunctionCall(&state->in_funcs[i], text,
+								InputFunctionCall(&state->in_funcs[i],
+#if PG_VERSION_NUM < 200000
+												  pstrdup(text),
+#else
+												  text,
+#endif
 												  state->typioparams[i],
 												  TupleDescAttr(tupdesc, i)->atttypmod);
 							state->row_nulls[i] = false;
@@ -384,8 +390,13 @@ bool
 lakehouse_IsForeignScanParallelSafe(PlannerInfo *root, RelOptInfo *baserel,
 									RangeTblEntry *rte)
 {
+#ifdef LAKEHOUSE_STOCK_FDW
+	/* The initial stock profile qualifies a single execution-time pin. */
+	return false;
+#else
 	/* process-local reads over object storage: always safe (doc 06 §3) */
 	return true;
+#endif
 }
 
 Size

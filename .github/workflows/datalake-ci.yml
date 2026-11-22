@@ -180,6 +180,37 @@ jobs:
           sh src/test/lakehouse/fixtures/cow-delete-guard.sh
           python3 src/test/lakehouse/fixtures/catalog-reply-loss-check.py
 
+      - name: Fetch unmodified PostgreSQL 19.0 for stock package qualification
+        uses: actions/checkout@v4
+        with:
+          repository: postgres/postgres
+          ref: 5c839a2a08b9b87a349be97371fac6c5a2873b10
+          path: build/stock-pg19-src
+          persist-credentials: false
+
+      - name: Build and install the stock PG19 FDW with upstream PGXS
+        run: |
+          prefix="$RUNNER_TEMP/stock-pg19"
+          (
+            set -e
+            cd build/stock-pg19-src
+            ./configure --prefix="$prefix" --without-icu --without-readline
+            make -s -j4
+            make -s install
+          )
+          make -j4 -C src/backend/access/lakehouse/stock PG_CONFIG="$prefix/bin/pg_config" CARGO_TARGET_DIR="$PWD/build/src/backend/access/lakehouse/rust-target"
+          make -C src/backend/access/lakehouse/stock PG_CONFIG="$prefix/bin/pg_config" install
+
+      - name: Stock FDW pins, external position deletes and dump/restore
+        run: |
+          export PATH="$RUNNER_TEMP/stock-pg19/bin:$PATH"
+          export PGHOST="$RUNNER_TEMP/stock-fdw-smoke" PGPORT=52593 PGUSER=postgres PGDATABASE=postgres
+          mkdir -m 700 "$PGHOST"
+          initdb -D "$PGHOST/data" -A trust -U "$PGUSER" --no-locale
+          pg_ctl -D "$PGHOST/data" -l "$PGHOST/server.log" -o "-k $PGHOST -p $PGPORT -c listen_addresses=''" -w start
+          trap 'pg_ctl -D "$PGHOST/data" -m fast -w stop' EXIT
+          python3 src/test/lakehouse/fixtures/stock-fdw-check.py
+
       - name: Upload test logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
