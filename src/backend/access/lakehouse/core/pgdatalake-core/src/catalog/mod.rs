@@ -5,5 +5,6 @@
 pub mod commit;
 pub mod metadata;
 pub mod oauth;
+pub mod publication;
 pub mod rest;
 pub mod types;

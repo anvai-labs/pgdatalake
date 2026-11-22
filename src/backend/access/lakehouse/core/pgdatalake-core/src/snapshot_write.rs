@@ -549,6 +549,8 @@ pub struct WrittenSnapshot {
     /// Object keys written (manifest + manifest-list) — surfaced so the
     /// caller can audit/clean on abort.
     pub written_keys: Vec<String>,
+    /// Digest of the exact manifest list bytes for staged recovery.
+    pub manifest_list_digest: [u8; 32],
 }
 
 /// Assemble and WRITE a snapshot for `new_files`: manifest avro +
@@ -702,6 +704,7 @@ pub fn write_snapshot(
     let list_bytes = build_manifest_list_bytes(&list_entries)?;
     let list_rel = format!("metadata/snap-{}-0-{}.avro", snapshot_id, Uuid::new_v4());
     let list_key = keyed(list_rel.clone());
+    let manifest_list_digest = crate::catalog::publication::sha256(&list_bytes);
     io.put_bytes(&list_key, list_bytes)?;
 
     // summary per the spec's snapshot summary keys (writers may add more);
@@ -748,6 +751,7 @@ pub fn write_snapshot(
     Ok(WrittenSnapshot {
         snapshot,
         written_keys,
+        manifest_list_digest,
     })
 }
 
@@ -851,6 +855,11 @@ mod tests {
         );
         assert_eq!(written.snapshot.sequence_number, Some(4), "base seq + 1");
         assert_eq!(written.written_keys.len(), 2, "manifest + manifest-list");
+        let persisted_list = io.get_bytes(written.written_keys.last().unwrap()).unwrap();
+        assert_eq!(
+            written.manifest_list_digest,
+            crate::catalog::publication::sha256(&persisted_list)
+        );
 
         // both avro files exist on the store
         for k in &written.written_keys {
