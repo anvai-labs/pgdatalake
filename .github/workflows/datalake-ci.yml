@@ -186,6 +186,13 @@ jobs:
           sh src/test/lakehouse/fixtures/cow-delete-guard.sh
           python3 src/test/lakehouse/fixtures/catalog-reply-loss-check.py
           COUNT_FORK_SMOKE=1 python3 src/test/lakehouse/fixtures/fdw-count-check.py
+          rust_target="$PWD/build/src/backend/access/lakehouse/rust-target"
+          (
+            cd src/backend/access/lakehouse/core
+            cargo build --locked --release --target-dir "$rust_target" --example bound_publication_fixture
+          )
+          python3 src/test/lakehouse/fixtures/bound-publication-restart.py \
+            --restart-fixture "$PGHOST/data" --worker "$rust_target/release/examples/bound_publication_fixture"
 
       - name: Fetch unmodified PostgreSQL 19.0 for stock package qualification
         uses: actions/checkout@v4

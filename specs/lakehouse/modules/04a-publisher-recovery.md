@@ -74,6 +74,28 @@ The parent manifest list is read with the object byte budget and deadline used b
 
 A failed preparation can leave unreferenced files, including if the store returns an uncertain PUT result. Proposed objects must survive recovery and cleanup while a send is unresolved. Automatic orphan reclamation remains a separate gate. This provider consumes a verified binding and an in-band Iceberg v2 pin. Binding enrollment, foreground capture and publisher orchestration remain dependencies.
 
+## Bound-provider crash smoke
+
+The CI smoke pre-enrolls one disposable Lakekeeper table and inserts bound
+segments directly into the fixture's PostgreSQL ledger. A test worker joins the
+existing Rust batch writer, preparation and single-submit adapters with the SQL
+claim and send authorization. Before forwarding the one POST, the loopback
+gateway checks that its exact body matches the stored intent and that PostgreSQL
+has flushed its commit WAL. After Lakekeeper accepts the append, the driver
+captures the next segment, terminates the sender with its reply still held, and
+restarts the disposable PostgreSQL cluster immediately.
+
+A replacement first sees a deliberately stale catalog response and leaves the
+receipt unresolved. Fresh catalog and object evidence then finalize segment 7.
+The smoke checks that a second recovery changes zero completion records, segment
+8 remains independently claimable, and Trino reads exactly `[10]` and
+`[10, 20]` at the parent and accepted pins. The harness records one POST and
+the observed restart and verification times on each run. [Test worker](../../../src/backend/access/lakehouse/core/pgdatalake-core/examples/bound_publication_fixture.rs) · [Crash smoke](../../../src/test/lakehouse/fixtures/bound-publication-restart.py)
+
+The fixture qualifies the provider integration for explicitly bound rows on a
+single retained volume. Production worker scheduling, ordinary bound SQL
+capture, two-source overlay visibility, and failover remain separate gates.
+
 ## When a second append is safe
 
 | Evidence | Decision |
