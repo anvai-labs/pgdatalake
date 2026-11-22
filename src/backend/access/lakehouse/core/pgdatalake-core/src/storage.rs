@@ -14,6 +14,7 @@ use crate::catalog::metadata::TableMetadata;
 #[derive(Debug)]
 pub enum StorageError {
     NotFound(String),
+    ReadDenied(String),
     Http(String),
     Decode(String),
     Config(String),
@@ -28,6 +29,7 @@ impl std::fmt::Display for StorageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StorageError::NotFound(m) => write!(f, "object not found: {m}"),
+            StorageError::ReadDenied(m) => write!(f, "storage read denied: {m}"),
             StorageError::Http(m) => write!(f, "storage IO error: {m}"),
             StorageError::Decode(m) => write!(f, "storage decode error: {m}"),
             StorageError::Config(m) => write!(f, "storage config error: {m}"),
@@ -187,8 +189,52 @@ pub struct StorageIo {
     store: std::sync::Arc<dyn ObjectStore>,
 }
 
+// object_store's default connector follows redirects. An explicit endpoint
+// is an authority boundary for bound reads, including on cache misses.
+#[derive(Debug)]
+struct BoundReadConnector;
+
+impl object_store::client::HttpConnector for BoundReadConnector {
+    fn connect(
+        &self,
+        _: &object_store::ClientOptions,
+    ) -> object_store::Result<object_store::client::HttpClient> {
+        let client = reqwest_s3::Client::builder()
+            .redirect(reqwest_s3::redirect::Policy::none())
+            .no_proxy()
+            .no_gzip()
+            .no_brotli()
+            .no_zstd()
+            .no_deflate()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|source| object_store::Error::Generic {
+                store: "bound S3 read",
+                source: Box::new(source),
+            })?;
+        Ok(object_store::client::HttpClient::new(client))
+    }
+}
+
 impl StorageIo {
     pub fn open(loc: &Location, s3: Option<&S3Options>) -> Result<Self, StorageError> {
+        Self::open_inner(loc, s3, false)
+    }
+
+    pub(crate) fn open_bound_s3(loc: &Location, s3: &S3Options) -> Result<Self, StorageError> {
+        if !matches!(loc, Location::S3 { .. }) || s3.endpoint.is_none() || s3.region.is_none() {
+            return Err(StorageError::Config(
+                "bound reads require explicit S3 transport".into(),
+            ));
+        }
+        Self::open_inner(loc, Some(s3), true)
+    }
+
+    fn open_inner(
+        loc: &Location,
+        s3: Option<&S3Options>,
+        bound_read: bool,
+    ) -> Result<Self, StorageError> {
         let store: Box<dyn ObjectStore> = match loc {
             Location::Local { root } => open_local_store(root, local_stores_allowed())?,
             Location::S3 { bucket, .. } => {
@@ -218,6 +264,11 @@ impl StorageIo {
                 }
                 if let (Some(k), Some(sec)) = (&opts.access_key_id, &opts.secret_access_key) {
                     b = b.with_access_key_id(k).with_secret_access_key(sec);
+                }
+                if bound_read {
+                    b = b
+                        .with_virtual_hosted_style_request(false)
+                        .with_http_connector(BoundReadConnector);
                 }
                 Box::new(b.build().map_err(|e| StorageError::Config(e.to_string()))?)
             }

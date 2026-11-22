@@ -12,6 +12,8 @@
 
 use std::ffi::{c_char, CStr, CString};
 
+pub use crate::read_binding::PgDatalakeReadStatus;
+use crate::read_binding::{ReadBinding, ReadError, S3ReadRoot};
 use crate::scan::ScanPlan;
 use crate::session::{CatalogClient, S3ClientOptions};
 use crate::storage::S3Options;
@@ -40,10 +42,16 @@ pub struct ScanSession {
     file_paths: Vec<CString>,
     s3: S3Options,
     deletes: crate::parquet::LoadedDeletes,
+    read_root: Option<S3ReadRoot>,
 }
 
 impl ScanSession {
-    fn from_plan(plan: ScanPlan, s3: S3Options, deletes: crate::parquet::LoadedDeletes) -> Self {
+    fn from_plan(
+        plan: ScanPlan,
+        s3: S3Options,
+        deletes: crate::parquet::LoadedDeletes,
+        read_root: Option<S3ReadRoot>,
+    ) -> Self {
         Self {
             file_paths: plan
                 .tasks
@@ -53,6 +61,7 @@ impl ScanSession {
             plan,
             s3,
             deletes,
+            read_root,
         }
     }
 
@@ -106,7 +115,58 @@ pub unsafe extern "C" fn pg_datalake_scan_new(
     err_buf: *mut c_char,
     err_len: usize,
 ) -> *mut ScanSession {
-    let result = std::panic::catch_unwind(|| -> Result<ScanSession, String> {
+    pg_datalake_scan_new_bound(
+        endpoint,
+        warehouse,
+        token,
+        namespace,
+        table,
+        s3_endpoint,
+        s3_access_key,
+        s3_secret_key,
+        predicate_json,
+        snapshot_selector_json,
+        std::ptr::null(),
+        std::ptr::null_mut(),
+        err_buf,
+        err_len,
+    )
+}
+
+/// Server-owned inputs for an enrolled S3 read. A non-null binding always
+/// requires all fields, with an empty catalog prefix representing no prefix.
+#[repr(C)]
+pub struct PgDatalakeReadBinding {
+    pub expected_table_uuid: *const c_char,
+    pub storage_root: *const c_char,
+    pub catalog_prefix: *const c_char,
+    pub s3_region: *const c_char,
+}
+
+/// Resolve a scan using an optional enrolled S3 binding.
+///
+/// # Safety
+/// String and error-buffer arguments follow [`pg_datalake_scan_new`]. If
+/// non-null, `binding` must point to a valid descriptor for this call and
+/// `status_out` must point to writable storage for one status.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_scan_new_bound(
+    endpoint: *const c_char,
+    warehouse: *const c_char,
+    token: *const c_char,
+    namespace: *const c_char,
+    table: *const c_char,
+    s3_endpoint: *const c_char,
+    s3_access_key: *const c_char,
+    s3_secret_key: *const c_char,
+    predicate_json: *const c_char,
+    snapshot_selector_json: *const c_char,
+    binding: *const PgDatalakeReadBinding,
+    status_out: *mut PgDatalakeReadStatus,
+    err_buf: *mut c_char,
+    err_len: usize,
+) -> *mut ScanSession {
+    let result = std::panic::catch_unwind(|| -> Result<ScanSession, ReadError> {
         let endpoint = unsafe { borrow_string(endpoint) };
         let warehouse = unsafe { borrow_string(warehouse) };
         let token = unsafe { borrow_string(token) };
@@ -124,12 +184,10 @@ pub unsafe extern "C" fn pg_datalake_scan_new(
         let predicate = if pred_json.is_empty() {
             None
         } else {
-            let v: serde_json::Value =
-                serde_json::from_str(&pred_json).map_err(|e| format!("predicate JSON: {e}"))?;
-            Some(crate::scan::predicate_from_json(&v)?)
+            let v: serde_json::Value = serde_json::from_str(&pred_json)
+                .map_err(|e| ReadError::unsupported(format!("predicate JSON: {e}")))?;
+            Some(crate::scan::predicate_from_json(&v).map_err(ReadError::unsupported)?)
         };
-        let client =
-            CatalogClient::new(&endpoint, &warehouse, &token, &s3).map_err(|e| e.to_string())?;
         let ns_levels: Vec<&str> = namespace.split('.').collect();
         // NULL/empty selector = current snapshot (time travel: slices 18/19)
         let sel_json = unsafe { borrow_string(snapshot_selector_json) };
@@ -137,23 +195,43 @@ pub unsafe extern "C" fn pg_datalake_scan_new(
             None
         } else {
             let v: serde_json::Value = serde_json::from_str(&sel_json)
-                .map_err(|e| format!("snapshot selector JSON: {e}"))?;
+                .map_err(|e| ReadError::unsupported(format!("snapshot selector JSON: {e}")))?;
             Some(
                 serde_json::from_value::<crate::catalog::metadata::SnapshotSelector>(v)
-                    .map_err(|e| format!("snapshot selector: {e}"))?,
+                    .map_err(|e| ReadError::unsupported(format!("snapshot selector: {e}")))?,
             )
         };
-        client
-            .scan_table(&ns_levels, &table, predicate.as_ref(), selector.as_ref())
-            .and_then(|(p, s3, schema)| {
-                // slice 20: load the snapshot's delete files up front (they
-                // are small relative to data; every read of this scan needs
-                // them). The schema binds equality deletes to their key
-                // columns (13-review blocker #5).
-                crate::scan::load_row_deletes(&p, Some(&s3), &schema)
-                    .map(|d| ScanSession::from_plan(p, s3, d))
-            })
-            .map_err(|e| e.to_string())
+        let (plan, s3, schema, read_root) = if let Some(binding) = unsafe { binding.as_ref() } {
+            if binding.catalog_prefix.is_null() || warehouse.is_empty() {
+                return Err(ReadError::unsupported(
+                    "bound reads require warehouse and catalog prefix options",
+                ));
+            }
+            let binding = ReadBinding::new(
+                &unsafe { borrow_string(binding.expected_table_uuid) },
+                unsafe { borrow_string(binding.storage_root) },
+                unsafe { borrow_string(binding.catalog_prefix) },
+                unsafe { borrow_string(binding.s3_region) },
+                &endpoint,
+                token,
+            )?;
+            let (plan, s3, schema) = binding.scan(
+                &ns_levels,
+                &table,
+                s3,
+                predicate.as_ref(),
+                selector.as_ref(),
+            )?;
+            (plan, s3, schema, Some(binding.root))
+        } else {
+            let client = CatalogClient::new(&endpoint, &warehouse, &token, &s3)?;
+            let (plan, s3, schema) =
+                client.scan_table(&ns_levels, &table, predicate.as_ref(), selector.as_ref())?;
+            (plan, s3, schema, None)
+        };
+        let deletes =
+            crate::scan::load_row_deletes_with_root(&plan, Some(&s3), &schema, read_root.as_ref())?;
+        Ok(ScanSession::from_plan(plan, s3, deletes, read_root))
     });
     let session = result.unwrap_or_else(|panic| {
         let msg = if let Some(s) = panic.downcast_ref::<&str>() {
@@ -163,12 +241,23 @@ pub unsafe extern "C" fn pg_datalake_scan_new(
         } else {
             "unexpected panic in pgdatalake-core".to_string()
         };
-        Err(format!("pgdatalake-core panic: {msg}"))
+        Err(ReadError(
+            PgDatalakeReadStatus::ReadUnavailable,
+            format!("pgdatalake-core panic: {msg}"),
+        ))
     });
     match session {
-        Ok(s) => Box::into_raw(Box::new(s)),
-        Err(e) => {
-            unsafe { set_err(err_buf, err_len, &e) };
+        Ok(s) => {
+            if !status_out.is_null() {
+                unsafe { status_out.write(PgDatalakeReadStatus::ReadOk) };
+            }
+            Box::into_raw(Box::new(s))
+        }
+        Err(ReadError(status, message)) => {
+            if !status_out.is_null() {
+                unsafe { status_out.write(status) };
+            }
+            unsafe { set_err(err_buf, err_len, &message) };
             std::ptr::null_mut()
         }
     }
@@ -406,7 +495,8 @@ pub unsafe extern "C" fn pg_datalake_rows_open(
             .ok_or_else(|| format!("task {task_idx} out of range"))?
             .to_string();
         let (io, key) =
-            crate::scan::open_for(&file_path, Some(&s.s3_options())).map_err(|e| e.to_string())?;
+            crate::scan::open_read_object(&file_path, Some(&s.s3_options()), s.read_root.as_ref())
+                .map_err(|e| e.to_string())?;
         // slice 20: apply this task's delete set (position positions for the
         // file + sequence-applicable equality deletes)
         let task = s

@@ -99,12 +99,25 @@ static const LakehouseOptSpec lakehouse_opt_specs[] = {
 	{"endpoint", LOPT_SERVER},
 	{"warehouse", LOPT_SERVER},
 	{"s3_endpoint", LOPT_SERVER},
+	{"expected_table_uuid", LOPT_SERVER},
+	{"storage_root", LOPT_SERVER},
+	{"catalog_prefix", LOPT_SERVER},
+	{"s3_region", LOPT_SERVER},
 	{"token", LOPT_MAPPING},
 	{"s3_access_key", LOPT_MAPPING},
 	{"s3_secret_key", LOPT_MAPPING},
 	{"table", LOPT_TABLE},
 	{"snapshot_id", LOPT_TABLE},
 };
+
+bool
+lakehouse_IsBoundServerOption(const char *name)
+{
+	return strcmp(name, "expected_table_uuid") == 0 ||
+		strcmp(name, "storage_root") == 0 ||
+		strcmp(name, "catalog_prefix") == 0 ||
+		strcmp(name, "s3_region") == 0;
+}
 
 static const LakehouseOptSpec *
 find_lakehouse_option(const char *name)
@@ -292,6 +305,14 @@ ExtractOptions(Oid foreigntableid, Oid checkAsUser, LakehouseOptions *opts)
 			opts->warehouse = defGetString(def);
 		else if (strcmp(def->defname, "s3_endpoint") == 0)
 			opts->s3_endpoint = defGetString(def);
+		else if (strcmp(def->defname, "expected_table_uuid") == 0)
+			opts->read_binding.expected_table_uuid = defGetString(def);
+		else if (strcmp(def->defname, "storage_root") == 0)
+			opts->read_binding.storage_root = defGetString(def);
+		else if (strcmp(def->defname, "catalog_prefix") == 0)
+			opts->read_binding.catalog_prefix = defGetString(def);
+		else if (strcmp(def->defname, "s3_region") == 0)
+			opts->read_binding.s3_region = defGetString(def);
 		else
 			reject_misplaced_option(def->defname, "servers", LOPT_SERVER);
 	}
@@ -355,6 +376,14 @@ lakehouse_OpenSession(LakehouseOptions *opts, const char *rte_selector)
 	char		errbuf[1024];
 	ScanSession *session;
 	char	   *sel_json;
+	PgDatalakeReadStatus status;
+	const PgDatalakeReadBinding *binding = NULL;
+
+	if (opts->read_binding.expected_table_uuid != NULL ||
+		opts->read_binding.storage_root != NULL ||
+		opts->read_binding.catalog_prefix != NULL ||
+		opts->read_binding.s3_region != NULL)
+		binding = &opts->read_binding;
 
 	/*
 	 * Selector priority (slice 19): the query-level FOR ... AS OF pin wins
@@ -370,7 +399,7 @@ lakehouse_OpenSession(LakehouseOptions *opts, const char *rte_selector)
 		sel_json = "";
 
 	errbuf[0] = '\0';
-	session = pg_datalake_scan_new(opts->endpoint,
+	session = pg_datalake_scan_new_bound(opts->endpoint,
 								   opts->warehouse,
 								   opts->token ? opts->token : "",
 								   opts->namespace,
@@ -380,10 +409,37 @@ lakehouse_OpenSession(LakehouseOptions *opts, const char *rte_selector)
 								   opts->s3_secret_key,
 								   opts->predicate_json ? opts->predicate_json : "",
 								   sel_json,
+								   binding,
+								   &status,
 								   errbuf,
 								   sizeof(errbuf));
 	if (session == NULL)
 	{
+		if (binding != NULL)
+		{
+			int			sqlstate = ERRCODE_CONNECTION_EXCEPTION;
+
+			switch (status)
+			{
+				case ReadDenied:
+					sqlstate = ERRCODE_INSUFFICIENT_PRIVILEGE;
+					break;
+				case ReadChangedBinding:
+					sqlstate = ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE;
+					break;
+				case ReadPinUnavailable:
+					sqlstate = ERRCODE_INVALID_PARAMETER_VALUE;
+					break;
+				case ReadUnsupported:
+					sqlstate = ERRCODE_FEATURE_NOT_SUPPORTED;
+					break;
+				default:
+					break;
+			}
+			ereport(ERROR,
+					(errcode(sqlstate),
+					 errmsg("lakehouse: could not resolve bound scan: %s", errbuf)));
+		}
 		if (sel_json[0] != '\0')
 			ereport(ERROR,
 					(errcode(ERRCODE_CONNECTION_EXCEPTION),

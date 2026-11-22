@@ -18,6 +18,7 @@ pub mod ffi;
 pub mod manifest;
 pub mod parquet;
 pub mod puffin;
+mod read_binding;
 pub mod scan;
 pub mod session;
 pub mod snapshot_write;

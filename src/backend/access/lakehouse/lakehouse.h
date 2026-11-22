@@ -34,7 +34,11 @@ typedef struct LakehouseOptions
 	int			write_mode;		/* 0 = unset (GUC wins), 1 = cow, 2 = staged
 								 * (R2: CREATE/WITH-time sticky mode) */
 	char	   *snapshot_id;	/* time travel pin (slice 18); NULL = current */
+	PgDatalakeReadBinding read_binding; /* FDW server-owned read scope */
 } LakehouseOptions;
+
+/* Detect read-only binding options on a foreign server. */
+extern bool lakehouse_IsBoundServerOption(const char *name);
 
 /*
  * Canonical RTE selector string ("ts:<ms>" / "id:<n>" / "ref:<name>") ->
