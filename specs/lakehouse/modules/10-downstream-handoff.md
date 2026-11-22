@@ -15,7 +15,7 @@ The first independently usable boundary is a stock reader on PostgreSQL 19. Core
 
 ## Stock reader smoke receipt v1
 
-Run the stock smoke with `--receipt PATH` on a clean candidate checkout and a disposable stock installation. It writes JSON after the live checks and cleanup succeed. Fork CI publishes `stock-reader-receipt` from its build-and-test job. The checkout SHA on a PR can describe a synthetic merge. Use the post-merge run when pinning the branch revision. An absent receipt supplies no positive evidence. The synthetic example and consumer cases have no deployment authority. [Versioned fixture](fixtures/stock-reader-v1.json) · [Producer](../../../src/test/lakehouse/fixtures/stock-fdw-check.py)
+Run the stock smoke with `--receipt PATH` on a clean candidate checkout and a disposable stock installation. It writes JSON after the live checks and cleanup succeed. Fork CI retains `stock-reader-receipt` and a separate `stock-reader-test-package` for seven days. The package contains the installed module, control file and SQL install script. For a joined test choose the successful public run by source SHA, download both artifacts from that run, and hash the module independently. These test artifacts have no production release attestation. The checkout SHA on a PR can describe a synthetic merge. Use the post-merge run when pinning the branch revision. An absent receipt supplies no positive evidence. The synthetic example and consumer cases have no deployment authority. [Versioned fixture](fixtures/stock-reader-v1.json) · [Producer](../../../src/test/lakehouse/fixtures/stock-fdw-check.py)
 
 | Fields | Wire rule |
 |---|---|
