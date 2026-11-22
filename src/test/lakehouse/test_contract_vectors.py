@@ -180,7 +180,7 @@ class ScopedReadVectors(unittest.TestCase):
                     state = case.get("catalog_state", "available")
                     if state != "available":
                         status = {"replacement": "changed_binding", "pin_absent": "pin_unavailable",
-                                  "unavailable": "unavailable"}[state]
+                                  "unavailable": "unavailable", "unsupported": "unsupported"}[state]
                     elif case.get("object_scope", "within_both_roots") != "within_both_roots":
                         status = "denied"
                     else:
