@@ -25,3 +25,19 @@ Hub images in Sept 2026; see the Superseded note in specs/lakehouse/10-testing.m
 `meson setup build -Ddatalake=enabled && ninja` at the repo root builds the
 server + the `lakehouse` extension; see specs/lakehouse/12-roadmap.md for the
 milestone gates and specs/lakehouse/RULES.md §9 for the smoke-test ceremony.
+
+## Bound FDW read pilot
+
+Start the fixture services and Trino, then run `python3 src/test/lakehouse/fixtures/scoped-read-check.py`
+with `PGHOST`, `PGPORT`, `PGUSER` and `PSQL` pointing to a disposable local
+cluster. The fixture needs a superuser to create databases and mappings and a
+local authentication rule that allows the two test login roles. Native CI runs
+it on both packages. The fixture grants are in `fixtures/seaweedfs-s3.config.json`.
+For an isolated gateway backed by the same fixture store, set
+`SCOPED_READ_STORE_ADDR` to its `host:port`.
+
+The smoke prints one JSON record per tenant case with the exact requested pin,
+row multiplicity, token and storage-key fixture labels, timings, provider
+403s, and catalog, object and forbidden-root request counts. A provider 403
+incurs a real request to the enrolled object. A PostgreSQL mapping refusal
+emits zero network requests.

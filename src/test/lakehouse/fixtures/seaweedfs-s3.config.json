@@ -21,6 +21,30 @@
       "actions": ["Read", "List"]
     },
     {
+      "name": "scoped-tenant-a",
+      "credentials": [
+        {
+          "accessKey": "scope-a",
+          "secretKey": "scope-a-password"
+        },
+        {
+          "accessKey": "scope-a-rotated",
+          "secretKey": "scope-a-rotated-password"
+        }
+      ],
+      "actions": ["Read:warehouse/scope-a/*"]
+    },
+    {
+      "name": "scoped-tenant-b",
+      "credentials": [
+        {
+          "accessKey": "scope-b",
+          "secretKey": "scope-b-password"
+        }
+      ],
+      "actions": ["Read:warehouse/scope-a-old/*"]
+    },
+    {
       "name": "anonymous",
       "actions": []
     }
