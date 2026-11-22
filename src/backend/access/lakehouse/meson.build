@@ -36,13 +36,13 @@ pg_datalake_core_dep = declare_dependency(
 # --- lakehouse extension module --------------------------------------------
 
 lakehouse_sources = files(
-  'lakehouse_core.c',
+  'lakehouse_sql.c',
   'tableam.c',
   'fdw.c',
   'fdw_plan.c',
   'fdw_exec.c',
   'publisher.c',
-  'count_exec.c',
+  'managed_count.c',
   'batch_fill.c',
 )
 

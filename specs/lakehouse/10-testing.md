@@ -23,6 +23,8 @@ fixture* swapped. Revisit if Iceberg workloads hit SeaweedFS-specific gaps
 
 ### 1a. CI/CD strategy — pipelines, gates, coverage (amended 2026-11-20)
 
+The `docs-sentinel` job runs `python3 src/test/lakehouse/test_contract_vectors.py -v` on pushes and PRs, including specification-only changes. It checks the internal consistency of the versioned examples. Provider, SQL and live-catalog tests exercise their implementation at the corresponding milestone.
+
 **Pipeline map** (what runs, where, on what trigger):
 
 ```mermaid

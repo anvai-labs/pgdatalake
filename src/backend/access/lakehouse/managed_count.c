@@ -1,5 +1,5 @@
 /*-------------------------------------------------------------------------
- * count_exec.c — execution-time COUNT for MANAGED lakehouse tables
+ * managed_count.c — execution-time COUNT for MANAGED lakehouse tables
  * (spec 16, "COUNT must be computed at execution"; successor of the
  * gated-off plan-time elision count_elision.c).
  *

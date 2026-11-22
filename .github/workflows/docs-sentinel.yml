@@ -1,9 +1,7 @@
 # Docs-only sentinel (specs/lakehouse/10-testing.md §1a): datalake-ci is
 # path-filtered, so docs-only pushes produce NO checks — which blocks
-# required-status-check enforcement. This workflow ALWAYS runs and
-# always succeeds on non-code pushes; it is the stable check name for
-# future status gates, and a canary that the repo's CI plumbing is
-# alive at all.
+# required-status-check enforcement. This workflow also checks the versioned
+# module contract examples on docs-only pushes.
 name: docs-sentinel
 
 on:
@@ -17,7 +15,6 @@ jobs:
   sentinel:
     runs-on: ubuntu-24.04
     steps:
-      - name: Report pipeline alive (docs-only / canary)
-        run: |
-          echo "docs-sentinel: repository CI plumbing alive"
-          echo "datalake-ci (path-filtered) runs separately for code pushes"
+      - uses: actions/checkout@v4
+      - name: Check shared module contract examples
+        run: python3 src/test/lakehouse/test_contract_vectors.py -v

@@ -20,7 +20,7 @@ dir=src/backend/access/lakehouse
 files="
 $dir/batch_fill.c
 $dir/fdw.c
-$dir/lakehouse_core.c
+$dir/lakehouse_sql.c
 $dir/tableam.c
 "
 

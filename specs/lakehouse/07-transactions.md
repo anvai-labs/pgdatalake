@@ -4,6 +4,14 @@ The hardest part of the design. Postgres MVCC (tuple versions, WAL, snapshot
 xmin/cxmax) and Iceberg MVCC (immutable snapshots, optimistic catalog commits)
 are different systems; this doc pins the exact semantics we commit to.
 
+**Qualification update.** [Doc 18](18-anvai-lake-dml.md)
+defines the proposed published and managed read contracts, compatible snapshot
+cuts and supported DML gates. It supersedes retrying a changed row with
+last-writer-wins semantics, assuming a metadata TTL closes a commit recovery
+window, and treating PostgreSQL SERIALIZABLE as cross-engine SSI. The older
+protocol and phase goals below record design history. Claims about active
+capabilities require the tests in doc 18.
+
 ## 1. Visibility model
 
 | Scope | Heap behavior | Iceberg behavior (managed & external) |

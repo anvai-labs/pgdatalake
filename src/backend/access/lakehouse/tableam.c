@@ -3040,7 +3040,7 @@ _PG_init(void)
 	if (!xact_callbacks_registered)
 	{
 		/*
-		 * Execution-time COUNT (count_exec.c, spec 16 successor of the
+		 * Execution-time COUNT (managed_count.c, spec 16 successor of the
 		 * gated-off plan-time elision): rewrites trivial managed count(*)
 		 * into lakehouse.managed_count(relid), a volatile invoker function
 		 * that resolves permissions, RLS and the snapshot per execution with

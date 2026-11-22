@@ -12,7 +12,7 @@ import sys
 FILES = [
     "src/backend/access/lakehouse/tableam.c",
     "src/backend/access/lakehouse/fdw.c",
-    "src/backend/access/lakehouse/lakehouse_core.c",
+    "src/backend/access/lakehouse/lakehouse_sql.c",
     "src/backend/access/lakehouse/batch_fill.c",
     "src/backend/access/lakehouse/batch_fill.h",
     "src/backend/access/lakehouse/lakehouse.h",
