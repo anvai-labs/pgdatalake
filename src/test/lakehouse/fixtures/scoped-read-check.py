@@ -221,7 +221,7 @@ def exercise(db, parent, child, prefix, route, enrolled):
 
 
 @contextlib.contextmanager
-def login(db, role, env):
+def login(db, role, env=None):
     # Keep the backend and its prepared statements while the admin uses a
     # separate local connection for mapping rotation and revocation.
     with subprocess.Popen(
