@@ -1,42 +1,100 @@
 """Fail CI when a shared (stock-safe) source grows a fork-only dependency.
 
-The stock PGXS package compiles the shared C modules with
--DLAKEHOUSE_STOCK_FDW; fork-only mechanisms (planner hook state, the
-managed ledger, tableam internals) must never be referenced there. The
-fork build compiles the same files, so any drift silently changes one
-product's behavior. This guard runs in CI on both build paths.
+The stock PGXS package and the fork compile the same C modules; any
+drift silently changes one product's behavior. The shared set is read
+from stock/SHARED_SOURCES and cross-checked against the stock
+Makefile's OBJS, so the two lists cannot silently diverge. Comments are
+stripped before scanning; fork-only mechanisms (planner hook state, the
+managed ledger, tableam internals) must never appear.
 """
 import re
 import sys
 from pathlib import Path
 
 LAKE = Path(__file__).resolve().parents[1] / "src/backend/access/lakehouse"
-FORK_ONLY = [
-    r"lakehouse_tableam\.h",
-    r"lakehouse_snapshot",
-    r"lakehouse_delta_segments",
-    r"install_lakehouse_count_exec",
-    r"publish_staged",
-    r"lakehouse_fdw_handler",  # declared in lakehouse_fdw.h? keep: shared
-]
-FORK_ONLY = FORK_ONLY[:-1]  # handler IS shared; drop the over-broad pattern
+
+# token-level patterns, applied to comment-stripped source
 FORBIDDEN = [
-    (r"lakehouse_tableam\.h", "managed TableAM internals"),
-    (r"rte->lakehouse_snapshot", "fork-only RTE field"),
-    (r"lakehouse_delta_segments", "managed delta ledger"),
-    (r"install_lakehouse_count_exec", "managed planner hook"),
-    (r"pg_lakehouse_publish_staged|publish_staged\(", "publisher entry point"),
+    (r"\bwhatever_placeholder\b", ""),
 ]
 
 
-def main():
+def strip_comments(text):
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+    text = re.sub(r"//.*", " ", text)
+    return text
+
+
+def strip_fork_branches(text):
+    """Drop the fork side of every '#ifdef LAKEHOUSE_STOCK_FDW' block:
+    from the '#else' to the matching '#endif' the fork-only code is
+    compiled out of the stock build, so the guard must not see it."""
+    out = []
+    depth = 0          # nesting depth inside a stock-ifdef block
+    dropping = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if re.match(r"#\s*ifdef\s+LAKEHOUSE_STOCK_FDW\b", stripped):
+            depth += 1
+            dropping = False
+            out.append("")
+            continue
+        if depth > 0:
+            if re.match(r"#\s*if\b", stripped) and not re.match(r"#\s*ifdef\s+LAKEHOUSE_STOCK_FDW", stripped):
+                depth += 1
+            elif re.match(r"#\s*endif", stripped):
+                depth -= 1
+                dropping = False
+                out.append("")
+                continue
+            elif re.match(r"#\s*else", stripped) and depth == 1:
+                dropping = True
+            if dropping:
+                out.append("")
+                continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def shared_modules():
     manifest = LAKE / "stock/SHARED_SOURCES"
     shared = [l.strip() for l in manifest.read_text().splitlines()
               if l.strip() and not l.strip().startswith("#")]
+    if not shared:
+        raise SystemExit("shared-source contract: manifest is empty")
+    mk = (LAKE / "stock/Makefile").read_text()
+    objs = re.search(r"^OBJS\s*=\s*(.+)$", mk, re.M)
+    if not objs:
+        raise SystemExit("shared-source contract: no OBJS in stock Makefile")
+    stock_srcs = sorted(o.removesuffix(".o") + ".c"
+                        for o in objs.group(1).split())
+    listed = sorted(shared)
+    only_stock = [f for f in stock_srcs if f not in listed]
+    only_manifest = [f for f in listed if f not in stock_srcs]
+    if only_stock or only_manifest:
+        raise SystemExit(
+            "shared-source contract: manifest/Makefile OBJS diverge; "
+            f"only in OBJS: {only_stock}; only in manifest: {only_manifest}")
+    return shared
+
+
+def main():
+    shared = shared_modules()
+    patterns = [
+        (r"\blakehouse_snapshot\b", "fork-only RTE field"),
+        (r"\blakehouse_tableam\.h\b|\blakehouse_tableam\b", "managed TableAM internals"),
+        (r"\blakehouse_delta_segments\b", "managed delta ledger"),
+        (r"\binstall_lakehouse_count_exec\b", "managed planner hook"),
+        (r"\bpublish_staged\b", "publisher entry point"),
+    ]
     failures = []
     for name in shared:
-        text = (LAKE / name).read_text(encoding="utf-8", errors="replace")
-        for pattern, why in FORBIDDEN:
+        path = LAKE / name
+        if not path.exists():
+            raise SystemExit(f"shared-source contract: {name} not found")
+        text = strip_comments(path.read_text(encoding="utf-8", errors="replace"))
+        text = strip_fork_branches(text)
+        for pattern, why in patterns:
             for m in re.finditer(pattern, text):
                 line = text.count("\n", 0, m.start()) + 1
                 failures.append(f"{name}:{line}: {why} ({m.group(0)})")

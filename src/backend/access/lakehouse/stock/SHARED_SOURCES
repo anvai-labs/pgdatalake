@@ -1,8 +1,10 @@
 # Shared source contract: the C modules that compile into BOTH products.
 # Listed here = stock-safe; enforced by scripts/check_shared_sources.py
 # (fork-only symbols must never appear in these files). Anything NOT
-# listed is fork-only (tableam.c, publisher.c, count_exec.c, lakehouse_core.c).
+# listed is fork-only (tableam.c, publisher.c, count_exec.c). The stock
+# Makefile derives OBJS from this list plus the generated lakehouse_core.o.
 fdw.c
 fdw_plan.c
 fdw_exec.c
 batch_fill.c
+lakehouse_sql.c
