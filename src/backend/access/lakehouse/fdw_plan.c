@@ -31,6 +31,7 @@
 #include "parser/parse_collate.h"
 #include "parser/parsetree.h"
 #include "nodes/nodeFuncs.h"
+#include "access/sysattr.h"
 #include "access/table.h"
 #include "utils/typcache.h"
 #include "tcop/utility.h"
@@ -537,7 +538,9 @@ lakehouse_GetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 	TupleDesc	tupdesc;
 	ListCell   *lc;
 	StringInfoData pred;
-	List	   *local_quals = NIL;
+	Bitmapset  *used_attrs = NULL;
+	List	   *projection_attrs = NIL;
+	int			member;
 	char	   *pred_json = NULL;
 	bool		first_pred = true;
 	Relation	tmpl_rel;
@@ -556,11 +559,8 @@ lakehouse_GetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 	}
 
 	/*
-	 * Translate Var-op-Const quals into the ScanPredicate JSON (slice 15):
-	 * translated clauses are dropped from the local list — the Rust side
-	 * prunes whole FILES conservatively (bounds/partitions), while any
-	 * remaining clause is evaluated per-row by the executor. Row-level
-	 * correctness holds because pruning is strictly conservative.
+	 * Translate Var-op-Const quals for conservative file pruning. Keep all
+	 * clauses in the scan for exact per-row evaluation.
 	 */
 	tmpl_rel = table_open(foreigntableid, AccessShareLock);
 	tupdesc = CreateTupleDescCopy(RelationGetDescr(tmpl_rel));
@@ -568,6 +568,24 @@ lakehouse_GetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 
 	/* unwrap RestrictInfos first: TranslateQual wants plain Exprs */
 	scan_clauses = extract_actual_clauses(scan_clauses, false);
+	pull_varattnos((Node *) baserel->reltarget->exprs, baserel->relid, &used_attrs);
+	pull_varattnos((Node *) tlist, baserel->relid, &used_attrs);
+	pull_varattnos((Node *) scan_clauses, baserel->relid, &used_attrs);
+
+	/*
+	 * A whole-row or system-column reference retains the full tuple. An empty
+	 * list also uses the existing row-producing path for scans with no data
+	 * columns (for example a COUNT without upper-path elision).
+	 */
+	member = bms_next_member(used_attrs, -1);
+	if (member > -FirstLowInvalidHeapAttributeNumber)
+	{
+		for (; member >= 0; member = bms_next_member(used_attrs, member))
+			projection_attrs = lappend_int(projection_attrs,
+										   member + FirstLowInvalidHeapAttributeNumber);
+	}
+	bms_free(used_attrs);
+
 	initStringInfo(&pred);
 	foreach(lc, scan_clauses)
 	{
@@ -581,8 +599,6 @@ lakehouse_GetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 			appendStringInfoString(&pred, clause);
 			first_pred = false;
 		}
-		else
-			local_quals = lappend(local_quals, expr);
 	}
 	pfree(tupdesc);
 
@@ -600,8 +616,9 @@ lakehouse_GetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 
 		/* Empty selector lets the foreign table's snapshot_id take effect. */
 		return make_foreignscan(tlist, scan_clauses, baserel->relid,
-								NIL, list_make2(makeString(pred_private),
-												makeString(pstrdup(selector ? selector : ""))),
+								NIL, list_make3(makeString(pred_private),
+												makeString(pstrdup(selector ? selector : "")),
+												projection_attrs),
 								NIL, NIL, outer_plan);
 	}
 }
