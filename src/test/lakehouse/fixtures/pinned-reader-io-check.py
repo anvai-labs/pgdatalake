@@ -1,13 +1,13 @@
 """Measure range amplification for the same pinned TPC-DS date_dim read."""
 
 import argparse
-from collections import Counter
-from importlib import import_module
 import json
-from pathlib import Path
 import re
 import time
 import uuid
+from collections import Counter, defaultdict
+from importlib import import_module
+from pathlib import Path
 
 from publication_fixture import sql
 
@@ -21,6 +21,7 @@ def measure(requests):
     counts = Counter()
     sizes = Counter()
     intervals = Counter()
+    coverage = defaultdict(list)
     files = set()
     for target, method, path, status, size, byte_range in requests:
         assert status in (200, 206), (target, method, path, status)
@@ -35,13 +36,26 @@ def measure(requests):
         if data:
             files.add(path)
         if byte_range and data:
+            match = re.fullmatch(r"bytes=([0-9]+)-([0-9]+)", byte_range)
+            assert match and status == 206, (path, status, byte_range)
+            start, end = int(match[1]), int(match[2]) + 1
+            assert end - start == size, (path, byte_range, size)
+            coverage[path].append((start, end))
             intervals[path, byte_range] += 1
+    unique_bytes = 0
+    for ranges in coverage.values():
+        covered_until = 0
+        for start, end in sorted(ranges):
+            unique_bytes += max(0, end - max(start, covered_until))
+            covered_until = max(covered_until, end)
     kinds = ("catalog", "metadata_head", "metadata_whole", "data_head", "data_range", "data_whole")
     return {
         "requests": {kind: counts[kind] for kind in kinds},
         "response_bytes": {kind: sizes[kind] for kind in kinds},
         "unique_data_files": len(files), "unique_data_intervals": len(intervals),
         "repeated_data_intervals": sum(n - 1 for n in intervals.values()),
+        "unique_ranged_data_bytes": unique_bytes,
+        "overlapping_ranged_data_bytes": sizes["data_range"] - unique_bytes,
         "forbidden_root_requests": sum(target == "forbidden" for target, *_ in requests),
         "range_sizes": dict(Counter(size for target, method, path, status, size, byte_range
                                     in requests if byte_range and path.endswith(".parquet"))),
@@ -93,7 +107,7 @@ def exercise(db, pin, samples):
                 OPTIONS (table '{TABLE}', snapshot_id '{pin}');
         """)
         ddl = re.search(r"CREATE FOREIGN TABLE date_dim \(.+?\) SERVER smoke_server",
-                        DDL.read_text(), re.S)[0]
+                        DDL.read_text(), re.DOTALL)[0]
         sql(db, ddl.replace("SERVER smoke_server", "SERVER bench")
             + f" OPTIONS (table '{TABLE}', snapshot_id '{pin}');")
         query = f"SELECT d_date_sk, d_year FROM date_dim WHERE d_date_sk={KEY}"
@@ -105,13 +119,13 @@ def exercise(db, pin, samples):
 
         trials = {"date_dim": [], "narrow": []}
         for _ in range(samples):
-            for table in trials:
+            for table, observations in trials.items():
                 requests.clear()
                 started = time.monotonic()
                 rows = sql(db, f"{settings} SELECT d_date_sk, d_year FROM {table} WHERE d_date_sk={KEY}")
                 elapsed = time.monotonic() - started
                 assert rows == expected, (table, rows)
-                trials[table].append(measure(requests) | {"elapsed_seconds": elapsed})
+                observations.append(measure(requests) | {"elapsed_seconds": elapsed})
 
         requests.clear()
         assert sql(db, f"{settings} SELECT d_year FROM date_dim WHERE d_date_sk={KEY}") == "1998"
@@ -166,6 +180,8 @@ def main():
     parser.add_argument("--samples", type=int, default=3)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--require-projection", action="store_true")
+    parser.add_argument("--projection-baseline", type=Path,
+                        help="qualification receipt from the projection-only variant on the same release configuration")
     args = parser.parse_args()
     if not __debug__ or args.samples < 1:
         parser.error("requires Python assertions and at least one sample")
@@ -181,6 +197,18 @@ def main():
             for wide, narrow in zip(evidence["execution"]["date_dim"], evidence["execution"]["narrow"]):
                 for key in ("requests", "response_bytes", "range_sizes"):
                     assert wide[key] == narrow[key], (key, wide[key], narrow[key])
+        if args.projection_baseline:
+            baseline = json.loads(args.projection_baseline.read_text())
+            for key in ("snapshot_id", "table_uuid", "storage_root", "rows", "server", "server_settings"):
+                assert evidence[key] == baseline[key], (key, evidence[key], baseline[key])
+            for table, observations in evidence["execution"].items():
+                before = baseline["execution"][table]
+                assert len(observations) == len(before)
+                for current, prior in zip(observations, before):
+                    assert current["requests"]["data_whole"] == prior["requests"]["data_whole"] == 0
+                    assert current["requests"]["data_range"] <= 64
+                    assert current["requests"]["data_range"] < prior["requests"]["data_range"]
+                    assert 4 * current["response_bytes"]["data_range"] <= 5 * prior["response_bytes"]["data_range"]
     finally:
         sql("postgres", f"DROP DATABASE {db}")
 

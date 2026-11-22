@@ -16,14 +16,26 @@ window behind the existing scope check. A revoked grant or a reopened security
 scope cannot read bytes from an earlier scope. Qualify seeks, short reads,
 interrupted requests, cancellation and early LIMIT. [S3 range reads](https://docs.aws.amazon.com/AmazonS3/latest/userguide/download-objects.html)
 
-The exact-pin `date_dim` investigation identified 4,719 range GETs for one
-query over a 1,352,305-byte file. Selecting the same two columns through a
-two-column attachment issued 369 range GETs, with 223,408 range bytes versus
-1,352,301. Both returned `(2450992,1998)` at Iceberg snapshot
-`4331476042592330844`. At the published S3 Standard example rate of $0.0004
-per 1,000 GETs, 100,000 such queries would cost $188.76 versus $14.76 in range
-requests alone. This extrapolates the local request trace and excludes the
-catalog, HEAD, metadata, compute, retrieval and transfer charges. [AWS S3 pricing](https://aws.amazon.com/s3/pricing/)
+The release-build `date_dim` canary returned `(2450992,1998)` at Iceberg
+snapshot `4331476042592330844` over a 1,352,305-byte Parquet file. Each
+variant gave the same counts in three runs. The cost column extrapolates
+100,000 repetitions at the published AWS S3 Standard example rate of
+$0.0004 per 1,000 GETs. It covers data range GETs alone. [AWS S3 pricing](https://aws.amazon.com/s3/pricing/)
+
+| Variant | Data range GETs | Data bytes transferred | Estimated range GET charges |
+|---|---:|---:|---:|
+| Original wide attachment | 4,719 | 1,352,301 | $188.76 |
+| Planner projection | 369 | 223,408 | $14.76 |
+| Projection and bounded coalescing | 16 | 224,515 | $0.64 |
+
+The final projected read also issued one catalog call, three metadata GETs
+and one data HEAD, for 21 total calls. It transferred 1,107 overlapping data
+bytes. Whole-row and system-column fallback retain all columns and have
+a separate 156-range observation. Use the
+[same-pin fixture](../../../src/test/lakehouse/fixtures/pinned-reader-io-check.py)
+with `--require-projection` and `--projection-baseline` to enforce the
+projected request and byte budget on this workload. The repetitions qualify
+the observed I/O counts and leave latency percentiles unmeasured.
 
 Use the same artifact settings, exact Iceberg pin and independently verified
 result for baseline, projection alone, coalescing alone, and both. Begin with
