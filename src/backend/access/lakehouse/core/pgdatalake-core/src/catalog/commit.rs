@@ -20,6 +20,11 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::metadata::{FormatVersion, Snapshot, TableMetadata};
+pub use super::publication::PublicationIdentity;
+use super::publication::{
+    hex_digest, scoped_manifest_location, sha256, INPUT_DIGEST_KEY, MANIFEST_LIST_DIGEST_KEY,
+    MAX_STAGED_REQUEST_BYTES, OPERATION_ID_KEY,
+};
 use super::rest::{RestCatalog, RestError};
 use super::types::LoadTableResult;
 
@@ -137,20 +142,6 @@ struct CommitTableRequest<'a> {
     updates: &'a [TableUpdate],
 }
 
-/// Stable identity from the durable PostgreSQL claim.
-#[derive(Clone, Copy)]
-pub struct PublicationIdentity {
-    pub operation_id: uuid::Uuid,
-    pub table_uuid: uuid::Uuid,
-    pub input_digest: [u8; 32],
-}
-
-const OPERATION_ID_KEY: &str = "pgdatalake.operation-id";
-const INPUT_DIGEST_KEY: &str = "pgdatalake.input-sha256";
-const HEX: &[u8] = b"0123456789abcdef";
-// lakehouse.authorize_publication_send persists the exact request.
-const MAX_STAGED_REQUEST_BYTES: usize = 64 * 1024;
-
 /// An immutable append request associated with its original catalog client
 /// and route. Store its request digest in the ledger before consuming it.
 pub struct PreparedPublication<'a> {
@@ -180,10 +171,7 @@ impl PreparedPublication<'_> {
 
     #[must_use]
     pub fn request_digest(&self) -> [u8; 32] {
-        let digest = ring::digest::digest(&ring::digest::SHA256, &self.payload);
-        let mut result = [0; 32];
-        result.copy_from_slice(digest.as_ref());
-        result
+        sha256(&self.payload)
     }
 
     /// Submit after the durable send fence authorizes this exact digest.
@@ -265,6 +253,7 @@ impl RestCatalog {
         base: &TableMetadata,
         mut snapshot: Snapshot,
         identity: PublicationIdentity,
+        manifest_list_digest: [u8; 32],
     ) -> Result<PreparedPublication<'_>, RestError> {
         if base.table_uuid != identity.table_uuid {
             return Err(RestError::Conflict(
@@ -294,30 +283,11 @@ impl RestCatalog {
                 "staged append requires a known v2 schema".into(),
             ));
         }
-        let location = reqwest::Url::parse(&base.location)
-            .map_err(|_| RestError::Decode("invalid staged append storage location".into()))?;
-        if !location.username().is_empty()
-            || location.password().is_some()
-            || location.query().is_some()
-            || location.fragment().is_some()
-        {
+        if !scoped_manifest_location(&base.location, &snapshot.manifest_list) {
             return Err(RestError::Decode(
-                "staged append storage location must be free of credentials, queries and fragments"
-                    .into(),
+                "staged append manifest list is outside a valid table metadata location".into(),
             ));
         }
-        let manifest_is_scoped = snapshot
-            .manifest_list
-            .strip_prefix(base.location.trim_end_matches('/'))
-            .and_then(|path| path.strip_prefix("/metadata/"))
-            .is_some_and(|key| {
-                key.split('/').all(|component| {
-                    !matches!(component, "" | "." | "..")
-                        && component.bytes().all(|byte| {
-                            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
-                        })
-                })
-            });
         let expected_sequence = base.last_sequence_number.unwrap_or(0).checked_add(1);
         if snapshot.parent_snapshot_id != expected_parent
             || snapshot.schema_id != Some(base.current_schema_id)
@@ -326,7 +296,6 @@ impl RestCatalog {
             || expected_sequence != snapshot.sequence_number
             || snapshot.sequence_number.is_none()
             || snapshot.first_row_id.is_some()
-            || !manifest_is_scoped
             || snapshot.summary.get("operation").map(String::as_str) != Some("append")
         {
             return Err(RestError::Conflict(
@@ -334,15 +303,16 @@ impl RestCatalog {
             ));
         }
 
-        let mut input_hex = String::with_capacity(64);
-        for byte in identity.input_digest {
-            input_hex.push(char::from(HEX[usize::from(byte >> 4)]));
-            input_hex.push(char::from(HEX[usize::from(byte & 15)]));
-        }
         snapshot
             .summary
             .insert(OPERATION_ID_KEY.into(), identity.operation_id.to_string());
-        snapshot.summary.insert(INPUT_DIGEST_KEY.into(), input_hex);
+        snapshot
+            .summary
+            .insert(INPUT_DIGEST_KEY.into(), hex_digest(identity.input_digest));
+        snapshot.summary.insert(
+            MANIFEST_LIST_DIGEST_KEY.into(),
+            hex_digest(manifest_list_digest),
+        );
         let snapshot_id = snapshot.snapshot_id;
         let requirements = [
             TableRequirement::AssertTableUUID {
@@ -799,6 +769,7 @@ mod tests {
                 &loaded,
                 proposed,
                 identity,
+                [0; 32],
             )
             .unwrap();
         assert_eq!(mock.requests().len(), 0);
@@ -839,6 +810,195 @@ mod tests {
     }
 
     #[test]
+    fn staged_lookup_recovers_one_accepted_append_after_lost_reply() {
+        use crate::catalog::publication::{sha256, AuthorizedPublication, PublicationLookup};
+
+        let server = std::sync::Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
+        let endpoint = format!("http://{}", server.server_addr());
+        let mut loaded = load_result(100);
+        let base = loaded.metadata.as_mut().unwrap();
+        base.partition_specs
+            .push(crate::catalog::metadata::PartitionSpec {
+                spec_id: 0,
+                fields: vec![],
+            });
+        let identity = PublicationIdentity {
+            operation_id: uuid::Uuid::from_u128(42),
+            table_uuid: base.table_uuid,
+            input_digest: [0x31; 32],
+        };
+        let mut proposed = snap(101, Some(100));
+        proposed.sequence_number = Some(2);
+        let manifest = b"sealed manifest list";
+        let catalog = RestCatalog::new(&endpoint, Box::new(StaticToken(String::new()))).unwrap();
+        let prepared = catalog
+            .prepare_staged_append(&["ns"], "t", base, proposed, identity, sha256(manifest))
+            .unwrap();
+        let body = prepared.request_body().to_vec();
+        let authorized = AuthorizedPublication {
+            identity,
+            expected_parent: Some(100),
+            snapshot_id: 101,
+            request_digest: prepared.request_digest(),
+            request_body: &body,
+        };
+
+        let listener = server.clone();
+        let worker = std::thread::spawn(move || {
+            let mut posts = 0;
+            let mut reads = 0;
+            for mut req in listener.incoming_requests() {
+                let response = if req.method() == &tiny_http::Method::Post {
+                    let body: serde_json::Value = serde_json::from_reader(req.as_reader()).unwrap();
+                    let snapshot =
+                        serde_json::from_value(body["updates"][0]["snapshot"].clone()).unwrap();
+                    let md = loaded.metadata.as_mut().unwrap();
+                    let mut later = snap(102, Some(101));
+                    later.sequence_number = Some(3);
+                    md.snapshots.extend([snapshot, later]);
+                    md.refs.get_mut("main").unwrap().snapshot_id = 102;
+                    md.current_snapshot_id = Some(102);
+                    posts += 1;
+                    tiny_http::Response::from_string("").with_status_code(504)
+                } else {
+                    reads += 1;
+                    tiny_http::Response::from_string(serde_json::to_string(&loaded).unwrap())
+                };
+                req.respond(response).unwrap();
+            }
+            (posts, reads)
+        });
+
+        // The original request can still arrive after an inconclusive lookup.
+        assert_eq!(
+            catalog
+                .lookup_staged_append(&["ns"], "t", authorized, |_| panic!(
+                    "unexpected manifest read"
+                ))
+                .unwrap(),
+            PublicationLookup::Unresolved
+        );
+        assert!(matches!(
+            prepared.submit(),
+            Err(RestError::CommitStateUnknown(_))
+        ));
+        let result = catalog.lookup_staged_append(&["ns"], "t", authorized, |location| {
+            assert_eq!(location, "s3://w/t/metadata/manifests/snap-101-m0.avro");
+            Ok(sha256(manifest))
+        });
+        server.unblock();
+        assert_eq!(worker.join().unwrap(), (1, 2));
+        assert_eq!(
+            result.unwrap(),
+            PublicationLookup::Accepted { snapshot_id: 101 }
+        );
+    }
+
+    #[test]
+    fn staged_lookup_keeps_nonmatching_evidence_unresolved() {
+        use crate::catalog::publication::{sha256, AuthorizedPublication, PublicationLookup};
+
+        let mock = Mock::new(vec![]);
+        let catalog = mock.catalog();
+        let mut base = load_result(100).metadata.unwrap();
+        base.partition_specs
+            .push(crate::catalog::metadata::PartitionSpec {
+                spec_id: 0,
+                fields: vec![],
+            });
+        let identity = PublicationIdentity {
+            operation_id: uuid::Uuid::from_u128(43),
+            table_uuid: base.table_uuid,
+            input_digest: [0; 32],
+        };
+        let manifest = b"sealed manifest list";
+        let mut snapshot = snap(101, Some(100));
+        snapshot.sequence_number = Some(2);
+        let prepared = catalog
+            .prepare_staged_append(&["ns"], "t", &base, snapshot, identity, sha256(manifest))
+            .unwrap();
+        let authorized = AuthorizedPublication {
+            identity,
+            expected_parent: Some(100),
+            snapshot_id: 101,
+            request_digest: prepared.request_digest(),
+            request_body: prepared.request_body(),
+        };
+        let wire: serde_json::Value = serde_json::from_slice(prepared.request_body()).unwrap();
+        let matching: Snapshot =
+            serde_json::from_value(wire["updates"][0]["snapshot"].clone()).unwrap();
+        let retained = authorized.decode().unwrap();
+        base.snapshots.push(matching.clone()); // Present in metadata, unreachable from main.
+        assert_eq!(
+            retained
+                .verify(&base, |_| panic!("unexpected manifest read"))
+                .unwrap(),
+            PublicationLookup::Unresolved
+        );
+        base.current_snapshot_id = Some(102);
+        base.refs.get_mut("main").unwrap().snapshot_id = 102;
+        let mut later = snap(102, Some(101));
+        later.sequence_number = Some(3);
+        base.snapshots.push(later);
+        assert_eq!(
+            retained
+                .verify(&base, |_| Ok(sha256(b"different contents")))
+                .unwrap(),
+            PublicationLookup::Unresolved
+        );
+        let verified_table = base.table_uuid;
+        base.table_uuid = uuid::Uuid::from_u128(99);
+        assert_eq!(
+            retained
+                .verify(&base, |_| panic!("unexpected manifest read"))
+                .unwrap(),
+            PublicationLookup::Unresolved
+        );
+        base.table_uuid = verified_table;
+        let mut duplicate = snap(103, Some(102));
+        duplicate.summary = matching.summary;
+        base.snapshots.push(duplicate);
+        assert_eq!(
+            retained
+                .verify(&base, |_| panic!("unexpected manifest read"))
+                .unwrap(),
+            PublicationLookup::Unresolved
+        );
+        base.snapshots.pop();
+        let md_snapshot = base
+            .snapshots
+            .iter_mut()
+            .find(|s| s.snapshot_id == 101)
+            .unwrap();
+        md_snapshot
+            .summary
+            .insert("pgdatalake.input-sha256".into(), "bad".into());
+        assert_eq!(
+            retained
+                .verify(&base, |_| panic!("unexpected manifest read"))
+                .unwrap(),
+            PublicationLookup::Unresolved
+        );
+        // A mismatched retained digest is rejected before the catalog lookup.
+        assert_eq!(
+            catalog
+                .lookup_staged_append(
+                    &["ns"],
+                    "t",
+                    AuthorizedPublication {
+                        request_digest: [1; 32],
+                        ..authorized
+                    },
+                    |_| panic!("unexpected manifest read")
+                )
+                .unwrap(),
+            PublicationLookup::Unresolved
+        );
+        mock.join();
+        assert_eq!(mock.requests().len(), 0);
+    }
+
+    #[test]
     fn prepared_append_rejects_unretainable_requests() {
         let mock = Mock::new(vec![]);
         let catalog = mock.catalog();
@@ -859,14 +1019,14 @@ mod tests {
         let mut oversized = snapshot.clone();
         oversized.summary.insert("extra".into(), " ".repeat(65536));
         assert!(matches!(
-            catalog.prepare_staged_append(&["ns"], "t", &loaded, oversized, identity),
+            catalog.prepare_staged_append(&["ns"], "t", &loaded, oversized, identity, [0; 32]),
             Err(RestError::Decode(_))
         ));
 
         loaded.location = "s3://user:password@w/t".into();
         snapshot.manifest_list = format!("{}/metadata/snap.avro", loaded.location);
         assert!(matches!(
-            catalog.prepare_staged_append(&["ns"], "t", &loaded, snapshot, identity),
+            catalog.prepare_staged_append(&["ns"], "t", &loaded, snapshot, identity, [0; 32]),
             Err(RestError::Decode(_))
         ));
         mock.join();
@@ -890,7 +1050,14 @@ mod tests {
             input_digest: [0; 32],
         };
         assert!(matches!(
-            catalog.prepare_staged_append(&["ns"], "t", &loaded, snap(101, Some(100)), identity),
+            catalog.prepare_staged_append(
+                &["ns"],
+                "t",
+                &loaded,
+                snap(101, Some(100)),
+                identity,
+                [0; 32]
+            ),
             Err(RestError::Conflict(_))
         ));
         identity.table_uuid = loaded.table_uuid;
@@ -915,19 +1082,26 @@ mod tests {
             },
         ] {
             assert!(catalog
-                .prepare_staged_append(&["ns"], "t", &loaded, malformed, identity)
+                .prepare_staged_append(&["ns"], "t", &loaded, malformed, identity, [0; 32])
                 .is_err());
         }
         loaded.refs.get_mut("main").unwrap().snapshot_id = 99;
         assert!(catalog
-            .prepare_staged_append(&["ns"], "t", &loaded, snap(101, Some(100)), identity)
+            .prepare_staged_append(
+                &["ns"],
+                "t",
+                &loaded,
+                snap(101, Some(100)),
+                identity,
+                [0; 32]
+            )
             .is_err());
         loaded.snapshots.clear();
         loaded.refs.clear();
         loaded.current_snapshot_id = None;
         loaded.last_sequence_number = Some(0);
         let prepared = catalog
-            .prepare_staged_append(&["ns"], "t", &loaded, snap(101, None), identity)
+            .prepare_staged_append(&["ns"], "t", &loaded, snap(101, None), identity, [0; 32])
             .unwrap();
         assert_eq!(prepared.expected_parent(), None);
         let body: serde_json::Value = serde_json::from_slice(prepared.request_body()).unwrap();
