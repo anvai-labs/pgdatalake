@@ -4,6 +4,11 @@ The [write handle and receipt contract](03a-client-receipts.md) specifies member
 
 **Read** [shared contracts](00-integration-contracts.md) and [DML rules](../18-anvai-lake-dml.md#5-read-rules-mvcc-and-conflict-handling). **Own** the PostgreSQL snapshot/command rules, TableAM staged capture and overlay in `tableam.c`, and `managed_count.c`. Own local ledger schema and migrations through the shared SQL integration change. The publisher owns transitioning a publication claim. Catalog and reader supply immutable pinned results and operation membership.
 
+The [staged capture enrollment contract](03b-managed-capture-binding.md)
+defines the handoff from an approved local generation to the publisher's
+durable claim. Its executable red exercises ordinary INSERT and the 1.6
+ledger before the enrollment provider is wired.
+
 ## Implementation
 
 1. Capture supported staged INSERTs and their stable operation/segment IDs with their PostgreSQL transaction. Include an immutable table binding or verifiable durable reference, payload version and logical row count. Preserve savepoint semantics and relation lifecycle. Use normal PostgreSQL visibility for committed entries and a command-aware overlay for own earlier commands.
