@@ -2,7 +2,7 @@
 
 **Read** [shared contracts](00-integration-contracts.md) and [publication timing](../17-anvai-lake-product.md#4-publication-by-size-or-age). **Own** `publisher.c`, worker scheduling, claim orchestration, receipt state and reconciliation. PostgreSQL ledger persistence belongs to the visibility module. Rust writer and catalog modules provide file assembly, CAS and operation lookup.
 
-**First implementation slice.** Start with [staged append recovery](04a-publisher-recovery.md). It defines the lost-reply regression, the short PostgreSQL transactions on either side of catalog submission, and the evidence needed to authorize another attempt.
+**First implementation slice.** Start with [staged append recovery](04a-publisher-recovery.md). It defines the lost-reply regression, the short PostgreSQL transactions on either side of catalog submission, and the retained evidence used for read-only reconciliation. The [native worker handoff](04b-scoped-send-admission.md#native-worker-integration) defines the next integration gate.
 
 ## Implementation
 
@@ -12,7 +12,7 @@ The scheduler considers size or oldest committed segment age. The initial target
 |---|---|
 | Eligible | Persist an exact claim and stable operation ID before uploading files. Record table UUID/ref and membership digest. |
 | Claimed | Acquire or renew an ownership generation. Resume abandoned work with the same operation ID. Persist attempt evidence needed for recovery. |
-| Submitted / unknown | Before any retry, verify whether this operation already published. A proven rejection permits another compatible attempt with the same operation ID. Unknown remains recoverable and cannot create a new append. |
+| Submitted / unknown | In 1.8 an existing intent admits lookup only, including after a catalog conflict. Preserve its original members, request and reservation until acceptance can be proven. Another send would require a future durable rejection transition. |
 | Verified | Persist the verified snapshot and complete exactly those claimed segment IDs. Check lease ownership and update cardinality. A stale owner cannot finalize. |
 | Needs reconciliation | Hold pending rows and surface a receipt. Retry lookup under a bounded policy. Release rows only when an operator or verified catalog outcome resolves the state. |
 
