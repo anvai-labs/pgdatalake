@@ -811,7 +811,9 @@ mod tests {
 
     #[test]
     fn staged_lookup_recovers_one_accepted_append_after_lost_reply() {
-        use crate::catalog::publication::{sha256, AuthorizedPublication, PublicationLookup};
+        use crate::catalog::publication::{
+            sha256, AuthorizedPublication, PublicationLookup, PublicationStorage,
+        };
 
         let server = std::sync::Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
         let endpoint = format!("http://{}", server.server_addr());
@@ -822,6 +824,10 @@ mod tests {
                 spec_id: 0,
                 fields: vec![],
             });
+        crate::storage::test_allow_local_stores();
+        let local = tempfile::tempdir().unwrap();
+        let table_root = format!("file://{}", local.path().display());
+        base.location.clone_from(&table_root);
         let identity = PublicationIdentity {
             operation_id: uuid::Uuid::from_u128(42),
             table_uuid: base.table_uuid,
@@ -830,6 +836,10 @@ mod tests {
         let mut proposed = snap(101, Some(100));
         proposed.sequence_number = Some(2);
         let manifest = b"sealed manifest list";
+        let relative_manifest = "metadata/manifests/snap-101-m0.avro";
+        proposed.manifest_list = format!("{table_root}/{relative_manifest}");
+        std::fs::create_dir_all(local.path().join("metadata/manifests")).unwrap();
+        std::fs::write(local.path().join(relative_manifest), manifest).unwrap();
         let catalog = RestCatalog::new(&endpoint, Box::new(StaticToken(String::new()))).unwrap();
         let prepared = catalog
             .prepare_staged_append(&["ns"], "t", base, proposed, identity, sha256(manifest))
@@ -882,12 +892,35 @@ mod tests {
             prepared.submit(),
             Err(RestError::CommitStateUnknown(_))
         ));
-        let result = catalog.lookup_staged_append(&["ns"], "t", authorized, |location| {
-            assert_eq!(location, "s3://w/t/metadata/manifests/snap-101-m0.avro");
-            Ok(sha256(manifest))
-        });
+        let credentials = crate::storage::S3Options::default();
+        let bound = PublicationStorage {
+            table_root: &table_root,
+            s3: &credentials,
+            max_bytes: 64,
+            read_timeout: Duration::from_secs(2),
+        };
+        let wrong = PublicationStorage {
+            table_root: "file:///other/table",
+            ..bound
+        };
+        assert!(matches!(
+            catalog.lookup_staged_append_on_storage(&["ns"], "t", authorized, &wrong),
+            Err(RestError::Decode(_))
+        ));
+        let result = catalog.lookup_staged_append_on_storage(&["ns"], "t", authorized, &bound);
+        std::fs::write(
+            local.path().join(relative_manifest),
+            b"changed manifest list",
+        )
+        .unwrap();
+        assert_eq!(
+            catalog
+                .lookup_staged_append_on_storage(&["ns"], "t", authorized, &bound)
+                .unwrap(),
+            PublicationLookup::Unresolved
+        );
         server.unblock();
-        assert_eq!(worker.join().unwrap(), (1, 2));
+        assert_eq!(worker.join().unwrap(), (1, 4));
         assert_eq!(
             result.unwrap(),
             PublicationLookup::Accepted { snapshot_id: 101 }
