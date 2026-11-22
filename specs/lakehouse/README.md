@@ -10,6 +10,8 @@ integrations (DataFusion, Polars) are future FORMAT layers by design — hence t
 generic `lakehouse` SQL surface chosen up front (2026-11-19; see
 01-architecture.md, RULES.md §4).
 
+See the [two public packages and managed publication diagrams](17-anvai-lake-product.md#two-packages-one-shared-reader) for the implemented surfaces, live evidence and remaining gates. The SQL below illustrates the design goals.
+
 ## Goal
 
 A user of this fork should be able to do all of the following with plain SQL:

@@ -1,6 +1,8 @@
 # Lakehouse progress and release gates
 
-**Reviewed at merged `lakehouse-dev` revision `1acdf09f4f3fb90b7bfebb8bbe8b500c26ec967c` (PR #45).** The [post-merge fork CI](https://github.com/anvai-labs/pgdatalake/actions/runs/44987466812) passed. Stock FDW distribution, managed append recovery on the active worker, compatible reads and all hosted or real-cloud release profiles still need their own evidence. The [release gates](modules/08a-core-release-gates.md) and [module ownership and dependencies](modules/README.md) govern new work. The original review is the 2026-11-20 baseline. The [reassessment](16-release-reassessment-and-scale.md) records the eight findings and earlier measurements. Start implementation branches with the [delivery order and dependencies](modules/README.md#delivery-order-and-dependencies). Give each milestone its own smoke and measurement receipt.
+**Product snapshot at merged `lakehouse-dev` revision `90518dca8cca37348dc5da64305f782b267a18d6` (PR #47).** The PG19.0 serial source-package smoke is implemented. Managed foreground binding, verified worker recovery and compatible base-plus-overlay reads remain open. The [illustrated product map](17-anvai-lake-product.md#two-packages-one-shared-reader) ties each claim to its test and shows the order of the next correctness gates. The assessment below retains the historical findings at PR #45 and the original [performance baseline](16-release-reassessment-and-scale.md).
+
+**Managed COUNT blocker.** On the 1.6 fork a prepared COUNT returned 1 after an uncommitted insert while the same backend scanned `[10,20]`. Both paths agreed on 1 after rollback. The [minimal SQL case and exit condition](modules/03-managed-visibility.md#first-red-case-for-managed-count) belong to the managed visibility owner. The stock reader remains read-only.
 
 ## Stock read foundation following PR #46
 

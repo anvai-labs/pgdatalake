@@ -1,0 +1,42 @@
+---
+config:
+  theme: base
+  htmlLabels: false
+  deterministicIds: true
+  deterministicIDSeed: anvai-product
+  themeVariables:
+    fontFamily: "DejaVu Sans, sans-serif"
+    fontSize: "16px"
+    lineColor: "#41566c"
+    edgeLabelBackground: "#ffffff"
+    primaryTextColor: "#142b41"
+  flowchart:
+    htmlLabels: false
+    nodeSpacing: 28
+    rankSpacing: 32
+    curve: linear
+---
+flowchart TB
+    accTitle: Managed append from PostgreSQL commit to a proven Iceberg receipt
+    accDescr: Ordinary capture and a legacy worker exist. Verified binding and worker orchestration are open. Independent providers authorize one send per attempt and reconcile an unknown result using a read-only lookup. Insufficient evidence holds the claim.
+    local["Working SQL path<br/>Staged INSERT → local PostgreSQL commit"]:::code
+    legacy["Active legacy worker<br/>Publishes unbound segments<br/>Happy-path smoke"]:::tested
+    bind["Open SQL gate<br/>Capture with verified table and ref binding"]:::gate
+    claim["Ledger provider · 1.4<br/>Claim exact committed members + digest"]:::code
+    prep["Writer + catalog providers<br/>Prepare immutable objects and exact request"]:::code
+    fence["Ledger provider · 1.5 / 1.6<br/>Authorize once, retain bytes, flush intent WAL"]:::code
+    send["Open worker gate<br/>Dispatch the authorized request once"]:::gate
+    proof["Recovery provider after reply loss<br/>Read-only lookup of original proposal"]:::code
+    done["Positive proof<br/>Finalize exact members at introducing snapshot"]:::code
+    hold["Inconclusive<br/>Reserve claim and retry lookup only"]:::code
+    local --> legacy
+    local -.-> bind
+    bind -.-> claim
+    claim --> prep --> fence
+    fence -.-> send
+    send -.-> proof
+    proof --> done
+    proof --> hold
+    classDef code fill:#e5eff7,stroke:#365c78,color:#102f46
+    classDef tested fill:#e0f3e9,stroke:#246b50,color:#164332
+    classDef gate fill:#fff2d7,stroke:#906221,color:#51370f,stroke-dasharray:5 3

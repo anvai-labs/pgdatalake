@@ -13,6 +13,27 @@ The [write handle and receipt contract](03a-client-receipts.md) specifies member
 
 ## Independent test package
 
+### First red case for managed COUNT
+
+Reproduced on the local assertion-enabled fork used for PR #47 with extension 1.6. On an attached, initially empty table `events(id bigint)` using `write_mode='staged'`, issue the following as one backend. Both input IDs are non-NULL. The ordinary scan is the row oracle.
+
+```sql
+INSERT INTO events VALUES (10);
+PREPARE n AS SELECT count(*) FROM events;
+BEGIN;
+INSERT INTO events VALUES (20);
+SELECT array_agg(id ORDER BY id), count(id) FROM events;
+EXECUTE n;
+ROLLBACK;
+EXECUTE n;
+```
+
+The scan observed `[10,20]` and `count(id) = 2`. The optimized COUNT returned **1** inside the transaction and **1** after rollback. Required results are **2** then **1**. The ledger sum is available for the committed row. The new row is still in backend-local staged capture until pre-commit. Recomputing the ledger sum at execution cannot see it. [Managed COUNT](../../../src/backend/access/lakehouse/managed_count.c) · [TableAM capture](../../../src/backend/access/lakehouse/tableam.c)
+
+First make the existing shortcut fall back to the ordinary aggregate whenever the backend has visible staged rows whose membership it cannot prove. In the regression compare the shortcut with the ordinary scan before and after a savepoint rollback, full rollback and commit. On a later committed read exercise reuse of the same prepared plan. An FDW successor can share a proof for the published pin. The managed caller must also account for this backend's writes and for the PostgreSQL-visible segments already included in the selected pin.
+
+### Compatible published pin
+
 For managed current append reads, the pin decision precedes the first emitted row. The proof accounts for prior local publications as well as the newest claim. Within the statement's allowed candidate pins, the decision is:
 
 ```text
