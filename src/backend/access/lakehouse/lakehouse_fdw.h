@@ -75,7 +75,7 @@ typedef struct LakehouseExecState
 } LakehouseExecState;
 
 /* fdw.c */
-extern void ExtractOptions(Oid foreigntableid, LakehouseOptions *opts);
+extern void ExtractOptions(Oid foreigntableid, Oid checkAsUser, LakehouseOptions *opts);
 
 /* fdw_plan.c */
 extern void lakehouse_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
