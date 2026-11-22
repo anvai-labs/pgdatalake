@@ -46,6 +46,7 @@
 
 #include "lakehouse.h"
 #include "lakehouse_tableam.h"
+#include "lakehouse_fdw.h"
 
 extern Oid	lakehouse_am_oid(void);
 
@@ -86,26 +87,9 @@ managed_lakehouse_rel(Oid relid)
 static bool
 managed_count_wanted(Query *parse, Oid *relid_out)
 {
-	TargetEntry *te;
-	Aggref	   *agg;
 	RangeTblEntry *rte;
 
-	if (parse->commandType != CMD_SELECT || parse->hasWindowFuncs ||
-		parse->hasTargetSRFs || parse->setOperations ||
-		parse->groupClause || parse->groupingSets || parse->havingQual ||
-		parse->distinctClause || parse->limitOffset != NULL)
-		return false;
-
-	/* exactly one target: a plain star-aggregate */
-	if (list_length(parse->targetList) != 1)
-		return false;
-	te = linitial_node(TargetEntry, parse->targetList);
-	if (te->resjunk || !IsA(te->expr, Aggref))
-		return false;
-	agg = (Aggref *) te->expr;
-	if (agg->aggfnoid != F_COUNT_ ||
-		agg->aggdistinct != NIL || agg->aggfilter != NULL ||
-		agg->aggorder != NIL || agg->args != NIL)
+	if (!lakehouse_trivial_count_shape(parse))
 		return false;
 
 	/*
@@ -240,8 +224,6 @@ lakehouse_managed_count(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
 	AclResult	aclresult;
-	int64		ord_result;
-	int			ret_dummy = 0;
 	int			ret;
 	int64		result = 0;
 	bool		from_ledger = false;
@@ -257,8 +239,8 @@ lakehouse_managed_count(PG_FUNCTION_ARGS)
 
 	/*
 	 * The ledger receives staged rows at pre-commit. A backend with write
-	 * state for this relation must use the same overlay as a normal scan.
-	 * RLS and inherited rows also require the ordinary aggregate.
+	 * state for this relation must use the same overlay as a normal scan. RLS
+	 * and inherited rows also require the ordinary aggregate.
 	 */
 	if (lakehouse_find_write_entry(relid) != NULL ||
 		check_enable_rls(relid, GetUserId(), false) != RLS_NONE ||

@@ -64,80 +64,18 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 				   "count_exec") == 0)
 		{
 			char	   *sel = strVal(lsecond(fscan->fdw_private));
-			Oid			ftid = (Oid) strtoul(strVal(lthird(fscan->fdw_private)),
-											 NULL, 10);
-			bool		proved = false;
-			uint64		n;
-			ScanSession *session;
-			Relation	tmpl;
-			TupleDesc	tdesc;
-			char	   *nsp;
-			char	   *nm;
 
+			/*
+			 * FIRST-DEMAND EXECUTION (spec 16): Begin only carries the
+			 * descriptor — session open, delete-eligibility proof, manifest
+			 * sum and fallback ALL happen on the first Iterate demand, so
+			 * plain EXPLAIN and LIMIT 0 do no scan work at all.
+			 */
 			state = (LakehouseExecState *) palloc0(sizeof(LakehouseExecState));
 			state->count_exec = true;
-
-			ExtractOptions(ftid, &state->opts);
-			session = lakehouse_OpenSession(&state->opts,
-											sel[0] != '\0' ? sel : NULL);
-			if (session != NULL && !pg_datalake_scan_has_deletes(session))
-			{
-				n = pg_datalake_scan_task_count(session);
-				for (uint64 i = 0; i < n; i++)
-					state->count_value +=
-						(int64) pg_datalake_scan_task_rows(session, i);
-				state->count_from_manifest = true;
-				proved = true;
-				pg_datalake_scan_free(session);
-			}
-			else if (session != NULL)
-				pg_datalake_scan_free(session);
-
-			if (!proved)
-			{
-				/*
-				 * FALLBACK: the ordinary aggregate over the foreign table,
-				 * via SPI with full executor semantics (the base FT RTE stays
-				 * in the planned rtable, so ExecCheckRTPerms already enforced
-				 * SELECT as the invoker before we got here). The reentry
-				 * guard keeps the planner from attaching this path to the
-				 * inner query (see fdw_plan.c).
-				 */
-				tmpl = table_open(ftid, AccessShareLock);
-				nsp = get_namespace_name(RelationGetNamespace(tmpl));
-				nm = pstrdup(RelationGetRelationName(tmpl));
-				table_close(tmpl, AccessShareLock);
-
-				lakehouse_fdw_count_in_fallback = true;
-				PG_TRY();
-				{
-					SPI_connect();
-					PushActiveSnapshot(GetTransactionSnapshot());
-					if (SPI_execute(psprintf("SELECT count(*) FROM %s",
-											 quote_qualified_identifier(nsp,
-																		nm)),
-									true, 0) == SPI_OK_SELECT &&
-						SPI_processed == 1)
-					{
-						bool		dummy;
-
-						state->count_value =
-							DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
-														SPI_tuptable->tupdesc,
-														1, &dummy));
-					}
-					PopActiveSnapshot();
-					SPI_finish();
-					lakehouse_fdw_count_in_fallback = false;
-				}
-				PG_CATCH();
-				{
-					lakehouse_fdw_count_in_fallback = false;
-					PG_RE_THROW();
-				}
-				PG_END_TRY();
-			}
-
+			state->count_selector = pstrdup(sel);
+			state->count_ftid = (Oid) strtoul(strVal(lthird(fscan->fdw_private)),
+											  NULL, 10);
 			node->fdw_state = state;
 			return;
 		}
@@ -250,17 +188,125 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 	node->fdw_state = state;
 }
 
+/*
+ * Resolve the execution-time COUNT on first demand: open the CURRENT
+ * snapshot, re-prove delete eligibility, and sum manifest record_counts.
+ * Anything unprovable falls back to the ordinary aggregate via SPI behind
+ * the reentry guard. Same-pin contract: the PROOF path counts from the
+ * very session it opened; the fallback never answers twice — a declined
+ * proof means the ordinary aggregate is the ONLY read.
+ */
+static void
+lakehouse_count_exec_resolve(ForeignScanState *node, LakehouseExecState *state)
+{
+	ForeignScan *fscan = (ForeignScan *) node->ss.ps.plan;
+	bool		proved = false;
+	uint64		n;
+	ScanSession *session;
+
+	ExtractOptions(state->count_ftid, fscan->checkAsUser, &state->opts);
+	session = lakehouse_OpenSession(&state->opts,
+									state->count_selector[0] != '\0'
+									? state->count_selector : NULL);
+	if (session != NULL && !pg_datalake_scan_has_deletes(session))
+	{
+		/*
+		 * checked bigint (spec 16): a negative or overflowing manifest
+		 * record_count is corrupt input — decline to the ordinary aggregate
+		 * rather than fabricate
+		 */
+		n = pg_datalake_scan_task_count(session);
+		proved = true;
+		for (uint64 i = 0; i < n && proved; i++)
+		{
+			int64		rows = pg_datalake_scan_task_rows(session, i);
+
+			if (rows < 0 || rows > PG_INT64_MAX - state->count_value)
+				proved = false;
+			else
+				state->count_value += rows;
+		}
+		if (proved)
+			state->count_from_manifest = true;
+		pg_datalake_scan_free(session);
+	}
+	else if (session != NULL)
+		pg_datalake_scan_free(session);
+
+	if (proved)
+		return;
+
+	/*
+	 * FALLBACK: the ordinary aggregate over the foreign table, via SPI with
+	 * full executor semantics (the base FT RTE stays in the planned rtable,
+	 * so ExecCheckRTPerms already enforced SELECT — under the view's
+	 * checkAsUser identity — before we got here). Pinned plans replan to
+	 * the identical pin; unpinned plans perform this single read. The reentry
+	 * guard keeps the planner from attaching this path to the inner query
+	 * (see fdw_plan.c).
+	 */
+	{
+		Relation	tmpl;
+		char	   *nsp;
+		char	   *nm;
+
+		tmpl = table_open(state->count_ftid, AccessShareLock);
+		nsp = get_namespace_name(RelationGetNamespace(tmpl));
+		nm = pstrdup(RelationGetRelationName(tmpl));
+		table_close(tmpl, AccessShareLock);
+
+		lakehouse_fdw_count_in_fallback = true;
+		PG_TRY();
+		{
+			int			spi_rc;
+
+			SPI_connect();
+			PushActiveSnapshot(GetTransactionSnapshot());
+			spi_rc = SPI_execute(psprintf("SELECT count(*) FROM %s",
+										  quote_qualified_identifier(nsp,
+																	 nm)),
+								 true, 0);
+			if (spi_rc != SPI_OK_SELECT || SPI_processed != 1)
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("lakehouse: COUNT fallback did not return "
+								"one row (SPI status %d)", spi_rc)));
+			{
+				bool		dummy;
+
+				state->count_value =
+					DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+												SPI_tuptable->tupdesc, 1,
+												&dummy));
+			}
+			PopActiveSnapshot();
+			SPI_finish();
+			lakehouse_fdw_count_in_fallback = false;
+		}
+		PG_CATCH();
+		{
+			SPI_finish();
+			PopActiveSnapshot();
+			lakehouse_fdw_count_in_fallback = false;
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+	}
+}
+
 TupleTableSlot *
 lakehouse_IterateForeignScan(ForeignScanState *node)
 {
 	LakehouseExecState *state = (LakehouseExecState *) node->fdw_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
-	TupleDesc	tupdesc = node->ss.ss_currentRelation->rd_att;
+	TupleDesc	tupdesc;
 
 	/*
 	 * Execution-time COUNT (spec 16 successor): the answer was resolved in
 	 * Begin (manifest sum or the ordinary-aggregate fallback); yield it
-	 * exactly once, then EOF.
+	 * exactly once, then EOF. MUST run before any ss_currentRelation access —
+	 * a one-row upper scan has scanrelid 0 and NO base relation (the defect
+	 * spec 16 names verbatim).
 	 */
 	if (state->count_exec)
 	{
@@ -269,6 +315,11 @@ lakehouse_IterateForeignScan(ForeignScanState *node)
 			ExecClearTuple(slot);
 			return NULL;
 		}
+		if (!state->count_resolved)
+		{
+			lakehouse_count_exec_resolve(node, state);
+			state->count_resolved = true;
+		}
 		ExecClearTuple(slot);
 		slot->tts_values[0] = Int64GetDatum(state->count_value);
 		slot->tts_isnull[0] = false;
@@ -276,6 +327,8 @@ lakehouse_IterateForeignScan(ForeignScanState *node)
 		state->count_done = true;
 		return slot;
 	}
+
+	tupdesc = node->ss.ss_currentRelation->rd_att;
 
 	for (;;)
 	{

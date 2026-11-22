@@ -81,12 +81,16 @@ typedef struct LakehouseExecState
 	 */
 	bool		count_exec;
 	bool		count_done;
+	bool		count_resolved;
 	bool		count_from_manifest;
 	int64		count_value;
+	char	   *count_selector; /* descriptor from the plan (no count) */
+	Oid			count_ftid;
 } LakehouseExecState;
 
 /* fdw_exec.c — set while the ordinary-aggregate fallback replans */
 extern bool lakehouse_fdw_count_in_fallback;
+extern bool lakehouse_trivial_count_shape(Query *parse);
 
 /* fdw.c */
 extern void ExtractOptions(Oid foreigntableid, Oid checkAsUser, LakehouseOptions *opts);
