@@ -13,6 +13,8 @@
 
 The commit transport now sends one POST per attempt and recognizes a requirement rejection from the typed catalog response. Redirects, ambiguous gateway failures and unusable success replies surface as unknown. Append planning can still retry a proven conflict. Durable operation markers and lookup on takeover remain delivery items. [Catalog implementation and fault tests](../../../src/backend/access/lakehouse/core/pgdatalake-core/src/catalog/commit.rs)
 
+The [live reply-loss smoke](../../../src/test/lakehouse/fixtures/catalog-reply-loss-check.py) waits for Lakekeeper to accept a real direct append before substituting a gateway timeout. It requires PostgreSQL SQLSTATE `40003`, one successful catalog POST and exactly the old and new rows in Trino. Worker takeover adds the durable ledger and reconciliation checks in the [staged recovery slice](04a-publisher-recovery.md).
+
 - Stateful mock REST catalog and inert object store. Verify ref advance, empty snapshot, absent in-band metadata, table replacement and timestamp history after rollback.
 - Simulate rejection, reply lost before execution, reply lost after success, and reconciliation with missing or mismatched markers. Run the shared `publish-reply-lost` vector and the [staged recovery checkpoints](04a-publisher-recovery.md#when-a-second-append-is-safe). Observe actual commit requests at the catalog boundary to catch any retry hidden inside the transport.
 - Verify credential-scope isolation and range identity across refresh, cancellation and cache reuse. Record expected request counts and fetched bytes. Release gate includes Lakekeeper plus an independent reader checking exact pinned rows.
