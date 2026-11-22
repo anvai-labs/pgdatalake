@@ -1,170 +1,87 @@
-"""Fail CI when a shared (stock-safe) source grows a fork-only dependency.
+"""Check the shared C source list and named fork dependencies in a stock PGXS build.
 
-The stock PGXS package and the fork compile the same C modules; any
-drift silently changes one product's behavior. The shared set is read
-from stock/SHARED_SOURCES and cross-checked against the stock
-Makefile's OBJS, so the two lists cannot silently diverge. Comments are
-stripped before scanning; fork-only mechanisms (planner hook state, the
-managed ledger, tableam internals) must never appear in stock-active
-code. The ACTUAL authority is the stock PG19 PGXS build itself; this
-guard is the cheap tripwire that runs on every push before that build.
-
-Run `--self-test` (wired into CI) to prove the guard still fails on a
-deliberate build-list mismatch, an empty manifest, a fork-only symbol
-in stock-active code, and a missing manifest entry.
+Run with PG_CONFIG pointing to the installed PostgreSQL 19 pg_config. PGXS
+supplies the compiler, flags and generated ABI header for the build being
+checked. --check-list and --self-test also work before PostgreSQL is built.
+The stock compile, link, SQL install and live smoke qualify the resulting module.
 """
-import re
-import sys
+
+import argparse
 from pathlib import Path
-
-def lake_dir(root=None):
-    base = (Path(root).resolve() if root
-            else Path(__file__).resolve().parents[1])
-    return base / "src/backend/access/lakehouse"
-
-# token-level patterns, applied to comment-stripped source
-FORBIDDEN = [
-    (r"\bwhatever_placeholder\b", ""),
-]
+import re
+import subprocess
+import sys
 
 
-def strip_comments(text):
-    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
-    text = re.sub(r"//.*", " ", text)
-    return text
+FORK_NAMES = re.compile(
+    r"\b(lakehouse_snapshot|lakehouse_tableam|lakehouse_delta_segments|"
+    r"install_lakehouse_count_exec|(?:pg_lakehouse_)?publish_staged)\b"
+)
+LINE_MARKER = re.compile(r'^# (\d+) "([^"]+)"')
 
 
-def strip_fork_branches(text):
-    """Drop the fork side of every '#ifdef LAKEHOUSE_STOCK_FDW' block:
-    from the '#else' to the matching '#endif' the fork-only code is
-    compiled out of the stock build, so the guard must not see it."""
-    out = []
-    depth = 0          # nesting depth inside a stock-ifdef block
-    dropping = False
-    for line in text.splitlines():
-        stripped = line.strip()
-        if re.match(r"#\s*ifdef\s+LAKEHOUSE_STOCK_FDW\b", stripped):
-            depth += 1
-            dropping = False
-            out.append("")
+def shared_sources(lake):
+    names = (lake / "stock/SHARED_SOURCES").read_text().split()
+    if not names:
+        raise SystemExit("shared source manifest is empty")
+    if len(names) != len(set(names)):
+        raise SystemExit("duplicate source in shared source manifest")
+    for name in names:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*\.c", name):
+            raise SystemExit(f"invalid shared C filename: {name}")
+        if not (lake / name).is_file():
+            raise SystemExit(f"shared source missing: {name}")
+    return names
+
+
+def check_compiled_source(source, compiler):
+    # The same stock flags apply to nested conditionals and included headers.
+    # Leave strings intact because they can contain SQL references to the ledger.
+    result = subprocess.run([*compiler, "-E", source], stdout=subprocess.PIPE)
+    if result.returncode:
+        raise SystemExit(f"could not preprocess {source.name}")
+    filename = str(source)
+    number = 1
+    for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+        marker = LINE_MARKER.match(line)
+        if marker:
+            number = int(marker[1])
+            filename = marker[2]
+            if Path(filename).name == "lakehouse_tableam.h":
+                raise SystemExit(f"{source.name} includes managed header {filename}")
             continue
-        if depth > 0:
-            if re.match(r"#\s*if\b", stripped) and not re.match(r"#\s*ifdef\s+LAKEHOUSE_STOCK_FDW", stripped):
-                depth += 1
-            elif re.match(r"#\s*endif", stripped):
-                depth -= 1
-                dropping = False
-                out.append("")
-                continue
-            elif re.match(r"#\s*else", stripped) and depth == 1:
-                dropping = True
-            if dropping:
-                out.append("")
-                continue
-        out.append(line)
-    return "\n".join(out)
+        match = FORK_NAMES.search(line)
+        if match:
+            raise SystemExit(f"{filename}:{number}: stock code references {match[0]}")
+        number += 1
 
 
-def shared_modules(lake):
-    manifest = lake / "stock/SHARED_SOURCES"
-    shared = [l.strip() for l in manifest.read_text().splitlines()
-              if l.strip() and not l.strip().startswith("#")]
-    if not shared:
-        raise SystemExit("shared-source contract: manifest is empty")
-    mk = (lake / "stock/Makefile").read_text()
-    objs = re.search(r"^OBJS\s*=\s*(.+)$", mk, re.M)
-    if not objs:
-        raise SystemExit("shared-source contract: no OBJS in stock Makefile")
-    stock_srcs = sorted(o.removesuffix(".o") + ".c"
-                        for o in objs.group(1).split())
-    listed = sorted(shared)
-    only_stock = [f for f in stock_srcs if f not in listed]
-    only_manifest = [f for f in listed if f not in stock_srcs]
-    if only_stock or only_manifest:
-        raise SystemExit(
-            "shared-source contract: manifest/Makefile OBJS diverge; "
-            f"only in OBJS: {only_stock}; only in manifest: {only_manifest}")
-    return shared
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--self-test", action="store_true")
+    mode.add_argument("--check-list", action="store_true")
+    mode.add_argument("--cc", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
+    args = parser.parse_args()
 
+    if args.self_test:
+        test = Path(__file__).with_name("test_shared_sources.py")
+        raise SystemExit(subprocess.call([sys.executable, test]))
 
-def main(root=None):
-    lake = lake_dir(root)
-    shared = shared_modules(lake)
-    patterns = [
-        (r"\blakehouse_snapshot\b", "fork-only RTE field"),
-        (r"\blakehouse_tableam\.h\b|\blakehouse_tableam\b", "managed TableAM internals"),
-        (r"\blakehouse_delta_segments\b", "managed delta ledger"),
-        (r"\binstall_lakehouse_count_exec\b", "managed planner hook"),
-        (r"\bpublish_staged\b", "publisher entry point"),
-    ]
-    failures = []
-    for name in shared:
-        path = lake / name
-        if not path.exists():
-            raise SystemExit(f"shared-source contract: {name} not found")
-        text = strip_comments(path.read_text(encoding="utf-8", errors="replace"))
-        text = strip_fork_branches(text)
-        for pattern, why in patterns:
-            for m in re.finditer(pattern, text):
-                line = text.count("\n", 0, m.start()) + 1
-                failures.append(f"{name}:{line}: {why} ({m.group(0)})")
-    if failures:
-        print("shared-source contract violations:", file=sys.stderr)
-        print("\n".join(failures), file=sys.stderr)
-        raise SystemExit(1)
-    print(f"shared-source contract clean: {len(shared)} modules")
-
-
-def self_test():
-    """Prove each contract failure mode actually fires on a temp tree."""
-    import tempfile
-
-    def run_in(tmp, manifest_lines, objs, body):
-        base = tmp / "src/backend/access/lakehouse"
-        (base / "stock").mkdir(parents=True)
-        (base / "stock/SHARED_SOURCES").write_text(
-            "\n".join(manifest_lines) + "\n")
-        (base / "stock/Makefile").write_text("OBJS = %s\n" % objs)
-        for name in manifest_lines:
-            if name.startswith("#") or not name.strip():
-                continue
-            if body is not None:
-                (base / name).write_text(body)
-        import subprocess
-        r = subprocess.run(
-            [sys.executable, str(Path(__file__).resolve()),
-             "--root", str(tmp)],
-            capture_output=True, text=True)
-        return r.returncode
-
-    cases = [
-        ("obbs/manifest mismatch fails", 1,
-         ["fdw.c"], "fdw.o fdw_plan.o", "int main(void){return 0;}"),
-        ("empty manifest fails", 1,
-         ["# nothing"], "fdw.o", "int main(void){return 0;}"),
-        ("fork symbol in stock-active code fails", 1,
-         ["fdw.c"], "fdw.o",
-         "void f(void *r) { (void) ((RangeTblEntry *) r)->lakehouse_snapshot; }"),
-        ("fork symbol inside guarded #else branch passes", 0,
-         ["fdw.c"], "fdw.o",
-         "#ifdef LAKEHOUSE_STOCK_FDW\nreturn NULL;\n#else\n"
-         "return rte->lakehouse_snapshot;\n#endif\n"),
-        ("missing manifest entry fails loudly", 1,
-         ["gone.c"], "gone.o", None),
-    ]
-    for name, want, manifest, objs, body in cases:
-        with tempfile.TemporaryDirectory() as td:
-            got = run_in(Path(td), manifest, objs, body)
-        if got != want:
-            raise SystemExit(f"self-test FAILED: {name} "
-                             f"(want exit {want}, got {got})")
-    print(f"self-test clean: {len(cases)} failure modes fire correctly")
+    lake = args.root.resolve() / "src/backend/access/lakehouse"
+    names = shared_sources(lake)
+    if args.check_list:
+        print(f"{len(names)} shared C source files listed")
+    elif args.cc is not None:
+        if not args.cc:
+            parser.error("--cc requires the stock compiler")
+        for name in names:
+            check_compiled_source(lake / name, args.cc)
+        print(f"{len(names)} shared C sources checked with the stock preprocessor")
+    else:
+        raise SystemExit(subprocess.call(["make", "-C", lake / "stock", "check-shared-sources"]))
 
 
 if __name__ == "__main__":
-    args = sys.argv[1:]
-    if "--self-test" in args:
-        self_test()
-    else:
-        root = args[args.index("--root") + 1] if "--root" in args else None
-        main(root)
+    main()

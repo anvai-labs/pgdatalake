@@ -2,7 +2,9 @@
 EXTENSION = lakehouse
 MODULE_big = anvai_lake_fdw
 DATA = lakehouse--1.0-fdw.sql
-OBJS = fdw.o fdw_plan.o fdw_exec.o batch_fill.o lakehouse_sql.o
+# The fork's Meson target consumes the same source manifest.
+shared_sources := $(shell cat $(dir $(lastword $(MAKEFILE_LIST)))SHARED_SOURCES)
+OBJS = $(shared_sources:.c=.o)
 
 PG_CONFIG ?= pg_config
 ifeq ($(filter 19.%,$(word 2,$(shell $(PG_CONFIG) --version))),)
@@ -33,3 +35,7 @@ $(header) $(archive) &: $(shell find $(lake_dir)/core/pgdatalake-core/src -name 
 	env -u MAKEFLAGS -u MFLAGS python3 "$(lake_dir)/rust_build.py" --manifest-dir "$(lake_dir)/core" \
 	    --target-dir "$(abspath $(CARGO_TARGET_DIR))" --out-dir "$(rust_dir)"
 	@touch "$(header)" "$(archive)"
+
+.PHONY: check-shared-sources
+check-shared-sources: $(header)
+	python3 $(lake_dir)/../../../../scripts/check_shared_sources.py --cc $(CC) $(CFLAGS) $(CPPFLAGS)
