@@ -37,3 +37,9 @@ The consumer request contains `core_sha`, `module_sha256`, `platform`, `profile`
 4. A joined gate needs both providers' observations on the same profile. Archive the candidate digest, role/binding generation, pins, row multiplicity, request counts and result reason. Track producer pass, consumer replay and hosted qualification separately. Freeze release/ABI/ledger meaning at the producer; version behaviors that change evidence or retry decisions.
 
 **Stop detailing a seam** once each owner can independently write a failing test and both agree on the first visible result and failure owner. Open the next contract only when the next milestone needs it. The published reader can proceed while the managed recovery and sleep protocols are still behind their own gates.
+
+For per-viewer published reads, implement the proposed [06c provider and
+consumer boundary](06c-governed-published-read.md) against its versioned
+fixture. Existing stock/scoped-reader receipts qualify only their recorded
+profiles. A protected route also requires delegated identity, a governed
+source pin, exact visible rows and independent request observations.

@@ -108,3 +108,7 @@ Trino rows in 17.492 s and q3 matched 100 rows in 22.799 s. q1 timed out at
 40.031 s with `57014`. This is a correctness check and one timing observation
 per query. Trace q1 planning, join/rescan requests and spill as a separate
 baseline so high cache hit rates do not hide an expensive cold query.
+
+Per-viewer BI over a protected table consumes the [governed published-read
+contract](06c-governed-published-read.md). It adds provider policy freshness
+and output-scope checks before any persistent reuse or COUNT optimization.

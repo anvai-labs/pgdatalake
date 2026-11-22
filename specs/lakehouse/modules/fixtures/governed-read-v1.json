@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "source_uuid": "85fa1e63-7f07-4618-b48e-1ac6bf713a91",
+  "ref": "main",
+  "columns": ["region", "item", "amount"],
+  "pins": {
+    "9007199254740993": [["EU", 1, 10], ["EU", 1, 10], ["US", 2, 70], [null, 3, 90]],
+    "9007199254740991": [["EU", 1, 10], ["US", 2, 70], [null, 3, 90]]
+  },
+  "viewers": {
+    "viewer-a": {"region": "EU", "mask_amount": false},
+    "viewer-b": {"region": "US", "mask_amount": true}
+  },
+  "expected": [
+    {"viewer": "viewer-a", "pin": "9007199254740993", "rows": [["EU",1,10],["EU",1,10]], "count_star": 2, "count_amount": 2, "sum_amount": 20},
+    {"viewer": "viewer-b", "pin": "9007199254740993", "rows": [["US",2,null]], "count_star": 1, "count_amount": 0, "sum_amount": null},
+    {"viewer": "viewer-a", "pin": "9007199254740991", "rows": [["EU",1,10]], "count_star": 1, "count_amount": 1, "sum_amount": 10},
+    {"viewer": "viewer-b", "pin": "9007199254740991", "rows": [["US",2,null]], "count_star": 1, "count_amount": 0, "sum_amount": null}
+  ],
+  "refusals": [
+    {"case": "revoked-before-dispatch", "status": "denied"},
+    {"case": "generation-changed-during-fill", "status": "changed_binding"},
+    {"case": "source-pin-unproven", "status": "unsupported"},
+    {"case": "pin-expired", "status": "pin_unavailable"},
+    {"case": "governed-plan-unavailable", "status": "unavailable"},
+    {"case": "raw-only-on-protected-table", "status": "unsupported"}
+  ]
+}

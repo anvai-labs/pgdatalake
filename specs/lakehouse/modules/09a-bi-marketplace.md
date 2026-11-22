@@ -61,3 +61,16 @@ authority verification on each. [Unity credential vending](https://docs.databric
    procurement. Keep deployment eligibility, catalog support and completed
    commercial listing independently recorded. Marketplace publication needs
    partner acceptance and live onboarding evidence.
+
+For the [governed exact-pin contract](06c-governed-published-read.md), qualify
+Horizon External OAuth with the user's role and the IRC Scan Plan API. Snowflake
+serves a temporary filtered dataset. Verify source-pin linkage and account for
+server-side planning and warehouse use in the pilot. Unity Catalog's documented
+cross-engine ABAC profile requires a managed table with catalog commits,
+external access and machine-to-machine OAuth or a personal access token.
+Databricks documents serverless enforcement and a concurrent-write caveat for
+multi-scan queries. Qualify its credential mode and same-source-pin proof per
+profile. A user signing into a client through SSO supplies only the first
+identity boundary. [Horizon credentials](https://docs.snowflake.com/en/user-guide/tables-iceberg-access-using-external-query-engine-snowflake-horizon)
+· [Horizon protected scans](https://docs.snowflake.com/en/user-guide/tables-iceberg-enforce-access-policies-scan-plan-api)
+· [Unity Catalog cross-engine ABAC](https://docs.databricks.com/aws/en/external-access/cross-engine-abac)
