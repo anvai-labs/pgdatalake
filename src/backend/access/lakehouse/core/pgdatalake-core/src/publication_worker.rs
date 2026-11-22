@@ -18,6 +18,7 @@ pub struct CapturedMember {
     pub payload: Vec<u8>,
 }
 
+#[derive(PartialEq, Eq)]
 pub struct RetainedAttempt {
     pub expected_parent: Option<i64>,
     pub snapshot_id: i64,
@@ -30,6 +31,18 @@ pub enum ClaimState {
     Unsent,
     Reserved(RetainedAttempt),
     Complete { snapshot_id: i64 },
+}
+
+impl ClaimState {
+    // A first intent can appear during transfer. An intent already observed
+    // for an operation must survive the transfer byte-for-byte.
+    fn follows_acquisition_of(&self, previous: &Self) -> bool {
+        match (previous, self) {
+            (Self::Unsent, Self::Unsent | Self::Reserved(_)) => true,
+            (Self::Reserved(old), Self::Reserved(current)) => old == current,
+            _ => false,
+        }
+    }
 }
 
 /// Immutable provenance from the captured members and durable claim.
@@ -153,11 +166,11 @@ fn members_match(claim: &PublicationClaim, members: &[CapturedMember]) -> bool {
 
 fn verify(
     ledger: &impl PublicationLedger,
-    catalog: &impl PublicationCatalog,
     claim: &PublicationClaim,
     intent: AuthorizedPublication<'_>,
+    evidence: Result<PublicationLookup, RestError>,
 ) -> Result<WorkerOutcome, WorkerFailure> {
-    match catalog.lookup(claim, intent) {
+    match evidence {
         Ok(PublicationLookup::Accepted { snapshot_id }) if snapshot_id == intent.snapshot_id => {
             let members = stage(ledger.finalize(claim, intent), "finalization_unconfirmed")?;
             Ok(WorkerOutcome::Verified {
@@ -172,6 +185,100 @@ fn verify(
     }
 }
 
+fn load_operation(
+    ledger: &impl PublicationLedger,
+    operation: Uuid,
+) -> Result<PublicationClaim, WorkerFailure> {
+    let claim = stage(ledger.load(operation), "load_claim")?;
+    if claim.identity.operation_id != operation {
+        return stage(
+            Err::<_, &str>("ledger supplied another operation"),
+            "load_claim",
+        );
+    }
+    Ok(claim)
+}
+
+fn acquire_claim(
+    ledger: &impl PublicationLedger,
+    observed: &PublicationClaim,
+) -> Result<PublicationClaim, WorkerFailure> {
+    let generation = stage(ledger.acquire(observed), "acquire_claim")?;
+    let claim = stage(
+        ledger.load(observed.identity.operation_id),
+        "load_acquired_claim",
+    )?;
+    if !claim.state.follows_acquisition_of(&observed.state)
+        || generation <= observed.generation
+        || claim.generation != generation
+        || claim.binding != observed.binding
+        || claim.identity.operation_id != observed.identity.operation_id
+        || claim.identity.table_uuid != observed.identity.table_uuid
+        || claim.identity.input_digest != observed.identity.input_digest
+    {
+        return stage(
+            Err::<_, &str>("claim changed during ownership transfer"),
+            "load_acquired_claim",
+        );
+    }
+    Ok(claim)
+}
+
+fn verify_reserved(
+    ledger: &impl PublicationLedger,
+    claim: &PublicationClaim,
+    attempt: &RetainedAttempt,
+    lookup: impl FnOnce(
+        &PublicationClaim,
+        AuthorizedPublication<'_>,
+    ) -> Result<PublicationLookup, RestError>,
+) -> Result<WorkerOutcome, WorkerFailure> {
+    let Some(request_body) = &attempt.request_body else {
+        return Ok(WorkerOutcome::Pending(PendingReason::RetainedBodyMissing));
+    };
+    let intent = AuthorizedPublication {
+        identity: claim.identity,
+        expected_parent: attempt.expected_parent,
+        snapshot_id: attempt.snapshot_id,
+        request_digest: attempt.request_digest,
+        request_body,
+    };
+    if !intent.matches_retained_request() {
+        return Ok(WorkerOutcome::Pending(PendingReason::AcceptanceUnproved));
+    }
+    verify(ledger, claim, intent, lookup(claim, intent))
+}
+
+/// Reconcile a wake scheduled only for verification on the original scope.
+/// An unsent claim returns None without acquiring ownership or contacting the
+/// catalog. The caller supplies only a lookup operation; an accepted attempt
+/// still needs a generation-fenced local finalization.
+pub fn reconcile_publication(
+    ledger: &impl PublicationLedger,
+    operation: Uuid,
+    lookup: impl FnOnce(
+        &PublicationClaim,
+        AuthorizedPublication<'_>,
+    ) -> Result<PublicationLookup, RestError>,
+) -> Result<Option<WorkerOutcome>, WorkerFailure> {
+    let observed = load_operation(ledger, operation)?;
+    match observed.state {
+        ClaimState::Unsent => return Ok(None),
+        ClaimState::Complete { snapshot_id } => {
+            return Ok(Some(WorkerOutcome::Complete { snapshot_id }))
+        }
+        ClaimState::Reserved(_) => {}
+    }
+    let claim = acquire_claim(ledger, &observed)?;
+    let ClaimState::Reserved(ref attempt) = claim.state else {
+        return stage(
+            Err::<_, &str>("retained attempt unavailable"),
+            "load_acquired_claim",
+        );
+    };
+    verify_reserved(ledger, &claim, attempt, lookup).map(Some)
+}
+
 /// Drive one existing claim through the durable one-POST boundary.
 /// The caller owns scheduling, active-grant admission and the binding
 /// supplied to the adapters. Restart by loading the same operation again.
@@ -180,49 +287,15 @@ pub fn drive_publication(
     catalog: &impl PublicationCatalog,
     operation: Uuid,
 ) -> Result<WorkerOutcome, WorkerFailure> {
-    let observed = stage(ledger.load(operation), "load_claim")?;
-    if observed.identity.operation_id != operation {
-        return stage(
-            Err::<_, &str>("ledger supplied another operation"),
-            "load_claim",
-        );
-    }
+    let observed = load_operation(ledger, operation)?;
     if let ClaimState::Complete { snapshot_id } = observed.state {
         return Ok(WorkerOutcome::Complete { snapshot_id });
     }
-
-    let generation = stage(ledger.acquire(&observed), "acquire_claim")?;
-    // An earlier generation could have authorized between the first read
-    // and this transfer. Inspect its enduring intent before preparing.
-    let claim = stage(ledger.load(operation), "load_acquired_claim")?;
-    if claim.generation != generation
-        || claim.binding != observed.binding
-        || claim.identity.operation_id != operation
-        || claim.identity.table_uuid != observed.identity.table_uuid
-        || claim.identity.input_digest != observed.identity.input_digest
-        || matches!(claim.state, ClaimState::Complete { .. })
-    {
-        return stage(
-            Err::<_, &str>("claim changed during ownership transfer"),
-            "load_acquired_claim",
-        );
-    }
-    if let ClaimState::Reserved(attempt) = &claim.state {
-        let Some(request_body) = &attempt.request_body else {
-            return Ok(WorkerOutcome::Pending(PendingReason::RetainedBodyMissing));
-        };
-        return verify(
-            ledger,
-            catalog,
-            &claim,
-            AuthorizedPublication {
-                identity: claim.identity,
-                expected_parent: attempt.expected_parent,
-                snapshot_id: attempt.snapshot_id,
-                request_digest: attempt.request_digest,
-                request_body,
-            },
-        );
+    let claim = acquire_claim(ledger, &observed)?;
+    if let ClaimState::Reserved(ref attempt) = claim.state {
+        return verify_reserved(ledger, &claim, attempt, |claim, intent| {
+            catalog.lookup(claim, intent)
+        });
     }
 
     let members = stage(ledger.members(&claim), "load_members")?;
@@ -252,12 +325,35 @@ pub fn drive_publication(
         "authorization_unconfirmed",
     )?;
     match prepared.submit() {
-        Ok(_) => verify(ledger, catalog, &claim, intent),
+        Ok(_) => verify(ledger, &claim, intent, catalog.lookup(&claim, intent)),
         Err(error @ RestError::Conflict(_)) => Ok(WorkerOutcome::Pending(
             PendingReason::DispatchConflict(error),
         )),
         Err(error) => Ok(WorkerOutcome::Pending(PendingReason::DispatchUnknown(
             error,
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn attempt(bytes: &[u8]) -> ClaimState {
+        ClaimState::Reserved(RetainedAttempt {
+            expected_parent: Some(100),
+            snapshot_id: 101,
+            request_digest: crate::catalog::publication::sha256(bytes),
+            request_body: Some(bytes.to_vec()),
+        })
+    }
+
+    #[test]
+    fn takeover_preserves_an_observed_attempt() {
+        let observed = attempt(b"first");
+        assert!(attempt(b"first").follows_acquisition_of(&observed));
+        assert!(observed.follows_acquisition_of(&ClaimState::Unsent));
+        assert!(!ClaimState::Unsent.follows_acquisition_of(&observed));
+        assert!(!attempt(b"replacement").follows_acquisition_of(&observed));
     }
 }

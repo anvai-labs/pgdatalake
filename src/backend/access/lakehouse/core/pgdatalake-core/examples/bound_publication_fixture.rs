@@ -21,9 +21,9 @@ use pgdatalake_core::{
     parquet::CellValue,
     publication_transport::{PublicationLimits, PublicationTarget, ScopedPublisher},
     publication_worker::{
-        drive_publication, CapturedMember, ClaimState, LedgerResult, PendingReason,
-        PublicationBindingIdentity, PublicationCatalog, PublicationClaim, PublicationLedger,
-        RetainedAttempt, WorkerOutcome,
+        drive_publication, reconcile_publication, CapturedMember, ClaimState, LedgerResult,
+        PendingReason, PublicationBindingIdentity, PublicationCatalog, PublicationClaim,
+        PublicationLedger, RetainedAttempt, WorkerOutcome,
     },
     session::{CatalogClient, S3ClientOptions},
     snapshot_write::NewDataFile,
@@ -42,6 +42,8 @@ struct Fixture {
     operation_id: Uuid,
     #[serde(default)]
     admitted_transport: bool,
+    #[serde(default)]
+    lookup_only: bool,
     #[serde(flatten)]
     legacy: Option<LegacyTarget>,
 }
@@ -481,7 +483,7 @@ fn main() -> FixtureResult<()> {
     let catalog = FixtureCatalog {
         target: &fixture,
         scoped: OnceCell::new(),
-        writer: if fixture.admitted_transport {
+        writer: if fixture.admitted_transport || fixture.lookup_only {
             None
         } else {
             Some(CatalogClient::new(
@@ -498,7 +500,20 @@ fn main() -> FixtureResult<()> {
             )?)
         },
     };
-    match drive_publication(&fixture, &catalog, fixture.operation_id)? {
+    let outcome = if fixture.lookup_only {
+        let Some(outcome) =
+            reconcile_publication(&fixture, fixture.operation_id, |claim, intent| {
+                catalog.lookup(claim, intent)
+            })?
+        else {
+            println!("no_retained_intent");
+            return Ok(());
+        };
+        outcome
+    } else {
+        drive_publication(&fixture, &catalog, fixture.operation_id)?
+    };
+    match outcome {
         WorkerOutcome::Complete { snapshot_id } => println!("complete {snapshot_id}"),
         WorkerOutcome::Verified {
             snapshot_id,
