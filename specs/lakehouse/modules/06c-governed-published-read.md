@@ -22,7 +22,7 @@ before a C ABI, SQL option or transport is chosen.
 | 08 qualification, scan evidence | Correlate attempt, profile/version, authority, installation, binding and grant generation, pseudonymous viewer and effective role, source pin, terminal status, exact result digest and multiplicity, expiry and request/byte counters. Report protected planning costs and retries separately. A receipt describes one attempt. Each new execution obtains current authorization. | Run both viewers over one backend and a fresh backend. Revoke during a fill. Independently record requests to the original objects and compare with the provider's governed engine at the same pin. |
 
 Bind issuer-scoped subject and tenant to a stable local viewer identity.
-A service principal qualifies only for its own expressly enrolled grant.
+A service principal qualifies only for its own expressly enrolled grant. A database-audience credential may establish SQL login. The provider requires separate authority for the catalog audience and effective viewer. Keep both identities and their expiries distinct in the trusted execution context.
 An application sharing one database login must supply an independently
 authenticated viewer binding to use the per-viewer profile. An arbitrary SQL
 setting or BI workbook field supplies no such authority.
