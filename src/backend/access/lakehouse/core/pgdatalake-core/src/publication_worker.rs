@@ -32,8 +32,19 @@ pub enum ClaimState {
     Complete { snapshot_id: i64 },
 }
 
+/// Immutable provenance from the captured members and durable claim.
+/// This is distinct from the mutable publisher owner generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublicationBindingIdentity {
+    pub authority_id: Uuid,
+    pub binding_id: Uuid,
+    pub incarnation_id: Uuid,
+    pub binding_generation: i64,
+}
+
 pub struct PublicationClaim {
     pub identity: PublicationIdentity,
+    pub binding: Option<PublicationBindingIdentity>,
     pub generation: i64,
     pub state: ClaimState,
 }
@@ -70,7 +81,11 @@ pub trait PublicationCatalog {
         members: &[CapturedMember],
     ) -> Result<PreparedPublication<'_>, StorageError>;
 
-    fn lookup(&self, intent: AuthorizedPublication<'_>) -> Result<PublicationLookup, RestError>;
+    fn lookup(
+        &self,
+        claim: &PublicationClaim,
+        intent: AuthorizedPublication<'_>,
+    ) -> Result<PublicationLookup, RestError>;
 }
 
 #[derive(Debug)]
@@ -142,7 +157,7 @@ fn verify(
     claim: &PublicationClaim,
     intent: AuthorizedPublication<'_>,
 ) -> Result<WorkerOutcome, WorkerFailure> {
-    match catalog.lookup(intent) {
+    match catalog.lookup(claim, intent) {
         Ok(PublicationLookup::Accepted { snapshot_id }) if snapshot_id == intent.snapshot_id => {
             let members = stage(ledger.finalize(claim, intent), "finalization_unconfirmed")?;
             Ok(WorkerOutcome::Verified {
@@ -181,6 +196,7 @@ pub fn drive_publication(
     // and this transfer. Inspect its enduring intent before preparing.
     let claim = stage(ledger.load(operation), "load_acquired_claim")?;
     if claim.generation != generation
+        || claim.binding != observed.binding
         || claim.identity.operation_id != operation
         || claim.identity.table_uuid != observed.identity.table_uuid
         || claim.identity.input_digest != observed.identity.input_digest

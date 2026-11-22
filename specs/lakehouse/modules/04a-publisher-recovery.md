@@ -74,6 +74,37 @@ The parent manifest list is read with the object byte budget and deadline used b
 
 A failed preparation can leave unreferenced files, including if the store returns an uncertain PUT result. Proposed objects must survive recovery and cleanup while a send is unresolved. Automatic orphan reclamation remains a separate gate. This provider consumes a verified binding and an in-band Iceberg v2 pin. Binding enrollment, foreground capture and publisher orchestration remain dependencies.
 
+## Scoped REST and S3 transport
+
+The scoped Rust adapter takes an enrolled authority, binding, incarnation and
+enrollment generation. The ledger supplies the claim's immutable binding
+independently. The adapter compares these facts and the table UUID before
+provider access. The worker also checks that the binding survives an owner
+generation transfer. Owner generation remains a separate ledger fence.
+
+The trusted descriptor carries the exact REST origin, prefix, namespace,
+name, and S3 origin and region. Supply credentials separately. The adapter
+does not fetch catalog configuration or use catalog-delegated credentials,
+redirects or environment proxies. It accepts canonical S3 table roots and
+the explicit Iceberg v2 unpartitioned `main` profile. Cleartext is reserved
+for literal loopback fixtures. Static mapped S3 credentials are the
+supported transport credential form in this slice.
+
+Preparation validates the in-band metadata location, UUID, root, source
+columns, schema, spec and main pin before reading the bounded parent list
+or creating objects. It writes Parquet, a manifest and a manifest list as
+create-only objects under the enrolled root. The commit body uses the
+same selected parent and schema/spec requirements. The SQL admission
+and durable send authorization remain prerequisites for consuming it.
+
+A replacement obtains the original retained descriptor, even after
+revocation. It checks the retained proposal's schema and spec against
+the original descriptor, proves ancestry on the current head, and reads
+the introducing manifest list through the original S3 scope. A newer
+table schema does not invalidate proof of the original append. Replaced
+table identity, expired proof or changed scope prevents completion.
+[Scoped transport](../../../src/backend/access/lakehouse/core/pgdatalake-core/src/publication_transport.rs)
+
 ## Bound-provider crash smoke
 
 The CI smoke pre-enrolls one disposable Lakekeeper table and inserts bound

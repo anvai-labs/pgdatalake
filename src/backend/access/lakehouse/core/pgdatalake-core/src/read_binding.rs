@@ -35,14 +35,14 @@ impl From<StorageError> for ReadError {
     }
 }
 
-fn valid_component(component: &str) -> bool {
+pub(crate) fn valid_component(component: &str) -> bool {
     !matches!(component, "" | "." | "..")
         && component
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
 }
 
-fn valid_path(path: &str) -> bool {
+pub(crate) fn valid_path(path: &str) -> bool {
     path.split('/').all(valid_component)
 }
 
@@ -56,7 +56,7 @@ pub(crate) struct S3ReadRoot {
 }
 
 impl S3ReadRoot {
-    fn parse(uri: String) -> Result<Self, ReadError> {
+    pub(crate) fn parse(uri: String) -> Result<Self, ReadError> {
         let Some((bucket, prefix)) = uri.strip_prefix("s3://").and_then(|s| s.split_once('/'))
         else {
             return Err(ReadError::unsupported(
@@ -111,7 +111,7 @@ impl S3ReadRoot {
 
 /// Both routes come from local operator configuration. Restrict cleartext
 /// to the same-machine fixture profile. Storage endpoints are origins.
-fn checked_endpoint(value: &str, storage: bool) -> Result<String, ReadError> {
+pub(crate) fn checked_endpoint(value: &str, storage: bool) -> Result<String, ReadError> {
     let value = value.trim_end_matches('/');
     let parse_error = || ReadError::unsupported("invalid endpoint for the bound read profile");
     let url = reqwest::Url::parse(value).map_err(|_| parse_error())?;
@@ -169,7 +169,7 @@ impl ReadBinding {
             table_uuid: uuid,
             catalog_prefix,
             region,
-            catalog: RestCatalog::new_for_bound_read(
+            catalog: RestCatalog::new_scoped(
                 &checked_endpoint(endpoint, false)?,
                 Box::new(StaticToken(token)),
             )
