@@ -4,6 +4,15 @@
 
 **Managed COUNT and local writes.** On the PR #47 fork a prepared COUNT returned 1 while the same backend scanned `[10,20]`. The executor now takes the ordinary scan for relations with transaction-local write state. The SQL regression covers savepoint rollback, full rollback and commit with one reused generic plan. Compatible published-base and committed-overlay counts still need a membership proof. [Original reproducer and regression](modules/03-managed-visibility.md#first-red-case-for-managed-count)
 
+## Current dependency order after PRs #46–52
+
+| Dependency | Merged evidence or current gate | Next consumer |
+|---|---|---|
+| Public distribution | #46 specifies the release boundary. #47 builds and exercises the serial stock reader. #48 and #51 make the two builds use one C source list and test named fork dependencies under the stock preprocessor. #49 maps the public evidence. | Preserve each flavor's compile, install and pinned read smoke when extending shared code. |
+| Scoped enrollment | #50 fixes the meaning of 22 provider/consumer cases. The ordinary FDW role smoke in this slice exercises owner/invoker mappings and revocation during prepared reuse. | Test independently configured and catalog-resolved roots, cross-scope cache reuse and zero forbidden requests before claiming tenant isolation. [Scoped read handoff](modules/06b-scoped-read-handoff.md) |
+| Aggregate correctness | #52 fixes the observed own-write managed COUNT regression by using the ordinary scan when the backend has local write state. The FDW upper-path successor is under separate review. | Every aggregate must agree with its ordinary scan at the same authorized pin, including actual deletes. Neither shortcut establishes a compatible managed base-plus-overlay view. |
+| Managed publication | #39–45 supply claims, intent, request retention, bounded lookup and immutable writer preparation. | Join bound SQL capture to the worker, then require the lost-reply one-POST restart and mixed-visibility scan before offering managed append publication. |
+
 ## Stock read foundation following PR #46
 
 Base `8ed4cbab0b0`. On upstream PG19.0 (`5c839a2a08b`), the original planner failed to compile at the fork-only RTE field; clean SQL installation returned `0A000`. The [PGXS source package](../../src/backend/access/lakehouse/stock/README.md) now installs and runs the read-only surface on that release. The fork's assertion build passed 243 upstream subtests and 11 lakehouse SQL groups. One final local stock smoke took 12.18 seconds including Trino DDL and cleanup. Stock PG, schema-only dump/restore and Trino returned exactly `[10,20,20,30]` at snapshot `184327008694008591` and `[10,20,30]` at `1130167751514016848`. This sample measures fixture duration. Query p95/p99 and deployment SLOs are unmeasured.
