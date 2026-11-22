@@ -67,14 +67,110 @@ query_snapshot_selector(PlannerInfo *root, RelOptInfo *baserel)
 #endif
 }
 
+/*
+ * Trivial count(*) over exactly one foreign base relation of ours: the
+ * builtin identity (F_COUNT_), single star aggregate, no quals/joins/
+ * grouping/having/window/distinct/limit-offset. The shape checks mirror
+ * the managed successor (count_exec.c) — keep both in sync.
+ */
+bool
+lakehouse_trivial_count_shape(Query *parse)
+{
+	TargetEntry *te;
+	Aggref	   *agg;
+
+	if (parse->commandType != CMD_SELECT || parse->hasWindowFuncs ||
+		parse->hasTargetSRFs || parse->setOperations ||
+		parse->groupClause || parse->groupingSets || parse->havingQual ||
+		parse->distinctClause || parse->limitOffset != NULL)
+		return false;
+	if (list_length(parse->targetList) != 1)
+		return false;
+	te = linitial_node(TargetEntry, parse->targetList);
+	if (te->resjunk || !IsA(te->expr, Aggref))
+		return false;
+	agg = (Aggref *) te->expr;
+	if (agg->aggfnoid != F_COUNT_ ||
+		agg->aggdistinct != NIL || agg->aggfilter != NULL ||
+		agg->aggorder != NIL || agg->args != NIL)
+		return false;
+	return true;
+}
+
+static bool
+fdw_count_wanted(PlannerInfo *root, RelOptInfo *input_rel,
+				 RangeTblEntry **rte_out)
+{
+	Query	   *parse = root->parse;
+	RangeTblEntry *rte;
+
+	if (!lakehouse_trivial_count_shape(parse))
+		return false;
+	if (input_rel->rtekind != RTE_RELATION || input_rel->relid == 0)
+		return false;
+	rte = root->simple_rte_array[input_rel->relid];
+	if (rte->rtekind != RTE_RELATION ||
+		rte->relkind != RELKIND_FOREIGN_TABLE)
+		return false;
+	if (input_rel->baserestrictinfo != NIL || input_rel->joininfo != NIL)
+		return false;
+	if (parse->jointree && parse->jointree->quals != NULL)
+		return false;
+	if (rte_out != NULL)
+		*rte_out = rte;
+	return true;
+}
+
+/*
+ * Offer a descriptor-only path for the single COUNT result. Resolve the
+ * authorized snapshot and compute the count on first tuple demand.
+ */
+void
+lakehouse_GetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
+							   RelOptInfo *input_rel, RelOptInfo *output_rel,
+							   void *extra)
+{
+	ForeignPath *path;
+	ForeignPath *best;
+	RangeTblEntry *rte;
+	const char *selector;
+	PathTarget *target;
+
+	if (stage != UPPERREL_GROUP_AGG)
+		return;
+	if (!fdw_count_wanted(root, input_rel, &rte))
+		return;
+	best = (ForeignPath *) input_rel->cheapest_total_path;
+	if (best == NULL || !IsA(best, ForeignPath))
+		return;
+
+	target = output_rel->reltarget;
+	/* the stock selector is NULL: the descriptor carries an empty one */
+	selector = query_snapshot_selector(root, input_rel);
+	path = create_foreign_upper_path(root, output_rel,
+									 target,
+									 1 /* rows: exactly one answer */ ,
+									 0, 0.0 /* startup */ ,
+									 10.0 /* total: manifest sum, cached */ ,
+									 NIL, NULL,
+									 NIL /* fdw_restrictinfo */ ,
+									 list_make3(makeString("count_exec"),
+												makeString(selector
+														   ? pstrdup(selector)
+														   : pstrdup("")),
+												makeString(psprintf("%u",
+																	(unsigned) rte->relid))));
+	add_path(output_rel, &path->path);
+}
+
 void
 lakehouse_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 							Oid foreigntableid)
 {
 	/*
-	 * ExecutorStart checks relation permissions before opening the scan.
-	 * Keep planning local, including plans for views. Use catalog statistics
-	 * when available and otherwise retain core's foreign-table estimate.
+	 * ExecutorStart checks relation permissions before opening the scan. Keep
+	 * planning local, including plans for views. Use catalog statistics when
+	 * available and otherwise retain core's foreign-table estimate.
 	 */
 	if (baserel->tuples >= 0)
 		set_baserel_size_estimates(root, baserel);
@@ -445,6 +541,19 @@ lakehouse_GetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 	char	   *pred_json = NULL;
 	bool		first_pred = true;
 	Relation	tmpl_rel;
+
+	/*
+	 * Describe the aggregate emitted in the scan slot. setrefs matches the
+	 * plan's Aggref to this expression and substitutes an INDEX_VAR.
+	 */
+	if (baserel->reloptkind == RELOPT_UPPER_REL)
+	{
+		List	   *scan_tlist = make_tlist_from_pathtarget(best_path->path.pathtarget);
+
+		Assert(list_length(best_path->fdw_private) == 3);
+		return make_foreignscan(tlist, NIL, 0, NIL, best_path->fdw_private,
+								scan_tlist, NIL, NULL);
+	}
 
 	/*
 	 * Translate Var-op-Const quals into the ScanPredicate JSON (slice 15):

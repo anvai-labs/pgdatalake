@@ -7,6 +7,9 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/table.h"
+#include "executor/spi.h"
+#include "utils/snapmgr.h"
 #include "catalog/pg_collation_d.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
@@ -46,13 +49,32 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 	StringInfoData proj;
 	bool		first_col = true;
 
-	/*
-	 * COUNT(*) elision (spec 15 §6.6) is GATED OFF (spec 16, "COUNT must be
-	 * computed at execution"): the plan-time record_count Const only
-	 * revalidated the SUM in Begin — never delete eligibility — so a
-	 * same-total snapshot change with deletes overcounted. The successor is
-	 * an execution-time one-row upper path.
-	 */
+	/* An upper COUNT scan has no base relation or input tuple. */
+	{
+		ForeignScan *fscan = (ForeignScan *) node->ss.ps.plan;
+
+		if (fscan != NULL && fscan->fdw_private != NIL &&
+			list_length(fscan->fdw_private) == 3 &&
+			strcmp(strVal(linitial(fscan->fdw_private)),
+				   "count_exec") == 0)
+		{
+			char	   *sel = strVal(lsecond(fscan->fdw_private));
+
+			/*
+			 * FIRST-DEMAND EXECUTION (spec 16): Begin only carries the
+			 * descriptor — session open, delete-eligibility proof, manifest
+			 * sum and fallback ALL happen on the first Iterate demand, so
+			 * plain EXPLAIN and LIMIT 0 do no scan work at all.
+			 */
+			state = (LakehouseExecState *) palloc0(sizeof(LakehouseExecState));
+			state->count_exec = true;
+			state->count_selector = pstrdup(sel);
+			state->count_ftid = (Oid) strtoul(strVal(lthird(fscan->fdw_private)),
+											  NULL, 10);
+			node->fdw_state = state;
+			return;
+		}
+	}
 
 	tupdesc = RelationGetDescr(rel);
 
@@ -153,12 +175,131 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 	node->fdw_state = state;
 }
 
+/*
+ * Count visible rows from the session that already resolved the authorized
+ * snapshot. The reader applies the same delete semantics as a normal scan.
+ */
+static int64
+lakehouse_count_pinned_rows(ScanSession * session, uint64 tasks)
+{
+	RowsHandle *volatile rows = NULL;
+	int64		count = 0;
+
+	PG_TRY();
+	{
+		for (uint64 task = 0; task < tasks; task++)
+		{
+			char		errbuf[1024] = "";
+
+			CHECK_FOR_INTERRUPTS();
+			rows = pg_datalake_rows_open(session, task, "[]",
+										 errbuf, sizeof(errbuf));
+			if (rows == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_IO_ERROR),
+						 errmsg("lakehouse: could not open COUNT task %llu: %s",
+								(unsigned long long) task, errbuf)));
+
+			for (;;)
+			{
+				PgDatalakeRowBatch batch;
+				int			status;
+
+				CHECK_FOR_INTERRUPTS();
+				errbuf[0] = '\0';
+				status = pg_datalake_rows_batch_next(rows, &batch, errbuf,
+													 sizeof(errbuf));
+				if (status == 1)
+					break;
+				if (status != 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_EXCEPTION),
+							 errmsg("lakehouse: could not count rows in task %llu: %s",
+									(unsigned long long) task, errbuf)));
+				if ((uint64) batch.live_count > (uint64) (PG_INT64_MAX - count))
+					ereport(ERROR,
+							(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+							 errmsg("lakehouse: COUNT exceeds bigint range")));
+				count += batch.live_count;
+			}
+			pg_datalake_rows_close(rows);
+			rows = NULL;
+		}
+	}
+	PG_FINALLY();
+	{
+		if (rows != NULL)
+			pg_datalake_rows_close(rows);
+	}
+	PG_END_TRY();
+	return count;
+}
+
+static void
+lakehouse_count_exec_resolve(ForeignScanState *node, LakehouseExecState *state)
+{
+	ForeignScan *fscan = (ForeignScan *) node->ss.ps.plan;
+	ScanSession *session;
+
+	ExtractOptions(state->count_ftid, fscan->checkAsUser, &state->opts);
+	session = lakehouse_OpenSession(&state->opts,
+									state->count_selector[0] != '\0'
+									? state->count_selector : NULL);
+	PG_TRY();
+	{
+		int64		total = 0;
+		uint64		tasks = pg_datalake_scan_task_count(session);
+		bool		proved = !pg_datalake_scan_has_deletes(session);
+
+		for (uint64 task = 0; task < tasks && proved; task++)
+		{
+			int64		rows = pg_datalake_scan_task_rows(session, task);
+
+			CHECK_FOR_INTERRUPTS();
+			if (rows < 0 || rows > PG_INT64_MAX - total)
+				proved = false;
+			else
+				total += rows;
+		}
+		state->count_value = proved ? total : lakehouse_count_pinned_rows(session, tasks);
+		state->count_from_manifest = proved;
+	}
+	PG_FINALLY();
+	{
+		pg_datalake_scan_free(session);
+	}
+	PG_END_TRY();
+}
+
 TupleTableSlot *
 lakehouse_IterateForeignScan(ForeignScanState *node)
 {
 	LakehouseExecState *state = (LakehouseExecState *) node->fdw_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
-	TupleDesc	tupdesc = node->ss.ss_currentRelation->rd_att;
+	TupleDesc	tupdesc;
+
+	/* Resolve on first demand, then emit the single result. */
+	if (state->count_exec)
+	{
+		if (state->count_done)
+		{
+			ExecClearTuple(slot);
+			return NULL;
+		}
+		if (!state->count_resolved)
+		{
+			lakehouse_count_exec_resolve(node, state);
+			state->count_resolved = true;
+		}
+		ExecClearTuple(slot);
+		slot->tts_values[0] = Int64GetDatum(state->count_value);
+		slot->tts_isnull[0] = false;
+		ExecStoreVirtualTuple(slot);
+		state->count_done = true;
+		return slot;
+	}
+
+	tupdesc = node->ss.ss_currentRelation->rd_att;
 
 	for (;;)
 	{
@@ -330,6 +471,18 @@ lakehouse_ExplainForeignScan(ForeignScanState *node, ExplainState *es)
 
 	if (state == NULL)
 		return;
+	if (state->count_exec)
+	{
+		ExplainPropertyText("Lakehouse count",
+							!state->count_resolved
+							? "resolved on demand"
+							: state->count_from_manifest
+							? "computed at execution from manifest "
+							"record_counts (delete-free snapshot "
+							"re-proved; no data files read)"
+							: "counted visible rows at the selected snapshot", es);
+		return;
+	}
 	for (uint64 i = 0; i < state->task_count; i++)
 		rows += (uint64) pg_datalake_scan_task_rows(state->session, i);
 
@@ -363,6 +516,12 @@ void
 lakehouse_ReScanForeignScan(ForeignScanState *node)
 {
 	LakehouseExecState *state = (LakehouseExecState *) node->fdw_state;
+
+	if (state->count_exec)
+	{
+		state->count_done = false;
+		return;
+	}
 
 	/*
 	 * Rewind only: the planned session is REUSED. Merge/NestLoop join inner
