@@ -16,6 +16,10 @@ Keep the catalog token, object credential, PG role and provisioning identity dis
 
 ## Catalog expansion after Lakekeeper
 
+The [read-only BI marketplace brief](09a-bi-marketplace.md) defines separate
+catalog compatibility, compute placement, and listing approval gates for
+Databricks and Snowflake.
+
 The first core OSS target is a reproducible self-hosted stock PostgreSQL FDW pilot with Lakekeeper. Run a pinned upstream Lakekeeper image, public reference configuration and a clean smoke with an independent reader. Core PR #58 qualifies the bound REST/S3 reader in the Lakekeeper, SeaweedFS and Trino fixture. It covers exact v2 pins, position deletes, UUID/root rejection and prepared reuse with zero sibling object requests. A real two-role credential rotation drill, distribution and performance receipt remain pilot exit gates. Managed append has its own exit through ordinary bound capture, worker recovery and compatible reads. [Lakekeeper upstream](https://github.com/lakekeeper/lakekeeper) · [Core release gates](08a-core-release-gates.md)
 
 **Repository boundary.** Core OSS owns the client code needed to connect a self-hosted PostgreSQL instance to an enrolled catalog. This includes protocol profiles, signing and credential vending, URI and identity verification, capability checks, failure mapping, runnable conformance fixtures and self-hosted setup guidance. Use the same supported runtime artifact in hosted deployments. The operator owns enrollment and approved scope, account provisioning, IAM assignment and secret references, private networking, dedicated live test accounts, onboarding workflows and marketplace listing, metering and support commitments. Publish sanitized capability receipts and keep tenant-specific logs and credentials within their deployment trust boundary. [Release boundary](06a-release-contract.md)
