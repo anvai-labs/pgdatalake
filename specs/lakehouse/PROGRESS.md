@@ -1,10 +1,23 @@
 # Lakehouse progress and release gates
 
-**Product snapshot at merged `lakehouse-dev` revision `90518dca8cca37348dc5da64305f782b267a18d6` (PR #47).** The PG19.0 serial source-package smoke is implemented. Managed foreground binding, verified worker recovery and compatible base-plus-overlay reads remain open. The [illustrated product map](17-anvai-lake-product.md#two-packages-one-shared-reader) ties each claim to its test and shows the order of the next correctness gates. The assessment below retains the historical findings at PR #45 and the original [performance baseline](16-release-reassessment-and-scale.md).
+## Current dependency order
+
+Reviewed through public PR #69 at `f5b86d9a2f8c0f0e3ad2894562359bfb44ba36b5`.
+The first independently shippable path is a serial, read-only FDW on stock
+PG19.0. The managed writer and its visibility proof can advance separately.
+
+| Track | Established evidence | Next dependency and exit |
+|---|---|---|
+| Stock reader, 01/02/06 | #53 supplies execution-time FDW COUNT and same-pin fallback. #54/#58/#61 cover effective mapping, enrolled root, real SQL logins, rotation and revocation. The [TLS smoke](../../src/test/lakehouse/fixtures/stock-scoped-tls.sh) runs those reads and reconnect on verified PG-wire with SCRAM. | Qualify the deployed driver and trusted runtime against one actual catalog identity flow. Preserve ordinary/pinned count and denied-sibling controls. |
+| Governed tables, 01/02/06/08 | #67–69 define BI reuse, provider scope and a verifier for 12 positive SQL executions and six refusals. Current governed results come from synthetic evidence. | Implement and run one provider's protected plan on a real enrolled table. Require exact source pin, actual consumption, masks and distinct effective scopes. Only then qualify reuse and multiple readers. [Verifier](modules/06c-governed-published-read.md) |
+| Managed appends, 03/04 | #63/#65 join normal bound capture, locally durable intent, scoped send, one-POST recovery and original-member finalization on the fixture. #64 exercises compatible cuts with real PostgreSQL snapshots and an injected publication certificate. | Wire production credential resolution and native worker dispatch. Feed its real receipts into the TableAM reader and compare old/intermediate/fresh views at the same pin. Qualify promotion separately. [Managed gates](modules/08a-core-release-gates.md) |
+| Cost and expansion, 02/08/09 | #60 defines per-catalog profiles. #62 qualifies pinned benchmark digests. #66 reduces one projected canary from 4,719 to 16 data range GETs. | Diagnose the SF10 q1 timeout before a latency claim. Measure cold/warm dashboard completeness and spend on a qualified profile before selecting an elastic floor or enabling persistent reuse. [Cost evidence](modules/08b-io-cost.md) |
+
+## Historical findings through PR #52
 
 **Managed COUNT and local writes.** On the PR #47 fork a prepared COUNT returned 1 while the same backend scanned `[10,20]`. The executor now takes the ordinary scan for relations with transaction-local write state. The SQL regression covers savepoint rollback, full rollback and commit with one reused generic plan. Compatible published-base and committed-overlay counts still need a membership proof. [Original reproducer and regression](modules/03-managed-visibility.md#first-red-case-for-managed-count)
 
-## Current dependency order after PRs #46–52
+### Dependency order at PRs #46–52
 
 | Dependency | Merged evidence or current gate | Next consumer |
 |---|---|---|
@@ -17,9 +30,9 @@
 
 Base `8ed4cbab0b0`. On upstream PG19.0 (`5c839a2a08b`), the original planner failed to compile at the fork-only RTE field; clean SQL installation returned `0A000`. The [PGXS source package](../../src/backend/access/lakehouse/stock/README.md) now installs and runs the read-only surface on that release. The fork's assertion build passed 243 upstream subtests and 11 lakehouse SQL groups. One final local stock smoke took 12.18 seconds including Trino DDL and cleanup. Stock PG, schema-only dump/restore and Trino returned exactly `[10,20,20,30]` at snapshot `184327008694008591` and `[10,20,30]` at `1130167751514016848`. This sample measures fixture duration. Query p95/p99 and deployment SLOs are unmeasured.
 
-**Next dependency for the hosted reader:** prove the permission-checking role and approved storage root at planning, execution and cache reuse, including owner/invoker views and a denied sibling tenant with zero forbidden object requests. Signed runtime artifacts, multi-node qualification and managed worker recovery remain open. Downstream services pin the interface specification. A service rollout requires a separate runtime artifact and evidence.
+**Dependency identified at #47.** prove the permission-checking role and approved storage root at planning, execution and cache reuse, including owner/invoker views and a denied sibling tenant with zero forbidden object requests. Signed runtime artifacts, multi-node qualification and managed worker recovery remain open. Downstream services pin the interface specification. A service rollout requires a separate runtime artifact and evidence.
 
-## What changed since the original review
+## Original review findings at the historical baseline
 
 | Assessment | Evidence | Next action |
 |---|---|---|
@@ -34,12 +47,12 @@ Base `8ed4cbab0b0`. On upstream PG19.0 (`5c839a2a08b`), the original planner fai
 |---|---|---|
 | **M0 Foundation** | Historically accepted at `milestone/m0` | Revalidate clean builds, extension install and supported upgrades at each candidate SHA. |
 | **M1 External reads** | FDW, REST/S3, pruning, typed scans, time travel and supported v2/v3 delete reads landed. Time-travel deparse + dump/restore landed 2026-11-21 (ruleutils re-emits the pin; `time_travel.sql` carries the acceptance test) | Independent result equivalence, delete combinations, parallel pinning, cancellation and resource limits. |
-| **M2 Managed writes** | Append history, COW DML/MERGE, staged capture and a publisher exist | Exact bulk staging and crash/concurrency visibility. Demonstrate the documented local/remote commit semantics and publish-retry outcomes. |
+| **M2 Managed writes** | Ordinary bound INSERT, WAL recovery and one catalog commit exercised by the scoped fixture | Native worker, compatible managed scans and promoted-primary recovery. |
 | **M3 Semantics and cloud parity** | In progress. Ranged projection, cached bytes, lazy projected decode, and initial COUNT paths landed | Qualify COUNT and lazy reads. Close isolation, ADLS/GCS transport and auth, branch/tag/history semantics and the logical replication decision. |
 | **M4 Production hardening** | Design available for maintenance, statistics and execution tiers | Implement and qualify compaction, expiry, orphan safety, ANALYZE and bounded scan/publish resource use. |
 | **M5 Engine integrations** | Backlog | Compare independently against the same pinned dataset, permission scope, resource budgets and result digests. |
 
-## Evidence and next queue
+## Historical milestone evidence and work queue
 
 - **Implementation briefs.** The [module index](modules/README.md) assigns
   ownership and independent tests for the next wave. Land the shared contract

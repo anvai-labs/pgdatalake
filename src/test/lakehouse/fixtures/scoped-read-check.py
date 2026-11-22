@@ -1,4 +1,5 @@
 """Exercise a bound S3 read with an independent catalog and object recorder."""
+import argparse
 import contextlib
 import http.client
 import http.server
@@ -7,6 +8,7 @@ import json
 import os
 import queue
 import re
+import secrets
 import subprocess
 import threading
 import time
@@ -219,13 +221,13 @@ def exercise(db, parent, child, prefix, route, enrolled):
 
 
 @contextlib.contextmanager
-def login(db, role):
-    # A real login over the disposable cluster's trust socket. Keep the same
-    # backend and prepared statements while the admin uses a second connection.
+def login(db, role, env=None):
+    # Keep the backend and its prepared statements while the admin uses a
+    # separate local connection for mapping rotation and revocation.
     with subprocess.Popen(
-        PSQL + ["-d", db, "-U", role, "-v", "ON_ERROR_STOP=off", "-v", "VERBOSITY=terse"],
+        PSQL + ["-w", "-d", db, "-U", role, "-v", "ON_ERROR_STOP=off", "-v", "VERBOSITY=terse"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1,
+        text=True, bufsize=1, env=env,
     ) as psql:
         lines = queue.SimpleQueue()
         marker = "scoped-check-" + uuid.uuid4().hex
@@ -255,6 +257,12 @@ def login(db, role):
             return output
 
         try:
+            if env is not None:
+                protocol, = run("SELECT version FROM pg_stat_ssl WHERE pid = pg_backend_pid() AND ssl "
+                                "AND system_user = 'scram-sha-256:' || current_user")
+                assert protocol.startswith("TLS"), (role, protocol)
+                print(json.dumps({"check": "tenant_transport", "protocol": protocol,
+                                  "auth": "scram-sha-256", "sslmode": env["PGSSLMODE"]}), flush=True)
             yield run
         finally:
             psql.stdin.close()
@@ -270,7 +278,22 @@ def tenant_roles(db):
     return f"{db}_a", f"{db}_b"
 
 
-def exercise_tenants(db, parent, child, sibling, primary, secondary):
+def check_tls_login(db, role, env):
+    # Pin the libpq failure to the intended cause before running positive reads.
+    for patch, expected in (
+        ({"PGHOST": "wrong-name.invalid"}, "does not match host name"),
+        ({"PGPASSWORD": secrets.token_hex(24)}, "password authentication failed"),
+        ({"PGSSLMODE": "disable", "PGCHANNELBINDING": "disable"}, "no pg_hba.conf entry"),
+    ):
+        result = subprocess.run(
+            PSQL + ["-w", "-d", db, "-U", role, "-c", "SELECT 1"],
+            env=env | patch, capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 or expected not in result.stderr:
+            raise AssertionError(f"missing TLS login refusal for {expected}")
+
+
+def exercise_tenants(db, parent, child, sibling, primary, secondary, tls_root):
     role_a, role_b = tenant_roles(db)
     prefix, route_a, table_a = primary
     prefix_b, route_b, table_b = secondary
@@ -343,8 +366,21 @@ def exercise_tenants(db, parent, child, sibling, primary, secondary):
         }, sort_keys=True), flush=True)
 
     with recorder(catalog_response) as catalog, recorder(object_response) as storage:
+        login_env = {}
         for role in (role_a, role_b):
-            sql(db, f"CREATE ROLE {role} LOGIN")
+            if tls_root:
+                password = secrets.token_hex(24)
+                sql(db, f"SET password_encryption='scram-sha-256'; CREATE ROLE {role} LOGIN PASSWORD '{password}'")
+                login_env[role] = dict(
+                    os.environ, PGHOST="localhost", PGHOSTADDR="127.0.0.1", PGSSLMODE="verify-full",
+                    PGSSLROOTCERT=tls_root, PGREQUIREAUTH="scram-sha-256", PGCHANNELBINDING="require",
+                    PGGSSENCMODE="disable", PGPASSWORD=password, PGCONNECT_TIMEOUT="5", LC_ALL="C",
+                )
+            else:
+                sql(db, f"CREATE ROLE {role} LOGIN")
+                login_env[role] = None
+        if tls_root:
+            check_tls_login(db, role_a, login_env[role_a])
 
         for server, table, root, role, key in (
             ("tenant_a", table_a, root_a, role_a, key_a),
@@ -379,7 +415,7 @@ def exercise_tenants(db, parent, child, sibling, primary, secondary):
             GRANT SELECT ON owner_sibling TO {role_a};
         """)
 
-        with login(db, role_a) as a, login(db, role_b) as b:
+        with login(db, role_a, login_env[role_a]) as a, login(db, role_b, login_env[role_b]) as b:
             who = "SELECT session_user || ':' || current_user || ':' || pg_backend_pid()"
             login_a, = a(who)
             login_b, = b(who)
@@ -442,7 +478,7 @@ def exercise_tenants(db, parent, child, sibling, primary, secondary):
                      SET s3_secret_key '{key_rotated}-password');
             """)
             check("a-warm-plan-rotated", a, "EXECUTE pinned", parent, parent_rows, **rotated)
-            with login(db, role_a) as reopened:
+            with login(db, role_a, login_env[role_a]) as reopened:
                 reopened_login, = reopened(who)
                 assert reopened_login.startswith(f"{role_a}:{role_a}:") and reopened_login != login_a
                 check("a-reopened-rotated", reopened,
@@ -460,6 +496,9 @@ def exercise_tenants(db, parent, child, sibling, primary, secondary):
 def main():
     if not __debug__:
         raise RuntimeError("the smoke requires Python assertions")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tls-root-cert", help="use verify-full TCP and SCRAM for the tenant logins")
+    args = parser.parse_args()
     db = "bound_" + uuid.uuid4().hex
     table = f"iceberg.{db}.events"
     other = f"iceberg.{db}.events_old"
@@ -495,7 +534,10 @@ def main():
             ):
                 actual = trino(f"SELECT id FROM {source} FOR VERSION AS OF {pin} ORDER BY id")
                 assert actual == expected, (source, pin, actual)
-            exercise_tenants(db, parent, child, sibling, enrolled, catalog_identity(db, "events_old"))
+            exercise_tenants(db, parent, child, sibling, enrolled, catalog_identity(db, "events_old"),
+                             args.tls_root_cert)
+            if args.tls_root_cert:
+                print(json.dumps({"check": "scoped_tls_scram", "refusals": ["hostname", "password", "cleartext"]}), flush=True)
         finally:
             trino(f"DROP TABLE IF EXISTS {other}")
             trino(f"DROP TABLE IF EXISTS {table}")
