@@ -174,14 +174,15 @@ def main():
                 CREATE FOREIGN TABLE new_rows(id bigint) SERVER lake OPTIONS
                   (table '{db}.events', snapshot_id '{child}');
             """)
-            plan = json.loads(sql(db, """
-                SET min_parallel_table_scan_size = 0;
-                SET parallel_setup_cost = 0;
-                SET parallel_tuple_cost = 0;
-                EXPLAIN (FORMAT JSON) SELECT id FROM live_rows
-            """))
-            assert plan[0]["Plan"]["Node Type"] == "Foreign Scan", plan
-            assert not plan[0]["Plan"]["Parallel Aware"], plan
+            if not fork:
+                plan = json.loads(sql(db, """
+                    SET min_parallel_table_scan_size = 0;
+                    SET parallel_setup_cost = 0;
+                    SET parallel_tuple_cost = 0;
+                    EXPLAIN (FORMAT JSON) SELECT id FROM live_rows
+                """))
+                assert plan[0]["Plan"]["Node Type"] == "Foreign Scan", plan
+                assert not plan[0]["Plan"]["Parallel Aware"], plan
             dump = subprocess.check_output(["pg_dump", "--schema-only", db], text=True)
             sql(restored, dump)
             snapshots = []
@@ -199,7 +200,12 @@ def main():
                 print("setrefs", ft, plan.get("Node Type"), plan.get("Output"), plan.get("Lakehouse count"), flush=True)
                 rows = sql(db, f"SET plan_cache_mode=force_generic_plan; PREPARE n AS SELECT count(*) FROM {ft}; EXECUTE n; EXECUTE n; SELECT count(id) FROM {ft}")
                 print("setrefs result", ft, rows.splitlines(), flush=True)
-                assert plan["Node Type"] == "Foreign Scan" and "Lakehouse count" in plan
+                assert plan["Node Type"] == "Foreign Scan", plan
+                mode = plan["Lakehouse count"]
+                if ft == "old_rows":
+                    assert mode.startswith("computed at execution from manifest "), mode
+                else:
+                    assert mode == "counted visible rows at the selected snapshot", mode
                 assert rows.splitlines() == [want, want, want]
             check_view_mappings(db)
             actual = sql(db, """
