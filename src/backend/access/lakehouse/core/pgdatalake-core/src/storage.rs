@@ -172,16 +172,18 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+// A new network handle must get bytes from the store before serving a cache
+// hit. The same credentials can have different permissions after reopening.
+static NEXT_REMOTE_CACHE_SCOPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// An open handle to one object-store location.
 ///
 /// Cheap to CLONE (the store is behind an Arc): P0b's `RangedReader` owns
 /// a clone because parquet's `ChunkReader` consumers require 'static.
 #[derive(Clone)]
 pub struct StorageIo {
-    /// Cache namespace (spec 15 §6.2): endpoint+bucket for S3-family
-    /// stores, local-root for file stores — paths are only unique within
-    /// a warehouse, so every cached key is scoped by this.
-    pub scope_id: String,
+    /// Storage cache identity. Clones share an open handle's identity.
+    pub(crate) scope_id: std::sync::Arc<str>,
     store: std::sync::Arc<dyn ObjectStore>,
 }
 
@@ -233,18 +235,19 @@ impl StorageIo {
         // bucket), or relative to the prefix for Local (which is why the
         // local store is opened rooted). No re-prefixing happens here.
         //
-        // cache namespace: endpoint+bucket (S3), the local root, or the
-        // http URL — the only globally-unique identity of a store
         let scope_id = match loc {
             Location::Local { root } => format!("local:{root}"),
-            Location::S3 { bucket, .. } => format!(
-                "s3:{}:{bucket}",
-                s3.and_then(|o| o.endpoint.as_deref()).unwrap_or("aws")
-            ),
-            Location::Http { url } => format!("http:{url}"),
+            Location::S3 { .. } | Location::Http { .. } => {
+                use std::sync::atomic::Ordering::Relaxed;
+
+                let scope = NEXT_REMOTE_CACHE_SCOPE
+                    .try_update(Relaxed, Relaxed, |id| id.checked_add(1))
+                    .map_err(|_| StorageError::Config("remote cache scope exhausted".into()))?;
+                format!("remote:{scope}")
+            }
         };
         Ok(Self {
-            scope_id,
+            scope_id: scope_id.into(),
             store: std::sync::Arc::from(store),
         })
     }

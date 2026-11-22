@@ -1,14 +1,11 @@
-//! Immutable-path block cache (spec 15 §6.2, slice P0). Iceberg data,
-//! manifest and metadata objects are immutable — a rewritten table
-//! produces NEW paths — so a cached byte range for path P is correct for
-//! P forever. THERE IS NO INVALIDATION PATH by construction: capacity
-//! eviction only (LRU). The namespace must include the warehouse (a
-//! path is only unique within its warehouse — caller responsibility,
-//! see `BlockCache::scoped_key`).
+//! Bounded byte cache for immutable Iceberg objects (spec 15 §6.2).
+//! Remote entries belong to the open storage handle that fetched them.
+//! Clones can reuse its bytes. A new handle must fetch under its current
+//! storage authorization. Entries are evicted by capacity.
 
 use crate::storage::{StorageError, StorageIo};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// One cached entry: bytes + position in the LRU order.
 struct Entry {
@@ -16,18 +13,24 @@ struct Entry {
     tick: u64,
 }
 
-/// Thread-safe byte-capable LRU of byte ranges. Keys are
-/// `(scoped_key, offset, len)` where `scoped_key` embeds the warehouse
-/// (see below). Eviction is capacity-only: inserting past `max_bytes`
-/// evicts least-recently-used entries until the new entry fits (a
-/// single entry larger than the cap is NOT cached).
+/// Thread-safe LRU for object bytes and ranges. Keys include the storage
+/// handle, caller namespace, object key and range. Entries larger than
+/// the capacity pass through uncached.
 pub struct BlockCache {
     inner: Mutex<CacheInner>,
     max_bytes: u64,
 }
 
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct CacheKey {
+    storage: Arc<str>,
+    scope: String,
+    key: String,
+    range: Option<(u64, u64)>,
+}
+
 struct CacheInner {
-    map: HashMap<String, Entry>,
+    map: HashMap<CacheKey, Entry>,
     used: u64,
     tick: u64,
     hits: u64,
@@ -53,10 +56,13 @@ impl BlockCache {
         }
     }
 
-    /// Namespaced key: paths are only unique within a warehouse, so the
-    /// scope string (warehouse/endpoint identity) must prefix the path.
-    fn scoped_key(scope: &str, key: &str, offset: u64, len: u64) -> String {
-        format!("{scope}\u{1}{key}\u{1}{offset}\u{1}{len}")
+    fn scoped_key(io: &StorageIo, scope: &str, key: &str, range: Option<(u64, u64)>) -> CacheKey {
+        CacheKey {
+            storage: io.scope_id.clone(),
+            scope: scope.to_owned(),
+            key: key.to_owned(),
+            range,
+        }
     }
 
     /// Ranged GET through the cache: hit = bytes served without I/O,
@@ -71,7 +77,7 @@ impl BlockCache {
         offset: u64,
         len: u64,
     ) -> Result<Vec<u8>, StorageError> {
-        let sk = Self::scoped_key(scope, key, offset, len);
+        let sk = Self::scoped_key(io, scope, key, Some((offset, len)));
         {
             let mut inner = self.inner.lock().unwrap();
             inner.tick += 1;
@@ -103,9 +109,7 @@ impl BlockCache {
         scope: &str,
         key: &str,
     ) -> Result<Vec<u8>, StorageError> {
-        // whole-object entries key on (scope, key, 0, 0) — ranges never
-        // collide with them because their keys carry a real offset
-        let sk = Self::scoped_key(scope, key, 0, 0);
+        let sk = Self::scoped_key(io, scope, key, None);
         {
             let mut inner = self.inner.lock().unwrap();
             inner.tick += 1;
@@ -132,7 +136,7 @@ impl BlockCache {
     /// Cache-fill with capacity-only LRU eviction (immutable-path law:
     /// this is the ONLY way entries leave the cache). Oversized entries
     /// pass through uncached.
-    fn fill(&self, sk: String, bytes: Vec<u8>) {
+    fn fill(&self, sk: CacheKey, bytes: Vec<u8>) {
         let mut inner = self.inner.lock().unwrap();
         let cost = bytes.len() as u64;
         let max = self.max_bytes;
@@ -197,7 +201,7 @@ pub fn global() -> &'static BlockCache {
 /// manifest / manifest-list paths are immutable per snapshot — no
 /// invalidation path exists. Byte-identity with `io.get_bytes`.
 pub fn cached_get_bytes(io: &StorageIo, key: &str) -> Result<Vec<u8>, StorageError> {
-    global().get_bytes(io, &io.scope_id, key)
+    global().get_bytes(io, "", key)
 }
 
 /// Ranged GET through the global cache — the ranged counterpart of
@@ -210,7 +214,7 @@ pub fn cached_get_range(
     offset: u64,
     len: u64,
 ) -> Result<Vec<u8>, StorageError> {
-    global().get_range(io, &io.scope_id, key, offset, len)
+    global().get_range(io, "", key, offset, len)
 }
 
 #[cfg(test)]
@@ -278,6 +282,87 @@ mod tests {
         // other scope: miss -> real GET -> NotFound (scopes never collide)
         let err = cache.get_range(&io, "wh-b", "data/blob.bin", 0, 10);
         assert!(matches!(err, Err(StorageError::NotFound(_))));
+    }
+
+    #[test]
+    fn fresh_remote_handle_checks_storage_even_after_cache_is_warm() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let location = crate::storage::Location::S3 {
+            bucket: "fixture".into(),
+            key: "table".into(),
+        };
+        let options = crate::storage::S3Options {
+            endpoint: Some(format!("http://{}", server.server_addr())),
+            region: Some("us-east-1".into()),
+            access_key_id: Some("test".into()),
+            secret_access_key: Some("test".into()),
+            path_style: true,
+        };
+        let responder = std::thread::spawn(move || {
+            for (index, is_range) in [false, true, false, true].into_iter().enumerate() {
+                let request = server
+                    .recv_timeout(std::time::Duration::from_secs(4))
+                    .unwrap()
+                    .expect("each fresh read must consult the store");
+                assert_eq!(request.method(), &tiny_http::Method::Get);
+                assert!(request.url().ends_with("/table/manifest.avro"));
+                let range = request.headers().iter().find(|h| h.field.equiv("Range"));
+                assert_eq!(
+                    range.map(|h| h.value.as_str()),
+                    is_range.then_some("bytes=0-2")
+                );
+
+                // Revoke at the store after the initial whole object and range reads.
+                let mut response = if index >= 2 {
+                    tiny_http::Response::from_string("access denied").with_status_code(403)
+                } else if is_range {
+                    tiny_http::Response::from_string("row").with_status_code(206)
+                } else {
+                    tiny_http::Response::from_string("rows")
+                };
+                if index < 2 {
+                    for (name, value) in [
+                        ("ETag", "\"fixture\""),
+                        ("Last-Modified", "Sat, 21 Nov 2026 14:00:00 GMT"),
+                    ] {
+                        response.add_header(tiny_http::Header::from_bytes(name, value).unwrap());
+                    }
+                    if is_range {
+                        response.add_header(
+                            tiny_http::Header::from_bytes("Content-Range", "bytes 0-2/4").unwrap(),
+                        );
+                    }
+                }
+                request.respond(response).unwrap();
+            }
+        });
+        let cache = BlockCache::new(1024);
+        let authorized = StorageIo::open(&location, Some(&options)).unwrap();
+        let key = "table/manifest.avro";
+        assert_eq!(cache.get_bytes(&authorized, "", key).unwrap(), b"rows");
+        assert_eq!(cache.get_range(&authorized, "", key, 0, 3).unwrap(), b"row");
+
+        let same_handle = authorized.clone();
+        assert_eq!(cache.get_bytes(&same_handle, "", key).unwrap(), b"rows");
+        assert_eq!(
+            cache.get_range(&same_handle, "", key, 0, 3).unwrap(),
+            b"row"
+        );
+        assert_eq!(cache.counters(), (2, 2));
+
+        // The credentials can remain identical while the provider revokes access.
+        let reopened = StorageIo::open(&location, Some(&options)).unwrap();
+        assert!(matches!(
+            cache.get_bytes(&reopened, "", key),
+            Err(StorageError::Http(_))
+        ));
+        assert!(matches!(
+            cache.get_range(&reopened, "", key, 0, 3),
+            Err(StorageError::Http(_))
+        ));
+        responder.join().unwrap();
+        assert_eq!(cache.counters(), (2, 4));
+        assert_eq!(cache.fetched_bytes(), 7);
     }
 
     /// Capacity law: inserting past the cap evicts LRU entries; the cap
