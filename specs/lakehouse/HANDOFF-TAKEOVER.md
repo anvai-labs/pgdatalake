@@ -4,6 +4,11 @@ This document is the single entry point for a fresh session taking over
 the lakehouse fork. Read it top to bottom; every claim links to its
 authoritative source.
 
+For release qualification, start with the
+[2026-11-21 reassessment](16-release-reassessment-and-scale.md). It records
+outstanding COUNT, publication and resource-boundary gates and updates
+the performance work order below.
+
 ## 1. Vision (one paragraph)
 
 pgdatalake is a Postgres fork that natively speaks Apache Iceberg: FDW
