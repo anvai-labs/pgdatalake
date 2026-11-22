@@ -186,6 +186,7 @@ jobs:
           sh src/test/lakehouse/fixtures/cow-delete-guard.sh
           python3 src/test/lakehouse/fixtures/catalog-reply-loss-check.py
           COUNT_FORK_SMOKE=1 python3 src/test/lakehouse/fixtures/fdw-count-check.py
+          python3 src/test/lakehouse/fixtures/scoped-read-check.py
           rust_target="$PWD/build/src/backend/access/lakehouse/rust-target"
           (
             cd src/backend/access/lakehouse/core
@@ -225,6 +226,7 @@ jobs:
           trap 'pg_ctl -D "$PGHOST/data" -m fast -w stop' EXIT
           python3 src/test/lakehouse/fixtures/stock-fdw-check.py --receipt "$RUNNER_TEMP/stock-reader.json"
           python3 src/test/lakehouse/fixtures/fdw-count-check.py
+          python3 src/test/lakehouse/fixtures/scoped-read-check.py
 
       - name: Collect installed stock package for downstream tests
         run: |

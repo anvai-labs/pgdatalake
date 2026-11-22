@@ -146,13 +146,37 @@ impl std::error::Error for RestError {}
 
 impl RestCatalog {
     pub fn new(endpoint: &str, tokens: Box<dyn TokenProvider>) -> Result<Self, RestError> {
+        Self::with_read_client(
+            endpoint,
+            tokens,
+            reqwest::blocking::Client::builder().redirect(same_origin_redirect_policy()),
+        )
+    }
+
+    pub(crate) fn new_for_bound_read(
+        endpoint: &str,
+        tokens: Box<dyn TokenProvider>,
+    ) -> Result<Self, RestError> {
+        Self::with_read_client(
+            endpoint,
+            tokens,
+            reqwest::blocking::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .no_proxy(),
+        )
+    }
+
+    fn with_read_client(
+        endpoint: &str,
+        tokens: Box<dyn TokenProvider>,
+        client: reqwest::blocking::ClientBuilder,
+    ) -> Result<Self, RestError> {
         Ok(Self {
             endpoint: endpoint.trim_end_matches('/').to_string(),
             tokens,
             commit_client: std::sync::OnceLock::new(),
-            inner: reqwest::blocking::Client::builder()
+            inner: client
                 .timeout(Duration::from_secs(30))
-                .redirect(same_origin_redirect_policy())
                 .build()
                 .map_err(|e| RestError::Http(e.to_string()))?,
             prefix: std::sync::Mutex::new(None),

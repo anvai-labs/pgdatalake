@@ -406,6 +406,31 @@ pub(crate) fn ensure_within_table_root(
     Ok(())
 }
 
+pub(crate) fn open_read_object(
+    uri: &str,
+    s3: Option<&S3Options>,
+    root: Option<&crate::read_binding::S3ReadRoot>,
+) -> Result<(StorageIo, String), StorageError> {
+    match root {
+        Some(root) => root.open(
+            uri,
+            s3.ok_or_else(|| StorageError::Config("bound scan has no S3 options".into()))?,
+        ),
+        None => open_for(uri, s3),
+    }
+}
+
+fn check_read_object(
+    uri: &str,
+    metadata_root: &str,
+    bound_root: Option<&crate::read_binding::S3ReadRoot>,
+) -> Result<(), StorageError> {
+    match bound_root {
+        Some(root) => root.check_object(uri),
+        None => ensure_within_table_root(uri, metadata_root),
+    }
+}
+
 /// Plan a scan of the given table metadata. `selector = None` selects the
 /// current snapshot; a selector that resolves to nothing is a `NotFound`
 /// (doc 02 §2 pin semantics — `FOR … AS OF`, slice 19). `s3` carries
@@ -416,6 +441,16 @@ pub fn plan_scan(
     selector: Option<&SnapshotSelector>,
     s3: Option<&S3Options>,
     predicate: Option<&ScanPredicate>,
+) -> Result<ScanPlan, StorageError> {
+    plan_scan_with_root(md, selector, s3, predicate, None)
+}
+
+pub(crate) fn plan_scan_with_root(
+    md: &TableMetadata,
+    selector: Option<&SnapshotSelector>,
+    s3: Option<&S3Options>,
+    predicate: Option<&ScanPredicate>,
+    bound_root: Option<&crate::read_binding::S3ReadRoot>,
 ) -> Result<ScanPlan, StorageError> {
     let snapshot = match selector {
         Some(sel) => md.resolve_snapshot(sel).ok_or_else(|| {
@@ -444,8 +479,8 @@ pub fn plan_scan(
     };
 
     // 13-review #6: scope every hop to the table's own location root
-    ensure_within_table_root(&snapshot.manifest_list, &md.location)?;
-    let (list_io, list_key) = open_for(&snapshot.manifest_list, s3)?;
+    check_read_object(&snapshot.manifest_list, &md.location, bound_root)?;
+    let (list_io, list_key) = open_read_object(&snapshot.manifest_list, s3, bound_root)?;
     let list_bytes = crate::cache::cached_get_bytes(&list_io, &list_key)?;
     let list_entries = parse_manifest_list(&list_bytes)?;
 
@@ -492,8 +527,8 @@ pub fn plan_scan(
                 mle.manifest_path, mle.partition_spec_id
             )));
         }
-        ensure_within_table_root(&mle.manifest_path, &md.location)?;
-        let (io, key) = open_for(&mle.manifest_path, s3)?;
+        check_read_object(&mle.manifest_path, &md.location, bound_root)?;
+        let (io, key) = open_read_object(&mle.manifest_path, s3, bound_root)?;
         let bytes = crate::cache::cached_get_bytes(&io, &key)?;
         for e in parse_manifest(&bytes)? {
             // DELETED entries are history, not data (doc 06 §2)
@@ -502,7 +537,7 @@ pub fn plan_scan(
                 continue;
             }
             // 13-review #6: data/delete file paths stay inside the root too
-            ensure_within_table_root(&e.data_file.file_path, &md.location)?;
+            check_read_object(&e.data_file.file_path, &md.location, bound_root)?;
             live.push((mle, e));
         }
     }
@@ -585,11 +620,20 @@ pub fn load_row_deletes(
     s3: Option<&S3Options>,
     schema: &crate::catalog::metadata::Schema,
 ) -> Result<crate::parquet::LoadedDeletes, StorageError> {
+    load_row_deletes_with_root(plan, s3, schema, None)
+}
+
+pub(crate) fn load_row_deletes_with_root(
+    plan: &ScanPlan,
+    s3: Option<&S3Options>,
+    schema: &crate::catalog::metadata::Schema,
+    bound_root: Option<&crate::read_binding::S3ReadRoot>,
+) -> Result<crate::parquet::LoadedDeletes, StorageError> {
     use crate::parquet::{CellValue, EqDeleteMatch, LoadedDeletes};
 
     let mut loaded = LoadedDeletes::default();
     for t in &plan.delete_tasks {
-        let (io, key) = open_for(&t.entry.data_file.file_path, s3)?;
+        let (io, key) = open_read_object(&t.entry.data_file.file_path, s3, bound_root)?;
 
         // v3 deletion vectors: a PUFFIN-format delete file carries DV
         // blobs, each naming its referenced data file via a blob property;

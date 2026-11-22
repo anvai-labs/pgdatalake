@@ -178,23 +178,23 @@ ExtractManagedIdentity(Oid relid, LakehouseOptions *opts)
 		ForeignServer *server = GetForeignServer(serverid);
 		ListCell   *lc;
 
-		if (opts->endpoint == NULL || opts->warehouse == NULL ||
-			opts->s3_endpoint == NULL)
+		foreach(lc, server->options)
 		{
-			foreach(lc, server->options)
-			{
-				DefElem    *def = (DefElem *) lfirst(lc);
+			DefElem    *def = (DefElem *) lfirst(lc);
 
-				if (strcmp(def->defname, "endpoint") == 0 &&
-					opts->endpoint == NULL)
-					opts->endpoint = defGetString(def);
-				else if (strcmp(def->defname, "warehouse") == 0 &&
-						 opts->warehouse == NULL)
-					opts->warehouse = defGetString(def);
-				else if (strcmp(def->defname, "s3_endpoint") == 0 &&
-						 opts->s3_endpoint == NULL)
-					opts->s3_endpoint = defGetString(def);
-			}
+			if (lakehouse_IsBoundServerOption(def->defname))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("managed tables cannot use a bound read server")));
+			if (strcmp(def->defname, "endpoint") == 0 &&
+				opts->endpoint == NULL)
+				opts->endpoint = defGetString(def);
+			else if (strcmp(def->defname, "warehouse") == 0 &&
+					 opts->warehouse == NULL)
+				opts->warehouse = defGetString(def);
+			else if (strcmp(def->defname, "s3_endpoint") == 0 &&
+					 opts->s3_endpoint == NULL)
+				opts->s3_endpoint = defGetString(def);
 		}
 		{
 			UserMapping *um = GetUserMapping(GetUserId(), serverid);
