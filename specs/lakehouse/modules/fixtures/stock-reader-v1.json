@@ -32,6 +32,8 @@
     {"id":"managed-extension", "receipt_patch":{"extension_version":"1.6"}, "expect":"build_mismatch"},
     {"id":"other-storage-profile", "request_patch":{"profile":"real-aws-s3"}, "expect":"profile_mismatch"},
     {"id":"managed-request", "request_patch":{"required":["managed_append"]}, "expect":"capability_missing"},
+    {"id":"view-mapping-check-absent","request_patch":{"required":["view_mapping_roles"]},"expect":"capability_missing"},
+    {"id":"view-mapping-check-present","request_patch":{"required":["published_serial_scan","view_mapping_roles"]},"receipt_patch":{"passed":["published_serial_scan","view_mapping_roles"]},"expect":"eligible_for_hosted_test"},
     {"id":"extra-claim-cannot-enable-managed", "receipt_patch":{"passed":["managed_append"]}, "request_patch":{"required":["managed_append"]}, "expect":"capability_missing"},
     {"id":"missing-pin-check", "receipt_patch":{"passed":["published_serial_scan"]}, "expect":"capability_missing"},
     {"id":"duplicate-row-lost", "receipt_patch":{"parent":{"snapshot_id":"9007199254740993","rows":[10,20,30]}}, "expect":"invalid_evidence"},
