@@ -2,6 +2,8 @@
 
 **Product snapshot at merged `lakehouse-dev` revision `90518dca8cca37348dc5da64305f782b267a18d6` (PR #47).** The PG19.0 serial source-package smoke is implemented. Managed foreground binding, verified worker recovery and compatible base-plus-overlay reads remain open. The [illustrated product map](17-anvai-lake-product.md#two-packages-one-shared-reader) ties each claim to its test and shows the order of the next correctness gates. The assessment below retains the historical findings at PR #45 and the original [performance baseline](16-release-reassessment-and-scale.md).
 
+**Managed COUNT blocker.** On the 1.6 fork a prepared COUNT returned 1 after an uncommitted insert while the same backend scanned `[10,20]`. Both paths agreed on 1 after rollback. The [minimal SQL case and exit condition](modules/03-managed-visibility.md#first-red-case-for-managed-count) belong to the managed visibility owner. The stock reader remains read-only.
+
 ## Stock read foundation following PR #46
 
 Base `8ed4cbab0b0`. On upstream PG19.0 (`5c839a2a08b`), the original planner failed to compile at the fork-only RTE field; clean SQL installation returned `0A000`. The [PGXS source package](../../src/backend/access/lakehouse/stock/README.md) now installs and runs the read-only surface on that release. The fork's assertion build passed 243 upstream subtests and 11 lakehouse SQL groups. One final local stock smoke took 12.18 seconds including Trino DDL and cleanup. Stock PG, schema-only dump/restore and Trino returned exactly `[10,20,20,30]` at snapshot `184327008694008591` and `[10,20,30]` at `1130167751514016848`. This sample measures fixture duration. Query p95/p99 and deployment SLOs are unmeasured.
