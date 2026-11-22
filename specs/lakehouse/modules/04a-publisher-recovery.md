@@ -52,6 +52,16 @@ The 1.5 provider retains one immutable attempt per claim. It supports a lookup-o
 
 The [intent smoke](../../../src/test/lakehouse/fixtures/publication-intent-check.py) upgrades a 1.4 claim, parks and fences an old owner, races two current authorizers, and inspects the winner's WAL commit record with `pg_walinspect`. It repeats authorization after an immediate database restart and exercises rollback, mismatched evidence, exact segment completion, and a second claim.
 
+## Exact proposal retention in extension 1.6
+
+The authorization call now takes the exact prepared POST body as `bytea` in addition to its SHA-256 digest. The worker supplies the body, digest, expected parent and proposed snapshot ID from the same prepared Rust value. PostgreSQL validates the 1–65,536 byte bound and independently hashes the received bytes. It commits those bytes, the generation and the attempt identity in the same locally flushed transaction before allowing the send. This byte limit covers the request envelope. Payloads, Parquet files and manifest contents live in their existing objects. The staged Rust provider rejects oversized requests and credential-bearing or signed storage locations before authorization.
+
+A recovery worker reads the exact body with its retained hash and binding. It passes that proposal to catalog lookup, which still needs a provider that verifies the introducing snapshot and objects on the intended table and ref. The authorization API forbids another send even if the original worker has disappeared. The ledger rejects attempt edits, deletes and truncation until a receipt-aware retention path is added.
+
+The upgrade preserves digest-only 1.5 intents with a NULL body. They stay reserved for lookup and require independently retained bytes matching the original digest for verification. A missing proposal and insufficient catalog evidence require a hold. The migration cannot infer what was sent from the catalog's current state.
+
+The [intent smoke](../../../src/test/lakehouse/fixtures/publication-intent-check.py) verifies upgrade from 1.5, SHA-256 mismatch, bounds, immutable storage, exact recovery after immediate restart and an unchanged send fence for older intents.
+
 ## When a second append is safe
 
 | Evidence | Decision |
