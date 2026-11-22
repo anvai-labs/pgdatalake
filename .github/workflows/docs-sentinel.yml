@@ -22,3 +22,5 @@ jobs:
         run: python3 -m unittest discover -s scripts/perf -p test_pinned_receipt.py -v
       - name: Check governed-read SQL examples
         run: python3 specs/lakehouse/modules/fixtures/test_governed_read.py -v
+      - name: Check governed-read observation replay
+        run: python3 -m unittest discover -s scripts/qualification -p test_governed_read.py -v

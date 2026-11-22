@@ -74,3 +74,85 @@ and metadata shortcuts in this profile.
    observe a real governed read and distinguish allowed output requests from
    forbidden raw GETs. A fake or algebra test supplies no provider evidence.
    [Downstream qualification](10-downstream-handoff.md) · [BI reuse](02a-bi-reuse.md)
+
+## Replay externally recorded observations
+
+The [observation verifier](../../../scripts/qualification/governed_read.py)
+checks one 18-statement run against the public fixture. Run the following
+command after collecting the files. Success prints `observations_match`.
+The verifier performs offline consistency checks. Provider qualification
+also requires trusted collection and a retained copy of the underlying logs,
+including the authenticated role change, independent reference queries and
+raw-object coverage. Current sentinel coverage uses synthetic observations.
+
+```sh
+python3 scripts/qualification/governed_read.py request.json observations.json
+```
+
+The supervisor records the following fields in the request independently of
+the SQL, reference and trace recorders. Keep receipts free of tokens.
+
+| Request field | Encoding and source |
+|---|---|
+| `version`, `run_id`, `profile`, `authority`, `installation` | Version 1 (integer), new run identifier, exact catalog/auth profile version, catalog authority and database installation. Both files repeat the same header. Establish recorder provenance and profile independently before accepting the files. |
+| `source_uuid`, `ref`, `pins` | Canonical lower-case UUID and the fixture ref. Seed the fixture table, independently record the snapshot produced by each commit and map **each synthetic pin string** to its actual source pin string. The two actual pins must differ. Preserve their canonical signed 64-bit decimal encoding. |
+| `viewers` | Map each fixture viewer label to `principal`, `mapping_role`, `binding_id`, `provider_scope_id` (opaque nonempty strings) and `generation` (positive integer). The two authenticated principals and provider scopes must differ. Bind scope IDs independently to the resource account, audience, user and role. |
+| `attempts` | Map each case ID to a unique supervisor-assigned attempt ID. For each fixture viewer and fixture pin, append one of `rows`, `count`, `aggregates` with slashes, for example `viewer-b/9007199254740991/count`. Use the six fixture refusal names as the remaining keys. Those cases request viewer-a and the original parent pin. |
+
+In each positive case execute a separate ordinary projection of the fixture
+columns, a standalone `SELECT count(*)`, or `SELECT count(*), count(amount),
+sum(amount)` according to the case suffix. Run each positive statement under
+the actual viewer in the provider's independent governed engine at the same
+source pin. Use a fresh governed plan for each SQL statement in this replay.
+Collect every returned row with its SQL types. JSON uses integer values for the
+fixture's integral columns and JSON null for SQL NULL. Preserve duplicates.
+A pre-delivery refusal must carry zero returned rows.
+
+The observation file contains three arrays named `sql`, `reference`, and
+`trace`. Each record carries `attempt_id` and a `context` object with the
+five viewer fields plus `source_uuid`, `ref` and `requested_pin`. Correlate
+at record time using each connection, reference query and transport attempt.
+Derive actual effective identities from trusted SQL/provider session evidence;
+blindly copying assignment fields into observations defeats this check.
+
+| Stream | Required evidence |
+|---|---|
+| `sql` | Exactly one terminal result per attempt, including failures. Supply `status` (`ok` or fixture refusal), `rows` (array of row arrays) and on success `plan_id`, an opaque, nonsecret correlation ID for the protected plan the reader consumed. |
+| `reference` | One record for every positive attempt. Supply the independently observed `source_pin`, actual provider `effective_scope_id` and actual `rows` for the same SQL shape. |
+| `trace` | One record for every attempt, including pre-dispatch refusal. Include `complete` (true only for complete capture) and nonnegative integer `remote_requests`, `governed_plans` and `raw_requests`. Count reader-origin outbound requests including retries, the subset that requested protected planning, and all reader requests to underlying raw objects, respectively. Exclude the independent reference engine. On success record `fault: null`, the plan's actual `plan_id`, independently observed provider `effective_scope_id`, and provider-confirmed **source** `source_pin`; a temporary output pin or requested pin copied into this field cannot establish that proof. A decline carries the independently confirmed injected fault name in `fault`. |
+
+On positive traces include `output` with `plan_id`, `kind` and a positive
+integer `consumed_bytes`. Count authorized payload bytes actually consumed
+from a permitted protected object or a nonempty provider inline result.
+Use `protected_object` or `protected_inline` respectively. For an object
+read the trace also includes the reader's distinct output request. The plan
+ID must identify the consumed provider-authorized handle, independently
+visible to the SQL adapter and trace. A request ID generated by the SQL
+client alone does not establish this link. Use scoped provider provenance
+when the underlying object paths recur across contexts.
+
+For `generation-changed-during-fill`, capture `fill` with nonnegative recorder
+sequence numbers `started_seq`, `changed_seq` and `refused_seq` in strictly
+increasing order. Supply the independently observed higher `new_generation`
+of the same enrolled grant. Start this case with a cold fill and observe its
+protected-plan request. For `pin-expired`, capture the authority's
+negative reply in `pin_lookup` with `source_pin` set to the requested actual
+pin and `status` equal to `absent`.
+
+A complete trace spans the request through completion or cancellation,
+including concurrent fetches. Independently classify underlying raw objects
+and authorized protected output. Include all observed reader destinations in
+that classification. Mark incomplete or unclassified traces accordingly.
+A live supervisor must reconcile attempted request counts against the proxy
+or provider recorder, preserve backend/build IDs separately, confirm fault
+injection and retain source-to-produced-plan provenance. Refusal testing for
+revocation before dispatch requires zero outbound requests. The four
+provider-response fault tests exercise the actual planning route. A run that
+fails early without reaching that route cannot qualify those cases.
+
+The [synthetic recorder example and negative controls](../../../scripts/qualification/test_governed_read.py)
+also show the serialized fields and deliberate corruptions. The CLI exits
+nonzero for mismatched, ambiguous or missing evidence. A passing run covers
+the stated synthetic dataset and cases. Session reuse, waiters, rotation,
+real revocation propagation, live grants, stream interruption and multi-node
+operation retain their separate release gates.
