@@ -8,22 +8,25 @@ table), never authoritative metadata, with one exception: managed tables carry a
 `pg_lakehouse_table` row so a dropped/renamed Postgres table can be reconciled
 against the remote catalog at next refresh.
 
-## 1. Priority order
+## 1. Delivery order
 
-| Tier | Catalog | v1 | Notes |
-|---|---|---|---|
-| 1 | **REST** (`rest`) | create/read/write | The universal target: Polaris, Unity Catalog, Nessie REST, S3 Tables, SigV4 Glue REST, Tabulario, Lakekeeper, Gravitino. Auto-profile via `GET /v1/config`. |
-| 2 | **AWS Glue** (`glue`) | create/read/write | Native SigV4; Iceberg REST endpoints on Glue also reachable as `rest` profile; `glue` type exists because Lake Formation credentials differ. |
-| 3 | **Nessie** (`nessie`, native API) | create/read/write | Branch/commit model maps beautifully onto our ref model; REST profile preferred when available. |
-| 4 | **Hadoop/HMS** (`hadoop`, `hive`) | read-only (v1) | Legacy; sufficient for migration reads. |
-| 5 | JDBC (`jdbc`) | deferred | Requires an embedded client; REST covers most JDBC deployments' equivalents. |
+| Track | First capability | Release dependency |
+|---|---|---|
+| Reference Iceberg REST | Read-only FDW on Lakekeeper. Pin the catalog, storage and independent engine used in the fixture. | Complete the self-hosted read pilot and keep the Lakekeeper publication and recovery test separate. |
+| Additional REST profiles | Begin with Apache Polaris on the same object-store fixture. Use one profile each for Nessie REST, Unity Catalog OSS and managed provider services. | The same read oracle plus each provider's route, authorization, credential and table-class controls. |
+| Hive Metastore and Hadoop | Read-only migration and reconciliation for an already-published Iceberg table. | Use a supported Iceberg REST bridge or explicitly migrate the table using Iceberg tooling. Direct legacy clients require a separate demand and authorization gate. |
+| Additional protocols | Demand-driven follow-up, including native Nessie APIs and JDBC. | Identify a concrete operation that the REST or migration path cannot serve. |
+
+The [catalog profile roadmap](modules/09-cloud-profiles.md#catalog-expansion-after-lakekeeper) assigns ownership, distinct profiles and promotion tests. The [Iceberg REST specification](https://iceberg.apache.org/rest-catalog-spec/) is the protocol baseline.
 
 ## 2. REST catalog conformance (the big one)
 
 Implement the Iceberg REST openapi spec exactly:
 
-- `GET /v1/config` → server capabilities, defaults (`defaults`, `overrides` config
-  merge order: catalog `overrides` > table properties > `defaults` > client).
+- Where the profile uses `GET /v1/config`, allowlist the returned configuration fields.
+  Keep the operator-enrolled authority, expected UUID, permitted ref and storage roots
+  authoritative. The bound Lakekeeper pilot uses a preconfigured route and storage
+  settings. A profile that vends credentials needs an explicit trust and expiry contract.
 - OAuth2 client credentials flow (`/v1/oauth/tokens`) with proactive refresh at
   80% of token TTL; also accept bearer tokens, SigV4 signing (AWS REST profiles),
   and Azure Entra tokens (Polaris-on-ADLS deployments).
@@ -45,11 +48,10 @@ Implement the Iceberg REST openapi spec exactly:
   a transaction journal in `pg_lakehouse_table`).
 - View endpoints, `registerTable`, plan-table endpoints: v2.
 
-Header/feature negotiation table lives in code as a
-`RestProfile { polaris, unity, nessie_rest, s3tables, glue_rest, generic }` enum —
-profile quirks (e.g., Polaris's namespace-flattening, S3 Tables' regional
-endpoints, Unity's `catalog.schema.table` three-level namespacing) are data, not
-code paths.
+Treat route selection, required headers, credential mode and operation
+support as explicit profile capabilities. Keep the same pinned reader and
+commit/recovery contracts across compatible profiles. Add provider-specific code
+only where its authentication, routing or protocol semantics require it.
 
 ## 3. Namespace ↔ Postgres mapping
 
