@@ -10,7 +10,7 @@
 CREATE EXTENSION IF NOT EXISTS lakehouse;
 NOTICE:  extension "lakehouse" already exists, skipping
 ALTER EXTENSION lakehouse UPDATE; -- managed_count (v1.3)
-NOTICE:  version "1.4" of extension "lakehouse" is already installed
+NOTICE:  version "1.5" of extension "lakehouse" is already installed
 SELECT lakehouse.version();
           version           
 ----------------------------
