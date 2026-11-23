@@ -71,6 +71,33 @@ The worker checks the expected generation and retained body, copies the typed re
 
 CI exercises a lost catalog reply and a lost PostgreSQL authorization acknowledgement through native 1.12 after immediate restart. It moves the owner generation while an exact provider reply is in flight and expects `40001` at finalization with no published flip. A fresh native lookup can finish the same intent. The real joined cut also exercises missing, expired and stale approvals. Native scheduling, shorter-lived provider session tokens and native send activation have separate gates. [Mixed-cut fixture](../../../src/test/lakehouse/fixtures/managed-cut-check.py) · [Restart fixture](../../../src/test/lakehouse/fixtures/bound-publication-restart.py)
 
+### Native send authorization hold
+
+Opt-in 1.13 adds `lakehouse.hold_managed_publication_send` for a trusted internal
+role and one bounded prepared proposal. The function launches a one-shot
+worker on the current active primary. The worker runs the existing
+`authorize_publication_send` procedure through a top-level PostgreSQL portal.
+That procedure locks and rechecks the approved send binding, reads the exact
+membership and persists the prepared request and its digests. Its synchronous
+local commit precedes the returned intent XID. The launcher transfers at most
+64 KiB of prepared bytes and carries no provider credentials in shared memory.
+
+The worker stops after the transaction and reports the held intent as
+lookup-only. Keep it in a controlled operator context. Holding an unsent intent
+reserves the operation and requires later lookup or operator reconciliation.
+The hold receipt supplies no dispatch capability, and the worker makes no
+provider request. The default extension and scheduler retain their existing
+activation gates.
+
+CI races two native hold requests and requires a single authorization. The
+lost-acknowledgement test pauses the worker after the actual WAL-flushed
+authorization, cancels the launcher and restarts PostgreSQL immediately.
+Reopening the ledger must find the original proposal, membership and commit
+record, preserve the later segment and discover the held operation for lookup.
+A repeated attempt cannot authorize another send. Tying this barrier to a
+one-use prepared provider submit capability, independently issued credentials
+and native polling has a separate gate. [Native barrier fixture](../../../src/test/lakehouse/fixtures/native-managed-send-hold-check.py)
+
 ### Discovery and dispatch
 
 Extension 1.9 adds two read-only keyset pages. Both accept a page size of 1 to 1,024. Start with a NULL cursor, advance using the last row even if held and wrap after an empty page. The page reports candidates from one database snapshot. Owners must still use the transactional claim, compare-and-advance and WAL authorization operations after a page is read.
