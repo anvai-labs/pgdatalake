@@ -207,9 +207,9 @@ before loading bytes.
 
 The executor must copy selected payloads into scan-owned memory and verify
 SHA-256 of each copied payload against the sealed expected digest before
-emitting any row. Rescans use the retained copy. It also needs a bounded
-catalog adapter reused by scan planning and a retained object lease or
-equivalent provider proof. Reanchoring beyond retained history needs a
+emitting any row. Rescans use the retained copy. The C executor also needs
+to consume the shared [bounded observation](01-catalog-storage.md) and secure
+a retained object lease or equivalent provider proof. Reanchoring beyond retained history needs a
 durable membership checkpoint.
 
 TableAM must additionally integrate own-command visibility and prove the whole
