@@ -657,10 +657,9 @@ lakehouse_xact_callback(XactEvent event, void *arg)
 						for (k = 0; k < tupdesc->natts; k++)
 						{
 							/*
-							 * dropped attributes are omitted from the schema
-							 * (build_schema_json) and from the row too —
-							 * the cell count must match the column count
-							 * (13-review #8b)
+							 * Omit dropped attributes from the schema and row
+							 * so the cell and column counts match (13-review
+							 * #8b).
 							 */
 							if (TupleDescAttr(tupdesc, k)->attisdropped)
 								continue;
@@ -890,8 +889,8 @@ ensure_in_funcs(LakehouseWriteEntry *entry)
 }
 
 /* schema_json for pg_datalake_write_new, from the relation's tupdesc */
-static char *
-build_schema_json(TupleDesc tupdesc)
+char *
+lakehouse_build_schema_json(TupleDesc tupdesc)
 {
 	StringInfoData buf;
 	bool		first = true;
@@ -1018,7 +1017,7 @@ append_cell_json(StringInfoData *buf, Form_pg_attribute attr, Datum v,
 				break;
 			}
 		default:
-			/* build_schema_json rejected it before we ever got a row */
+			/* Schema validation already rejected this type. */
 			elog(ERROR, "lakehouse: unexpected column type in managed insert");
 	}
 }
@@ -1319,7 +1318,7 @@ get_write_entry(Relation rel)
 	 */
 	bound = lookup_capture_binding(relid, &binding_id);
 	if (bound)
-		pfree(build_schema_json(RelationGetDescr(rel)));
+		pfree(lakehouse_build_schema_json(RelationGetDescr(rel)));
 	if (write_entries == NULL)
 	{
 		HASHCTL		ctl;
@@ -2240,7 +2239,7 @@ open_write_session(LakehouseWriteEntry *entry, TupleDesc tupdesc)
 									  entry->opts.s3_endpoint,
 									  entry->opts.s3_access_key,
 									  entry->opts.s3_secret_key,
-									  build_schema_json(tupdesc),
+									  lakehouse_build_schema_json(tupdesc),
 									  errbuf, sizeof(errbuf));
 	if (entry->ws == NULL)
 		ereport(ERROR,
@@ -2270,7 +2269,7 @@ static void
 load_delta_segments(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 {
 	Oid			relid = RelationGetRelid(scan->rs_base.rs_rd);
-	char	   *schema_json = build_schema_json(tupdesc);
+	char	   *schema_json = lakehouse_build_schema_json(tupdesc);
 	int			ret;
 	int			i;
 
@@ -3403,7 +3402,7 @@ lakehouse_create_remote(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("bound managed capture requires an existing remote table")));
-	schema_json = build_schema_json(RelationGetDescr(rel));
+	schema_json = lakehouse_build_schema_json(RelationGetDescr(rel));
 
 	errbuf[0] = '\0';
 	loc = pg_datalake_create_table(entry->opts.endpoint,

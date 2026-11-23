@@ -128,6 +128,7 @@ extern void install_lakehouse_count_exec(void);
 extern void lakehouse_check_capture_read(Oid relid);
 extern LakehouseWriteEntry *lakehouse_find_write_entry(Oid relid);
 extern LakehouseWriteEntry *get_write_entry(Relation rel);
+extern char *lakehouse_build_schema_json(TupleDesc tupdesc);
 extern void open_write_session(LakehouseWriteEntry *entry, TupleDesc tupdesc);
 extern void register_publisher_worker(void);
 

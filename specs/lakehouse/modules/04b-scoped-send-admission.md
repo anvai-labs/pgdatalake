@@ -173,6 +173,44 @@ credential scope, stale ownership, expired credentials and excess members.
 This qualifies the preparation and lifetime boundary. One-shot native
 authorization and dispatch still require the two reply-loss drills below.
 
+### Native prepare-only diagnostic
+
+Opt-in extension 1.14 adds `lakehouse.prepare_managed_publication_send` for a
+trusted operator worker. Request an acquired operation and generation on an
+active primary from a standalone read-write command with no assigned XID.
+The one-shot PostgreSQL worker loads the exact source layout, ordered
+captured members and current binding under short ledger locks. The operator
+approves a Send-purpose mapping by binding and role in
+`lakehouse.publication_native_send_grants`. This separate record supplies the
+exact approved target, mapping OID and expiry. Keep the server and credentials
+operator-owned and give the worker neither server USAGE nor direct ledger
+mutation privileges. The bounded loader lets this trusted role read its own
+scoped source members. Rotate with a newly approved mapping. The initial
+mapping adapter supplies a catalog bearer and static S3 keys. Hosted issuer
+rotation and temporary session credentials have separate gates.
+
+The worker copies bounded data into its own memory and commits the load
+transaction before provider preparation. It drops the Rust owner before
+processing pending PostgreSQL cancellation, then reports the parent,
+candidate snapshot and request byte count with status
+`prepared_discarded`. A launcher deadline of 20 seconds requests worker
+termination. A provider operation in progress can finish before the worker
+observes termination. A stale or unavailable prerequisite rolls back the
+load and returns SQLSTATE without transmitting provider diagnostics.
+The receipt carries no credentials, exact proposal body or handle. The
+diagnostic creates no WAL send intent and changes no catalog reference.
+
+CI runs the one-shot worker over ordinary captured INSERT with Lakekeeper,
+S3-compatible storage and a Trino pin oracle. It checks wrong role, missing
+or expired approvals, wrong target and stale generation before catalog I/O.
+It also cancels a worker during catalog preparation and forces catalog
+unavailability. The claim, generation and staged duplicates stay unchanged
+on every path. The
+catalog must see zero commit POSTs. Immutable prepared objects may remain
+unreferenced until normal cleanup. Use this diagnostic with a disposable or
+explicitly approved test target. The default extension and publication
+scheduler retain their existing activation gates.
+
 ### Discovery and dispatch
 
 Extension 1.9 adds two read-only keyset pages. Both accept a page size of 1 to 1,024. Start with a NULL cursor, advance using the last row even if held and wrap after an empty page. The page reports candidates from one database snapshot. Owners must still use the transactional claim, compare-and-advance and WAL authorization operations after a page is read.
