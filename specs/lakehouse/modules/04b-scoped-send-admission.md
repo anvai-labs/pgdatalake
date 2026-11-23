@@ -153,7 +153,8 @@ catalog and object credentials, including an optional SigV4 session token.
 The Rust transport compares the two targets before provider I/O. The native
 caller owns role-specific credential enrollment and purpose checks.
 
-Each descriptor is limited to 16 KiB and the schema to 64 KiB. A preparation
+Each descriptor is limited to 16 KiB and the schema to 64 KiB. Credentials
+are length-delimited UTF-8 fields of at most 4 KiB each. A preparation
 accepts at most 1,024 members, 65,536 rows and 8 MiB of capture payload. The
 member payloads use the existing UTF-8 JSON capture format. A refused
 preparation clears the result view and returns no owner. On success, the

@@ -646,10 +646,14 @@ fn native_prepare_exposes_exact_proposal_and_drops_without_post() {
     let mut credentials = PgDatalakeNativeSendCredentials {
         target: target_bytes.as_ptr(),
         target_len: target_bytes.len(),
-        catalog_token: c"catalog-token".as_ptr(),
-        access_key: c"enrolled-key".as_ptr(),
-        secret_key: c"fixture-secret".as_ptr(),
-        session_token: c"send-session".as_ptr(),
+        catalog_token: b"catalog-token".as_ptr(),
+        catalog_token_len: b"catalog-token".len(),
+        access_key: b"enrolled-key".as_ptr(),
+        access_key_len: b"enrolled-key".len(),
+        secret_key: b"fixture-secret".as_ptr(),
+        secret_key_len: b"fixture-secret".len(),
+        session_token: b"send-session".as_ptr(),
+        session_token_len: b"send-session".len(),
         expires_unix_seconds: expiry,
     };
     let mut input = PgDatalakeNativeSendInputs {
@@ -698,6 +702,14 @@ fn native_prepare_exposes_exact_proposal_and_drops_without_post() {
     input.member_count = MAX_PUBLICATION_MEMBERS + 1;
     assert!(prepare(&input, &credentials).0.is_null());
     input.member_count = ffi_members.len();
+    let oversized_token = [b'x'; 4097];
+    let approved_token = credentials.catalog_token;
+    let approved_len = credentials.catalog_token_len;
+    credentials.catalog_token = oversized_token.as_ptr();
+    credentials.catalog_token_len = oversized_token.len();
+    assert!(prepare(&input, &credentials).0.is_null());
+    credentials.catalog_token = approved_token;
+    credentials.catalog_token_len = approved_len;
     {
         let state = remote.state.lock().unwrap();
         assert!(state.reads.is_empty() && state.object_reads.is_empty());

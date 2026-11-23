@@ -1,6 +1,5 @@
 //! Process-local preparation for a native managed publisher.
 
-use std::ffi::{c_char, CStr};
 use std::ptr;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, UNIX_EPOCH};
@@ -32,10 +31,14 @@ const MAX_CREDENTIAL_BYTES: usize = 4 * 1024;
 pub struct PgDatalakeNativeSendCredentials {
     pub target: *const u8,
     pub target_len: usize,
-    pub catalog_token: *const c_char,
-    pub access_key: *const c_char,
-    pub secret_key: *const c_char,
-    pub session_token: *const c_char,
+    pub catalog_token: *const u8,
+    pub catalog_token_len: usize,
+    pub access_key: *const u8,
+    pub access_key_len: usize,
+    pub secret_key: *const u8,
+    pub secret_key_len: usize,
+    pub session_token: *const u8,
+    pub session_token_len: usize,
     pub expires_unix_seconds: u64,
 }
 
@@ -98,14 +101,15 @@ unsafe fn bounded_json<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(std::slice::from_raw_parts(bytes, len)).ok()
 }
 
-unsafe fn credential_string(value: *const c_char) -> Option<String> {
-    if value.is_null() {
+unsafe fn credential_string(value: *const u8, len: usize) -> Option<String> {
+    if value.is_null() || !(1..=MAX_CREDENTIAL_BYTES).contains(&len) {
         return None;
     }
-    let value = CStr::from_ptr(value).to_str().ok()?;
-    (1..=MAX_CREDENTIAL_BYTES)
-        .contains(&value.len())
-        .then(|| value.to_owned())
+    let bytes = std::slice::from_raw_parts(value, len);
+    if bytes.contains(&0) {
+        return None;
+    }
+    Some(std::str::from_utf8(bytes).ok()?.to_owned())
 }
 
 unsafe fn prepare_native_send(
@@ -146,14 +150,21 @@ unsafe fn prepare_native_send(
             target,
             purpose,
             expires_at,
-            catalog_bearer: credential_string(credentials.catalog_token)?,
+            catalog_bearer: credential_string(
+                credentials.catalog_token,
+                credentials.catalog_token_len,
+            )?,
             objects: AwsCredential {
-                key_id: credential_string(credentials.access_key)?,
-                secret_key: credential_string(credentials.secret_key)?,
-                token: if credentials.session_token.is_null() {
+                key_id: credential_string(credentials.access_key, credentials.access_key_len)?,
+                secret_key: credential_string(credentials.secret_key, credentials.secret_key_len)?,
+                token: if credentials.session_token.is_null() && credentials.session_token_len == 0
+                {
                     None
                 } else {
-                    Some(credential_string(credentials.session_token)?)
+                    Some(credential_string(
+                        credentials.session_token,
+                        credentials.session_token_len,
+                    )?)
                 },
             },
         },
@@ -211,8 +222,8 @@ unsafe fn prepare_native_send(
 ///
 /// # Safety
 /// Non-null input pointers must be aligned and readable for the supplied
-/// lengths throughout this call. Credential strings must be readable through
-/// a terminating NUL. Non-null `view` must be aligned, writable, and must not
+/// lengths throughout this call, including UTF-8 credential bytes. Non-null
+/// `view` must be aligned, writable, and must not
 /// alias the inputs. Keep its borrowed body only while the owner lives.
 #[no_mangle]
 pub unsafe extern "C" fn pg_datalake_prepare_managed_send(
