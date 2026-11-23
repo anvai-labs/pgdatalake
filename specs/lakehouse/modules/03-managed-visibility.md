@@ -217,6 +217,41 @@ statement pin vector before first output. The fixture continues to require
 `0A000` from the bound SQL path. Held snapshots exercise the selector under
 real MVCC and leave application Repeatable Read support unqualified.
 
+#### Native statement cut boundary
+
+Start with one supported serial append-only base relation. The executor
+keeps the PostgreSQL statement snapshot and normal permission checks. A
+trusted, fixed SQL ledger call can read private proof data as the ledger
+owner after those checks. Do not select storage credentials as that owner.
+Derive the approved reader binding from the authorized relation and
+current enrollment. Require the original snapshot to recognize that scope.
+Both checks must succeed even after a prepared plan, credential rotation
+or binding invalidation. Decline unsupported query shapes before output
+until every bound relation can be preflighted as one statement cut.
+
+Use one scoped catalog observation for certification and scan planning.
+Obtain current binding, finalized edges and the one pending candidate with
+a bounded fresh committed ledger observation. Restore the original executor
+snapshot before loading visible segments and payloads. Copy the bounded
+proof and payload data out of SPI before remote I/O. Rust only receives
+owned or call-scoped values. PostgreSQL error cleanup stays on the C side.
+Verify the payload bytes against the selected sealed digests and the
+chosen pin against the enrolled source shape before installing the scan
+state. A missing compatible pin, scope mismatch, unavailable payload
+or unproved shape prevents the first row. Keep the legacy published-flag
+loader outside this path.
+
+The retained scan state owns the immutable pin, the ordered overlay
+members, decoded readers and their resource lifetimes. Rescan rewinds its
+base and overlay readers without another catalog resolution or ledger
+selection. EndScan and the executor's error path release both. Portals
+continue using their installed cut across fetches. Object retention
+must protect the selected pin for the supported portal lifetime. Bound
+COUNT continues to decline until it can preserve the same privileges,
+snapshot and cut. Add distinct telemetry for the compatibility refusal,
+origin timeout and oversized proof so operators can distinguish a safe
+refusal from a slow authorized read.
+
 #### SQL executor acceptance
 
 Use a v2 Lakekeeper table with parent pin `P` containing `[10]`. Hold one
