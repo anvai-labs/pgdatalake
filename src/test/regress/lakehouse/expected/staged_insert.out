@@ -156,3 +156,26 @@ SELECT count(*) AS bulk_65_rows FROM bulk_65;
             1
 (1 row)
 
+-- Force a parameterized inner scan to rewind both committed segments and
+-- this transaction's own rows. Keep the duplicate in each result.
+BEGIN;
+INSERT INTO stg VALUES (2, 'own-duplicate');
+SET LOCAL enable_material = off;
+SET LOCAL enable_memoize = off;
+DO $rewind$
+DECLARE
+    results text[];
+BEGIN
+    SELECT array_agg(exact::text ORDER BY lower_bound) INTO results
+    FROM (VALUES (0), (2)) AS requested(lower_bound)
+    CROSS JOIN LATERAL (
+        SELECT array_agg(id ORDER BY id) AS exact
+        FROM stg WHERE id >= requested.lower_bound
+    ) AS scanned;
+
+    IF results IS DISTINCT FROM ARRAY['{1,2,2,3,4}', '{2,2,3,4}'] THEN
+        RAISE EXCEPTION 'staged scan lost rows on rescan: %', results;
+    END IF;
+END
+$rewind$;
+ROLLBACK;

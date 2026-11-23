@@ -1288,6 +1288,17 @@ pub unsafe extern "C" fn pg_datalake_delta_rows_close(h: *mut DeltaRowsHandle) {
     }
 }
 
+/// Rewind the existing decoded payload without reading the ledger again.
+///
+/// # Safety
+/// `h` must be a live handle from `pg_datalake_delta_rows_open`.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_delta_rows_rewind(h: *mut DeltaRowsHandle) {
+    if let Some(rows) = unsafe { h.as_mut() } {
+        rows.row_pos = 0;
+    }
+}
+
 /// # Safety
 /// `h` must be a live handle.
 #[no_mangle]
@@ -4219,6 +4230,15 @@ mod tests {
             unsafe { pg_datalake_delta_rows_next(h, err.as_mut_ptr().cast(), 1024) },
             1,
             "EOF"
+        );
+        unsafe { pg_datalake_delta_rows_rewind(h) };
+        assert_eq!(
+            unsafe { pg_datalake_delta_rows_next(h, err.as_mut_ptr().cast(), err.len()) },
+            0
+        );
+        assert_eq!(
+            unsafe { CStr::from_ptr(pg_datalake_delta_rows_col_text(h, 0)) }.to_bytes(),
+            b"1"
         );
         unsafe { pg_datalake_delta_rows_close(h) };
     }

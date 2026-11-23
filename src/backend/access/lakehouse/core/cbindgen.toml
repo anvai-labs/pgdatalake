@@ -28,6 +28,7 @@ include = [
     "PgDatalakeCommitFailure",
     "pg_datalake_delta_rows_open",
     "pg_datalake_delta_rows_close",
+    "pg_datalake_delta_rows_rewind",
     "pg_datalake_delta_rows_next",
     "pg_datalake_delta_rows_col_null",
     "pg_datalake_delta_rows_col_text",
