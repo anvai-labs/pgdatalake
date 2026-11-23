@@ -2,11 +2,11 @@
 
 ## Current dependency order
 
-The merged predecessor for this integration is public #85 at
-`7415ad6b0176dc99a42de6a005c2cd8ac7761cb9`. Its
-[merged CI receipt](https://github.com/anvai-labs/pgdatalake/actions/runs/45139266582)
-qualifies the stock package and the native prepare-only worker. The #81
-foundation has its own [CI receipt](https://github.com/anvai-labs/pgdatalake/actions/runs/45112681173).
+The merged predecessor for this integration is public #86 at
+`ff02bfcd79a6fb284fede9ac9f47d6b4b2ab545c`. It adds the opt-in 1.15 read
+evidence schema. Public #85 at `7415ad6b0176dc99a42de6a005c2cd8ac7761cb9`
+supplies the [stock and prepare-only CI receipt](https://github.com/anvai-labs/pgdatalake/actions/runs/45139266582).
+The #81 foundation has its own [CI receipt](https://github.com/anvai-labs/pgdatalake/actions/runs/45112681173).
 The first independently shippable path is a serial, read-only FDW on stock
 PG19.0. The managed writer and its visibility proof can advance separately.
 
@@ -14,15 +14,44 @@ PG19.0. The managed writer and its visibility proof can advance separately.
 |---|---|---|
 | Stock reader, 01/02/06 | #53 supplies execution-time FDW COUNT and same-pin fallback. #54/#58/#61 cover effective mapping, enrolled root, real SQL logins, rotation and revocation. #70 runs the [TLS smoke](../../src/test/lakehouse/fixtures/stock-scoped-tls.sh) for those reads and reconnect on verified PG-wire with SCRAM. | The ordinary external pilot needs a deployed client-network, login and grant-generation test. Governed provider identity follows its own gate. Preserve ordinary/pinned count and denied-sibling controls. [External client handoff](modules/10-downstream-handoff.md#external-postgresql-client-handoff) |
 | Governed tables, 01/02/06/08 | #67–69 define BI reuse, provider scope and a verifier for 12 positive SQL executions and six refusals. Current governed results come from synthetic evidence. | Implement and run one provider's protected plan on a real enrolled table. Require exact source pin, actual consumption, masks and distinct effective scopes. Only then qualify reuse and multiple readers. [Verifier](modules/06c-governed-published-read.md) |
-| Managed send and recovery, 01/04 | #75–79 qualified discovery, scoped credentials, bounded ledger loads, stale-work refusal and native lookup/finalize after WAL restart. #80 qualified a native WAL authorization hold with zero provider requests and a lookup-only receipt. #81 rejects assigned launcher XIDs, bounds ledger-lock waits and qualifies a process-local Rust prepare handle that can be dropped without a catalog POST. #83 adds the [C preparation ABI](modules/04b-scoped-send-admission.md#process-local-native-preparation-abi), which exposes the exact bounded proposal. #85’s opt-in native 1.14 diagnostic joins role-bound static Send credentials to it after closing the ledger transaction, then discards the proposal. | Join the native preparation to durable authorization and dispatch through the same live handle. Recheck grant and generation at authorization. Recovered state can use lookup only. Prove both lost-reply barriers and independently issued credentials before enabling native polling. [Publisher handoff](modules/04b-scoped-send-admission.md#native-worker-integration) |
+| Managed send and recovery, 01/04 | #75–79 qualified discovery, scoped credentials, bounded ledger loads, stale-work refusal and native lookup/finalize after WAL restart. #80 qualified a native WAL authorization hold with zero provider requests and a lookup-only receipt. #81 rejects assigned launcher XIDs, bounds ledger-lock waits and qualifies a process-local Rust prepare handle that can be dropped without a catalog POST. #83 adds the [C preparation ABI](modules/04b-scoped-send-admission.md#process-local-native-preparation-abi), which exposes the exact bounded proposal. #85’s opt-in native 1.14 diagnostic joins role-bound static Send credentials to it after closing the ledger transaction, then discards the proposal. Opt-in 1.16 [dispatches once](modules/04b-scoped-send-admission.md#native-one-shot-dispatch) through the live handle after durable authorization and proves both reply-loss barriers with the static mapping fixture. | Qualify independently issued temporary credentials, hard-disable fencing, bounded polling and primary promotion. Keep recovered attempts lookup-only. [Publisher handoff](modules/04b-scoped-send-admission.md#native-worker-integration) |
 | Managed read visibility, 01/03 | #80 qualified the compatible-pin selector under three PostgreSQL snapshots. #81 certifies bounded Iceberg v2 explicit-`main` parent links with real Lakekeeper metadata. #84 rewinds retained cursors and fixes a missing staged rescan result. Opt-in 1.15 persists a pristine enrollment anchor and reads finalized membership separately from the statement-visible segment IDs. An unfinalized child stays unknown. | Prove the accepted child independently at the active reply-loss barrier, retain exact overlay payloads under the executor snapshot and select the statement pin vector before first output. Prove stable rescan and expiry refusal before enabling a serial append scan. TableAM SQL and COUNT remain gated. [Visibility contract](modules/03-managed-visibility.md#certified-retained-ancestry) |
 | Cost and expansion, 02/08/09 | #60 defines per-catalog profiles. #62 qualifies pinned benchmark digests. #66 reduces one projected canary from 4,719 to 16 data range GETs. | Diagnose the SF10 q1 timeout before a latency claim. Measure cold/warm dashboard completeness and spend on a qualified profile before selecting an elastic floor or enabling persistent reuse. [Cost evidence](modules/08b-io-cost.md) |
 
 ### MVP integration order
 
 1. [Stock published reader](modules/10-downstream-handoff.md#external-postgresql-client-handoff) delivers the independent read-only pilot. For hosted use, verify the deployed backend and complete the external grant-rotation and cancellation drill. Provisioning and hosted admission can proceed alongside managed work.
-2. The Rust/C preparation boundary can advance independently of the managed reader. Carry only bounded, owned request bytes and identity across the native WAL authorization barrier. The sender then joins [read-only discovery](modules/04b-scoped-send-admission.md#discovery-and-dispatch), independently scoped Send credentials and the top-level transaction adapter. Refuse stale, expired and canceled preparation with zero POST. Lose the authorization reply and require zero POST with exact WAL retention. Then lose the catalog reply after one POST, restart, recover through Lookup and leave the later member staged.
+2. Opt in to the one-shot 1.16 test boundary before joining [read-only discovery](modules/04b-scoped-send-admission.md#discovery-and-dispatch) and its scheduler. The scheduler consumes exact claim and grant inputs without gaining authority to resend a recovered proposal. First qualify separate temporary Send and Lookup credentials, a retiring writer fenced at the provider, and the source/intent WAL horizon on replacement. Reuse both reply-loss drills with the actual scheduler and deployment profile.
 3. Managed visibility can proceed against qualified fixture receipts while native send integration proceeds. Join the 1.15 saved anchor and finalized membership with provider acceptance evidence and executor payload lifetime. Start with `[10]`, `[10,20]`, `[10,20,20]`, a missing compatible parent before any output, and rescan at the same exact pin. Keep the overlay COUNT shortcut, writer promotion, publication cadence, governed reads and fleet cost qualification gated independently.
+
+### One-shot native dispatch smoke for 1.16
+
+The original worker made zero POSTs after losing the PostgreSQL authorization
+reply. Restart recovered source WAL `0/01D8BF88` and exact reserved intent
+WAL `0/01D8E6E8`. After five catalog GETs across the drill, lookup remained
+unresolved and parent `7762361749703517515` still held `[10]`.
+
+With a lost accepted catalog reply, the proxy saw one POST and matched its
+bytes against the already-flushed intent before forwarding. Restart
+preserved source WAL `0/023F4E78` and intent WAL `0/023F6388`. Two catalog
+GETs verified child `3822450108288747699` with `[10,20,20]` above parent
+`5004875050324735321`. Both cases refused resend and kept `[30]` staged.
+These are single-primary fixture samples with separate static Send and Lookup
+mappings. [Native dispatch contract](modules/04b-scoped-send-admission.md#native-one-shot-dispatch)
+
+### Next managed visibility join
+
+At the accepted-reply-loss barrier, read the unique retained attempt and its
+sealed members under a fresh committed ledger snapshot. Verify the exact
+binding, body and manifest-list digest against the same bounded catalog
+metadata used for ancestry certification. Reuse the read-only verifier.
+Keep the original statement snapshot for visible rows and leave generation,
+attempt and finalization state untouched. The first red is the fresh view
+selecting parent plus both segments. Require the exact child with an empty
+overlay while old and middle snapshots still use the parent and their
+respective overlays. Keep bound SQL gated until chosen-pin schema and
+payload lifetime, whole-statement preflight and stable rescan pass.
+[Executor acceptance](modules/03-managed-visibility.md#sql-executor-acceptance)
 
 ### Enrollment and membership smoke for 1.15
 
@@ -93,7 +122,7 @@ Base `8ed4cbab0b0`. On upstream PG19.0 (`5c839a2a08b`), the original planner fai
 |---|---|---|
 | **M0 Foundation** | Historically accepted at `milestone/m0` | Revalidate clean builds, extension install and supported upgrades at each candidate SHA. |
 | **M1 External reads** | FDW, REST/S3, pruning, typed scans, time travel and supported v2/v3 delete reads landed. Time-travel deparse + dump/restore landed 2026-11-21 (ruleutils re-emits the pin; `time_travel.sql` carries the acceptance test) | Independent result equivalence, delete combinations, parallel pinning, cancellation and resource limits. |
-| **M2 Managed writes** | Ordinary bound INSERT and one catalog commit exercised by the scoped fixture. Native lookup/finalize and the separate WAL authorization hold have restart evidence. | Same-process native dispatch with both reply-loss barriers, compatible executor scans and promoted-primary recovery. |
+| **M2 Managed writes** | Ordinary bound INSERT through opt-in one-shot native dispatch. Both reply-loss cases preserve exact WAL and lookup-only recovery on one primary. | Temporary credentials, scheduled polling, compatible executor scans and promoted-primary recovery. |
 | **M3 Semantics and cloud parity** | In progress. Ranged projection, cached bytes, lazy projected decode, and initial COUNT paths landed | Qualify COUNT and lazy reads. Close isolation, ADLS/GCS transport and auth, branch/tag/history semantics and the logical replication decision. |
 | **M4 Production hardening** | Design available for maintenance, statistics and execution tiers | Implement and qualify compaction, expiry, orphan safety, ANALYZE and bounded scan/publish resource use. |
 | **M5 Engine integrations** | Backlog | Compare independently against the same pinned dataset, permission scope, resource budgets and result digests. |
