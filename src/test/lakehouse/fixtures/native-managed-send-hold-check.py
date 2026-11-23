@@ -100,9 +100,39 @@ def check(db, role, endpoint, directory, baseline):
         GRANT INSERT ON {admission.ATTEMPTS} TO {role};
     """)
     sql(db, f"SET ROLE {role}; BEGIN; {local_call}", error="55000")
+    local_expression = local_call.removeprefix("SELECT ").removesuffix(";")
+    sql(db, f"SET ROLE {role}; SELECT CASE WHEN pg_current_xact_id() IS NOT NULL "
+            f"THEN {local_expression} END;", error="55000")
     sql(db, f"SET ROLE {role}; SELECT {HOLD}('{first}', 1, decode('{first_digest}', 'hex'), NULL, 101, "
             "decode(repeat('11', 32), 'hex'), decode(repeat('11', 65537), 'hex'));", error="22023")
     sql(db, f"SET ROLE {role}; {native_call(first, first_digest, 101, generation=2)}", error="40001")
+    assert sql(db, f"SELECT count(*) FROM {admission.ATTEMPTS};") == "0"
+
+    # A lock held by another backend must not strand the launcher even when
+    # statement_timeout is disabled. Keep the blocker's lock until the launcher
+    # has returned.
+    worker_running = f"EXISTS (SELECT FROM pg_stat_activity WHERE datname=current_database() AND backend_type='{WORKER}'"
+    blocker_active = """EXISTS (SELECT FROM pg_stat_activity
+        WHERE datname=current_database() AND application_name='native_send_lock'
+          AND wait_event='PgSleep')"""
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        blocker = pool.submit(sql, db, f"BEGIN; LOCK TABLE {HDR} IN ACCESS EXCLUSIVE MODE; "
+                              "SELECT pg_sleep(30);", "57014", "native_send_lock")
+        try:
+            wait_for(db, blocker_active)
+            started = time.monotonic()
+            launcher = pool.submit(sql, db, f"SET ROLE {role}; SET statement_timeout TO 0; {local_call}", "57014")
+            wait_for(db, worker_running + " AND wait_event_type='Lock')")
+            launcher.result(timeout=15)
+            bounded_wait_ms = (time.monotonic() - started) * 1000
+            assert sql(db, f"SELECT {blocker_active};") == "t"
+            wait_for(db, "NOT " + worker_running + ")")
+        finally:
+            assert sql(db, """
+                SELECT pg_cancel_backend(pid) FROM pg_stat_activity
+                WHERE datname=current_database() AND application_name='native_send_lock';
+            """) == "t"
+        blocker.result(timeout=10)
     assert sql(db, f"SELECT count(*) FROM {admission.ATTEMPTS};") == "0"
 
     # Only one top-level CALL may reserve the operation.
@@ -142,7 +172,6 @@ def check(db, role, endpoint, directory, baseline):
         GRANT EXECUTE ON PROCEDURE lakehouse.authorize_publication_send({SEND_ARGS}) TO {role};
     """)
     lost_call = native_call(lost, lost_digest, 102)
-    worker_running = f"EXISTS (SELECT FROM pg_stat_activity WHERE datname=current_database() AND backend_type='{WORKER}'"
     with ThreadPoolExecutor(max_workers=1) as pool:
         launcher = pool.submit(sql, db, f"SET ROLE {role}; {lost_call}", "57014", "native_send_lost_ack")
         try:
@@ -179,6 +208,7 @@ def check(db, role, endpoint, directory, baseline):
     assert sql(db, "SELECT count(*) FROM lakehouse.discover_managed_publication_claims(NULL,16) "
                    "WHERE mode='lookup';") == "2"
     return {"case": "native_send_hold", "one_concurrent_authorization": True,
+            "assigned_launcher_xid_denied": True, "bounded_lock_wait_ms": round(bounded_wait_ms, 3),
             "ordinary_role_denied": True, "lost_ack_sqlstate": "57014", "restart": directory is not None,
             "receipt": receipts[0], "lost_ack_intent": lost_record, "later_pending": late}
 

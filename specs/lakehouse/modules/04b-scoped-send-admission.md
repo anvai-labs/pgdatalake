@@ -82,6 +82,14 @@ membership and persists the prepared request and its digests. Its synchronous
 local commit precedes the returned intent XID. The launcher transfers at most
 64 KiB of prepared bytes and carries no provider credentials in shared memory.
 
+The launcher command must run standalone on an active primary with no assigned
+transaction ID. It returns `55000` before starting a worker if the surrounding
+command assigned an XID, which can happen in autocommit SQL. A monotonic
+10-second launcher deadline applies even with `statement_timeout` disabled.
+On cancellation or deadline expiry, the launcher requests worker termination
+and returns `57014`. Resolve an uncertain outcome by lookup. The procedure can
+already have committed when a receipt is lost.
+
 The worker stops after the transaction and reports the held intent as
 lookup-only. Keep it in a controlled operator context. Holding an unsent intent
 reserves the operation and requires later lookup or operator reconciliation.
