@@ -252,6 +252,43 @@ snapshot and cut. Add distinct telemetry for the compatibility refusal,
 origin timeout and oversized proof so operators can distinguish a safe
 refusal from a slow authorized read.
 
+#### Native observation and exact-pin open
+
+The internal C ABI starts with `pg_datalake_managed_read_observe` after
+PostgreSQL has checked permissions and resolved the statement's approved
+route, table UUID and root, authority and incarnation, retained `main`
+anchor and enrolled Iceberg schema ID. The caller uses the current
+static S3 credentials from the explicitly approved mapping, as in the
+scoped FDW read profile. Expiring purpose-bound Read grants and provider
+credential issuance require a separate admission gate. The opaque
+process-local owner retains one bounded catalog/storage observation. It certifies the existing
+append ancestry and exposes positive signed 64-bit pins in newest-first
+order, including the retained anchor. It returns zero for an unavailable
+pin index. The existing limits are 4,096 snapshot records and 512 ancestry
+pins. Reading an index makes no provider request.
+
+After the ledger owner has proved the statement's compatible cut,
+`pg_datalake_managed_read_plan_exact` consumes the caller's owner slot and
+plans the selected certified pin from its original metadata. A pin
+outside the certified chain returns a pin refusal. A selected snapshot
+needs an explicit schema ID equal to the enrolled schema and the schema
+used by the planner, with one matching schema definition. The ABI refuses
+unproved or changed schemas before manifest I/O. A successfully planned
+session owns the original root and uses the regular scoped scan and delete
+loader. The caller applies its statement qualifications across base and
+overlay and checks actual PostgreSQL source-column compatibility.
+The stock FDW continues to use its observed current schema.
+
+The consume call clears the slot even on error. Use
+`pg_datalake_managed_read_observation_drop` to clear an unused owner and
+`pg_datalake_scan_free` for a planned session. The C owner releases both on
+its executor error path. The loopback ABI fixture observes one catalog GET
+and one metadata GET, then exactly the selected manifest for an accepted
+pin above 2^53. Bad schema, an off-chain pin and an unused owner make no
+manifest request. The ABI allows a later same-handle pending-head proof.
+PostgreSQL still owns original-snapshot ledger visibility, payload and
+object retention, statement-wide correctness and all runtime activation.
+
 #### SQL executor acceptance
 
 Use a v2 Lakekeeper table with parent pin `P` containing `[10]`. Hold one

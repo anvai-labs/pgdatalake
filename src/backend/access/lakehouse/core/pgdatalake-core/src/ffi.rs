@@ -12,6 +12,10 @@
 
 use std::ffi::{c_char, CStr, CString};
 
+mod managed_read;
+#[cfg(test)]
+mod managed_read_tests;
+pub use managed_read::*;
 mod native_send;
 mod publication_material;
 pub use native_send::*;
@@ -70,6 +74,17 @@ impl ScanSession {
             deletes,
             read_root,
         }
+    }
+
+    fn from_read_plan(
+        plan: ScanPlan,
+        s3: S3Options,
+        schema: &crate::catalog::metadata::Schema,
+        read_root: Option<S3ReadRoot>,
+    ) -> Result<Self, ReadError> {
+        let deletes =
+            crate::scan::load_row_deletes_with_root(&plan, Some(&s3), schema, read_root.as_ref())?;
+        Ok(Self::from_plan(plan, s3, deletes, read_root))
     }
 
     fn s3_options(&self) -> S3Options {
@@ -222,23 +237,21 @@ pub unsafe extern "C" fn pg_datalake_scan_new_bound(
                 &endpoint,
                 token,
             )?;
-            let (plan, s3, schema) = binding.scan(
+            let bound = binding.scan(
                 &ns_levels,
                 &table,
                 s3,
                 predicate.as_ref(),
                 selector.as_ref(),
             )?;
-            (plan, s3, schema, Some(binding.root))
+            (bound.plan, bound.s3, bound.schema, Some(bound.root))
         } else {
             let client = CatalogClient::new(&endpoint, &warehouse, &token, &s3)?;
             let (plan, s3, schema) =
                 client.scan_table(&ns_levels, &table, predicate.as_ref(), selector.as_ref())?;
             (plan, s3, schema, None)
         };
-        let deletes =
-            crate::scan::load_row_deletes_with_root(&plan, Some(&s3), &schema, read_root.as_ref())?;
-        Ok(ScanSession::from_plan(plan, s3, deletes, read_root))
+        ScanSession::from_read_plan(plan, s3, &schema, read_root)
     });
     let session = result.unwrap_or_else(|panic| {
         let msg = if let Some(s) = panic.downcast_ref::<&str>() {
@@ -253,7 +266,17 @@ pub unsafe extern "C" fn pg_datalake_scan_new_bound(
             format!("pgdatalake-core panic: {msg}"),
         ))
     });
-    match session {
+    return_read_handle(session, status_out, err_buf, err_len)
+}
+
+/// Transfer a successful read owner or report a typed refusal.
+unsafe fn return_read_handle<T>(
+    result: Result<T, ReadError>,
+    status_out: *mut PgDatalakeReadStatus,
+    err_buf: *mut c_char,
+    err_len: usize,
+) -> *mut T {
+    match result {
         Ok(s) => {
             if !status_out.is_null() {
                 unsafe { status_out.write(PgDatalakeReadStatus::ReadOk) };
