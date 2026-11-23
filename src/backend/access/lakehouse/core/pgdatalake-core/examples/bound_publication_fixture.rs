@@ -20,7 +20,7 @@ use pgdatalake_core::{
     },
     managed_visibility::{
         ManagedAncestry, ManagedCatalogObservation, ManagedPinCandidate, ManagedReadError,
-        ManagedReadScope, PinMembership, VisibleSegment,
+        ManagedReadScope, PendingHeadAttempt, PinMembership, SealedPendingMember, VisibleSegment,
     },
     parquet::CellValue,
     publication_credentials::{
@@ -571,6 +571,32 @@ struct ManagedCutFixture {
     catalog: CutCatalogObservation,
     candidates: Vec<CutCandidate>,
     visible: Vec<CutSegment>,
+    pending_head: Option<CutPendingHead>,
+    reader_object_endpoint: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CutPendingHead {
+    scope: ManagedReadScope,
+    schema_id: i64,
+    spec_id: i32,
+    operation_id: Uuid,
+    input_digest: String,
+    #[serde(deserialize_with = "exact_bigint")]
+    expected_parent: i64,
+    #[serde(deserialize_with = "exact_bigint")]
+    snapshot_id: i64,
+    proposal_digest: String,
+    proposal_body: String,
+    members: Vec<CutPendingMember>,
+}
+
+#[derive(Deserialize)]
+struct CutPendingMember {
+    #[serde(deserialize_with = "exact_bigint")]
+    segment_id: i64,
+    row_count: i32,
+    payload_digest: String,
 }
 
 #[derive(Deserialize)]
@@ -652,8 +678,65 @@ fn run_managed_cut() -> FixtureResult<()> {
         ref_name: &catalog.ref_name,
         metadata: &catalog.metadata,
     };
-    let cut = ManagedAncestry::certify(&fixture.scope, catalog.anchor, observation)
-        .and_then(|ancestry| ancestry.select(&candidates, &visible));
+    let cut = if let Some(pending) = fixture.pending_head {
+        let proposal = unhex(&pending.proposal_body)?;
+        let members = pending
+            .members
+            .iter()
+            .map(|member| {
+                Ok(SealedPendingMember {
+                    segment_id: member.segment_id,
+                    row_count: member.row_count,
+                    payload_digest: digest(&member.payload_digest)?,
+                })
+            })
+            .collect::<FixtureResult<Vec<_>>>()?;
+        let attempt = PendingHeadAttempt {
+            scope: &pending.scope,
+            schema_id: pending.schema_id,
+            spec_id: pending.spec_id,
+            authorization: AuthorizedPublication {
+                identity: PublicationIdentity {
+                    operation_id: pending.operation_id,
+                    table_uuid: pending.scope.table_uuid,
+                    input_digest: digest(&pending.input_digest)?,
+                },
+                expected_parent: Some(pending.expected_parent),
+                snapshot_id: pending.snapshot_id,
+                request_digest: digest(&pending.proposal_digest)?,
+                request_body: &proposal,
+            },
+            members: &members,
+        };
+        let s3 = S3Options {
+            endpoint: fixture.reader_object_endpoint,
+            region: Some("us-east-1".into()),
+            access_key_id: Some("lakehouse-reader".into()),
+            secret_access_key: Some("lakehouse-reader-password".into()),
+            path_style: true,
+        };
+        ManagedAncestry::certify(&fixture.scope, catalog.anchor, observation).and_then(|ancestry| {
+            let [head, parent, ..] = candidates.as_slice() else {
+                return Err(ManagedReadError::InvalidProof);
+            };
+            if Some(&head.pin) != ancestry.pins().first()
+                || head.scope != &fixture.scope
+                || !matches!(head.membership, PinMembership::Unknown)
+            {
+                return Err(ManagedReadError::InvalidProof);
+            }
+            let included = ancestry.prove_pending_head(parent, &attempt, &s3)?;
+            if let Some(included) = &included {
+                let mut proved = candidates.clone();
+                proved[0].membership = PinMembership::Complete(included);
+                return ancestry.select(&proved, &visible);
+            }
+            ancestry.select(&candidates, &visible)
+        })
+    } else {
+        ManagedAncestry::certify(&fixture.scope, catalog.anchor, observation)
+            .and_then(|ancestry| ancestry.select(&candidates, &visible))
+    };
     let output = match cut {
         Ok(cut) => serde_json::json!({
             "pin": cut.pin.to_string(),

@@ -2,10 +2,12 @@
 
 ## Current dependency order
 
-The merged predecessor for this integration is public #86 at
-`ff02bfcd79a6fb284fede9ac9f47d6b4b2ab545c`. It adds the opt-in 1.15 read
-evidence schema. Public #85 at `7415ad6b0176dc99a42de6a005c2cd8ac7761cb9`
-supplies the [stock and prepare-only CI receipt](https://github.com/anvai-labs/pgdatalake/actions/runs/45139266582).
+The merged predecessor for this integration is public #87 at
+`0128c25f9bc75f9655fb0a94537d950d7bd6556d`. Its
+[native CI](https://github.com/anvai-labs/pgdatalake/actions/runs/45181913806)
+qualifies both one-shot reply-loss cases on one primary. Public #86 adds
+the opt-in 1.15 read evidence schema. Public #85 supplies the
+[stock and prepare-only CI receipt](https://github.com/anvai-labs/pgdatalake/actions/runs/45139266582).
 The #81 foundation has its own [CI receipt](https://github.com/anvai-labs/pgdatalake/actions/runs/45112681173).
 The first independently shippable path is a serial, read-only FDW on stock
 PG19.0. The managed writer and its visibility proof can advance separately.
@@ -15,14 +17,14 @@ PG19.0. The managed writer and its visibility proof can advance separately.
 | Stock reader, 01/02/06 | #53 supplies execution-time FDW COUNT and same-pin fallback. #54/#58/#61 cover effective mapping, enrolled root, real SQL logins, rotation and revocation. #70 runs the [TLS smoke](../../src/test/lakehouse/fixtures/stock-scoped-tls.sh) for those reads and reconnect on verified PG-wire with SCRAM. | The ordinary external pilot needs a deployed client-network, login and grant-generation test. Governed provider identity follows its own gate. Preserve ordinary/pinned count and denied-sibling controls. [External client handoff](modules/10-downstream-handoff.md#external-postgresql-client-handoff) |
 | Governed tables, 01/02/06/08 | #67–69 define BI reuse, provider scope and a verifier for 12 positive SQL executions and six refusals. Current governed results come from synthetic evidence. | Implement and run one provider's protected plan on a real enrolled table. Require exact source pin, actual consumption, masks and distinct effective scopes. Only then qualify reuse and multiple readers. [Verifier](modules/06c-governed-published-read.md) |
 | Managed send and recovery, 01/04 | #75–79 qualified discovery, scoped credentials, bounded ledger loads, stale-work refusal and native lookup/finalize after WAL restart. #80 qualified a native WAL authorization hold with zero provider requests and a lookup-only receipt. #81 rejects assigned launcher XIDs, bounds ledger-lock waits and qualifies a process-local Rust prepare handle that can be dropped without a catalog POST. #83 adds the [C preparation ABI](modules/04b-scoped-send-admission.md#process-local-native-preparation-abi), which exposes the exact bounded proposal. #85’s opt-in native 1.14 diagnostic joins role-bound static Send credentials to it after closing the ledger transaction, then discards the proposal. Opt-in 1.16 [dispatches once](modules/04b-scoped-send-admission.md#native-one-shot-dispatch) through the live handle after durable authorization and proves both reply-loss barriers with the static mapping fixture. | Qualify independently issued temporary credentials, hard-disable fencing, bounded polling and primary promotion. Keep recovered attempts lookup-only. [Publisher handoff](modules/04b-scoped-send-admission.md#native-worker-integration) |
-| Managed read visibility, 01/03 | #80 qualified the compatible-pin selector under three PostgreSQL snapshots. #81 certifies bounded Iceberg v2 explicit-`main` parent links with real Lakekeeper metadata. #84 rewinds retained cursors and fixes a missing staged rescan result. Opt-in 1.15 persists a pristine enrollment anchor and reads finalized membership separately from the statement-visible segment IDs. An unfinalized child stays unknown. | Prove the accepted child independently at the active reply-loss barrier, retain exact overlay payloads under the executor snapshot and select the statement pin vector before first output. Prove stable rescan and expiry refusal before enabling a serial append scan. TableAM SQL and COUNT remain gated. [Visibility contract](modules/03-managed-visibility.md#certified-retained-ancestry) |
+| Managed read visibility, 01/03 | #80 qualified the compatible-pin selector under three PostgreSQL snapshots. #81 certifies bounded Iceberg v2 explicit-`main` parent links with real Lakekeeper metadata. #84 rewinds retained cursors and fixes a missing staged rescan result. Opt-in 1.15 persists a pristine enrollment anchor and reads finalized membership separately from the statement-visible segment IDs. At the lost-reply barrier the independent read-only verifier can now prove the unfinalized child from one observed catalog head, exact WAL proposal, bounded manifest digest and sealed membership. | Join that verifier to a scoped native metadata/ledger load and retain exact overlay payloads under the executor snapshot. Select the whole statement pin vector before first output. Prove stable rescan and expiry refusal before enabling a serial append scan. TableAM SQL and COUNT remain gated. [Visibility contract](modules/03-managed-visibility.md#certified-retained-ancestry) |
 | Cost and expansion, 02/08/09 | #60 defines per-catalog profiles. #62 qualifies pinned benchmark digests. #66 reduces one projected canary from 4,719 to 16 data range GETs. | Diagnose the SF10 q1 timeout before a latency claim. Measure cold/warm dashboard completeness and spend on a qualified profile before selecting an elastic floor or enabling persistent reuse. [Cost evidence](modules/08b-io-cost.md) |
 
 ### MVP integration order
 
 1. [Stock published reader](modules/10-downstream-handoff.md#external-postgresql-client-handoff) delivers the independent read-only pilot. For hosted use, verify the deployed backend and complete the external grant-rotation and cancellation drill. Provisioning and hosted admission can proceed alongside managed work.
 2. Opt in to the one-shot 1.16 test boundary before joining [read-only discovery](modules/04b-scoped-send-admission.md#discovery-and-dispatch) and its scheduler. The scheduler consumes exact claim and grant inputs without gaining authority to resend a recovered proposal. First qualify separate temporary Send and Lookup credentials, a retiring writer fenced at the provider, and the source/intent WAL horizon on replacement. Reuse both reply-loss drills with the actual scheduler and deployment profile.
-3. Managed visibility can proceed against qualified fixture receipts while native send integration proceeds. Join the 1.15 saved anchor and finalized membership with provider acceptance evidence and executor payload lifetime. Start with `[10]`, `[10,20]`, `[10,20,20]`, a missing compatible parent before any output, and rescan at the same exact pin. Keep the overlay COUNT shortcut, writer promotion, publication cadence, governed reads and fleet cost qualification gated independently.
+3. Join the qualified read-only pending-head verifier to a native statement cut. Reuse its bounded catalog observation for scan planning. Read proof under a fresh committed ledger snapshot and read row visibility and retained payloads under the original executor snapshot. Start with `[10]`, `[10,20]`, `[10,20,20]`, a missing compatible parent before any output, and rescan at the same exact pin. Keep the overlay COUNT shortcut, writer promotion, publication cadence, governed reads and fleet cost qualification gated independently.
 
 ### One-shot native dispatch smoke for 1.16
 
@@ -46,11 +48,15 @@ sealed members under a fresh committed ledger snapshot. Verify the exact
 binding, body and manifest-list digest against the same bounded catalog
 metadata used for ancestry certification. Reuse the read-only verifier.
 Keep the original statement snapshot for visible rows and leave generation,
-attempt and finalization state untouched. The first red is the fresh view
-selecting parent plus both segments. Require the exact child with an empty
-overlay while old and middle snapshots still use the parent and their
-respective overlays. Keep bound SQL gated until chosen-pin schema and
-payload lifetime, whole-statement preflight and stable rescan pass.
+attempt and finalization state untouched. The live verifier now resolves parent `7809961547152552931` for the
+old and middle views with overlays `[]` and `[2]` and the accepted child
+`4884973408649104829` with an empty overlay for the fresh view. All three
+ran before local finalization. One bounded metadata GET and three healthy
+manifest ranges supplied their proof. A fourth, corrupt range forced the
+safe parent overlay. Missing or mismatched local evidence avoided object
+I/O. Zero reader POSTs and unchanged attempt, ownership and member state
+held throughout. Keep bound SQL gated until chosen-pin schema and payload
+lifetime, whole-statement preflight and stable rescan pass.
 [Executor acceptance](modules/03-managed-visibility.md#sql-executor-acceptance)
 
 ### Enrollment and membership smoke for 1.15

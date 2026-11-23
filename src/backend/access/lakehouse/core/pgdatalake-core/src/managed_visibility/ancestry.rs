@@ -30,7 +30,8 @@ pub struct ManagedCatalogObservation<'a> {
 /// require independent evidence before a scan can produce rows.
 #[derive(Debug)]
 pub struct ManagedAncestry<'a> {
-    scope: &'a ManagedReadScope,
+    pub(super) scope: &'a ManagedReadScope,
+    pub(super) metadata: &'a TableMetadata,
     pins: Vec<i64>,
 }
 
@@ -43,7 +44,7 @@ impl<'a> ManagedAncestry<'a> {
     pub fn certify(
         scope: &'a ManagedReadScope,
         anchor: i64,
-        observation: ManagedCatalogObservation<'_>,
+        observation: ManagedCatalogObservation<'a>,
     ) -> Result<Self, ManagedReadError> {
         let metadata = observation.metadata;
         if !scope.is_valid() || scope.ref_name != "main" || anchor <= 0 {
@@ -108,7 +109,11 @@ impl<'a> ManagedAncestry<'a> {
 
             pins.push(pin);
             if pin == anchor {
-                return Ok(Self { scope, pins });
+                return Ok(Self {
+                    scope,
+                    metadata,
+                    pins,
+                });
             }
             pin = snapshot
                 .parent_snapshot_id
