@@ -1776,6 +1776,7 @@ typedef struct LakehouseTableScanDescData
 	 */
 	bool		capture_bound;
 	bool		cut_installed;
+	bool		cut_proved;
 	int64		cut_pin;
 	int64	   *cut_overlay_ids;
 	int			n_cut_overlay;
@@ -1868,8 +1869,11 @@ lakehouse_scan_common_setup(LakehouseTableScanDesc scan, Relation rel,
 
 			/*
 			 * Managed-cut bypass: no session and no tasks until the
-			 * demand-time cut plans the compatible pin exactly.
+			 * demand-time cut plans the compatible pin exactly. The cut's
+			 * overlay serves through the staged delta loop (the identity
+			 * decode above was skipped for bound tables).
 			 */
+			scan->opts.write_mode = LAKEHOUSE_WRITE_MODE_STAGED;
 			scan->session = NULL;
 			scan->task_count = 0;
 			return;
@@ -1947,30 +1951,16 @@ lakehouse_scan_begin(Relation rel, Snapshot snapshot,
 		scan->rs_base.rs_instrument = NULL;
 
 	{
-		bool		with_identity = decode_lakehouse_reloptions(rel, &scan->opts);
-		bool		attach_identity =
-			ExtractManagedIdentity(RelationGetRelid(rel), &scan->opts);
-
-		if (!with_identity && !attach_identity)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("managed table %s has no lakehouse identity",
-							RelationGetRelationName(rel)),
-					 errdetail("Managed DDL wiring arrives with M2 slice 27; "
-							   "for now attach one explicitly."),
-					 errhint("SELECT lakehouse.attach_table('%s'::regclass, "
-							 "'namespace.table_name', endpoint => '...');",
-							 RelationGetRelationName(rel))));
-	}
-
-	{
 		pg_uuid_t	binding;
 
 		/*
 		 * Bound managed capture (03-managed-visibility, "Admission before the
 		 * native cut"): supported-shape declines are catalog-local — a
 		 * declined scan makes zero origin requests. Ordinary bound SQL was
-		 * refused outright before the managed cut existed.
+		 * refused outright before the managed cut existed. The bound path
+		 * also skips the attached-identity decode below: its route and
+		 * credentials come from the admitted purpose=read mapping, never from
+		 * the read server of the querying user.
 		 */
 		if (lookup_capture_binding(RelationGetRelid(rel), &binding))
 		{
@@ -1989,6 +1979,24 @@ lakehouse_scan_begin(Relation rel, Snapshot snapshot,
 			scan->capture_bound = true;
 			lakehouse_admit_managed_cut(scan);
 		}
+	}
+
+	if (!scan->capture_bound)
+	{
+		bool		with_identity = decode_lakehouse_reloptions(rel, &scan->opts);
+		bool		attach_identity =
+			ExtractManagedIdentity(RelationGetRelid(rel), &scan->opts);
+
+		if (!with_identity && !attach_identity)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("managed table %s has no lakehouse identity",
+							RelationGetRelationName(rel)),
+					 errdetail("Managed DDL wiring arrives with M2 slice 27; "
+							   "for now attach one explicitly."),
+					 errhint("SELECT lakehouse.attach_table('%s'::regclass, "
+							 "'namespace.table_name', endpoint => '...');",
+							 RelationGetRelationName(rel))));
 	}
 
 	lakehouse_scan_common_setup(scan, rel, NULL);
@@ -2662,6 +2670,7 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 	int32	   *pending_row_counts = NULL;
 	uint8	   *pending_digests = NULL;
 	int			pending_member_count = 0;
+	int			proof_edge = -1;
 	int			i;
 
 	/* everything this routine builds lives and dies with the scan */
@@ -2715,6 +2724,7 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 		managed_read_status_error(status, errbuf,
 								  "managed read could not observe the enrolled catalog");
 	scan->read_observation = observation;
+	scan->cut_proved = false;
 
 	pin_count = (int) pg_datalake_managed_read_pin_count(observation);
 	if (pin_count < 1 || pin_count > MANAGED_READ_MAX_PINS)
@@ -2812,8 +2822,9 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 						bool	   *nulls;
 						int			n;
 
-						deconstruct_array_builtin(DatumGetArrayTypeP(additions),
-												  INT8OID, &ids, &nulls, &n);
+						deconstruct_array(DatumGetArrayTypeP(additions),
+										  INT8OID, 8, FLOAT8PASSBYVAL, 'd',
+										  &ids, &nulls, &n);
 						for (int k = 0; k < n; k++)
 						{
 							int64		id = DatumGetInt64(ids[k]);
@@ -2839,8 +2850,19 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 				}
 			}
 
-			/* prove the pending head when its edge is unknown */
-			if (!pin_known[0] && pin_count >= 2 && pin_known[1])
+			/*
+			 * Prove the DEEPEST unknown edge adjacent to the complete chain:
+			 * the pending attempt sits at that pin, even when the provider
+			 * head has already moved past it (unrelated newer snapshots leave
+			 * the head edge unprovable by design).
+			 */
+			for (int p = pin_count - 1; p >= 1; p--)
+				if (pin_known[p] && !pin_known[p - 1])
+				{
+					proof_edge = p - 1;
+					break;
+				}
+			if (proof_edge >= 0)
 			{
 				argtypes[0] = OIDOID;
 				argtypes[1] = UUIDOID;
@@ -2848,8 +2870,8 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 				argtypes[3] = INT8OID;
 				args[0] = ObjectIdGetDatum(relid);
 				args[1] = UUIDPGetDatum(&scan->admission.binding);
-				args[2] = Int64GetDatum(pins[0]);
-				args[3] = Int64GetDatum(pins[1]);
+				args[2] = Int64GetDatum(pins[proof_edge]);
+				args[3] = Int64GetDatum(pins[proof_edge + 1]);
 				ret = SPI_execute_with_args(
 											"SELECT (value->>'operation_id')::uuid,"
 											" decode(value->>'input_digest', 'hex'),"
@@ -2985,9 +3007,9 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 			memcpy(members[m].payload_digest, pending_digests + 32 * m, 32);
 		}
 		memset(&proof, 0, sizeof(proof));
-		proof.parent_pin = pins[1];
-		proof.parent_members = pin_members[1];
-		proof.parent_member_count = pin_member_counts[1];
+		proof.parent_pin = pins[proof_edge + 1];
+		proof.parent_members = pin_members[proof_edge + 1];
+		proof.parent_member_count = pin_member_counts[proof_edge + 1];
 		proof.schema_id = scan->admission.schema_id;
 		proof.spec_id = scan->admission.spec_id;
 		memcpy(proof.operation_id, &pending_operation, 16);
@@ -3015,10 +3037,11 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 									  "managed read could not prove the pending head");
 		if (n_included > 0)
 		{
-			pin_known[0] = true;
-			pin_members[0] = palloc(sizeof(int64) * n_included);
-			memcpy(pin_members[0], included, sizeof(int64) * n_included);
-			pin_member_counts[0] = (int) n_included;
+			pin_known[proof_edge] = true;
+			scan->cut_proved = true;
+			pin_members[proof_edge] = palloc(sizeof(int64) * n_included);
+			memcpy(pin_members[proof_edge], included, sizeof(int64) * n_included);
+			pin_member_counts[proof_edge] = (int) n_included;
 		}
 	}
 
@@ -3072,10 +3095,12 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 				elog(ERROR, "could not read the managed read segment retention");
 			for (int v = 0; v < n_visible; v++)
 			{
+				bool		row_null;
+
 				while (retention_pos < SPI_processed &&
 					   DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[retention_pos],
 												   SPI_tuptable->tupdesc, 1,
-												   NULL)) < visible_ids[v])
+												   &row_null)) < visible_ids[v])
 					retention_pos++;
 				if (retention_pos < SPI_processed)
 				{
@@ -3239,9 +3264,15 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 			PopActiveSnapshot();
 			SPI_finish();
 		}
-		scan->delta_loaded = true;
-		scan->delta_pos = 0;
 	}
+
+	/*
+	 * The cut owns the staged delta read side: never fall back to the
+	 * ordinary unpublished-segment loader (it would double-serve the accepted
+	 * append outside the compatible-pin discipline).
+	 */
+	scan->delta_loaded = true;
+	scan->delta_pos = 0;
 
 	/* ---- 6. plan the selected pin exactly (consumes the observation) ---- */
 	errbuf[0] = '\0';
@@ -3263,8 +3294,9 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 		StringInfoData ev;
 
 		initStringInfo(&ev);
-		appendStringInfo(&ev, "{\"pin\": %lld, \"overlay\": [",
-						 (long long) scan->cut_pin);
+		appendStringInfo(&ev, "{\"pin\": %lld, \"proved\": %s, \"overlay\": [",
+						 (long long) scan->cut_pin,
+						 scan->cut_proved ? "true" : "false");
 		for (i = 0; i < scan->n_cut_overlay; i++)
 			appendStringInfo(&ev, "%s%lld", i > 0 ? ", " : "",
 							 (long long) scan->cut_overlay_ids[i]);

@@ -11,12 +11,36 @@ CREATE TABLE lakehouse.managed_read_grants (
     catalog_prefix text NOT NULL DEFAULT '',
     s3_region text NOT NULL DEFAULT 'us-east-1',
     expires_at timestamptz NOT NULL CHECK (isfinite(expires_at)),
+    revoked boolean NOT NULL DEFAULT false,
     PRIMARY KEY (binding_id, reader_role)
 );
 REVOKE ALL ON lakehouse.managed_read_grants FROM PUBLIC;
 CREATE TRIGGER guard_managed_read_grant
     BEFORE UPDATE OR DELETE ON lakehouse.managed_read_grants
     FOR EACH ROW EXECUTE FUNCTION lakehouse.guard_publication_admission();
+DO $$ BEGIN
+    -- Revocation is a one-way flag transition, like the send grants.
+    CREATE OR REPLACE FUNCTION lakehouse.guard_publication_admission() RETURNS trigger
+    LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $fn$
+    BEGIN
+        IF TG_TABLE_NAME = 'publication_send_grants' AND TG_OP = 'UPDATE' THEN
+            IF NOT OLD.revoked AND NEW.revoked
+               AND (OLD.capture_binding_id, OLD.catalog_prefix, OLD.s3_region)
+                   IS NOT DISTINCT FROM (NEW.capture_binding_id, NEW.catalog_prefix, NEW.s3_region) THEN
+                RETURN NEW;
+            END IF;
+        END IF;
+        IF TG_TABLE_NAME = 'managed_read_grants' AND TG_OP = 'UPDATE' THEN
+            -- The row is the operator's CURRENT read decision, not sealed
+            -- admission evidence: rotation may update the mapping, prefix,
+            -- region, expiry and the revoked flag, but never the identity.
+            IF (OLD.binding_id, OLD.reader_role) = (NEW.binding_id, NEW.reader_role) THEN
+                RETURN NEW;
+            END IF;
+        END IF;
+        RAISE EXCEPTION 'publication admission evidence is immutable' USING ERRCODE = '55000';
+    END $fn$;
+END $$;
 CREATE TRIGGER guard_managed_read_grant_truncate
     BEFORE TRUNCATE ON lakehouse.managed_read_grants
     FOR EACH STATEMENT EXECUTE FUNCTION lakehouse.guard_publication_admission();
@@ -56,14 +80,20 @@ BEGIN
     INSERT INTO lakehouse.managed_read_grants
         (binding_id, reader_role, mapping_id, catalog_prefix, s3_region, expires_at)
     VALUES (binding, reader, mapping, catalog_prefix, s3_region,
-            clock_timestamp() + ttl);
+            clock_timestamp() + ttl)
+    ON CONFLICT (binding_id, reader_role) DO UPDATE
+        SET mapping_id = EXCLUDED.mapping_id,
+            catalog_prefix = EXCLUDED.catalog_prefix,
+            s3_region = EXCLUDED.s3_region,
+            expires_at = EXCLUDED.expires_at,
+            revoked = false;
 END;
 $$;
 
 CREATE FUNCTION lakehouse.revoke_managed_read(binding uuid, reader regrole)
 RETURNS void LANGUAGE sql AS $$
-    DELETE FROM lakehouse.managed_read_grants
-    WHERE binding_id = binding AND reader_role = reader
+    UPDATE lakehouse.managed_read_grants SET revoked = true
+    WHERE binding_id = binding AND reader_role = reader AND NOT revoked
 $$;
 
 -- Admission for one bound table under one checked role: one row or
@@ -91,7 +121,7 @@ SET search_path = pg_catalog, pg_temp AS $$
     FROM lakehouse.managed_capture_state s
     JOIN lakehouse.managed_read_grants g
       ON g.binding_id = s.active_binding_id AND g.reader_role = reader::oid
-     AND g.expires_at > clock_timestamp()
+     AND g.expires_at > clock_timestamp() AND NOT g.revoked
     JOIN pg_user_mapping m ON m.oid = g.mapping_id AND m.umuser = g.reader_role
     JOIN lakehouse.managed_capture_bindings b ON b.binding_id = g.binding_id
     JOIN lakehouse.managed_capture_bindings initial
