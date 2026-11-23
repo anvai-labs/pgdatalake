@@ -2581,22 +2581,39 @@ lakehouse_admit_managed_cut(LakehouseTableScanDesc scan)
 	{
 		Oid			argtypes[2] = {OIDOID, OIDOID};
 		Datum		args[2] = {ObjectIdGetDatum(relid), ObjectIdGetDatum(reader)};
+		bool		isnull;
 		int			ret;
 
 		SetUserIdAndSecContext(owner, sec_context | SECURITY_LOCAL_USERID_CHANGE |
 							   SECURITY_RESTRICTED_OPERATION);
-		ret = SPI_execute_with_args("SELECT * FROM lakehouse.admit_managed_read($1, $2)",
-									2, argtypes, args, NULL, true, 1);
-		if (ret != SPI_OK_SELECT)
-			elog(ERROR, "could not read the managed read admission");
-		if (SPI_processed == 1)
+
+		/*
+		 * Extensions below 1.19 have no admission function yet: an unadmitted
+		 * scan keeps the historical 0A000 baseline instead of failing on the
+		 * missing function (the capture-binding fixture runs the 1.6/1.7
+		 * chain).
+		 */
+		ret = SPI_execute("SELECT to_regprocedure('lakehouse.admit_managed_read(regclass,regrole)')"
+						  " IS NOT NULL", true, 1);
+		if (ret != SPI_OK_SELECT || SPI_processed != 1 ||
+			!DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1,
+										&isnull)))
+			admitted = false;
+		else
 		{
-			managed_read_admission_fill(&scan->admission,
-										SPI_tuptable->vals[0],
-										SPI_tuptable->tupdesc);
-			/* strings die with the SPI context; re-home them first */
-			managed_read_admission_copy_strings(&scan->admission, scan_context);
-			admitted = true;
+			ret = SPI_execute_with_args("SELECT * FROM lakehouse.admit_managed_read($1, $2)",
+										2, argtypes, args, NULL, true, 1);
+			if (ret != SPI_OK_SELECT)
+				elog(ERROR, "could not read the managed read admission");
+			if (SPI_processed == 1)
+			{
+				managed_read_admission_fill(&scan->admission,
+											SPI_tuptable->vals[0],
+											SPI_tuptable->tupdesc);
+				/* strings die with the SPI context; re-home them first */
+				managed_read_admission_copy_strings(&scan->admission, scan_context);
+				admitted = true;
+			}
 		}
 	}
 	PG_FINALLY();
