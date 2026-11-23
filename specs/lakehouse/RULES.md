@@ -248,8 +248,7 @@ separately.
   measurements, time to the first successful query, queue and completion
   counts, origin requests, drain outcomes and sample counts; report p95 and
   p99 where samples support them. The receipt itself follows
-  [the milestone TDD and smoke receipt format](10-testing.md
-  #milestone-tdd-and-smoke-receipts).
+  [the milestone TDD and smoke receipt format](10-testing.md#milestone-tdd-and-smoke-receipts).
 - The core supplies the data-plane conformance tests and versioned artifacts.
   Operators own deployment and live-provider qualification.
   [Cloud profile contract](modules/09-cloud-profiles.md) ·
