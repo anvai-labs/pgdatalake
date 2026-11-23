@@ -12,6 +12,9 @@
 
 use std::ffi::{c_char, CStr, CString};
 
+mod native_send;
+pub use native_send::*;
+
 pub use crate::read_binding::PgDatalakeReadStatus;
 use crate::read_binding::{ReadBinding, ReadError, S3ReadRoot};
 use crate::scan::ScanPlan;
@@ -4252,7 +4255,7 @@ struct NativeLookupRequest {
     proposal_digest: String,
 }
 
-fn parse_lookup_digest(hex: &str) -> Option<[u8; 32]> {
+fn parse_digest_hex(hex: &str) -> Option<[u8; 32]> {
     if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
@@ -4310,8 +4313,8 @@ pub unsafe extern "C" fn pg_datalake_lookup_managed_publication(
                 Err(_) => return ManagedLookupInvalid,
             };
         let (Some(input_digest), Some(request_digest)) = (
-            parse_lookup_digest(&request.input_digest),
-            parse_lookup_digest(&request.proposal_digest),
+            parse_digest_hex(&request.input_digest),
+            parse_digest_hex(&request.proposal_digest),
         ) else {
             return ManagedLookupInvalid;
         };

@@ -584,6 +584,166 @@ fn dropping_owned_preparation_keeps_only_create_only_objects() {
 }
 
 #[test]
+#[allow(unsafe_code)]
+fn native_prepare_exposes_exact_proposal_and_drops_without_post() {
+    use crate::ffi::{
+        pg_datalake_drop_managed_send, pg_datalake_prepare_managed_send,
+        PgDatalakeNativeSendCredentials, PgDatalakeNativeSendInputs, PgDatalakeNativeSendMember,
+        PgDatalakeNativeSendProposal,
+    };
+    use std::{fmt::Write, mem::MaybeUninit};
+
+    let remote = FakeProviders::start();
+    let target = target(&remote.endpoint());
+    let credential_target = json!({
+        "binding": {
+            "authority_id": target.binding.authority_id,
+            "binding_id": target.binding.binding_id,
+            "incarnation_id": target.binding.incarnation_id,
+            "binding_generation": target.binding.binding_generation,
+        },
+        "table_uuid": target.table_uuid,
+        "table_root": target.table_root,
+        "schema_id": target.schema_id,
+        "spec_id": target.spec_id,
+        "ref_name": target.ref_name,
+        "catalog_endpoint": target.catalog_endpoint,
+        "catalog_prefix": target.catalog_prefix,
+        "namespace": target.namespace,
+        "table_name": target.table_name,
+        "object_endpoint": target.object_endpoint,
+        "s3_region": target.s3_region,
+    });
+    let (hint, claim) = acquired_send();
+    let mut input_digest = String::with_capacity(64);
+    for byte in claim.identity.input_digest {
+        write!(input_digest, "{byte:02x}").unwrap();
+    }
+    let request = json!({
+        "target": &credential_target,
+        "operation_id": claim.identity.operation_id,
+        "owner_generation": claim.generation,
+        "input_digest": input_digest,
+        "observation": {
+            "mode": "send", "operation_id": hint.operation_id, "binding_id": hint.binding_id,
+            "owner_generation": hint.owner_generation,
+        },
+    });
+    let request_bytes = serde_json::to_vec(&request).unwrap();
+    let schema = br#"[{"name":"id","type":"long"}]"#;
+    let member = member();
+    let ffi_members = [PgDatalakeNativeSendMember {
+        segment_id: member.segment_id,
+        row_count: member.row_count,
+        payload: member.payload.as_ptr(),
+        payload_len: member.payload.len(),
+    }];
+    let target_bytes = serde_json::to_vec(&credential_target).unwrap();
+    let expiry = (SystemTime::now() + Duration::from_secs(60))
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut credentials = PgDatalakeNativeSendCredentials {
+        target: target_bytes.as_ptr(),
+        target_len: target_bytes.len(),
+        catalog_token: b"catalog-token".as_ptr(),
+        catalog_token_len: b"catalog-token".len(),
+        access_key: b"enrolled-key".as_ptr(),
+        access_key_len: b"enrolled-key".len(),
+        secret_key: b"fixture-secret".as_ptr(),
+        secret_key_len: b"fixture-secret".len(),
+        session_token: b"send-session".as_ptr(),
+        session_token_len: b"send-session".len(),
+        expires_unix_seconds: expiry,
+    };
+    let mut input = PgDatalakeNativeSendInputs {
+        request: request_bytes.as_ptr(),
+        request_len: request_bytes.len(),
+        schema: schema.as_ptr(),
+        schema_len: schema.len(),
+        members: ffi_members.as_ptr(),
+        member_count: ffi_members.len(),
+        credentials: std::ptr::null(),
+    };
+    let prepare = |input: &PgDatalakeNativeSendInputs,
+                   credentials: &PgDatalakeNativeSendCredentials| {
+        let input = PgDatalakeNativeSendInputs {
+            credentials,
+            ..*input
+        };
+        let mut view = MaybeUninit::<PgDatalakeNativeSendProposal>::uninit();
+        let handle =
+            unsafe { pg_datalake_prepare_managed_send(&raw const input, view.as_mut_ptr()) };
+        (handle, unsafe { view.assume_init() })
+    };
+
+    let mut wrong_scope = credential_target;
+    wrong_scope["table_root"] = json!(format!("{ROOT}-other"));
+    let wrong_target = serde_json::to_vec(&wrong_scope).unwrap();
+    credentials.target = wrong_target.as_ptr();
+    credentials.target_len = wrong_target.len();
+    let (handle, view) = prepare(&input, &credentials);
+    assert!(handle.is_null() && view.body.is_null() && view.body_len == 0);
+    credentials.target = target_bytes.as_ptr();
+    credentials.target_len = target_bytes.len();
+
+    let mut stale = request;
+    stale["observation"]["owner_generation"] = json!(hint.owner_generation - 1);
+    let stale = serde_json::to_vec(&stale).unwrap();
+    input.request = stale.as_ptr();
+    input.request_len = stale.len();
+    assert!(prepare(&input, &credentials).0.is_null());
+    input.request = request_bytes.as_ptr();
+    input.request_len = request_bytes.len();
+
+    credentials.expires_unix_seconds = 0;
+    assert!(prepare(&input, &credentials).0.is_null());
+    credentials.expires_unix_seconds = expiry;
+    input.member_count = MAX_PUBLICATION_MEMBERS + 1;
+    assert!(prepare(&input, &credentials).0.is_null());
+    input.member_count = ffi_members.len();
+    let oversized_token = [b'x'; 4097];
+    let approved_token = credentials.catalog_token;
+    let approved_len = credentials.catalog_token_len;
+    credentials.catalog_token = oversized_token.as_ptr();
+    credentials.catalog_token_len = oversized_token.len();
+    assert!(prepare(&input, &credentials).0.is_null());
+    credentials.catalog_token = approved_token;
+    credentials.catalog_token_len = approved_len;
+    {
+        let state = remote.state.lock().unwrap();
+        assert!(state.reads.is_empty() && state.object_reads.is_empty());
+        assert!(state.object_writes.is_empty() && state.posts.is_empty());
+    }
+
+    let (mut handle, view) = prepare(&input, &credentials);
+    assert!(!handle.is_null());
+    assert!(!view.parent_is_null && view.parent == 100);
+    assert!((1..=64 * 1024).contains(&view.body_len));
+    let exact_body = unsafe { std::slice::from_raw_parts(view.body, view.body_len) }.to_vec();
+    let exact = AuthorizedPublication {
+        identity: claim.identity,
+        expected_parent: Some(view.parent),
+        snapshot_id: view.snapshot,
+        request_digest: view.digest,
+        request_body: &exact_body,
+    };
+    assert!(exact.matches_retained_request());
+    unsafe {
+        pg_datalake_drop_managed_send(&raw mut handle);
+        pg_datalake_drop_managed_send(&raw mut handle);
+    }
+    assert!(handle.is_null());
+
+    let state = remote.state.lock().unwrap();
+    assert_eq!(state.reads, [ROUTE]);
+    assert_eq!(state.object_reads, [PARENT_PATH]);
+    assert_eq!(state.object_writes.len(), 3);
+    assert_eq!(state.posts, [] as [Value; 0]);
+    assert_eq!(state.catalog["metadata"]["current-snapshot-id"], 100);
+}
+
+#[test]
 fn cancellation_during_last_prepare_put_yields_no_proposal_or_post() {
     let remote = FakeProviders::start();
     let cancelled = Arc::new(AtomicBool::new(false));
