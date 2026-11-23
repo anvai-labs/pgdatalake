@@ -18,27 +18,42 @@ login = import_module("scoped-read-check").login
 trino = trino_fixture.trino
 
 
-class IncompatibleCut(ValueError):
-    """No proven published pin is compatible with the local snapshot."""
+EXPIRED = object()
+SCOPE_FIELDS = ("authority_id", "table_uuid", "ref_name", "incarnation_id", "storage_root")
 
 
-def compatible_cut(source, candidates, visible):
-    """Consume authorized ancestry order and complete membership from a provider.
+def select_cut(worker, source, candidates, visible):
+    def membership(included):
+        if included is EXPIRED:
+            return {"proof": "expired"}
+        if included is None:
+            return {"proof": "unknown"}
+        return {"proof": "complete", "included": [str(segment) for segment in sorted(included)]}
 
-    The source identity covers the table's entire local publication lineage.
-    An empty membership is proof of absence. None means missing proof.
-    """
-    for scope, pin, included, base_rows in candidates:
-        if scope != source:
-            raise IncompatibleCut("binding_changed")
-        if included is None or not included <= visible.keys():
-            continue
-        overlay_ids = sorted(visible.keys() - included)
-        rows = list(base_rows)
-        for seg_id in overlay_ids:
-            rows.extend(visible[seg_id][0])
-        return pin, overlay_ids, sorted(rows)
-    raise IncompatibleCut("no_compatible_pin")
+    request = {
+        "scope": dict(zip(SCOPE_FIELDS, source, strict=True)),
+        "candidates": [
+            {"scope": dict(zip(SCOPE_FIELDS, scope, strict=True)), "pin": pin,
+             "membership": membership(included)}
+            for scope, pin, included, _ in candidates
+        ],
+        "visible": [
+            {"segment_id": str(seg_id), "payload_retained": payload is not None}
+            for seg_id, (payload, _) in visible.items()
+        ],
+    }
+    result = subprocess.run([worker, "--select-managed-cut"], input=json.dumps(request),
+                            check=True, capture_output=True, text=True, timeout=10)
+    cut = json.loads(result.stdout)
+    if "error" in cut:
+        return cut["error"]
+    pin = cut["pin"]
+    overlay_ids = [int(seg_id) for seg_id in cut["overlay_segment_ids"]]
+    base, = (rows for _, candidate, _, rows in candidates if candidate == pin)
+    rows = list(base)
+    for seg_id in overlay_ids:
+        rows.extend(visible[seg_id][0])
+    return pin, overlay_ids, sorted(rows)
 
 
 def ledger_snapshot(session):
@@ -61,12 +76,9 @@ def certify(scope, pin, included, namespace, expected):
     return scope, pin, included, rows
 
 
-def check(name, expected, scope, candidates, observation):
+def check(worker, name, expected, scope, candidates, observation):
     pg_snapshot, visible = observation
-    try:
-        result = compatible_cut(scope, candidates, visible)
-    except IncompatibleCut as exc:
-        result = str(exc)
+    result = select_cut(worker, scope, candidates, visible)
     assert result == expected, (name, result, expected, pg_snapshot, visible)
     print(json.dumps({"case": name, "pg_snapshot": pg_snapshot,
                       "visible_ids": list(visible), "result": result}, sort_keys=True), flush=True)
@@ -129,14 +141,15 @@ def verified_membership(db, operation):
     document = sql(db, f"""
         SELECT json_build_object('pin', c.verified_snapshot_id::text,
                                  'binding', c.capture_binding_id,
-                                 'source', json_build_array(c.authority_id, c.table_uuid, b.ref_name),
+                                 'source', json_build_array(c.authority_id, c.table_uuid, b.ref_name,
+                                                            b.incarnation_id, b.storage_root),
                                  'members', json_agg(s.seg_id ORDER BY s.seg_id))
         FROM {HDR} c JOIN lakehouse.publication_binding_descriptors b ON b.binding_id=c.capture_binding_id
             JOIN {MEM} m USING (operation_id)
             JOIN {SEG} s USING (seg_id)
         WHERE c.operation_id='{operation}' AND c.verified_snapshot_id IS NOT NULL
             AND s.published AND s.published_snapshot_id=c.verified_snapshot_id
-        GROUP BY c.operation_id, b.ref_name
+        GROUP BY c.operation_id, b.ref_name, b.incarnation_id, b.storage_root
     """)
     assert document, "worker left no verified membership"
     return json.loads(document)
@@ -195,7 +208,7 @@ def exercise(db, namespace, role, owner, worker, expect_runtime_red, native_look
     table = metadata["table-uuid"]
     root = metadata["location"]
     authority, incarnation, binding = (str(uuid4()) for _ in range(3))
-    source = (authority, table, "main")
+    source = (authority, table, "main", incarnation, root.rstrip("/"))
     base = certify(source, parent, set(), namespace, [10])
 
     prefix = route.split("/namespaces/", 1)[0].removeprefix("/catalog/v1").lstrip("/")
@@ -212,11 +225,11 @@ def exercise(db, namespace, role, owner, worker, expect_runtime_red, native_look
 def check_visibility(db, role, owner, worker, approval, base, history, gateway, native_lookup):
     route, posts, lookups = gateway
     source, parent, _, _ = base
-    authority, table, _ = source
+    authority, table, _, incarnation, _ = source
     namespace, = approval["namespace_components"]
     endpoint, prefix = approval["catalog_endpoint"], approval["catalog_prefix"]
     root, binding = approval["storage_root"], approval["binding_id"]
-    incarnation = approval["incarnation_id"]
+    assert incarnation == approval["incarnation_id"]
     sql(db, f"""
         CREATE EXTENSION lakehouse;
         ALTER EXTENSION lakehouse UPDATE TO '1.10';
@@ -316,26 +329,33 @@ def check_visibility(db, role, owner, worker, approval, base, history, gateway, 
         published = certify(tuple(receipt["source"]), receipt["pin"], set(receipt["members"]),
                             namespace, [10, 20, 20])
         unknown = source, child, None, published[3]
-        wrong = (authority, str(uuid4()), "main"), child, set(), published[3]
+        wrong = (authority, str(uuid4()), *source[2:]), child, set(), published[3]
+        expired_parent = (source, parent, EXPIRED, [])
         candidates = [published, base]
 
-        check("before-both-commits", (parent, [], [10]), source, candidates, first_view)
-        check("mixed-batch-between-commits", (parent, [first_id], [10, 20]), source,
+        check(worker, "before-both-commits", (parent, [], [10]), source, candidates, first_view)
+        check(worker, "mixed-batch-between-commits", (parent, [first_id], [10, 20]), source,
               candidates, second_view)
-        check("missing-compatible-parent", "no_compatible_pin", source, [published], second_view)
-        check("accepted-before-local-completion", (child, [], [10, 20, 20]), source,
+        check(worker, "missing-compatible-parent", "no_compatible_pin", source, [published], second_view)
+        check(worker, "expired-compatible-parent", "no_compatible_pin", source,
+              [published, expired_parent], second_view)
+        _, visible = second_view
+        reclaimed = {seg_id: (None, published) for seg_id, (_, published) in visible.items()}
+        check(worker, "missing-overlay-payload", "no_compatible_pin", source, candidates,
+              (second_view[0], reclaimed))
+        check(worker, "accepted-before-local-completion", (child, [], [10, 20, 20]), source,
               candidates, fresh_view)
-        check("unknown-membership-no-output", "no_compatible_pin", source, [unknown], fresh_view)
-        check("unknown-head-fallback", (parent, [first_id, late_id], [10, 20, 20]), source,
+        check(worker, "unknown-membership-no-output", "no_compatible_pin", source, [unknown], fresh_view)
+        check(worker, "unknown-head-fallback", (parent, [first_id, late_id], [10, 20, 20]), source,
               [unknown, base], fresh_view)
-        check("replaced-binding-no-output", "binding_changed", source, [wrong, base], fresh_view)
+        check(worker, "replaced-binding-no-output", "binding_changed", source, [wrong, base], fresh_view)
 
         assert ledger_snapshot(before) == first_view
         assert ledger_snapshot(between) == second_view
         completed = ledger_snapshot(fresh)
         assert completed[1] == {first_id: ([20], True), late_id: ([20], True)}, completed
-        check("after-local-completion", (child, [], [10, 20, 20]), source, candidates, completed)
-        check("retained-parent-after-completion", (parent, [first_id, late_id], [10, 20, 20]), source,
+        check(worker, "after-local-completion", (child, [], [10, 20, 20]), source, candidates, completed)
+        check(worker, "retained-parent-after-completion", (parent, [first_id, late_id], [10, 20, 20]), source,
               [base], completed)
 
 

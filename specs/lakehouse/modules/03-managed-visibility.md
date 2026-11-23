@@ -86,11 +86,24 @@ PostgreSQL view before local completion. After both source commits the child
 contains `[10,20,20]`. The middle snapshot uses the retained parent and the
 one visible member, yielding `[10,20]`. The old snapshot yields `[10]`.
 
-The oracle now consumes real membership for this bounded fixture. Production
-still needs the catalog-to-TableAM ancestry and membership handoff for the
-entire retained lineage and scan-time enforcement before first output. The
-fixture asserts the bound SQL gate `0A000`. Its held snapshots exercise the
-oracle and leave product Repeatable Read support unqualified.
+The shared Rust `select_compatible_pin` routine now selects the cut in this
+fixture. It accepts the enrolled authority, table UUID, incarnation, ref and
+storage root, certified ancestry candidates, and the visible PostgreSQL segment
+IDs including whether their exact payloads remain available. Candidate states
+distinguish complete membership, unknown proof and expired pins. The selector
+checks exact IDs and monotone append membership across the complete candidates.
+It refuses a changed scope, contradictory proof, or the absence of a usable
+cut. An older pin is usable only if each needed overlay payload remains
+available. The output is one exact pin and sorted segment IDs. The fixture
+compares its row multiset with the independent oracle and the pinned external
+engine. [Selector](../../../src/backend/access/lakehouse/core/pgdatalake-core/src/managed_visibility.rs)
+
+The caller still owns certified ancestry and retained-lineage membership.
+TableAM must hold the chosen pin and local payloads through execution, integrate
+own-command visibility and prove the whole statement pin vector before first
+output. The fixture continues to require `0A000` from the bound SQL path. Held
+snapshots exercise the selector under real MVCC and leave application Repeatable
+Read support unqualified.
 
 - Run the managed overlay vectors with a fake published view and ledger membership responses. Verify older base/new ledger, new base/stale ledger, future operation and unknown-membership cases. Assert exact rows, including duplicates.
 - Run `mixed-visibility-claim` through pin selection and ordinary SQL scans. Two segments share one verified publication. A reader between their source commits falls back to the retained parent and adds just its visible segment. Dropping that parent gives an explicit consistency error. A reader after both commits can use the published pin directly.
