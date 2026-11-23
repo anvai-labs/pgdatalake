@@ -512,6 +512,17 @@ fn preparation_refuses_stale_owner_wrong_scope_oversize_expiry_and_cancellation(
         prepare_publication_send(&publisher, hint, &claim, &[over_budget], &cancelled),
         Err(error) if error.stage == "load_members" && error.to_string().contains("batch limits")
     ));
+    let too_many_members: Vec<_> = (0..=MAX_PUBLICATION_MEMBERS)
+        .map(|_| {
+            let mut invalid_member = member();
+            invalid_member.row_count = 0;
+            invalid_member
+        })
+        .collect();
+    assert!(matches!(
+        prepare_publication_send(&publisher, hint, &claim, &too_many_members, &cancelled),
+        Err(error) if error.stage == "load_members" && error.to_string().contains("batch limits")
+    ));
     let member = member();
     cancelled.store(true, Ordering::Relaxed);
     assert!(matches!(

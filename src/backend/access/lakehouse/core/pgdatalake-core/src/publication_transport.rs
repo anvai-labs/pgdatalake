@@ -261,6 +261,12 @@ impl ScopedPublisher {
         &self,
         members: &[CapturedMember],
     ) -> Result<(), StorageError> {
+        let over_budget = || {
+            StorageError::Config("captured publication exceeds the configured batch limits".into())
+        };
+        if members.is_empty() || members.len() > MAX_PUBLICATION_MEMBERS {
+            return Err(over_budget());
+        }
         let mut bytes = 0usize;
         let mut row_count = 0usize;
         for member in members {
@@ -272,14 +278,8 @@ impl ScopedPublisher {
             }
             row_count = row_count.saturating_add(member.row_count as usize);
         }
-        if row_count == 0
-            || members.len() > MAX_PUBLICATION_MEMBERS
-            || row_count > self.limits.captured_rows
-            || bytes > self.limits.captured_bytes
-        {
-            return Err(StorageError::Config(
-                "captured publication exceeds the configured batch limits".into(),
-            ));
+        if row_count > self.limits.captured_rows || bytes > self.limits.captured_bytes {
+            return Err(over_budget());
         }
         Ok(())
     }
