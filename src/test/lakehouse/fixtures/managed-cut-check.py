@@ -142,9 +142,11 @@ def verified_membership(db, operation):
     return json.loads(document)
 
 
-def run_worker(worker, db, operation, approval, *, lookup_only=False, error=None):
+def run_worker(worker, db, operation, approval, *, lookup_only=False, error=None,
+               member_byte_budget=None):
     request = {"database": db, "operation_id": operation, "admitted_transport": True,
-               "lookup_only": lookup_only, "approved_target": approval}
+               "lookup_only": lookup_only, "approved_target": approval,
+               "member_byte_budget": member_byte_budget}
     result = subprocess.run([worker], input=json.dumps(request), timeout=35, text=True, capture_output=True)
     if error:
         assert result.returncode and error in result.stderr, (result.returncode, result.stderr)
@@ -187,7 +189,7 @@ def check_visibility(db, role, owner, worker, approval, base, history, gateway):
     incarnation = approval["incarnation_id"]
     sql(db, f"""
         CREATE EXTENSION lakehouse;
-        ALTER EXTENSION lakehouse UPDATE TO '1.9';
+        ALTER EXTENSION lakehouse UPDATE TO '1.10';
         CREATE SERVER cut_catalog FOREIGN DATA WRAPPER lakehouse_fdw OPTIONS
             (endpoint '{endpoint}', warehouse 'smoke',
              s3_endpoint 'http://127.0.0.1:9000');
@@ -226,6 +228,9 @@ def check_visibility(db, role, owner, worker, approval, base, history, gateway):
                     "lakehouse.discover_managed_publication_claims(NULL, 16)")
         sql(db, f"SELECT lakehouse.claim_managed_publication('{operation}', ARRAY[{first_id},{late_id}]::bigint[])")
         assert sql(db, discover) == f"{operation}|{binding}|send"
+        run_worker(worker, db, operation, approval, member_byte_budget=1,
+                   error="managed publication exceeds its member budget")
+        assert not posts and not lookups
         run_worker(worker, db, operation, approval | {"storage_root": root.rstrip("/") + "-wrong"},
                    error="publication credentials lack matching approval")
         assert not posts and not lookups
@@ -258,7 +263,7 @@ def check_visibility(db, role, owner, worker, approval, base, history, gateway):
         print(json.dumps({"case": "verified-worker-cut", "parent": parent, "pin": child,
                           "operation": operation, "members": receipt["members"],
                           "catalog_posts": len(posts), "catalog_gets": len(lookups),
-                          "wrong_approval_catalog_requests": 0}, sort_keys=True),
+                          "wrong_approval_catalog_requests": 0, "overbudget_catalog_requests": 0}, sort_keys=True),
               flush=True)
         published = certify(tuple(receipt["source"]), receipt["pin"], set(receipt["members"]),
                             namespace, [10, 20, 20])

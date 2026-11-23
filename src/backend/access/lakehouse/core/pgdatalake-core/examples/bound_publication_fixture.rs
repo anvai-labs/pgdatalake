@@ -41,6 +41,8 @@ use uuid::Uuid;
 
 type FixtureResult<T> = Result<T, Box<dyn std::error::Error>>;
 const MANIFEST_BUDGET: (u64, Duration) = (1024 * 1024, Duration::from_secs(4));
+const CAPTURED_ROWS: usize = 1024;
+const CAPTURED_BYTES: usize = 1024 * 1024;
 
 #[derive(Deserialize)]
 struct Fixture {
@@ -51,6 +53,7 @@ struct Fixture {
     #[serde(default)]
     lookup_only: bool,
     approved_target: Option<BindingDescriptor>,
+    member_byte_budget: Option<usize>,
     #[serde(flatten)]
     legacy: Option<LegacyTarget>,
 }
@@ -184,6 +187,10 @@ fn s3_options() -> S3Options {
 }
 
 impl Fixture {
+    fn captured_bytes(&self) -> usize {
+        self.member_byte_budget.unwrap_or(CAPTURED_BYTES)
+    }
+
     fn legacy_target(&self) -> FixtureResult<&LegacyTarget> {
         self.legacy
             .as_ref()
@@ -211,30 +218,34 @@ impl Fixture {
 
 impl PublicationLedger for Fixture {
     fn load(&self, operation: Uuid) -> LedgerResult<PublicationClaim> {
-        let (binding_json, binding_join, binding_match) = if self.admitted_transport {
-            ("CASE WHEN b.binding_id IS NOT NULL THEN json_build_object(
-                 'authority_id', b.authority_id, 'binding_id', b.binding_id,
-                 'incarnation_id', b.incarnation_id, 'binding_generation', b.generation) END",
-             "LEFT JOIN lakehouse.managed_capture_bindings AS b ON b.binding_id = c.capture_binding_id",
-             "AND (a.operation_id IS NULL OR a.capture_binding_id = c.capture_binding_id)")
+        let source = if self.admitted_transport {
+            format!(
+                "SELECT j.*, json_build_object('authority_id', j.authority_id,
+                         'binding_id', j.binding_id, 'incarnation_id', j.incarnation_id,
+                         'binding_generation', j.binding_generation) AS binding
+                 FROM lakehouse.load_managed_publication_job('{operation}') j"
+            )
         } else {
-            ("NULL::json", "", "")
+            format!(
+                "SELECT c.input_digest, c.authority_id, c.table_uuid, c.owner_generation,
+                        c.verified_snapshot_id, NULL::json AS binding, a.expected_parent,
+                        a.proposed_snapshot_id, a.proposal_digest, a.proposal_body
+                 FROM lakehouse.publication_claims c
+                 LEFT JOIN lakehouse.publication_attempts a USING (operation_id)
+                 WHERE c.operation_id = '{operation}'"
+            )
         };
         let claim: Claim = serde_json::from_str(&self.sql(&format!(
-            "SELECT json_build_object('input_digest', encode(c.input_digest, 'hex'),
-                        'authority_id', c.authority_id, 'table_uuid', c.table_uuid,
-                        'owner_generation', c.owner_generation,
-                        'binding', {binding_json},
-                        'verified_snapshot_id', c.verified_snapshot_id,
-                        'attempt', CASE WHEN a.operation_id IS NOT NULL THEN
-                            json_build_object('expected_parent', a.expected_parent,
-                                'proposed_snapshot_id', a.proposed_snapshot_id,
-                                'proposal_digest', encode(a.proposal_digest, 'hex'),
-                                'proposal_body', encode(a.proposal_body, 'hex')) END)
-             FROM lakehouse.publication_claims AS c
-             LEFT JOIN lakehouse.publication_attempts AS a USING (operation_id)
-             {binding_join}
-             WHERE c.operation_id = '{operation}' {binding_match};"
+            "SELECT json_build_object('input_digest', encode(j.input_digest, 'hex'),
+                        'authority_id', j.authority_id, 'table_uuid', j.table_uuid,
+                        'owner_generation', j.owner_generation, 'binding', j.binding,
+                        'verified_snapshot_id', j.verified_snapshot_id,
+                        'attempt', CASE WHEN j.proposed_snapshot_id IS NOT NULL THEN
+                            json_build_object('expected_parent', j.expected_parent,
+                                'proposed_snapshot_id', j.proposed_snapshot_id,
+                                'proposal_digest', encode(j.proposal_digest, 'hex'),
+                                'proposal_body', encode(j.proposal_body, 'hex')) END)
+             FROM ({source}) j;"
         ))?)?;
         if self.admitted_transport {
             let scope = claim
@@ -284,14 +295,27 @@ impl PublicationLedger for Fixture {
     }
 
     fn members(&self, claim: &PublicationClaim) -> LedgerResult<Vec<CapturedMember>> {
+        let op = claim.identity.operation_id;
+        let source = if self.admitted_transport {
+            format!(
+                "SELECT * FROM lakehouse.load_managed_publication_members(
+                                '{op}', {}, {CAPTURED_ROWS}, {})",
+                claim.generation,
+                self.captured_bytes()
+            )
+        } else {
+            format!(
+                "SELECT s.seg_id AS segment_id, s.row_count, s.payload
+                 FROM lakehouse.publication_members m
+                 JOIN lakehouse.lakehouse_delta_segments s USING (seg_id)
+                 WHERE m.operation_id = '{op}'"
+            )
+        };
         let members: Vec<LedgerMember> = serde_json::from_str(&self.sql(&format!(
-            "SELECT json_agg(json_build_object('segment_id', s.seg_id,
+            "SELECT json_agg(json_build_object('segment_id', s.segment_id,
                         'row_count', s.row_count,
-                        'payload', encode(s.payload, 'hex')) ORDER BY s.seg_id)
-             FROM lakehouse.publication_members AS m
-             JOIN lakehouse.lakehouse_delta_segments AS s USING (seg_id)
-             WHERE m.operation_id = '{}';",
-            claim.identity.operation_id,
+                        'payload', encode(s.payload, 'hex')) ORDER BY s.segment_id)
+             FROM ({source}) s;"
         ))?)?;
         members
             .into_iter()
@@ -380,8 +404,8 @@ impl FixtureCatalog<'_> {
             credentials,
             vec![("id".into(), IcebergType::Long)],
             PublicationLimits {
-                captured_bytes: 1024 * 1024,
-                captured_rows: 1024,
+                captured_bytes: self.target.captured_bytes(),
+                captured_rows: CAPTURED_ROWS,
                 manifest_bytes: MANIFEST_BUDGET.0,
                 manifest_timeout: MANIFEST_BUDGET.1,
             },
