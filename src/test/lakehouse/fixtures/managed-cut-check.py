@@ -80,22 +80,24 @@ def dropped_catalog_reply(route):
 
     class Gateway(BaseHTTPRequestHandler):
         def do_GET(self):
+            purpose = self.headers.get("Authorization")
+            lookups.append((self.path, purpose))
             if self.path != route:
                 self.send_error(404)
                 return
-            purpose = self.headers.get("Authorization")
             if purpose not in ("Bearer fixture-send", "Bearer fixture-lookup"):
                 self.send_error(403)
                 return
-            lookups.append(purpose)
             self.reply(*trino_fixture.catalog_request("GET", self.path))
 
         def do_POST(self):
             if self.path != route or self.headers.get("Authorization") != "Bearer fixture-send":
+                posts.append((403, b""))
                 self.send_error(403)
                 return
             payload = self.rfile.read(int(self.headers["Content-Length"]))
             if posts:
+                posts.append((409, payload))
                 self.send_error(409)
                 return
             status, _ = trino_fixture.catalog_request(
@@ -140,10 +142,15 @@ def verified_membership(db, operation):
     return json.loads(document)
 
 
-def run_worker(worker, db, operation, *, lookup_only=False):
+def run_worker(worker, db, operation, approval, *, lookup_only=False, error=None):
     request = {"database": db, "operation_id": operation, "admitted_transport": True,
-               "lookup_only": lookup_only}
-    return subprocess.check_output([worker], input=json.dumps(request), timeout=35, text=True).strip()
+               "lookup_only": lookup_only, "approved_target": approval}
+    result = subprocess.run([worker], input=json.dumps(request), timeout=35, text=True, capture_output=True)
+    if error:
+        assert result.returncode and error in result.stderr, (result.returncode, result.stderr)
+        return None
+    result.check_returncode()
+    return result.stdout.strip()
 
 
 def exercise(db, namespace, role, owner, worker, expect_runtime_red):
@@ -161,21 +168,26 @@ def exercise(db, namespace, role, owner, worker, expect_runtime_red):
 
     prefix = route.split("/namespaces/", 1)[0].removeprefix("/catalog/v1").lstrip("/")
     with dropped_catalog_reply(route) as (endpoint, posts, lookups):
-        check_visibility(db, namespace, role, owner, worker, source, root, incarnation, binding,
-                         base, history, endpoint, prefix, posts, lookups)
+        approval = trino_fixture.approved_target(namespace, endpoint, prefix, authority, table,
+                                                  root.rstrip("/"), binding, incarnation)
+        check_visibility(db, role, owner, worker, approval, base, history, (route, posts, lookups))
 
     if expect_runtime_red:
         sql(db, f"SET ROLE {role}; SELECT count(id) FROM events", error="0A000")
         print("bound SQL overlay remains gated with 0A000", flush=True)
 
 
-def check_visibility(db, namespace, role, owner, worker, source, root, incarnation, binding,
-                     base, history, endpoint, prefix, posts, lookups):
+def check_visibility(db, role, owner, worker, approval, base, history, gateway):
+    route, posts, lookups = gateway
+    source, parent, _, _ = base
     authority, table, _ = source
-    parent = base[1]
+    namespace, = approval["namespace_components"]
+    endpoint, prefix = approval["catalog_endpoint"], approval["catalog_prefix"]
+    root, binding = approval["storage_root"], approval["binding_id"]
+    incarnation = approval["incarnation_id"]
     sql(db, f"""
         CREATE EXTENSION lakehouse;
-        ALTER EXTENSION lakehouse UPDATE TO '1.8';
+        ALTER EXTENSION lakehouse UPDATE TO '1.9';
         CREATE SERVER cut_catalog FOREIGN DATA WRAPPER lakehouse_fdw OPTIONS
             (endpoint '{endpoint}', warehouse 'smoke',
              s3_endpoint 'http://127.0.0.1:9000');
@@ -207,8 +219,18 @@ def check_visibility(db, namespace, role, owner, worker, source, root, incarnati
         assert fresh_view[1] == {first_id: ([20], False), late_id: ([20], False)}, fresh_view
 
         operation = str(uuid4())
+        candidates = sql(db, "SELECT segment_id, binding_id, eligible FROM "
+                         "lakehouse.discover_managed_publication_segments(NULL, 16) ORDER BY segment_id")
+        assert candidates == f"{first_id}|{binding}|t\n{late_id}|{binding}|t", candidates
+        discover = ("SELECT operation_id, binding_id, mode FROM "
+                    "lakehouse.discover_managed_publication_claims(NULL, 16)")
         sql(db, f"SELECT lakehouse.claim_managed_publication('{operation}', ARRAY[{first_id},{late_id}]::bigint[])")
-        assert run_worker(worker, db, operation) == "hold dispatch_unknown"
+        assert sql(db, discover) == f"{operation}|{binding}|send"
+        run_worker(worker, db, operation, approval | {"storage_root": root.rstrip("/") + "-wrong"},
+                   error="publication credentials lack matching approval")
+        assert not posts and not lookups
+        assert sql(db, f"SELECT count(*) FROM lakehouse.publication_attempts WHERE operation_id='{operation}'") == "0"
+        assert run_worker(worker, db, operation, approval) == "hold dispatch_unknown"
         assert len(posts) == 1 and 200 <= posts[0][0] < 300
         child = trino(history)
         assert child != parent
@@ -224,16 +246,19 @@ def check_visibility(db, namespace, role, owner, worker, source, root, incarnati
         snapshot = next(s for s in head["snapshots"] if str(s["snapshot-id"]) == child)
         assert head["table-uuid"] == table and str(snapshot["parent-snapshot-id"]) == parent
         assert ledger_snapshot(fresh)[1] == fresh_view[1]
+        assert sql(db, discover) == f"{operation}|{binding}|lookup"
 
-        assert run_worker(worker, db, operation, lookup_only=True) == f"verified {child} 2"
+        assert run_worker(worker, db, operation, approval, lookup_only=True) == f"verified {child} 2"
         receipt = verified_membership(db, operation)
         assert receipt == {"pin": child, "binding": binding, "source": list(source),
                            "members": [first_id, late_id]}, receipt
         assert len(posts) == 1
-        assert lookups == ["Bearer fixture-send", "Bearer fixture-lookup"], lookups
+        assert lookups == [(route, "Bearer fixture-send"), (route, "Bearer fixture-lookup")], lookups
+        assert sql(db, discover) == ""
         print(json.dumps({"case": "verified-worker-cut", "parent": parent, "pin": child,
                           "operation": operation, "members": receipt["members"],
-                          "catalog_posts": len(posts), "catalog_gets": len(lookups)}, sort_keys=True),
+                          "catalog_posts": len(posts), "catalog_gets": len(lookups),
+                          "wrong_approval_catalog_requests": 0}, sort_keys=True),
               flush=True)
         published = certify(tuple(receipt["source"]), receipt["pin"], set(receipt["members"]),
                             namespace, [10, 20, 20])

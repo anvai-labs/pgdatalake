@@ -43,6 +43,18 @@ def enrolled_metadata(namespace):
     return route, body, json.loads(body)["metadata"]
 
 
+def approved_target(namespace, endpoint, prefix, authority, table, root, binding, incarnation):
+    # Independent fixture enrollment. The worker compares it with the SQL
+    # descriptor. A catalog response cannot broaden this record.
+    return {
+        "authority_id": authority, "binding_id": binding, "incarnation_id": incarnation,
+        "binding_generation": 1, "table_uuid": table, "storage_root": root,
+        "schema_id": 0, "spec_id": 0, "ref_name": "main", "catalog_endpoint": endpoint,
+        "catalog_prefix": prefix, "namespace_components": [namespace], "table_name": "events",
+        "object_endpoint": "http://127.0.0.1:9000", "s3_region": "us-east-1",
+    }
+
+
 def disconnect_after_authorization(db):
     # The nested CALL commits the real intent. The outer CALL never gets to
     # send CommandComplete to libpq. Only this disposable database is changed.
@@ -266,7 +278,8 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
             input_digest = claim_member(operation, first)
             worker_input = {"database": db, "operation_id": operation}
             if admitted_transport:
-                worker_input["admitted_transport"] = True
+                worker_input.update(admitted_transport=True, approved_target=approved_target(
+                    namespace, endpoint, prefix, authority, remote, root, binding, incarnation))
             else:
                 worker_input.update(endpoint=endpoint, namespace=namespace, authority_id=authority,
                                     table_uuid=remote, root=root)

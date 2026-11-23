@@ -196,7 +196,9 @@ jobs:
             --restart-fixture "$PGHOST/data" --worker "$rust_target/release/examples/bound_publication_fixture" \
             --capture-adapter "$PWD/src/test/lakehouse/fixtures/managed-capture-binding-adapter.sql" \
             --admitted-transport
-          python3 src/test/lakehouse/fixtures/managed-cut-check.py --expect-runtime-red
+          python3 src/test/lakehouse/fixtures/publication-discovery-check.py
+          python3 src/test/lakehouse/fixtures/managed-cut-check.py \
+            --worker "$rust_target/release/examples/bound_publication_fixture" --expect-runtime-red
 
       - name: Fetch unmodified PostgreSQL 19.0 for stock package qualification
         uses: actions/checkout@v4

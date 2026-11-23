@@ -2,7 +2,7 @@
 
 ## Current dependency order
 
-Reviewed through public #73 at `e4d87097099198bb41f682f1ea78c50be834384a`.
+The merged baseline for this integration is public #74 at `bee63a831bdd3eecbf1ae5be3fcd17535b6787fb`.
 The first independently shippable path is a serial, read-only FDW on stock
 PG19.0. The managed writer and its visibility proof can advance separately.
 
@@ -10,8 +10,14 @@ PG19.0. The managed writer and its visibility proof can advance separately.
 |---|---|---|
 | Stock reader, 01/02/06 | #53 supplies execution-time FDW COUNT and same-pin fallback. #54/#58/#61 cover effective mapping, enrolled root, real SQL logins, rotation and revocation. #70 runs the [TLS smoke](../../src/test/lakehouse/fixtures/stock-scoped-tls.sh) for those reads and reconnect on verified PG-wire with SCRAM. | The ordinary external pilot needs a deployed client-network, login and grant-generation test. Governed provider identity follows its own gate. Preserve ordinary/pinned count and denied-sibling controls. [External client handoff](modules/10-downstream-handoff.md#external-postgresql-client-handoff) |
 | Governed tables, 01/02/06/08 | #67–69 define BI reuse, provider scope and a verifier for 12 positive SQL executions and six refusals. Current governed results come from synthetic evidence. | Implement and run one provider's protected plan on a real enrolled table. Require exact source pin, actual consumption, masks and distinct effective scopes. Only then qualify reuse and multiple readers. [Verifier](modules/06c-governed-published-read.md) |
-| Managed appends, 03/04 | #63/#65 join normal bound capture, locally durable intent, scoped send, one-POST recovery and original-member finalization on the fixture. #64 exercises compatible cuts with real PostgreSQL snapshots and an injected publication certificate. | The Rust driver now accepts lookup-only wakes. The fixture proves zero commit POSTs for a lost local authorization reply and one for a lost remote acceptance reply. Scoped transport now validates the target, purpose and expiry and carries S3 session tokens. The fixture uses a separate read identity for recovery. Implement runtime credential issuance and the native scheduler independently, then repeat the [two barriers](modules/04b-scoped-send-admission.md#native-worker-integration) through their actual adapters. Feed verified receipts into the TableAM reader and compare old/intermediate/fresh views at the same pin. Qualify promotion separately. [Managed gates](modules/08a-core-release-gates.md) |
+| Managed appends, 01/03/04 | Bound capture and both reply-loss barriers are live on the fixture worker. 1.9 discovers exact eligible segments and existing send/lookup work without authorizing I/O. The independent Rust resolver gates credential issuance on approved target and purpose. The joined cut fixture consumes an actual verified two-member publication with one POST and two catalog reads. | Join the native background worker and deployment credential issuer to discovery, ownership and the WAL fence. Then derive TableAM scan-time membership across the retained lineage. The fixture oracles exercise mixed visibility. The bound SQL overlay and promoted-primary recovery remain gated. [Publisher handoff](modules/04b-scoped-send-admission.md#discovery-and-dispatch) · [Managed visibility](modules/03-managed-visibility.md#compatible-published-pin) |
 | Cost and expansion, 02/08/09 | #60 defines per-catalog profiles. #62 qualifies pinned benchmark digests. #66 reduces one projected canary from 4,719 to 16 data range GETs. | Diagnose the SF10 q1 timeout before a latency claim. Measure cold/warm dashboard completeness and spend on a qualified profile before selecting an elastic floor or enabling persistent reuse. [Cost evidence](modules/08b-io-cost.md) |
+
+### MVP integration order
+
+1. [Stock published reader](modules/10-downstream-handoff.md#external-postgresql-client-handoff) delivers the independent read-only pilot. For hosted use, verify the deployed backend and complete the external grant-rotation and cancellation drill. Provisioning and hosted admission can proceed alongside managed work.
+2. Managed sender joins [read-only discovery](modules/04b-scoped-send-admission.md#discovery-and-dispatch), the independently approved credential resolver and the native transaction adapter. Repeat both reply-loss barriers before a managed write readiness claim.
+3. Managed visibility consumes verified receipts and complete ancestry at statement execution. Use the mixed-cut oracle and pin equivalence before enabling overlay or its COUNT shortcut. Keep writer promotion, publication cadence, governed reads and fleet cost qualification behind their own gates.
 
 ### Managed recovery smoke at the #71 baseline plus the lookup-only driver
 

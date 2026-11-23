@@ -75,15 +75,21 @@ visibility and require the complete vector for joins before output. Returning a
 partial result would be a different consistency contract.
 
 The [live decision fixture](../../../src/test/lakehouse/fixtures/managed-cut-check.py)
-uses ordinary INSERT, two held PostgreSQL snapshots and Trino's exact parent and
-child rows. One batch contains the same value in two committed segments. The
-middle snapshot must use the parent and its one visible segment. The fresh
-snapshot suppresses both overlays on the published child, including before it
-can see local completion. The fixture injects membership and simulates completion
-as separate inputs to the decision oracle. A live acceptance test must replace
-them with verified worker receipts, derive candidate ancestry from the enrolled
-authority, and exercise the real bound TableAM scan. The fixture currently
-asserts the bound SQL gate `0A000`. Its held snapshots exercise the visibility
+starts with ordinary bound INSERTs, two held PostgreSQL snapshots and a real
+two-member append discovered through 1.9. The worker receives an independently
+approved target. A mismatched approval produces zero catalog calls. The matching
+send is accepted once and its catalog reply is withheld. Lookup verifies the
+original intent and finalizes both segments. The fixture reads the verified
+receipt and members from PostgreSQL, checks the actual parent and child in
+Lakekeeper, and compares exact pinned rows with Trino. It captures the fresh
+PostgreSQL view before local completion. After both source commits the child
+contains `[10,20,20]`. The middle snapshot uses the retained parent and the
+one visible member, yielding `[10,20]`. The old snapshot yields `[10]`.
+
+The oracle now consumes real membership for this bounded fixture. Production
+still needs the catalog-to-TableAM ancestry and membership handoff for the
+entire retained lineage and scan-time enforcement before first output. The
+fixture asserts the bound SQL gate `0A000`. Its held snapshots exercise the
 oracle and leave product Repeatable Read support unqualified.
 
 - Run the managed overlay vectors with a fake published view and ledger membership responses. Verify older base/new ledger, new base/stale ledger, future operation and unknown-membership cases. Assert exact rows, including duplicates.
