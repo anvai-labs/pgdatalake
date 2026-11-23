@@ -27,9 +27,10 @@ use pgdatalake_core::{
         PublicationLimits, PublicationPurpose, PublicationTarget, ScopedPublisher,
     },
     publication_worker::{
-        drive_publication, reconcile_publication, CapturedMember, ClaimState, LedgerResult,
-        PendingReason, PublicationBindingIdentity, PublicationCatalog, PublicationClaim,
-        PublicationLedger, RetainedAttempt, WorkerOutcome,
+        dispatch_publication_lookup, dispatch_publication_send, drive_publication,
+        reconcile_publication, CapturedMember, ClaimState, LedgerResult, PendingReason,
+        PublicationBindingIdentity, PublicationCatalog, PublicationClaim, PublicationDispatchHint,
+        PublicationDispatchMode, PublicationLedger, RetainedAttempt, WorkerOutcome,
     },
     session::{CatalogClient, S3ClientOptions},
     snapshot_write::NewDataFile,
@@ -53,6 +54,7 @@ struct Fixture {
     #[serde(default)]
     lookup_only: bool,
     approved_target: Option<BindingDescriptor>,
+    dispatch_hint: Option<PublicationDispatchHint>,
     member_byte_budget: Option<usize>,
     #[serde(flatten)]
     legacy: Option<LegacyTarget>,
@@ -610,7 +612,28 @@ fn main() -> FixtureResult<()> {
             )?)
         },
     };
-    let outcome = if fixture.lookup_only {
+    let outcome = if let Some(hint) = fixture.dispatch_hint {
+        if !fixture.admitted_transport
+            || fixture.lookup_only
+            || hint.operation_id != fixture.operation_id
+        {
+            return Err("invalid scheduled publication fixture request".into());
+        }
+        let outcome = match hint.mode {
+            PublicationDispatchMode::Send => dispatch_publication_send(&fixture, &catalog, hint)?,
+            PublicationDispatchMode::Lookup => {
+                dispatch_publication_lookup(&fixture, hint, |claim, intent| {
+                    catalog.lookup(claim, intent)
+                })?
+            }
+            PublicationDispatchMode::Hold => None,
+        };
+        let Some(outcome) = outcome else {
+            println!("rediscover");
+            return Ok(());
+        };
+        outcome
+    } else if fixture.lookup_only {
         let Some(outcome) =
             reconcile_publication(&fixture, fixture.operation_id, |claim, intent| {
                 catalog.lookup(claim, intent)

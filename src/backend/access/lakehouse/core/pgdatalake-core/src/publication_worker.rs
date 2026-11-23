@@ -62,6 +62,24 @@ pub struct PublicationClaim {
     pub state: ClaimState,
 }
 
+/// The mode reported by the ledger's bounded, read-only discovery query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationDispatchMode {
+    Send,
+    Lookup,
+    Hold,
+}
+
+/// One discovery row. A hint may be stale and supplies no send authorization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct PublicationDispatchHint {
+    pub operation_id: Uuid,
+    pub binding_id: Uuid,
+    pub owner_generation: i64,
+    pub mode: PublicationDispatchMode,
+}
+
 /// Adapter scoped to one independently admitted immutable target binding.
 /// A load observes the claim and attempt in the same database snapshot.
 /// Acquire, authorize and finalize use the DB's generation and state fences.
@@ -249,6 +267,65 @@ fn verify_reserved(
     verify(ledger, claim, intent, lookup(claim, intent))
 }
 
+fn load_dispatch_hint(
+    ledger: &impl PublicationLedger,
+    hint: PublicationDispatchHint,
+    mode: PublicationDispatchMode,
+) -> Result<Option<PublicationClaim>, WorkerFailure> {
+    if hint.mode != mode {
+        return Ok(None);
+    }
+    let claim = load_operation(ledger, hint.operation_id)?;
+    if claim.generation != hint.owner_generation
+        || claim
+            .binding
+            .is_none_or(|binding| binding.binding_id != hint.binding_id)
+    {
+        return Ok(None);
+    }
+    Ok(Some(claim))
+}
+
+/// Try an admitted send wake. If its hint is stale or an intent is retained
+/// before or during acquisition, return to discovery for a fresh lookup wake.
+/// As with direct dispatch, the ledger and catalog enforce current admission.
+pub fn dispatch_publication_send(
+    ledger: &impl PublicationLedger,
+    catalog: &impl PublicationCatalog,
+    hint: PublicationDispatchHint,
+) -> Result<Option<WorkerOutcome>, WorkerFailure> {
+    let Some(observed) = load_dispatch_hint(ledger, hint, PublicationDispatchMode::Send)? else {
+        return Ok(None);
+    };
+    if !matches!(observed.state, ClaimState::Unsent) {
+        return Ok(None);
+    }
+    let claim = acquire_claim(ledger, &observed)?;
+    if !matches!(claim.state, ClaimState::Unsent) {
+        return Ok(None);
+    }
+    drive_unsent(ledger, catalog, &claim).map(Some)
+}
+
+/// Try a discovered lookup wake using only its lookup capability. If the
+/// operation has moved since discovery or is unsent, return to discovery.
+pub fn dispatch_publication_lookup(
+    ledger: &impl PublicationLedger,
+    hint: PublicationDispatchHint,
+    lookup: impl FnOnce(
+        &PublicationClaim,
+        AuthorizedPublication<'_>,
+    ) -> Result<PublicationLookup, RestError>,
+) -> Result<Option<WorkerOutcome>, WorkerFailure> {
+    let Some(observed) = load_dispatch_hint(ledger, hint, PublicationDispatchMode::Lookup)? else {
+        return Ok(None);
+    };
+    if !matches!(observed.state, ClaimState::Reserved(_)) {
+        return Ok(None);
+    }
+    reconcile_reserved(ledger, &observed, lookup).map(Some)
+}
+
 /// Reconcile a wake scheduled only for verification on the original scope.
 /// An unsent claim returns None without acquiring ownership or contacting the
 /// catalog. The caller supplies only a lookup operation; an accepted attempt
@@ -269,14 +346,25 @@ pub fn reconcile_publication(
         }
         ClaimState::Reserved(_) => {}
     }
-    let claim = acquire_claim(ledger, &observed)?;
+    reconcile_reserved(ledger, &observed, lookup).map(Some)
+}
+
+fn reconcile_reserved(
+    ledger: &impl PublicationLedger,
+    observed: &PublicationClaim,
+    lookup: impl FnOnce(
+        &PublicationClaim,
+        AuthorizedPublication<'_>,
+    ) -> Result<PublicationLookup, RestError>,
+) -> Result<WorkerOutcome, WorkerFailure> {
+    let claim = acquire_claim(ledger, observed)?;
     let ClaimState::Reserved(ref attempt) = claim.state else {
         return stage(
             Err::<_, &str>("retained attempt unavailable"),
             "load_acquired_claim",
         );
     };
-    verify_reserved(ledger, &claim, attempt, lookup).map(Some)
+    verify_reserved(ledger, &claim, attempt, lookup)
 }
 
 /// Drive one existing claim through the durable one-POST boundary.
@@ -298,14 +386,22 @@ pub fn drive_publication(
         });
     }
 
-    let members = stage(ledger.members(&claim), "load_members")?;
-    if !members_match(&claim, &members) {
+    drive_unsent(ledger, catalog, &claim)
+}
+
+fn drive_unsent(
+    ledger: &impl PublicationLedger,
+    catalog: &impl PublicationCatalog,
+    claim: &PublicationClaim,
+) -> Result<WorkerOutcome, WorkerFailure> {
+    let members = stage(ledger.members(claim), "load_members")?;
+    if !members_match(claim, &members) {
         return stage(
             Err::<_, &str>("captured members do not match the claimed input digest"),
             "load_members",
         );
     }
-    let prepared = stage(catalog.prepare(&claim, &members), "prepare_unsent")?;
+    let prepared = stage(catalog.prepare(claim, &members), "prepare_unsent")?;
     let body = prepared.request_body().to_vec();
     let intent = AuthorizedPublication {
         identity: claim.identity,
@@ -320,12 +416,9 @@ pub fn drive_publication(
             "prepare_unsent",
         );
     }
-    stage(
-        ledger.authorize(&claim, intent),
-        "authorization_unconfirmed",
-    )?;
+    stage(ledger.authorize(claim, intent), "authorization_unconfirmed")?;
     match prepared.submit() {
-        Ok(_) => verify(ledger, &claim, intent, catalog.lookup(&claim, intent)),
+        Ok(_) => verify(ledger, claim, intent, catalog.lookup(claim, intent)),
         Err(error @ RestError::Conflict(_)) => Ok(WorkerOutcome::Pending(
             PendingReason::DispatchConflict(error),
         )),
@@ -337,6 +430,8 @@ pub fn drive_publication(
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, collections::VecDeque};
+
     use super::*;
 
     fn attempt(bytes: &[u8]) -> ClaimState {
@@ -346,6 +441,176 @@ mod tests {
             request_digest: crate::catalog::publication::sha256(bytes),
             request_body: Some(bytes.to_vec()),
         })
+    }
+
+    struct DispatchLedger {
+        loads: RefCell<VecDeque<PublicationClaim>>,
+        calls: RefCell<Vec<&'static str>>,
+    }
+
+    impl DispatchLedger {
+        fn new(claims: impl IntoIterator<Item = PublicationClaim>) -> Self {
+            Self {
+                loads: RefCell::new(claims.into_iter().collect()),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl PublicationLedger for DispatchLedger {
+        fn load(&self, _operation: Uuid) -> LedgerResult<PublicationClaim> {
+            self.calls.borrow_mut().push("load");
+            Ok(self
+                .loads
+                .borrow_mut()
+                .pop_front()
+                .expect("unexpected load"))
+        }
+
+        fn acquire(&self, claim: &PublicationClaim) -> LedgerResult<i64> {
+            self.calls.borrow_mut().push("acquire");
+            Ok(claim.generation + 1)
+        }
+
+        fn members(&self, _claim: &PublicationClaim) -> LedgerResult<Vec<CapturedMember>> {
+            panic!("dispatch must not load source members")
+        }
+
+        fn authorize(
+            &self,
+            _claim: &PublicationClaim,
+            _intent: AuthorizedPublication<'_>,
+        ) -> LedgerResult<()> {
+            panic!("dispatch must not authorize")
+        }
+
+        fn finalize(
+            &self,
+            _claim: &PublicationClaim,
+            _intent: AuthorizedPublication<'_>,
+        ) -> LedgerResult<usize> {
+            panic!("dispatch must not finalize without verification")
+        }
+    }
+
+    struct NoCatalog;
+
+    impl PublicationCatalog for NoCatalog {
+        fn prepare(
+            &self,
+            _claim: &PublicationClaim,
+            _members: &[CapturedMember],
+        ) -> Result<PreparedPublication<'_>, StorageError> {
+            panic!("dispatch must not prepare")
+        }
+
+        fn lookup(
+            &self,
+            _claim: &PublicationClaim,
+            _intent: AuthorizedPublication<'_>,
+        ) -> Result<PublicationLookup, RestError> {
+            panic!("dispatch must not issue a lookup on a send wake for a newly retained intent")
+        }
+    }
+
+    fn discovered(mode: PublicationDispatchMode) -> PublicationDispatchHint {
+        PublicationDispatchHint {
+            operation_id: Uuid::from_u128(1),
+            binding_id: Uuid::from_u128(2),
+            owner_generation: 3,
+            mode,
+        }
+    }
+
+    fn hinted_claim(hint: PublicationDispatchHint, state: ClaimState) -> PublicationClaim {
+        PublicationClaim {
+            identity: PublicationIdentity {
+                operation_id: hint.operation_id,
+                table_uuid: Uuid::from_u128(3),
+                input_digest: [0; 32],
+            },
+            binding: Some(PublicationBindingIdentity {
+                authority_id: Uuid::from_u128(4),
+                binding_id: hint.binding_id,
+                incarnation_id: Uuid::from_u128(5),
+                binding_generation: 1,
+            }),
+            generation: hint.owner_generation,
+            state,
+        }
+    }
+
+    #[test]
+    fn held_or_wrong_duty_never_opens_ledger() {
+        let ledger = DispatchLedger::new([]);
+        let hold = discovered(PublicationDispatchMode::Hold);
+        assert!(dispatch_publication_send(&ledger, &NoCatalog, hold)
+            .unwrap()
+            .is_none());
+        assert!(
+            dispatch_publication_lookup(&ledger, hold, |_, _| unreachable!())
+                .unwrap()
+                .is_none()
+        );
+        let lookup = discovered(PublicationDispatchMode::Lookup);
+        assert!(dispatch_publication_send(&ledger, &NoCatalog, lookup)
+            .unwrap()
+            .is_none());
+        let send = discovered(PublicationDispatchMode::Send);
+        assert!(
+            dispatch_publication_lookup(&ledger, send, |_, _| unreachable!())
+                .unwrap()
+                .is_none()
+        );
+        assert!(ledger.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn stale_hints_and_changed_modes_never_acquire() {
+        let send = discovered(PublicationDispatchMode::Send);
+        let mut wrong_generation = hinted_claim(send, ClaimState::Unsent);
+        wrong_generation.generation += 1;
+        let mut wrong_binding = hinted_claim(send, ClaimState::Unsent);
+        wrong_binding.binding.as_mut().unwrap().binding_id = Uuid::from_u128(6);
+        let already_reserved = hinted_claim(send, attempt(b"already reserved"));
+        let ledger = DispatchLedger::new([wrong_generation, wrong_binding, already_reserved]);
+        for _ in 0..3 {
+            assert!(dispatch_publication_send(&ledger, &NoCatalog, send)
+                .unwrap()
+                .is_none());
+        }
+        let lookup = discovered(PublicationDispatchMode::Lookup);
+        let lookup_ledger = DispatchLedger::new([hinted_claim(lookup, ClaimState::Unsent)]);
+        assert!(
+            dispatch_publication_lookup(&lookup_ledger, lookup, |_, _| unreachable!())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(*lookup_ledger.calls.borrow(), ["load"]);
+        assert_eq!(*ledger.calls.borrow(), ["load", "load", "load"]);
+    }
+
+    #[test]
+    fn send_wake_yields_if_attempt_appears_during_takeover() {
+        let wake = discovered(PublicationDispatchMode::Send);
+        let mut acquired = hinted_claim(wake, attempt(b"reserved during takeover"));
+        acquired.generation += 1;
+        let ledger = DispatchLedger::new([hinted_claim(wake, ClaimState::Unsent), acquired]);
+        assert!(dispatch_publication_send(&ledger, &NoCatalog, wake)
+            .unwrap()
+            .is_none());
+        assert_eq!(*ledger.calls.borrow(), ["load", "acquire", "load"]);
+    }
+
+    #[test]
+    fn lookup_wake_does_not_accept_a_replaced_attempt() {
+        let wake = discovered(PublicationDispatchMode::Lookup);
+        let mut acquired = hinted_claim(wake, attempt(b"replacement"));
+        acquired.generation += 1;
+        let ledger = DispatchLedger::new([hinted_claim(wake, attempt(b"original")), acquired]);
+        let error = dispatch_publication_lookup(&ledger, wake, |_, _| unreachable!()).unwrap_err();
+        assert_eq!(error.stage, "load_acquired_claim");
+        assert_eq!(*ledger.calls.borrow(), ["load", "acquire", "load"]);
     }
 
     #[test]

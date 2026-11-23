@@ -284,6 +284,16 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
                 worker_input.update(endpoint=endpoint, namespace=namespace, authority_id=authority,
                                     table_uuid=remote, root=root)
             request = json.dumps(worker_input)
+
+            def wake(mode):
+                if not admitted_transport:
+                    return request
+                hint = json.loads(sql(db, """
+                    SELECT row_to_json(c) FROM lakehouse.discover_managed_publication_claims(NULL, 16) c
+                """))
+                assert (hint["operation_id"], hint["binding_id"], hint["mode"]) == (operation, binding, mode), hint
+                return json.dumps(worker_input | {"dispatch_hint": hint})
+
             # A transient failure before authorization leaves the claim
             # eligible for a new owner. This first pass reaches no POST.
             unavailable.set()
@@ -294,7 +304,7 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
                 assert len(requests) == before, "lookup-only wake contacted the catalog for an unsent claim"
                 assert probe.returncode == 0 and probe.stdout.strip() == "no_retained_intent", probe
                 assert sql(db, f"SELECT owner_generation FROM {HDR} WHERE operation_id='{operation}'") == "0"
-            failed = subprocess.run([worker], check=False, input=request, text=True, timeout=25,
+            failed = subprocess.run([worker], check=False, input=wake("send"), text=True, timeout=25,
                                     capture_output=True)
             assert failed.returncode and "prepare_unsent" in failed.stderr, failed
             assert not posts
@@ -304,7 +314,7 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
             lost_authorization = reply_loss == "authorization_ack"
             if lost_authorization:
                 disconnect_after_authorization(db)
-                failed = subprocess.run([worker], input=request, text=True, capture_output=True, timeout=30)
+                failed = subprocess.run([worker], input=wake("send"), text=True, capture_output=True, timeout=30)
                 assert not posts, f"expected zero commit POSTs after lost authorization reply, saw {len(posts)}"
                 assert (failed.returncode and "authorization_unconfirmed" in failed.stderr
                         and "terminating connection due to administrator command" in failed.stderr), failed
@@ -315,7 +325,7 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
                 with subprocess.Popen([worker], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                       text=True) as sender:
                     try:
-                        sender.stdin.write(request)
+                        sender.stdin.write(wake("send"))
                         sender.stdin.close()
                         assert accepted.wait(timeout=30), "the catalog never accepted the first POST"
                         assert not errors, errors
@@ -344,9 +354,9 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
                            check=True, timeout=60)
             restart_ms = (time.monotonic() - started) * 1000
 
-            def drive(*, lookup_only=False):
-                return subprocess.check_output([worker], input=lookup_request if lookup_only else request,
-                                               text=True, timeout=25).strip()
+            def recover(*, completed=False):
+                wake_request = lookup_request if completed and admitted_transport else wake("lookup")
+                return subprocess.check_output([worker], input=wake_request, text=True, timeout=25).strip()
 
             proposed_snapshot = int(sql(db, f"""
                 SELECT proposed_snapshot_id FROM lakehouse.publication_attempts
@@ -357,11 +367,11 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
             expected_posts = 0 if lost_authorization else 1
             restart_requests = len(catalog_auth)
             unavailable.set()
-            assert drive(lookup_only=admitted_transport) == "hold lookup_unavailable"
+            assert recover() == "hold lookup_unavailable"
             assert len(posts) == expected_posts
             unavailable.clear()
             stale_head.set()
-            assert drive() == "hold acceptance_unproved"
+            assert recover() == "hold acceptance_unproved"
             assert len(posts) == expected_posts
             assert lookups[-1] is True
             assert sql(db, f"SELECT count(*) FROM {SEG} WHERE published") == "0"
@@ -369,7 +379,7 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
             stale_head.clear()
             if lost_authorization:
                 before = len(lookups)
-                assert drive(lookup_only=True) == "hold acceptance_unproved"
+                assert recover() == "hold acceptance_unproved"
                 assert len(lookups) > before and not any(lookups[before:])
                 assert retained_intent(db, operation, first, checkpoint) == retained
                 assert proposed_snapshot == retained["proposed"] and proposed_snapshot != parent
@@ -399,7 +409,7 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
                 }), flush=True)
                 return
             started = time.monotonic()
-            assert drive(lookup_only=admitted_transport) == f"verified {proposed_snapshot} 1"
+            assert recover() == f"verified {proposed_snapshot} 1"
             recovery_ms = (time.monotonic() - started) * 1000
             assert lookups[-1] is False
             row_versions = f"""
@@ -408,7 +418,7 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
             """
             completed = sql(db, row_versions)
             before = len(requests)
-            assert drive(lookup_only=admitted_transport) == f"complete {proposed_snapshot}"
+            assert recover(completed=True) == f"complete {proposed_snapshot}"
             assert len(requests) == before
             assert sql(db, row_versions) == completed
             assert len(posts) == 1
