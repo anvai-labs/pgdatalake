@@ -1,0 +1,113 @@
+\echo Use "ALTER EXTENSION lakehouse UPDATE TO '1.19'" to load this file. \quit
+
+-- Operator-approved Read admission (managed visibility, spec 03
+-- "Admission before the native cut"): exact role-specific credential
+-- mapping for one capture binding generation. Scope identity is derived
+-- from the binding at admission time, never stored here.
+CREATE TABLE lakehouse.managed_read_grants (
+    binding_id uuid NOT NULL REFERENCES lakehouse.managed_capture_bindings,
+    reader_role oid NOT NULL,
+    mapping_id oid NOT NULL,
+    catalog_prefix text NOT NULL DEFAULT '',
+    s3_region text NOT NULL DEFAULT 'us-east-1',
+    expires_at timestamptz NOT NULL CHECK (isfinite(expires_at)),
+    PRIMARY KEY (binding_id, reader_role)
+);
+REVOKE ALL ON lakehouse.managed_read_grants FROM PUBLIC;
+CREATE TRIGGER guard_managed_read_grant
+    BEFORE UPDATE OR DELETE ON lakehouse.managed_read_grants
+    FOR EACH ROW EXECUTE FUNCTION lakehouse.guard_publication_admission();
+CREATE TRIGGER guard_managed_read_grant_truncate
+    BEFORE TRUNCATE ON lakehouse.managed_read_grants
+    FOR EACH STATEMENT EXECUTE FUNCTION lakehouse.guard_publication_admission();
+
+-- Grant one reader role: the mapping must be ROLE-SPECIFIC (rejects a
+-- PUBLIC mapping structurally) on the dedicated publication-credential
+-- wrapper and carry purpose=read. The C side re-validates
+-- authoritatively at use time.
+CREATE FUNCTION lakehouse.grant_managed_read(
+    binding uuid, reader regrole, mapping oid,
+    catalog_prefix text DEFAULT '', s3_region text DEFAULT 'us-east-1',
+    ttl interval DEFAULT '15 minutes')
+RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    IF ttl <= interval '0' THEN
+        RAISE EXCEPTION 'managed read grant ttl must be positive'
+            USING ERRCODE = '22023';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_user_mapping m,
+             pg_foreign_server s,
+             pg_foreign_data_wrapper w,
+             unnest(m.umoptions) opt
+        WHERE m.oid = mapping
+          AND m.umuser = reader
+          AND s.oid = m.umserver
+          AND w.oid = s.srvfdw
+          AND w.fdwname = 'lakehouse_publication_credentials'
+          AND opt = 'purpose=read')
+    THEN
+        RAISE EXCEPTION 'managed read grant requires a role-specific '
+                        'mapping with purpose=read on the publication '
+                        'credential server'
+            USING ERRCODE = '42501';
+    END IF;
+    INSERT INTO lakehouse.managed_read_grants
+        (binding_id, reader_role, mapping_id, catalog_prefix, s3_region, expires_at)
+    VALUES (binding, reader, mapping, catalog_prefix, s3_region,
+            clock_timestamp() + ttl);
+END;
+$$;
+
+CREATE FUNCTION lakehouse.revoke_managed_read(binding uuid, reader regrole)
+RETURNS void LANGUAGE sql AS $$
+    DELETE FROM lakehouse.managed_read_grants
+    WHERE binding_id = binding AND reader_role = reader
+$$;
+
+-- Admission for one bound table under one checked role: one row or
+-- nothing. SECURITY DEFINER so the read scope is resolved without
+-- granting the reader any ledger privilege; the reader_role parameter is
+-- the CHECKED role (executor passes GetUserId()/checkAsUser), so a
+-- definer view cannot widen admission. Zero rows for unadmitted,
+-- revoked, rotated, shape-drifted or expired bindings.
+CREATE FUNCTION lakehouse.admit_managed_read(target regclass, reader regrole)
+RETURNS TABLE(binding_id uuid, reader_role oid, mapping_id oid, server_id oid,
+              expires_unix_seconds bigint,
+              incarnation_id uuid, authority_id uuid, table_uuid uuid,
+              ref_name text, storage_root text, anchor_snapshot bigint,
+              schema_id integer, spec_id integer, target_identity text,
+              catalog_endpoint text, catalog_prefix text, s3_region text)
+LANGUAGE sql VOLATILE STRICT SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp AS $$
+    SELECT g.binding_id, g.reader_role, g.mapping_id, m.umserver,
+           floor(extract(epoch FROM g.expires_at))::bigint,
+           b.incarnation_id, b.authority_id, b.table_uuid, 'main'::text,
+           b.storage_root, a.snapshot_id, b.schema_id, b.spec_id,
+           b.target_identity, b.catalog_endpoint, g.catalog_prefix, g.s3_region
+    FROM lakehouse.managed_capture_state s
+    JOIN lakehouse.managed_read_grants g
+      ON g.binding_id = s.active_binding_id AND g.reader_role = reader::oid
+     AND g.expires_at > clock_timestamp()
+    JOIN pg_user_mapping m ON m.oid = g.mapping_id AND m.umuser = g.reader_role
+    JOIN lakehouse.managed_capture_bindings b ON b.binding_id = g.binding_id
+    JOIN lakehouse.managed_capture_bindings initial
+      ON initial.incarnation_id = b.incarnation_id AND initial.generation = 1
+    JOIN lakehouse.managed_read_anchors a ON a.binding_id = initial.binding_id
+    WHERE s.relid = target
+      AND (s.incarnation_id, s.generation) = (b.incarnation_id, b.generation)
+      AND b.source_columns = lakehouse.capture_source_columns(target)
+      AND NOT EXISTS (
+          SELECT FROM lakehouse.managed_capture_bindings prior
+          WHERE prior.incarnation_id = b.incarnation_id
+            AND (prior.relid, prior.authority_id, prior.table_uuid, prior.storage_root,
+                 prior.target_identity, prior.catalog_endpoint, prior.warehouse, prior.object_endpoint,
+                 prior.schema_id, prior.spec_id, prior.source_columns) IS DISTINCT FROM
+                (b.relid, b.authority_id, b.table_uuid, b.storage_root,
+                 b.target_identity, b.catalog_endpoint, b.warehouse, b.object_endpoint,
+                 b.schema_id, b.spec_id, b.source_columns))
+$$;
+REVOKE ALL ON FUNCTION lakehouse.admit_managed_read(regclass, regrole),
+    lakehouse.grant_managed_read(uuid, regrole, oid, text, text, interval),
+    lakehouse.revoke_managed_read(uuid, regrole) FROM PUBLIC;

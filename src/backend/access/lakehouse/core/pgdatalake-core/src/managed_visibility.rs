@@ -6,7 +6,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 mod ancestry;
-mod pending;
+pub(crate) mod pending;
 
 pub use ancestry::{ManagedAncestry, ManagedCatalogObservation};
 pub use pending::{PendingHeadAttempt, SealedPendingMember};
@@ -75,7 +75,7 @@ pub enum ManagedReadError {
 /// Check exact segment identities and monotone append membership in a chain
 /// already certified by `ManagedAncestry`. The caller holds the chosen pin
 /// and local payloads through execution and accounts for own commands.
-fn select_compatible_pin(
+pub(crate) fn select_compatible_pin(
     scope: &ManagedReadScope,
     candidates: &[ManagedPinCandidate<'_>],
     visible: &[VisibleSegment],
