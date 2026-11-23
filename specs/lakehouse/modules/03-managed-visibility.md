@@ -151,18 +151,34 @@ visible segments or cumulatively proved members. Indexed pin and segment
 lookups serve these private accessors. The executor will still need to retain
 actual payloads and protect object retention for the selected pin.
 
-Before finalization the adapter reports the accepted child as unknown. Its
-descendants also remain unknown. The live fixture holds this exact state after
-one accepted POST and before lookup. With both members visible the selector
-falls back to the retained parent plus both exact segment IDs, yielding
-`[10,20,20]`. After reconciliation the child carries the complete membership
-and the selector uses it with an empty overlay. The fixture also verifies
-route discontinuity and malformed or incomplete ledger evidence. This
-qualifies the private ledger seam. The executor acceptance below still
-requires exact child membership at the pre-finalization barrier. That proof
-must authenticate the independently retained intent and manifest evidence
-through the approved route. Reanchoring beyond the retained history horizon
-will require a durable membership checkpoint.
+The finalized-edge accessor reports the accepted child as unknown before
+local finalization. Its descendants also remain unknown. A read-only verifier
+can prove one pending head above a complete parent. It binds the exact
+retained body and complete sealed members to the certified parent/head,
+schema/spec and scope. It validates the member digest, proposed snapshot
+markers and one scoped manifest-list digest using the metadata already held by
+the ancestry proof. The existing one-open-claim rule bounds the pending
+case. An unavailable or unproved head leaves the earlier cut available when
+it has complete evidence and retained overlay payloads.
+
+The live fixture uses the approved route for one size-bounded metadata GET and
+a separate committed read-only SQL observation for the pending attempt and
+members. Each held snapshot uses the same catalog observation and no additional
+catalog GET. The digest read uses a separate scoped S3 reader and a 1 MiB,
+four-second limit. At the accepted POST barrier, old and middle snapshots use the
+retained parent with the exact visible overlay. The fresh snapshot uses the
+accepted child with an empty overlay while the ledger remains unfinalized.
+Changed proposal bytes, a missing member and a changed manifest leave the head
+unknown. A missing complete parent prevents proof. The test compares the
+retained ledger before and after the decisions and then separately reconciles
+through the publication lookup worker.
+
+This fixture qualifies the pending-head verifier and cut selection without
+enabling the TableAM executor. The operator fixture supplies the read-only
+ledger observation. Production still needs a scoped accessor, a bounded
+catalog adapter reused for scan planning, and object and payload retention.
+Reanchoring beyond the retained history horizon needs a durable membership
+checkpoint.
 
 TableAM must additionally integrate own-command visibility and prove the whole
 statement pin vector before first output. The fixture continues to require

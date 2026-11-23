@@ -6,8 +6,10 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 mod ancestry;
+mod pending;
 
 pub use ancestry::{ManagedAncestry, ManagedCatalogObservation};
+pub use pending::{PendingHeadAttempt, SealedPendingMember};
 
 /// The enrolled remote ref and local capture lineage. A lineage spans
 /// capture binding generations while its incarnation and remote scope agree.

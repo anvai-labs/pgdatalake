@@ -1,28 +1,32 @@
 """Exercise compatible-pin decisions using live PG visibility and pinned Trino rows."""
 
 import argparse
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import hashlib
+from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import subprocess
 from threading import Thread
 from importlib import import_module
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from publication_fixture import HDR, MEM, SEG, sql
 
 trino_fixture = import_module("bound-publication-restart")
-login = import_module("scoped-read-check").login
+scoped_read = import_module("scoped-read-check")
+login = scoped_read.login
 trino = trino_fixture.trino
 
 
 EXPIRED = object()
 SCOPE_FIELDS = ("authority_id", "table_uuid", "ref_name", "incarnation_id", "storage_root")
+MAX_CATALOG_BYTES = 2 * 1024 * 1024
 
 
-def select_cut(worker, source, catalog, candidates, visible):
+def select_cut(worker, source, catalog, candidates, visible, *, pending_head=None, reader_object_endpoint=None):
     def membership(included):
         if included is EXPIRED:
             return {"proof": "expired"}
@@ -43,6 +47,8 @@ def select_cut(worker, source, catalog, candidates, visible):
             for seg_id, (payload, _) in visible.items()
         ],
     }
+    if pending_head is not None:
+        request.update(pending_head=pending_head, reader_object_endpoint=reader_object_endpoint)
     result = subprocess.run([worker, "--select-managed-cut"], input=json.dumps(request),
                             check=True, capture_output=True, text=True, timeout=10)
     cut = json.loads(result.stdout)
@@ -82,6 +88,89 @@ def ledger_additions(db, binding, *pins):
     """))
 
 
+def retained_pending_head(db, binding, child, parent):
+    # A committed observation separate from the caller's original scan
+    # snapshot. This fixture selects from the private ledger as its operator.
+    # Readers must eventually get the same evidence via a scoped adapter.
+    value = sql(db, f"""
+        BEGIN READ ONLY;
+        WITH scoped AS (
+            SELECT * FROM lakehouse.get_managed_read_scope('events', '{binding}')
+        ), possible AS (
+            SELECT a.*, c.owner_generation AS current_owner, c.input_digest,
+                   c.verified_snapshot_id, b.schema_id, b.spec_id, b.authority_id, b.table_uuid,
+                   b.incarnation_id, b.storage_root
+            FROM lakehouse.publication_attempts a
+            JOIN {HDR} c ON c.operation_id = a.operation_id
+            JOIN lakehouse.managed_capture_bindings b ON b.binding_id = a.capture_binding_id
+            JOIN scoped s ON b.incarnation_id = s.incarnation_id
+            WHERE a.proposed_snapshot_id = {child} AND a.capture_binding_id IS NOT NULL
+              AND c.capture_binding_id = a.capture_binding_id
+              AND c.relid = 'events'::regclass
+              AND (c.authority_id, c.table_uuid) = (s.authority_id, s.table_uuid)
+            LIMIT 2
+        )
+        SELECT json_build_object(
+            'scope', json_build_object('authority_id', p.authority_id, 'table_uuid', p.table_uuid,
+                'ref_name', 'main', 'incarnation_id', p.incarnation_id, 'storage_root', p.storage_root),
+            'schema_id', p.schema_id, 'spec_id', p.spec_id,
+            'operation_id', p.operation_id, 'input_digest', encode(p.input_digest, 'hex'),
+            'expected_parent', p.expected_parent::text, 'snapshot_id', p.proposed_snapshot_id::text,
+            'proposal_digest', encode(p.proposal_digest, 'hex'), 'proposal_body', encode(p.proposal_body, 'hex'),
+            'current_owner', p.current_owner, 'intent_owner', p.owner_generation, 'members', batch.members)
+        FROM possible p
+        CROSS JOIN LATERAL (
+            SELECT count(*) AS n, bool_and(m.capture_binding_id = p.capture_binding_id
+                AND m.published IS FALSE AND m.published_snapshot_id IS NULL
+                AND octet_length(m.payload_digest) = 32) AS held,
+                json_agg(json_build_object('segment_id', m.seg_id::text, 'row_count', m.row_count,
+                    'payload_digest', encode(m.payload_digest, 'hex')) ORDER BY m.seg_id) AS members
+            FROM (
+                SELECT pm.seg_id, s.capture_binding_id, s.row_count, s.published,
+                       s.published_snapshot_id, s.payload_digest
+                FROM {MEM} pm LEFT JOIN {SEG} s USING (seg_id)
+                WHERE pm.operation_id = p.operation_id
+                ORDER BY pm.seg_id LIMIT 1025
+            ) m
+        ) batch
+        WHERE (SELECT count(*) FROM possible) = 1 AND p.expected_parent = {parent}
+          AND p.verified_snapshot_id IS NULL AND octet_length(p.proposal_body) BETWEEN 1 AND 65536
+          AND batch.n BETWEEN 1 AND 1024 AND batch.held IS TRUE;
+        ROLLBACK;
+    """)
+    return json.loads(value) if value else None
+
+
+def bounded_table_get(address, route, bearer=None):
+    headers = {} if bearer is None else {"Authorization": f"Bearer {bearer}"}
+    with closing(HTTPConnection(address, timeout=10)) as conn:
+        conn.request("GET", route, headers=headers)
+        response = conn.getresponse()
+        body = response.read(MAX_CATALOG_BYTES + 1)
+    if len(body) > MAX_CATALOG_BYTES:
+        return 413, b""
+    return response.status, body
+
+
+@contextmanager
+def reader_manifest_probe(manifest):
+    requests = []
+    state = {"corrupt": False}
+    expected = "/" + manifest.removeprefix("s3://")
+
+    def reply(method, path, headers):
+        requests.append((method, path, headers.get("Range")))
+        if method != "GET" or path != expected:
+            return 403, [], b""
+        status, returned_headers, data = scoped_read.upstream("127.0.0.1:9000", method, path, dict(headers))
+        if state["corrupt"] and status == 206 and data:
+            data = bytes([data[0] ^ 1]) + data[1:]
+        return status, returned_headers, data
+
+    with scoped_read.recorder(reply) as endpoint:
+        yield endpoint, requests, state
+
+
 def certify(scope, pin, included, namespace, expected):
     reference = trino(f"SELECT id FROM iceberg.{namespace}.events FOR VERSION AS OF {pin} ORDER BY id")
     rows = [int(value) for value in reference.splitlines()]
@@ -89,9 +178,9 @@ def certify(scope, pin, included, namespace, expected):
     return scope, pin, included, rows
 
 
-def check(worker, name, expected, scope, catalog, candidates, observation):
+def check(worker, name, expected, scope, catalog, candidates, observation, **proof):
     pg_snapshot, visible = observation
-    result = select_cut(worker, scope, catalog, candidates, visible)
+    result = select_cut(worker, scope, catalog, candidates, visible, **proof)
     assert result == expected, (name, result, expected, pg_snapshot, visible)
     print(json.dumps({"case": name, "pg_snapshot": pg_snapshot,
                       "visible_ids": list(visible), "result": result}, sort_keys=True), flush=True)
@@ -110,10 +199,13 @@ def dropped_catalog_reply(route):
             if self.path != route:
                 self.send_error(404)
                 return
-            if purpose not in ("Bearer fixture-send", "Bearer fixture-lookup"):
+            if purpose not in ("Bearer fixture-send", "Bearer fixture-lookup", "Bearer fixture-cut"):
                 self.send_error(403)
                 return
-            self.reply(*trino_fixture.catalog_request("GET", self.path))
+            if purpose == "Bearer fixture-cut":
+                self.reply(*bounded_table_get("127.0.0.1:8181", self.path))
+            else:
+                self.reply(*trino_fixture.catalog_request("GET", self.path))
 
         def do_POST(self):
             if self.path != route or self.headers.get("Authorization") != "Bearer fixture-send":
@@ -183,6 +275,7 @@ def run_worker(worker, db, operation, approval, hint, *, error=None, member_byte
 def run_native_lookup(db, role, operation, binding, generation, child, posts, lookups):
     function = trino_fixture.NATIVE_LOOKUP
     call = f"SET ROLE {role}; SELECT {function}('{operation}', {generation});"
+    reads_before = len(lookups)
     trino_fixture.install_native_lookup_role(db, role, upgrade=False)
     sql(db, call, error="42501")
     sql(db, f"GRANT EXECUTE ON FUNCTION {function}(uuid, bigint) TO {role};")
@@ -190,7 +283,7 @@ def run_native_lookup(db, role, operation, binding, generation, child, posts, lo
     trino_fixture.approve_native_lookup(db, role, binding, expired=True)
     sql(db, call, error="42501")
     assert sql(db, f"SELECT owner_generation FROM {HDR} WHERE operation_id='{operation}'") == str(generation)
-    assert len(posts) == len(lookups) == 1, "unapproved or expired lookup touched the provider"
+    assert len(posts) == 1 and len(lookups) == reads_before, "unapproved or expired lookup touched the provider"
 
     sql(db, f"""
         UPDATE lakehouse.publication_lookup_grants
@@ -199,7 +292,7 @@ def run_native_lookup(db, role, operation, binding, generation, child, posts, lo
         SELECT lakehouse.revoke_publication_send('{binding}');
     """)
     sql(db, f"SET ROLE {role}; SELECT {function}('{operation}', {generation - 1});", error="40001")
-    assert len(posts) == len(lookups) == 1, "stale native lookup touched the provider"
+    assert len(posts) == 1 and len(lookups) == reads_before, "stale native lookup touched the provider"
     result = json.loads(sql(db, call))
     assert result == {"status": "verified", "owner_generation": str(generation + 1),
                       "snapshot_id": child, "members": 2}, result
@@ -355,7 +448,11 @@ def check_visibility(db, role, owner, worker, approval, base, history, gateway, 
             FROM lakehouse.publication_attempts a JOIN {HDR} c USING (operation_id)
             WHERE a.operation_id='{operation}'
         """) == "t"
-        _, _, head = trino_fixture.enrolled_metadata(namespace)
+        status, body = bounded_table_get(urlsplit(endpoint).netloc, route, "fixture-cut")
+        assert status == 200
+        loaded = json.loads(body)
+        assert loaded["metadata-location"].startswith(root + "/metadata/")
+        head = loaded["metadata"]
         snapshot = next(s for s in head["snapshots"] if str(s["snapshot-id"]) == child)
         assert head["table-uuid"] == table and str(snapshot["parent-snapshot-id"]) == parent
         observation = {key: approval[key] for key in ("authority_id", "incarnation_id", "ref_name")}
@@ -363,17 +460,50 @@ def check_visibility(db, role, owner, worker, approval, base, history, gateway, 
         assert ledger_snapshot(fresh, binding)[1] == fresh_view[1]
         pending = ledger_additions(db, binding, child, parent)
         assert pending == {parent: [], child: None}, pending
-        unknown = source, child, pending[child], []
-        for name, expected, view in (
-            ("old", (parent, [], [10]), first_view),
-            ("middle", (parent, [first_id], [10, 20]), second_view),
-            ("fresh", (parent, [first_id, late_id], [10, 20, 20]), fresh_view),
-        ):
-            check(worker, f"ledger-accepted-unfinalized-{name}", expected,
-                  source, observation, [unknown, base], view)
+        unknown = certify(source, child, pending[child], namespace, [10, 20, 20])
+        candidate = retained_pending_head(db, binding, child, parent)
+        assert candidate and candidate["operation_id"] == operation, candidate
+        assert [int(member["segment_id"]) for member in candidate["members"]] == [first_id, late_id]
+        fallback = (parent, [first_id, late_id], [10, 20, 20])
+        manifest = snapshot["manifest-list"]
+        with reader_manifest_probe(manifest) as (reader_object_endpoint, requests, probe_state):
+            def check_head(name, expected, view, proof, candidates=None):
+                check(worker, name, expected, source, observation, candidates or [unknown, base], view,
+                      pending_head=proof, reader_object_endpoint=reader_object_endpoint)
+
+            for name, expected, view in (
+                ("old", (parent, [], [10]), first_view),
+                ("middle", (parent, [first_id], [10, 20]), second_view),
+                ("fresh", (child, [], [10, 20, 20]), fresh_view),
+            ):
+                check_head(f"ledger-accepted-unfinalized-{name}", expected, view, candidate)
+            exact_request = ("GET", "/" + manifest.removeprefix("s3://"), "bytes=0-1048576")
+            assert requests == [exact_request] * 3, requests
+            check_head("pending-head-missing-member", fallback, fresh_view,
+                       candidate | {"members": candidate["members"][:-1]})
+            check_head("pending-head-changed-proposal", fallback, fresh_view,
+                       candidate | {"proposal_body": candidate["proposal_body"] + "20"})
+            check_head("pending-head-changed-scope", "binding_changed", fresh_view,
+                       candidate | {"scope": candidate["scope"] | {"incarnation_id": str(uuid4())}})
+            check_head("pending-head-no-proved-parent", "no_compatible_pin", fresh_view, candidate,
+                       [unknown, (source, parent, None, [10])])
+            assert len(requests) == 3, requests
+            probe_state["corrupt"] = True
+            check_head("pending-head-changed-manifest", fallback, fresh_view, candidate)
+            assert requests == [exact_request] * 4, requests
+        assert retained_pending_head(db, binding, child, parent) == candidate
+        assert ledger_snapshot(fresh, binding)[1] == fresh_view[1]
+        assert ledger_additions(db, binding, child, parent) == pending
+        assert len(posts) == 1
+        assert lookups == [(route, "Bearer fixture-send"), (route, "Bearer fixture-cut")], lookups
+        print(json.dumps({"case": "read-only-pending-head", "accepted_child": child,
+                          "unfinalized_owner_unchanged": True, "reader_catalog_gets": 1,
+                          "reader_manifest_range_gets": len(requests),
+                          "corrupt_manifest_fallback": parent, "reader_catalog_posts": 0}),
+              flush=True)
         lookup_hint = discover("lookup")
         assert run_worker(worker, db, operation, approval, lookup_hint | {"mode": "send"}) == "rediscover"
-        assert discover("lookup") == lookup_hint and len(posts) == len(lookups) == 1
+        assert discover("lookup") == lookup_hint and len(posts) == 1 and len(lookups) == 2
 
         if native_lookup:
             run_native_lookup(db, role + "_lookup", operation, binding, lookup_hint["owner_generation"],
@@ -384,7 +514,8 @@ def check_visibility(db, role, owner, worker, approval, base, history, gateway, 
         assert receipt == {"pin": child, "binding": binding, "source": list(source),
                            "members": [first_id, late_id]}, receipt
         assert len(posts) == 1
-        assert lookups == [(route, "Bearer fixture-send"), (route, "Bearer fixture-lookup")], lookups
+        assert lookups == [(route, f"Bearer fixture-{purpose}")
+                           for purpose in ("send", "cut", "lookup")], lookups
         finalized = ledger_additions(db, binding, child, parent)
         assert finalized == {parent: [], child: [first_id, late_id]}, finalized
         wrong_parent = str(next(pin for pin in range(1, 4) if str(pin) not in (parent, child)))
