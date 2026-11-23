@@ -54,6 +54,7 @@ pub(crate) fn valid_path(path: &str) -> bool {
 /// The approved directory is independent of the catalog response. Only
 /// canonical S3 paths are accepted so the check and the transport see the
 /// same bucket and key.
+#[derive(Clone)]
 pub(crate) struct S3ReadRoot {
     uri: String,
     bucket: String,
@@ -146,7 +147,7 @@ pub(crate) fn checked_endpoint(value: &str, storage: bool) -> Result<String, Rea
 }
 
 pub(crate) struct ReadBinding {
-    pub(crate) root: S3ReadRoot,
+    root: S3ReadRoot,
     table_uuid: uuid::Uuid,
     catalog_prefix: String,
     region: String,
@@ -156,13 +157,20 @@ pub(crate) struct ReadBinding {
 /// One metadata observation fetched from the enrolled route and storage root.
 /// Selection can inspect metadata before consuming the observation to plan an
 /// exact scan. Raw metadata alone cannot open a scoped reader.
-pub(crate) struct BoundReadObservation<'binding> {
-    binding: &'binding ReadBinding,
+pub(crate) struct BoundReadObservation {
+    root: S3ReadRoot,
     metadata: TableMetadata,
     s3: S3Options,
 }
 
-impl BoundReadObservation<'_> {
+pub(crate) struct BoundSnapshotPlan {
+    pub(crate) plan: ScanPlan,
+    pub(crate) s3: S3Options,
+    pub(crate) schema: Schema,
+    pub(crate) root: S3ReadRoot,
+}
+
+impl BoundReadObservation {
     pub(crate) fn metadata(&self) -> &TableMetadata {
         &self.metadata
     }
@@ -171,7 +179,7 @@ impl BoundReadObservation<'_> {
         self,
         snapshot_id: i64,
         predicate: Option<&ScanPredicate>,
-    ) -> Result<(ScanPlan, S3Options, Schema), ReadError> {
+    ) -> Result<BoundSnapshotPlan, ReadError> {
         let md = self.metadata();
         if md.snapshot(snapshot_id).is_none() {
             return Err(ReadError(
@@ -185,7 +193,7 @@ impl BoundReadObservation<'_> {
             Some(&selector),
             Some(&self.s3),
             predicate,
-            Some(&self.binding.root),
+            Some(&self.root),
         )?;
         let schema = md.current_schema().cloned().ok_or_else(|| {
             ReadError(
@@ -193,7 +201,12 @@ impl BoundReadObservation<'_> {
                 "enrolled table has no current schema".into(),
             )
         })?;
-        Ok((plan, self.s3, schema))
+        Ok(BoundSnapshotPlan {
+            plan,
+            s3: self.s3,
+            schema,
+            root: self.root,
+        })
     }
 }
 
@@ -239,7 +252,7 @@ impl ReadBinding {
         client: crate::session::S3ClientOptions,
         predicate: Option<&ScanPredicate>,
         selector: Option<&SnapshotSelector>,
-    ) -> Result<(ScanPlan, S3Options, Schema), ReadError> {
+    ) -> Result<BoundSnapshotPlan, ReadError> {
         let Some(SnapshotSelector::Id { value }) = selector else {
             return Err(ReadError::unsupported(
                 "bound reads require an explicit snapshot ID",
@@ -254,7 +267,7 @@ impl ReadBinding {
         namespace: &[&str],
         table: &str,
         client: crate::session::S3ClientOptions,
-    ) -> Result<BoundReadObservation<'_>, ReadError> {
+    ) -> Result<BoundReadObservation, ReadError> {
         // Names form URL path segments. Refuse dot segments before URL handling.
         if namespace.is_empty()
             || namespace
@@ -312,7 +325,7 @@ impl ReadBinding {
             ));
         }
         Ok(BoundReadObservation {
-            binding: self,
+            root: self.root.clone(),
             metadata,
             s3,
         })
@@ -419,7 +432,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(observation.metadata().current_snapshot_id, Some(PIN + 1));
-        let (plan, _, _) = observation.plan_snapshot(PIN, None).unwrap();
+        let plan = observation.plan_snapshot(PIN, None).unwrap().plan;
         assert_eq!(plan.snapshot_id, PIN);
         assert!(plan.tasks.is_empty() && plan.delete_tasks.is_empty());
         worker.join().unwrap();

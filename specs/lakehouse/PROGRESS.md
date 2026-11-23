@@ -2,7 +2,9 @@
 
 ## Current dependency order
 
-Public #90 at `c104bd72f9058215ce5018f90c7a9d188aa8974a` bounds and reuses
+Public #91 at `8765e97f4ba8015171178ff39067b6b47cdc1ded` qualifies separate
+fresh proof and original-snapshot payload access. Public #90 at
+`c104bd72f9058215ce5018f90c7a9d188aa8974a` bounds and reuses
 the approved scoped catalog observation. Public #89 at
 `0dc85911759b8880aa59424289c174d473719e5c` qualifies the
 purpose-scoped native session credential adapter. Public #88 at
@@ -21,7 +23,7 @@ PG19.0. The managed writer and its visibility proof can advance separately.
 | Stock reader, 01/02/06 | #53 supplies execution-time FDW COUNT and same-pin fallback. #54/#58/#61 cover effective mapping, enrolled root, real SQL logins, rotation and revocation. #70 runs the [TLS smoke](../../src/test/lakehouse/fixtures/stock-scoped-tls.sh) for those reads and reconnect on verified PG-wire with SCRAM. | The scoped reader now bounds catalog and metadata reads and reuses the approved observation for exact-pin planning. The ordinary external pilot needs a deployed client-network, login and grant-generation test. Governed provider identity follows its own gate. Preserve ordinary/pinned count and denied-sibling controls. [External client handoff](modules/10-downstream-handoff.md#external-postgresql-client-handoff) |
 | Governed tables, 01/02/06/08 | #67–69 define BI reuse, provider scope and a verifier for 12 positive SQL executions and six refusals. Current governed results come from synthetic evidence. | Implement and run one provider's protected plan on a real enrolled table. Require exact source pin, actual consumption, masks and distinct effective scopes. Only then qualify reuse and multiple readers. [Verifier](modules/06c-governed-published-read.md) |
 | Managed send and recovery, 01/04 | #75–79 qualified discovery, scoped credentials, bounded ledger loads, stale-work refusal and native lookup/finalize after WAL restart. #80 qualified a native WAL authorization hold with zero provider requests and a lookup-only receipt. #81 rejects assigned launcher XIDs, bounds ledger-lock waits and qualifies a process-local Rust prepare handle that can be dropped without a catalog POST. #83 adds the [C preparation ABI](modules/04b-scoped-send-admission.md#process-local-native-preparation-abi), which exposes the exact bounded proposal. #85’s opt-in native 1.14 diagnostic joins role-bound static Send credentials to it after closing the ledger transaction, then discards the proposal. Opt-in 1.16 [dispatches once](modules/04b-scoped-send-admission.md#native-one-shot-dispatch) through the live handle after durable authorization and proves both reply-loss barriers with the static mapping fixture. Opt-in 1.17 supplies separate purpose-checked native session credentials and rejects mapping rotation during preparation. | Qualify actual provider issuance, renewal and revocation, hard-disable fencing, bounded polling and primary promotion. Keep recovered attempts lookup-only. [Publisher handoff](modules/04b-scoped-send-admission.md#native-worker-integration) |
-| Managed read visibility, 01/03 | #80 qualified the compatible-pin selector under three PostgreSQL snapshots. #81 certifies bounded Iceberg v2 explicit-`main` parent links with real Lakekeeper metadata. #84 rewinds retained cursors and fixes a missing staged rescan result. Opt-in 1.15 persists a pristine enrollment anchor and reads finalized membership separately from the statement-visible segment IDs. At the lost-reply barrier the independent read-only verifier can now prove the unfinalized child from one observed catalog head, exact WAL proposal, bounded manifest digest and sealed membership. Opt-in 1.18 reads pending facts and original-snapshot overlay bytes through separate private scoped ledger accessors. | Join those accessors and the approved observation in C and retain validated overlay bytes through EndScan. Select the whole statement pin vector before first output. Prove stable rescan and expiry refusal before enabling a serial append scan. TableAM SQL and COUNT remain gated. [Visibility contract](modules/03-managed-visibility.md#certified-retained-ancestry) |
+| Managed read visibility, 01/03 | #80 qualified the compatible-pin selector under three PostgreSQL snapshots. #81 certifies bounded Iceberg v2 explicit-`main` parent links with real Lakekeeper metadata. #84 rewinds retained cursors and fixes a missing staged rescan result. Opt-in 1.15 persists a pristine enrollment anchor and reads finalized membership separately from the statement-visible segment IDs. At the lost-reply barrier the independent read-only verifier can now prove the unfinalized child from one observed catalog head, exact WAL proposal, bounded manifest digest and sealed membership. Opt-in 1.18 reads pending facts and original-snapshot overlay bytes through separate private scoped ledger accessors. The Rust/C ABI owns one scoped observation with certified pins and a consuming exact-pin plan. | Join the checked-role Read enrollment, same-observation pending verifier and private ledger inputs at the native executor boundary. Retain validated overlay bytes through EndScan. Select the whole statement pin vector before first output. Prove stable rescan and expiry refusal before enabling a serial append scan. TableAM SQL and COUNT remain gated. [Visibility contract](modules/03-managed-visibility.md#certified-retained-ancestry) |
 | Cost and expansion, 02/08/09 | #60 defines per-catalog profiles. #62 qualifies pinned benchmark digests. #66 reduces one projected canary from 4,719 to 16 data range GETs. | Diagnose the SF10 q1 timeout before a latency claim. Measure cold/warm dashboard completeness and spend on a qualified profile before selecting an elastic floor or enabling persistent reuse. [Cost evidence](modules/08b-io-cost.md) |
 
 ### MVP integration order
@@ -115,6 +117,23 @@ A newer generation was refused under the held snapshot and the retired
 generation failed the fresh scope check. These accessors enable the
 [executor join](modules/03-managed-visibility.md#native-statement-cut-boundary).
 Ordinary bound scans still return `0A000`.
+
+### Native managed observation ABI
+
+The loopback fixture certifies exact ancestry IDs above 2^53 from one
+catalog GET and one metadata GET. Planning reads only the selected
+manifest. A changed, missing or duplicate schema, a pin outside the
+certified chain and dropping the unconsumed owner issue zero manifest
+requests. Failure consumes the owner slot. A C11 test compiled the
+generated header and the stock PG19 smoke matched Trino at the two
+position-delete pins and the sibling pin without forbidden-root calls.
+The local Rust suite passed 173 tests with one manual ignore.
+
+The next #88 join needs the effective-role managed Read grant and the
+native membership, pending-proof and scan lifetime integration. Start
+with a direct serial append scan in the local scoped v2 profile. Before
+output, verify the full cut and exact copied bytes. Existing bound reads
+still return `0A000`. [Admission and native ABI](modules/03-managed-visibility.md#admission-before-the-native-cut)
 
 ### Enrollment and membership smoke for 1.15
 
