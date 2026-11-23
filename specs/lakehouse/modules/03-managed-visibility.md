@@ -39,6 +39,17 @@ The executor now falls back to the ordinary aggregate while this backend has wri
 
 An FDW successor can share a proof for the published pin. The managed caller must also account for this backend's writes and for the PostgreSQL-visible segments already included in the selected pin.
 
+### Rescanning staged rows
+
+A serial TableAM rescan rewinds the current file cursor and both staged
+row sources. It keeps the original scan session and retained ledger
+payloads. The offline staged scan regression forces a nested-loop rescan
+with committed and transaction-local duplicates. Its inner scans return
+`[1,2,2,3,4]` and `[2,2,3,4]`. The baseline returned no rows on the
+second pass. Scan teardown releases the Rust cursors and session, including
+when a PostgreSQL error discards the executor context.
+[Regression SQL](../../../src/test/regress/lakehouse/sql/staged_insert.sql)
+
 ### Compatible published pin
 
 For managed current append reads, the pin decision precedes the first emitted row. The proof accounts for prior local publications as well as the newest claim. Within the statement's allowed candidate pins, the decision is:
@@ -132,6 +143,36 @@ TableAM must additionally integrate own-command visibility and prove the whole
 statement pin vector before first output. The fixture continues to require
 `0A000` from the bound SQL path. Held snapshots exercise the selector under
 real MVCC and leave application Repeatable Read support unqualified.
+
+#### SQL executor acceptance
+
+Use a v2 Lakekeeper table with parent pin `P` containing `[10]`. Hold one
+PostgreSQL snapshot before both source commits and another between them.
+Commit two segments `A` and `B`, each containing one row with value `20`.
+Publish both as one append on child pin `C`. Use the catalog reply-loss
+barrier after the single accepted POST and before reconciliation or local
+finalization. Independently observe `C` in Lakekeeper and check that the
+claim's `verified_snapshot_id` is still NULL. Run ordinary serial TableAM
+SQL at the barrier and repeat after finalization.
+
+| PostgreSQL snapshot | Exact selected pin | Exact overlay segment IDs | Sorted rows |
+| --- | --- | --- | --- |
+| Before both source commits | `P` | empty | `[10]` |
+| Between `A` and `B` | `P` | `[A]` | `[10,20]` |
+| After both source commits | `C` | empty | `[10,20,20]` |
+
+Record the real parent and child IDs, actual SQL scan pin and overlay IDs
+through the test harness. Row equality alone leaves open which cut the SQL
+executor used. Validate the published pins separately with Trino. Hold the
+same statement open for a forced rescan, change the observable catalog head,
+and prove that the rescan uses the original pin and payloads with zero
+additional catalog resolutions. Remove the compatible parent or the needed
+overlay payload before opening a fresh older-snapshot scan. A simple
+`SELECT id` cursor must report a consistency error by its first fetch, with
+zero rows emitted. Keep separate logs for provider request counts, exact
+pin and member evidence, and SQL results. The native scan milestone uses
+held snapshots as test controls. Qualify application transaction isolation,
+joins and managed COUNT through their own gates.
 
 - Run the managed overlay vectors with a fake published view and ledger membership responses. Verify older base/new ledger, new base/stale ledger, future operation and unknown-membership cases. Assert exact rows, including duplicates.
 - Run `mixed-visibility-claim` through pin selection and ordinary SQL scans. Two segments share one verified publication. A reader between their source commits falls back to the retained parent and adds just its visible segment. Dropping that parent gives an explicit consistency error. A reader after both commits can use the published pin directly.

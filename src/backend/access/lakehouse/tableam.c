@@ -1697,6 +1697,7 @@ typedef struct LakehouseTableScanDescData
 	LakehouseOptions opts;
 	ScanSession *session;
 	RowsHandle *rows;
+	MemoryContextCallback cleanup;
 	uint64		current_task;
 	uint64		task_count;
 	char	   *projection_csv;
@@ -1830,6 +1831,18 @@ lakehouse_slot_callbacks(Relation rel)
 	return &TTSOpsVirtual;
 }
 
+/* Also runs when an ERROR discards the executor context before EndScan. */
+static void
+lakehouse_scan_release(void *arg)
+{
+	LakehouseTableScanDesc scan = (LakehouseTableScanDesc) arg;
+
+	pg_datalake_rows_close(scan->rows);
+	pg_datalake_scan_free(scan->session);
+	for (int i = 0; i < scan->n_delta; i++)
+		pg_datalake_delta_rows_close(scan->delta_rows[i]);
+}
+
 static TableScanDesc
 lakehouse_scan_begin(Relation rel, Snapshot snapshot,
 					 int nkeys, ScanKey key,
@@ -1850,6 +1863,9 @@ lakehouse_scan_begin(Relation rel, Snapshot snapshot,
 						"(quals are pushed as predicates in slice 15 parity, M2)")));
 
 	scan = (LakehouseTableScanDesc) palloc0(sizeof(LakehouseTableScanDescData));
+	scan->cleanup.func = lakehouse_scan_release;
+	scan->cleanup.arg = scan;
+	MemoryContextRegisterResetCallback(GetMemoryChunkContext(scan), &scan->cleanup);
 
 	RelationIncrementReferenceCount(rel);
 	scan->rs_base.rs_rd = rel;
@@ -1896,16 +1912,8 @@ lakehouse_scan_end(TableScanDesc bscan)
 {
 	LakehouseTableScanDesc scan = (LakehouseTableScanDesc) bscan;
 
-	if (scan->rows != NULL)
-	{
-		pg_datalake_rows_close(scan->rows);
-		scan->rows = NULL;
-	}
-	if (scan->session != NULL)
-	{
-		pg_datalake_scan_free(scan->session);
-		scan->session = NULL;
-	}
+	MemoryContextUnregisterResetCallback(GetMemoryChunkContext(scan), &scan->cleanup);
+	lakehouse_scan_release(scan);
 	unregister_scan_for_dml(RelationGetRelid(scan->rs_base.rs_rd), scan);
 	if (scan->rs_base.rs_flags & SO_TEMP_SNAPSHOT)
 		UnregisterSnapshot(scan->rs_base.rs_snapshot);
@@ -1920,14 +1928,20 @@ lakehouse_scan_rescan(TableScanDesc bscan, ScanKey key, bool set_params,
 	LakehouseTableScanDesc scan = (LakehouseTableScanDesc) bscan;
 
 	/*
-	 * rewind-only, mirroring the FDW fix from the M1 gate (retro #2): the
-	 * session stays pinned to the snapshot from scan_begin
+	 * Rewind the existing scan without resolving another Iceberg pin or
+	 * reloading the staged payloads from the ledger.
 	 */
-	if (scan->rows != NULL)
-	{
-		pg_datalake_rows_close(scan->rows);
-		scan->rows = NULL;
-	}
+	pg_datalake_rows_close(scan->rows);
+	scan->rows = NULL;
+	scan->current_task = 0;
+	scan->row_in_task = 0;
+	scan->cur_task_path = NULL;
+	scan->batch_valid = false;
+	scan->batch_cursor = 0;
+	scan->staged_pos = 0;
+	scan->delta_pos = 0;
+	for (int i = 0; i < scan->n_delta; i++)
+		pg_datalake_delta_rows_rewind(scan->delta_rows[i]);
 }
 
 static bool
@@ -2255,7 +2269,6 @@ open_write_session(LakehouseWriteEntry *entry, TupleDesc tupdesc)
 static void
 load_delta_segments(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 {
-	MemoryContext old = CurrentMemoryContext;
 	Oid			relid = RelationGetRelid(scan->rs_base.rs_rd);
 	char	   *schema_json = build_schema_json(tupdesc);
 	int			ret;
@@ -2278,38 +2291,28 @@ load_delta_segments(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 						 (unsigned) relid);
 		ret = SPI_execute(sql.data, true, 0);
 	}
-	if (ret == SPI_OK_SELECT)
+	if (ret == SPI_OK_SELECT && SPI_processed > 0)
 	{
-		MemoryContext sc = MemoryContextSwitchTo(old);
-
-		scan->n_delta = (int) SPI_processed;
-		scan->delta_rows = (DeltaRowsHandle * *)
-			palloc0(sizeof(DeltaRowsHandle *) * (SPI_processed ? SPI_processed : 1));
+		scan->delta_rows =
+			MemoryContextAllocZero(GetMemoryChunkContext(scan),
+								   mul_size(sizeof(DeltaRowsHandle *), SPI_processed));
 		for (i = 0; i < SPI_processed; i++)
 		{
 			bool		isnull;
 			Datum		d = SPI_getbinval(SPI_tuptable->vals[i],
 										  SPI_tuptable->tupdesc, 1, &isnull);
-			char	   *payload;
+			DeltaRowsHandle *rows;
 
 			if (isnull)
 				continue;
-			payload = TextDatumGetCString(d);
-			MemoryContextSwitchTo(old);
-			scan->delta_rows[scan->delta_pos] =
-				pg_datalake_delta_rows_open(payload, schema_json,
-											NULL, 0);
-			MemoryContextSwitchTo(sc);
-			if (scan->delta_rows[scan->delta_pos] != NULL)
-				scan->delta_pos++;
+			rows = pg_datalake_delta_rows_open(TextDatumGetCString(d),
+											   schema_json, NULL, 0);
+			if (rows != NULL)
+				scan->delta_rows[scan->n_delta++] = rows;
 		}
-		/* every handle serves from pos 0 */
-		scan->delta_pos = 0;
-		MemoryContextSwitchTo(sc);
 	}
 	PopActiveSnapshot();
 	SPI_finish();
-	MemoryContextSwitchTo(old);
 }
 
 /*
@@ -2388,7 +2391,7 @@ stage_slot(LakehouseWriteEntry *entry, TupleTableSlot *slot, TupleDesc tupdesc)
 
 /* The raw COW rewrite and UPDATE's row-version fetch both need a delete-free base. */
 static void
-check_cow_scan(ScanSession * session)
+check_cow_scan(ScanSession *session)
 {
 	if (pg_datalake_scan_has_deletes(session))
 		ereport(ERROR,
