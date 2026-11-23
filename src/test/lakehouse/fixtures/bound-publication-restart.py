@@ -104,11 +104,12 @@ def retained_intent(db, operation, first, start):
 NATIVE_LOOKUP = "lakehouse.reconcile_managed_publication_lookup"
 
 
-def install_native_lookup_role(db, role):
+def install_native_lookup_role(db, role, *, upgrade=True):
     # A dedicated operator-owned credential mapping. The role has no server
     # USAGE or ownership. It is trusted internal code, never a tenant role.
+    if upgrade:
+        sql(db, "ALTER EXTENSION lakehouse UPDATE TO '1.12'")
     sql(db, f"""
-        ALTER EXTENSION lakehouse UPDATE TO '1.12';
         CREATE ROLE {role} LOGIN;
         GRANT USAGE ON SCHEMA lakehouse TO {role};
         GRANT EXECUTE ON FUNCTION lakehouse.load_managed_publication_job(uuid),

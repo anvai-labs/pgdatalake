@@ -99,9 +99,9 @@ one visible member, yielding `[10,20]`. The old snapshot yields `[10]`.
 
 The shared Rust ancestry adapter and cut selector make the decision in this
 fixture. The fixture passes the real Lakekeeper `loadTable` metadata and the
-approved route identity, with the pre-publication pin as a fixture enrollment
-anchor. The selector consumes visible PostgreSQL segment IDs and whether their
-exact payloads remain available. Candidate states distinguish complete
+approved route identity, using the persisted pre-publication pin as its
+enrollment anchor. The selector consumes visible PostgreSQL segment IDs and
+whether their exact payloads remain available. Candidate states distinguish complete
 membership, unknown proof and expired pins. The selector checks exact IDs and
 monotone append membership across the complete candidates.
 It refuses a changed scope, contradictory proof, or the absence of a usable
@@ -127,17 +127,42 @@ metadata and also reverses candidate order to check both refusals before row
 assembly. [Iceberg snapshots and references](https://iceberg.apache.org/spec/#snapshots)
 
 The successful adapter accepts membership only in the certified chain's order.
-An omitted pin has no usable membership. The fixture derives its accepted
-child membership from the verified ledger receipt and proves the empty anchor
-against its own initial contents. To enable a production scan, persist the
-enrollment anchor and support a bounded metadata read through the approved
-route. Protect snapshot/object retention for the selected pin and hold local
-payloads through execution. The ledger must independently prove complete
-retained-lineage membership, including publications accepted before local
-finalization. A catalog append label alone supplies no membership proof. A
-v2 table without a retained enrollment snapshot needs a separate empty-base
-contract. Reanchoring beyond the supported history horizon needs a durable
-checkpoint with complete membership.
+An omitted pin has no usable membership.
+
+#### Enrollment and ledger evidence
+
+Opt-in extension 1.15 records the operator's independently verified retained
+`main` pin in the first capture enrollment transaction. The existing
+relation lock serializes capture, and the source ledger must be empty.
+The private scope accessor requires the active binding, current source shape
+and continuous scope across every generation in the enrollment lineage.
+Rotation with identical scope retains the anchor. Returning to an earlier
+route after a change leaves the proof unavailable. Upgrade leaves existing
+bindings without inferred anchors. An empty remote table needs a separate
+empty-base proof.
+
+The original SQL snapshot supplies visible segment IDs, row counts and sealed
+payload digests, including locally published rows. A fresh ledger observation
+supplies edge additions for the independently certified chain. An edge is
+complete only when one exact retained attempt agrees with the certified parent,
+the verified snapshot and the digest of all its sealed published members.
+The current bounds are 512 pins, 1,024 members per publication, and 16,384
+visible segments or cumulatively proved members. Indexed pin and segment
+lookups serve these private accessors. The executor will still need to retain
+actual payloads and protect object retention for the selected pin.
+
+Before finalization the adapter reports the accepted child as unknown. Its
+descendants also remain unknown. The live fixture holds this exact state after
+one accepted POST and before lookup. With both members visible the selector
+falls back to the retained parent plus both exact segment IDs, yielding
+`[10,20,20]`. After reconciliation the child carries the complete membership
+and the selector uses it with an empty overlay. The fixture also verifies
+route discontinuity and malformed or incomplete ledger evidence. This
+qualifies the private ledger seam. The executor acceptance below still
+requires exact child membership at the pre-finalization barrier. That proof
+must authenticate the independently retained intent and manifest evidence
+through the approved route. Reanchoring beyond the retained history horizon
+will require a durable membership checkpoint.
 
 TableAM must additionally integrate own-command visibility and prove the whole
 statement pin vector before first output. The fixture continues to require

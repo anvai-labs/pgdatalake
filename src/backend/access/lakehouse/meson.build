@@ -73,7 +73,7 @@ install_data(
    'lakehouse--1.7--1.8.sql', 'lakehouse--1.8--1.9.sql',
    'lakehouse--1.9--1.10.sql', 'lakehouse--1.10--1.11.sql',
    'lakehouse--1.11--1.12.sql', 'lakehouse--1.12--1.13.sql',
-   'lakehouse--1.13--1.14.sql'],
+   'lakehouse--1.13--1.14.sql', 'lakehouse--1.14--1.15.sql'],
   install_dir: dir_data_extension,
 )
 
