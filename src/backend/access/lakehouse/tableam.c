@@ -1719,6 +1719,7 @@ typedef struct ManagedReadAdmission
 	char	   *catalog_prefix;
 	char	   *s3_region;
 	char	   *s3_endpoint;
+	char	   *mapping_fingerprint;
 } ManagedReadAdmission;
 
 typedef struct LakehouseTableScanDescData
@@ -2478,6 +2479,8 @@ managed_read_admission_copy_strings(ManagedReadAdmission *a, MemoryContext ctx)
 		a->s3_region = pstrdup(a->s3_region);
 	if (a->s3_endpoint)
 		a->s3_endpoint = pstrdup(a->s3_endpoint);
+	if (a->mapping_fingerprint)
+		a->mapping_fingerprint = pstrdup(a->mapping_fingerprint);
 	MemoryContextSwitchTo(old);
 }
 
@@ -2533,6 +2536,9 @@ managed_read_admission_fill(ManagedReadAdmission *a, HeapTuple tuple,
 	val = SPI_getbinval(tuple, desc, 18, &isnull);
 	raw = isnull ? NULL : DatumGetByteaPP(val);
 	a->s3_endpoint = raw == NULL ? NULL : pnstrdup(VARDATA_ANY(raw), VARSIZE_ANY_EXHDR(raw));
+	val = SPI_getbinval(tuple, desc, 19, &isnull);
+	raw = isnull ? NULL : DatumGetByteaPP(val);
+	a->mapping_fingerprint = raw == NULL ? NULL : pnstrdup(VARDATA_ANY(raw), VARSIZE_ANY_EXHDR(raw));
 }
 
 static bool
@@ -2554,7 +2560,8 @@ managed_read_admission_equal(const ManagedReadAdmission *a,
 		strcmp(a->catalog_endpoint, b->catalog_endpoint) == 0 &&
 		strcmp(a->catalog_prefix, b->catalog_prefix) == 0 &&
 		strcmp(a->s3_region, b->s3_region) == 0 &&
-		strcmp(a->s3_endpoint, b->s3_endpoint) == 0;
+		strcmp(a->s3_endpoint, b->s3_endpoint) == 0 &&
+		strcmp(a->mapping_fingerprint, b->mapping_fingerprint) == 0;
 }
 
 /*
@@ -2676,6 +2683,7 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 	int			n_overlay = 0;
 	int64		cut_pin = 0;
 	bool		has_pending = false;
+	Snapshot	fresh_snapshot = NULL;
 	pg_uuid_t	pending_operation;
 	uint8		pending_input_digest[32];
 	uint8		pending_proposal_digest[32];
@@ -2693,6 +2701,79 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 	/* everything this routine builds lives and dies with the scan */
 	MemoryContextSwitchTo(scan_context);
 	scan->cut_installed = true; /* never attempt twice, even on error paths */
+
+	/* ---- 0. statement-scope preflight (zero origin contact) ---- */
+
+	/*
+	 * Acquire the ORIGINAL-snapshot scope before any catalog access: a reader
+	 * whose statement snapshot predates a binding rotation has no scope for
+	 * the admitted binding and must fail with the consistency error before
+	 * the observation makes a single request.
+	 */
+	{
+		Oid			owner = capture_table_owner("managed_capture_state", true);
+		Oid			user;
+		int			sec_context;
+
+		GetUserIdAndSecContext(&user, &sec_context);
+		SPI_connect();
+		PushActiveSnapshot(scan->rs_base.rs_snapshot);
+		PG_TRY();
+		{
+			bool		isnull;
+			Oid			argtypes[2] = {OIDOID, UUIDOID};
+			Datum		args[2] = {ObjectIdGetDatum(relid),
+				UUIDPGetDatum(&scan->admission.binding)
+			};
+			int			ret;
+
+			SetUserIdAndSecContext(owner, sec_context | SECURITY_LOCAL_USERID_CHANGE |
+								   SECURITY_RESTRICTED_OPERATION);
+			{
+				SPIPlanPtr	plan = SPI_prepare(
+											   "SELECT EXISTS (SELECT FROM lakehouse.get_managed_read_scope($1, $2))",
+											   2, argtypes);
+
+				if (plan == NULL)
+					elog(ERROR, "could not prepare the managed read scope probe");
+
+				/* the ORIGINAL snapshot must recognize the admitted scope... */
+				ret = SPI_execute_snapshot(plan, args, NULL,
+										   scan->rs_base.rs_snapshot, InvalidSnapshot,
+										   true, false, 1);
+				if (ret != SPI_OK_SELECT || SPI_processed != 1 ||
+					!DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+												SPI_tuptable->tupdesc, 1,
+												&isnull)) || isnull)
+					ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("managed read anchor is unavailable or its scope changed")));
+
+				/*
+				 * ... and the CURRENT one: the enrollment the cut will
+				 * observe must still be the state's active binding as of now,
+				 * or the scope changed under the held snapshot.
+				 */
+				ret = SPI_execute_snapshot(plan, args, NULL,
+										   GetLatestSnapshot(), InvalidSnapshot,
+										   true, false, 1);
+				if (ret != SPI_OK_SELECT || SPI_processed != 1 ||
+					!DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+												SPI_tuptable->tupdesc, 1,
+												&isnull)) || isnull)
+					ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("managed read anchor is unavailable or its scope changed")));
+			}
+		}
+		PG_FINALLY();
+		{
+			SetUserIdAndSecContext(user, sec_context);
+		}
+		PG_END_TRY();
+		PopActiveSnapshot();
+		SPI_finish();
+	}
 
 	/* ---- 1. observe ---- */
 	lakehouse_load_publication_material(&material, scan->admission.role,
@@ -2770,7 +2851,7 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 
 		GetUserIdAndSecContext(&user, &sec_context);
 		SPI_connect();
-		PushActiveSnapshot(GetLatestSnapshot());
+		fresh_snapshot = RegisterSnapshot(GetLatestSnapshot());
 		PG_TRY();
 		{
 			ManagedReadAdmission fresh;
@@ -2814,10 +2895,18 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 				args[0] = ObjectIdGetDatum(relid);
 				args[1] = UUIDPGetDatum(&scan->admission.binding);
 				args[2] = PointerGetDatum(pin_array);
-				ret = SPI_execute_with_args(
-											"SELECT snapshot_id, additions FROM"
-											" lakehouse.get_managed_read_additions($1, $2, $3)",
-											3, argtypes, args, NULL, true, 0);
+				{
+					SPIPlanPtr	plan = SPI_prepare(
+												   "SELECT snapshot_id, additions FROM"
+												   " lakehouse.get_managed_read_additions($1, $2, $3)",
+												   3, argtypes);
+
+					if (plan == NULL)
+						elog(ERROR, "could not prepare the managed read additions");
+					ret = SPI_execute_snapshot(plan, args, NULL,
+											   fresh_snapshot, InvalidSnapshot,
+											   true, false, 0);
+				}
 				if (ret != SPI_OK_SELECT || SPI_processed != pin_count)
 					elog(ERROR, "could not read the managed read additions");
 
@@ -2859,7 +2948,8 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 							cumulative[cumulative_len++] = id;
 						}
 						pin_known[p] = true;
-						pin_members[p] = palloc(sizeof(int64) * cumulative_len);
+						pin_members[p] = MemoryContextAlloc(scan_context,
+															sizeof(int64) * cumulative_len);
 						memcpy(pin_members[p], cumulative,
 							   sizeof(int64) * cumulative_len);
 						pin_member_counts[p] = cumulative_len;
@@ -2868,18 +2958,15 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 			}
 
 			/*
-			 * Prove the DEEPEST unknown edge adjacent to the complete chain:
-			 * the pending attempt sits at that pin, even when the provider
-			 * head has already moved past it (unrelated newer snapshots leave
-			 * the head edge unprovable by design).
+			 * Prove the head edge only: the #88 verifier accepts a pending
+			 * attempt AT the certified head (it resolves the attempt's
+			 * snapshot against pins()[..2]). Once the provider head has moved
+			 * past the child, the cut falls back to the retained parent with
+			 * the full overlay — the recorded fallback shape.
 			 */
-			for (int p = pin_count - 1; p >= 1; p--)
-				if (pin_known[p] && !pin_known[p - 1])
-				{
-					proof_edge = p - 1;
-					break;
-				}
-			if (proof_edge >= 0)
+			if (pin_count >= 2 && !pin_known[0] && pin_known[1])
+				proof_edge = 0;
+			if (proof_edge == 0)
 			{
 				argtypes[0] = OIDOID;
 				argtypes[1] = UUIDOID;
@@ -2889,17 +2976,25 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 				args[1] = UUIDPGetDatum(&scan->admission.binding);
 				args[2] = Int64GetDatum(pins[proof_edge]);
 				args[3] = Int64GetDatum(pins[proof_edge + 1]);
-				ret = SPI_execute_with_args(
-											"SELECT (value->>'operation_id')::uuid,"
-											" decode(value->>'input_digest', 'hex'),"
-											" (value->>'expected_parent')::bigint,"
-											" (value->>'snapshot_id')::bigint,"
-											" decode(value->>'proposal_digest', 'hex'),"
-											" decode(value->>'proposal_body', 'hex'),"
-											" value->'members'"
-											" FROM (SELECT lakehouse.get_managed_read_pending_head($1, $2, $3, $4)"
-											" AS value) q",
-											4, argtypes, args, NULL, true, 1);
+				{
+					SPIPlanPtr	plan = SPI_prepare(
+												   "SELECT (value->>'operation_id')::uuid,"
+												   " decode(value->>'input_digest', 'hex'),"
+												   " (value->>'expected_parent')::bigint,"
+												   " (value->>'snapshot_id')::bigint,"
+												   " decode(value->>'proposal_digest', 'hex'),"
+												   " decode(value->>'proposal_body', 'hex'),"
+												   " value->'members'"
+												   " FROM (SELECT lakehouse.get_managed_read_pending_head($1, $2, $3, $4)"
+												   " AS value) q",
+												   4, argtypes);
+
+					if (plan == NULL)
+						elog(ERROR, "could not prepare the managed pending head");
+					ret = SPI_execute_snapshot(plan, args, NULL,
+											   fresh_snapshot, InvalidSnapshot,
+											   true, false, 1);
+				}
 				if (ret != SPI_OK_SELECT)
 					elog(ERROR, "could not read the managed pending head");
 				if (SPI_processed == 1)
@@ -2945,7 +3040,8 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 									 errmsg("managed pending head lost its proposal body")));
 						raw = DatumGetByteaPP(val);
 						pending_body_len = VARSIZE_ANY_EXHDR(raw);
-						pending_body = palloc(pending_body_len + 1);
+						pending_body = MemoryContextAlloc(scan_context,
+														  pending_body_len + 1);
 						memcpy(pending_body, VARDATA_ANY(raw), pending_body_len);
 						pending_body[pending_body_len] = '\0';
 						members = SPI_getbinval(SPI_tuptable->vals[0],
@@ -2958,21 +3054,31 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 							Oid			mtypes[1] = {JSONBOID};
 							Datum		margs[1] = {members};
 							int			mret;
+							SPIPlanPtr	mplan;
 
-							mret = SPI_execute_with_args(
-														 "SELECT (m->>'segment_id')::bigint,"
-														 " (m->>'row_count')::integer,"
-														 " decode(m->>'payload_digest', 'hex')"
-														 " FROM jsonb_array_elements($1) m",
-														 1, mtypes, margs, NULL, true, 0);
+							mplan = SPI_prepare(
+												"SELECT (m->>'segment_id')::bigint,"
+												" (m->>'row_count')::integer,"
+												" decode(m->>'payload_digest', 'hex')"
+												" FROM jsonb_array_elements($1) m",
+												1, mtypes);
+							if (mplan == NULL)
+								elog(ERROR, "could not prepare the pending members");
+							mret = SPI_execute_snapshot(mplan, margs, NULL,
+														fresh_snapshot,
+														InvalidSnapshot,
+														true, false, 0);
 							if (mret != SPI_OK_SELECT || SPI_processed < 1)
 								ereport(ERROR,
 										(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 										 errmsg("managed pending head carries no members")));
 							pending_member_count = (int) SPI_processed;
-							pending_seg_ids = palloc(sizeof(int64) * pending_member_count);
-							pending_row_counts = palloc(sizeof(int32) * pending_member_count);
-							pending_digests = palloc(32 * pending_member_count);
+							pending_seg_ids = MemoryContextAlloc(scan_context,
+																 sizeof(int64) * pending_member_count);
+							pending_row_counts = MemoryContextAlloc(scan_context,
+																	sizeof(int32) * pending_member_count);
+							pending_digests = MemoryContextAlloc(scan_context,
+																 32 * pending_member_count);
 							for (int m = 0; m < pending_member_count; m++)
 							{
 								bytea	   *digest;
@@ -3004,8 +3110,9 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 			SetUserIdAndSecContext(user, sec_context);
 		}
 		PG_END_TRY();
-		PopActiveSnapshot();
 		SPI_finish();
+		UnregisterSnapshot(fresh_snapshot);
+		fresh_snapshot = NULL;
 	}
 
 	/* pending-head proof: the observation's own metadata (origin contact) */
@@ -3013,8 +3120,12 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 	{
 		PgDatalakeManagedPendingProof proof;
 		PgDatalakeManagedPendingMember *members =
-			palloc(sizeof(PgDatalakeManagedPendingMember) * pending_member_count);
-		int64	   *included = palloc(sizeof(int64) * MANAGED_READ_MAX_MEMBERS);
+			MemoryContextAlloc(scan_context,
+							   sizeof(PgDatalakeManagedPendingMember) *
+							   pending_member_count);
+		int64	   *included = MemoryContextAlloc(scan_context,
+												  sizeof(int64) *
+												  MANAGED_READ_MAX_MEMBERS);
 		uintptr_t	n_included;
 
 		for (int m = 0; m < pending_member_count; m++)
@@ -3056,7 +3167,8 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 		{
 			pin_known[proof_edge] = true;
 			scan->cut_proved = true;
-			pin_members[proof_edge] = palloc(sizeof(int64) * n_included);
+			pin_members[proof_edge] = MemoryContextAlloc(scan_context,
+														 sizeof(int64) * n_included);
 			memcpy(pin_members[proof_edge], included, sizeof(int64) * n_included);
 			pin_member_counts[proof_edge] = (int) n_included;
 		}
@@ -3082,15 +3194,25 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 
 			SetUserIdAndSecContext(owner, sec_context | SECURITY_LOCAL_USERID_CHANGE |
 								   SECURITY_RESTRICTED_OPERATION);
-			ret = SPI_execute_with_args(
-										"SELECT segment_id FROM lakehouse.get_managed_read_visible_segments($1, $2)",
-										2, argtypes, args, NULL, true, 0);
+			{
+				SPIPlanPtr	plan = SPI_prepare(
+											   "SELECT segment_id FROM lakehouse.get_managed_read_visible_segments($1, $2)",
+											   2, argtypes);
+
+				if (plan == NULL)
+					elog(ERROR, "could not prepare the visible segments");
+				ret = SPI_execute_snapshot(plan, args, NULL,
+										   scan->rs_base.rs_snapshot, InvalidSnapshot,
+										   true, false, 0);
+			}
 			if (ret != SPI_OK_SELECT)
 				elog(ERROR, "could not read the managed read visible segments");
 			if (SPI_processed > 0)
 			{
-				visible_ids = palloc(sizeof(int64) * SPI_processed);
-				visible_retained = palloc(sizeof(bool) * SPI_processed);
+				visible_ids = MemoryContextAlloc(scan_context,
+												 sizeof(int64) * SPI_processed);
+				visible_retained = MemoryContextAlloc(scan_context,
+													  sizeof(bool) * SPI_processed);
 				for (int v = 0; v < SPI_processed; v++)
 				{
 					bool		isnull;
@@ -3104,10 +3226,18 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 			}
 
 			/* merge retention flags (both sides ordered by seg_id) */
-			ret = SPI_execute_with_args(
-										"SELECT segment_id, payload_retained FROM"
-										" lakehouse.get_managed_read_segment_retention($1, $2)",
-										2, argtypes, args, NULL, true, 0);
+			{
+				SPIPlanPtr	plan = SPI_prepare(
+											   "SELECT segment_id, payload_retained FROM"
+											   " lakehouse.get_managed_read_segment_retention($1, $2)",
+											   2, argtypes);
+
+				if (plan == NULL)
+					elog(ERROR, "could not prepare the segment retention");
+				ret = SPI_execute_snapshot(plan, args, NULL,
+										   scan->rs_base.rs_snapshot, InvalidSnapshot,
+										   true, false, 0);
+			}
 			if (ret != SPI_OK_SELECT)
 				elog(ERROR, "could not read the managed read segment retention");
 			for (int v = 0; v < n_visible; v++)
@@ -3214,10 +3344,18 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 
 				SetUserIdAndSecContext(owner, sec_context | SECURITY_LOCAL_USERID_CHANGE |
 									   SECURITY_RESTRICTED_OPERATION);
-				ret = SPI_execute_with_args(
-											"SELECT segment_id, payload_digest, payload, sha256(payload)"
-											" FROM lakehouse.load_managed_read_overlay($1, $2, $3, 65536, 8388608)",
-											3, argtypes, args, NULL, true, 0);
+				{
+					SPIPlanPtr	plan = SPI_prepare(
+												   "SELECT segment_id, payload_digest, payload, sha256(payload)"
+												   " FROM lakehouse.load_managed_read_overlay($1, $2, $3, 65536, 8388608)",
+												   3, argtypes);
+
+					if (plan == NULL)
+						elog(ERROR, "could not prepare the overlay load");
+					ret = SPI_execute_snapshot(plan, args, NULL,
+											   scan->rs_base.rs_snapshot, InvalidSnapshot,
+											   true, false, 0);
+				}
 				if (ret != SPI_OK_SELECT || SPI_processed != n_overlay)
 					ereport(ERROR,
 							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -3265,7 +3403,8 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 								(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 								 errmsg("managed read overlay payload could not be decoded")));
 					if (scan->n_delta == 0)
-						scan->delta_rows = palloc(sizeof(DeltaRowsHandle *));
+						scan->delta_rows = MemoryContextAlloc(scan_context,
+															  sizeof(DeltaRowsHandle *));
 					else
 						scan->delta_rows = repalloc(scan->delta_rows,
 													sizeof(DeltaRowsHandle *) *

@@ -330,18 +330,32 @@ admission runs at scan_begin under the ledger owner's context for the
 checked role (`lakehouse.admit_managed_read`, grant table 1.18→1.19) and
 declines catalog-locally, with zero origin requests, for parallel plans,
 scan keys, RLS, inheritance, own staged writes and non-staged write modes.
-The cut itself installs on the first fetch: observe → fresh-proof frame
+Before the observation makes any request, install runs a zero-origin
+statement-scope preflight: a reader whose registered snapshot predates a
+binding rotation fails with the consistency error before the first
+origin contact. Admission returns a mapping-options fingerprint and the
+fresh-proof frame compares it field by field, so a same-OID mapping
+replacement is a detected credential change. The pending-head proof is
+head-only (the #88 verifier resolves the attempt against the certified
+head): once the provider head moves past the accepted child, the cut
+falls back to the retained parent with the full overlay. The cut itself
+installs on the first fetch: preflight → observe → fresh-proof frame
 (re-admission compare, certified addition chain, pending-head proof) →
 statement frame (registered snapshot: visible segments + payload
 retention) → compatible-pin selection → digest-verified overlay load →
 exact-pin plan. `lakehouse.managed_read_cut_evidence()` exposes the
-installed pin and overlay IDs of the current backend. DOCUMENTED GAP
-(until RTE-aware admission lands): scans derived from views and
-redirected permission identities (`checkAsUser`) are not detectable at
-scan_begin; the role-specific `purpose=read` credential mapping
-structurally prevents a definer view from widening admission, and the
-fresh-frame scope recheck rejects any grant change mid-scan. Bound COUNT
-keeps declining through `lakehouse_check_capture_read`.
+installed pin, proof flag and overlay IDs of the current backend.
+DOCUMENTED GAP (until RTE-aware admission lands): scans derived from
+views and redirected permission identities (`checkAsUser`) are not
+detectable at scan_begin; the role-specific `purpose=read` credential
+mapping structurally prevents a definer view from widening admission
+(the invoker's identity admits), and the fresh-frame scope recheck
+rejects mapping rotation, revocation, prefix, region and option
+changes mid-scan. Bound COUNT keeps declining through
+`lakehouse_check_capture_read`. NOT IMPLEMENTED in this slice, tracked
+for the governed-reads band: the retained object lease / provider proof
+across portal lifetime, and distinct telemetry for the compatibility
+refusal, origin timeout and oversized-proof channels.
 
 Use a v2 Lakekeeper table with parent pin `P` containing `[10]`. Hold one
 PostgreSQL snapshot before both source commits and another between them.

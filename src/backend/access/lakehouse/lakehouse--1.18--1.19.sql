@@ -19,7 +19,9 @@ CREATE TRIGGER guard_managed_read_grant
     BEFORE UPDATE OR DELETE ON lakehouse.managed_read_grants
     FOR EACH ROW EXECUTE FUNCTION lakehouse.guard_publication_admission();
 DO $$ BEGIN
-    -- Revocation is a one-way flag transition, like the send grants.
+    -- The row is the operator's current read decision: rotation updates
+    -- the credential fields (the admission fingerprint tracks any option
+    -- change), never the identity. DELETE is forbidden.
     CREATE OR REPLACE FUNCTION lakehouse.guard_publication_admission() RETURNS trigger
     LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $fn$
     BEGIN
@@ -109,7 +111,7 @@ RETURNS TABLE(binding_id uuid, reader_role oid, mapping_id oid, server_id oid,
               ref_name text, storage_root text, anchor_snapshot bigint,
               schema_id integer, spec_id integer, target_identity text,
               catalog_endpoint text, catalog_prefix text, s3_region text,
-              s3_endpoint text)
+              s3_endpoint text, mapping_fingerprint text)
 LANGUAGE sql VOLATILE STRICT SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp AS $$
     SELECT g.binding_id, g.reader_role, g.mapping_id, m.umserver,
@@ -117,7 +119,9 @@ SET search_path = pg_catalog, pg_temp AS $$
            b.incarnation_id, b.authority_id, b.table_uuid, 'main'::text,
            b.storage_root, a.snapshot_id, b.schema_id, b.spec_id,
            b.target_identity, b.catalog_endpoint, g.catalog_prefix, g.s3_region,
-           b.object_endpoint
+           b.object_endpoint,
+           md5(coalesce((SELECT string_agg(opt, '|' ORDER BY opt)
+                         FROM unnest(m.umoptions) opt), ''))
     FROM lakehouse.managed_capture_state s
     JOIN lakehouse.managed_read_grants g
       ON g.binding_id = s.active_binding_id AND g.reader_role = reader::oid

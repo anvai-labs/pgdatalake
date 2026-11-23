@@ -204,19 +204,39 @@ def exercise(db, namespace, writer, reader, owner, worker):
                                               "reader_catalog_gets": len(reads) - scan_reads}),
                                   flush=True)
 
-                            # Rescan keeps the cut with zero catalog resolutions.
-                            fresh_r("DECLARE drill SCROLL CURSOR FOR SELECT id FROM events ORDER BY id")
-                            assert fresh_r("FETCH ALL IN drill") == ["10", "20", "20"]
+                            # Rescan keeps the cut with zero catalog
+                            # resolutions. The rescan must happen INSIDE
+                            # one open statement: hold a cursor over a
+                            # nested loop whose INNER side is the bound
+                            # scan, FETCH 1 (installs the cut, executor
+                            # suspends mid-loop), move the catalog head,
+                            # then FETCH ALL — the resumed executor runs a
+                            # genuine ExecReScan of the inner scan with the
+                            # retained cut. (A scroll cursor's backward
+                            # fetch would be served from a tuplestore and
+                            # never re-run the scan; a fresh statement
+                            # would re-admit and re-observe.)
+                            drill_query = ("WITH x AS MATERIALIZED "
+                                           "(SELECT generate_series(1, 2) i) "
+                                           "SELECT e.id FROM x, events e "
+                                           "WHERE e.id > x.i - 100")
+                            plan = "\n".join(fresh_r(f"EXPLAIN (COSTS OFF) {drill_query}"))
+                            assert "Nested Loop" in plan, plan
+                            assert plan.index("CTE Scan on x") < plan.index("Seq Scan on events e"), plan
+                            fresh_r(f"DECLARE drill CURSOR FOR {drill_query}")
+                            assert fresh_r("FETCH 1 IN drill") == ["10"]
+                            rescan_reads = len(reads)
                             trino(f"INSERT INTO {relation} VALUES (30)")
                             head_after = trino(history)
                             assert head_after != child
-                            rescan_reads = len(reads)
-                            fresh_r("MOVE BACKWARD ALL IN drill")
-                            assert fresh_r("FETCH ALL IN drill") == ["10", "20", "20"]
-                            assert json.loads(
-                                fresh_r("SELECT lakehouse.managed_read_cut_evidence()")[0]) \
-                                == {"pin": int(child), "proved": True, "overlay": []}
+                            rest = fresh_r("FETCH ALL IN drill")
+                            assert sorted(int(v) for v in rest) == [10, 20, 20, 20, 20], rest
+                            rescan_state = json.loads(
+                                fresh_r("SELECT lakehouse.managed_read_cut_evidence()")[0])
+                            assert rescan_state == {"pin": int(child), "proved": True,
+                                                    "overlay": []}, rescan_state
                             assert len(reads) == rescan_reads, reads[rescan_reads:]
+                            fresh_r("CLOSE drill")
                             print(json.dumps({"case": "rescan-retained-cut", "head_moved_to": head_after,
                                               "catalog_resolutions": 0}), flush=True)
                             fresh_r("COMMIT")
@@ -282,6 +302,9 @@ def exercise(db, namespace, writer, reader, owner, worker):
                         with login(db, reader) as broken:
                             broken("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
                             broken("SELECT 1 AS held")
+                            import os as _os
+                            if _os.getenv("DRILL_DEBUG"):
+                                print("S1:", broken("SELECT pg_current_snapshot()::text"), flush=True)
                             sql(db, f"""
                                 SELECT lakehouse.revoke_managed_capture('events', '{binding}', 1);
                                 SELECT lakehouse.enroll_managed_capture('events',
@@ -291,12 +314,30 @@ def exercise(db, namespace, writer, reader, owner, worker):
                             """)
                             install_reader_grant(db, successor, reader, prefix,
                                                  server="reader_credentials_v3")
+                            import os as _os
+                            if _os.getenv("DRILL_DEBUG"):
+                                print("STATE:", sql(db,
+                                    "SELECT json_build_object('active', active_binding_id::text, "
+                                    "'generation', generation, 'successor', "
+                                    f"'{successor}') FROM lakehouse.managed_capture_state "
+                                    "WHERE relid='events'::regclass"), flush=True)
+                                print("ADMITS:", sql(db,
+                                    "SELECT grant_managed_read_response FROM "
+                                    "(SELECT lakehouse.admit_managed_read('events', "
+                                    f"'{reader}'::regrole) AS grant_managed_read_response) q"), flush=True)
+                            if _os.getenv("DRILL_DEBUG"):
+                                print("S2:", broken("SELECT pg_current_snapshot()::text"), flush=True)
                             broken("SAVEPOINT rotated")
                             broken("SELECT id FROM events ORDER BY id", sqlstate="55000")
                             broken("ROLLBACK TO SAVEPOINT rotated")
                             assert broken("SELECT current_user") == [reader]
                             broken("COMMIT")
                         assert len(posts) == 1
+                        import os as _os
+                        if _os.getenv("DRILL_DEBUG"):
+                            print("READS:", reads[reclaim_reads:], flush=True)
+                        assert len(reads) - reclaim_reads == 0, \
+                            "rotated-scope consistency error must precede any origin request"
                         print(json.dumps({"case": "nested-spi-denials-rotated-scope",
                                           "reader_catalog_posts": 0,
                                           "rotated_scope_sqlstate": "55000",
