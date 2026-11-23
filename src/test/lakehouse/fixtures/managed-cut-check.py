@@ -57,17 +57,29 @@ def select_cut(worker, source, catalog, candidates, visible):
     return pin, overlay_ids, sorted(rows)
 
 
-def ledger_snapshot(session):
+def ledger_snapshot(session, binding):
     data, = session(f"""
         SELECT json_build_array(pg_current_snapshot()::text,
-            coalesce(json_agg(json_build_array(seg_id, convert_from(payload, 'UTF8')::json,
-                                               published) ORDER BY seg_id), '[]'::json))
-        FROM {SEG} WHERE relid='events'::regclass
+            coalesce((SELECT json_agg(json_build_array(seg_id,
+                convert_from(payload, 'UTF8')::json, published,
+                encode(sha256(payload), 'hex')) ORDER BY seg_id)
+                FROM {SEG} WHERE relid='events'::regclass), '[]'::json),
+            coalesce((SELECT json_agg(json_build_array(segment_id, row_count,
+                encode(payload_digest, 'hex')) ORDER BY segment_id)
+                FROM lakehouse.get_managed_read_visible_segments('events', '{binding}')), '[]'::json))
     """)
-    pg_snapshot, segments = json.loads(data)
+    pg_snapshot, segments, evidence = json.loads(data)
+    assert evidence == [[seg_id, len(payload), digest] for seg_id, payload, _, digest in segments], evidence
     visible = {seg_id: ([row[0] for row in payload], published)
-               for seg_id, payload, published in segments}
+               for seg_id, payload, published, _ in segments}
     return pg_snapshot, visible
+
+
+def ledger_additions(db, binding, *pins):
+    return json.loads(sql(db, f"""
+        SELECT json_object_agg(snapshot_id::text, additions)
+        FROM lakehouse.get_managed_read_additions('events', '{binding}', ARRAY[{','.join(pins)}]::bigint[])
+    """))
 
 
 def certify(scope, pin, included, namespace, expected):
@@ -171,9 +183,7 @@ def run_worker(worker, db, operation, approval, hint, *, error=None, member_byte
 def run_native_lookup(db, role, operation, binding, generation, child, posts, lookups):
     function = trino_fixture.NATIVE_LOOKUP
     call = f"SET ROLE {role}; SELECT {function}('{operation}', {generation});"
-    sql(db, "ALTER EXTENSION lakehouse UPDATE TO '1.11';")
-    sql(db, f"SELECT {function}('{operation}', {generation});", error="42883")
-    trino_fixture.install_native_lookup_role(db, role)
+    trino_fixture.install_native_lookup_role(db, role, upgrade=False)
     sql(db, call, error="42501")
     sql(db, f"GRANT EXECUTE ON FUNCTION {function}(uuid, bigint) TO {role};")
     sql(db, call, error="42501")
@@ -231,25 +241,68 @@ def check_visibility(db, role, owner, worker, approval, base, history, gateway, 
     endpoint, prefix = approval["catalog_endpoint"], approval["catalog_prefix"]
     root, binding = approval["storage_root"], approval["binding_id"]
     assert incarnation == approval["incarnation_id"]
+    enroll = f"""SELECT lakehouse.enroll_managed_capture_with_anchor(
+        'events', '{namespace}.events', 'cut_catalog', '{incarnation}', '{binding}',
+        '{authority}', '{table}', '{root}', 0, 0, {{anchor}})"""
+    prior_binding, prior_lineage = (str(uuid4()) for _ in range(2))
     sql(db, f"""
+        CREATE EXTENSION lakehouse VERSION '1.15';
+        DROP EXTENSION lakehouse;
         CREATE EXTENSION lakehouse;
-        ALTER EXTENSION lakehouse UPDATE TO '1.10';
+        ALTER EXTENSION lakehouse UPDATE TO '1.14';
         CREATE SERVER cut_catalog FOREIGN DATA WRAPPER lakehouse_fdw OPTIONS
             (endpoint '{endpoint}', warehouse 'smoke',
              s3_endpoint 'http://127.0.0.1:9000');
+        CREATE TABLE prior_events(id bigint) USING lakehouse WITH (write_mode='staged');
+        SELECT lakehouse.enroll_managed_capture('prior_events', '{namespace}.events',
+            'cut_catalog', '{prior_lineage}', '{prior_binding}', 1, '{authority}', '{table}', '{root}', 0, 0);
         CREATE TABLE events(id bigint) USING lakehouse WITH (write_mode='staged');
         GRANT INSERT, SELECT ON events TO {role};
-        SELECT lakehouse.enroll_managed_capture('events'::regclass, '{namespace}.events',
-            'cut_catalog', '{incarnation}', '{binding}', 1, '{authority}', '{table}', '{root}', 0, 0);
-        SELECT lakehouse.grant_publication_send('{binding}', '{prefix}', 'us-east-1');
     """)
+    sql(db, enroll.format(anchor=parent), error="42883")
+    sql(db, "ALTER EXTENSION lakehouse UPDATE TO '1.15'")
+    assert not sql(db, f"SELECT * FROM lakehouse.get_managed_read_scope('prior_events', '{prior_binding}')")
+    sql(db, f"SELECT lakehouse.get_managed_read_visible_segments('prior_events', '{prior_binding}')",
+        error="55000")
+    sql(db, enroll.format(anchor=0), error="22023")
+    sql(db, f"""
+        BEGIN;
+        INSERT INTO {SEG}(relid, payload, row_count, published)
+            VALUES ('events'::regclass, convert_to('[[12]]', 'UTF8'), 1, true);
+        {enroll.format(anchor=parent)};
+    """, error="55000")
+    assert not sql(db, "SELECT active_binding_id FROM lakehouse.managed_capture_state WHERE relid='events'::regclass")
+    sql(db, enroll.format(anchor=parent))
+    sql(db, enroll.format(anchor=parent), error="55000")
+    scope = json.loads(sql(db, f"""
+        SELECT json_build_array(authority_id, table_uuid, ref_name, incarnation_id,
+                                storage_root, anchor_snapshot::text)
+        FROM lakehouse.get_managed_read_scope('events', '{binding}')
+    """))
+    assert scope == [*source, parent], scope
+    anchor = scope[-1]
+    assert ledger_additions(db, binding, parent) == {parent: []}
+    for statement in ("UPDATE lakehouse.managed_read_anchors SET snapshot_id=1",
+                      "DELETE FROM lakehouse.managed_read_anchors",
+                      "TRUNCATE lakehouse.managed_read_anchors"):
+        sql(db, statement, error="55000")
+    for evidence in (f"lakehouse.get_managed_read_scope('events', '{binding}')",
+                     f"lakehouse.get_managed_read_visible_segments('events', '{binding}')",
+                     f"lakehouse.get_managed_read_additions('events', '{binding}', ARRAY[{parent}])",
+                     "lakehouse.managed_read_anchors"):
+        sql(db, f"SET ROLE {role}; SELECT * FROM {evidence}", error="42501")
+    for invalid in ("NULL::bigint[]", "'{}'::bigint[]", f"ARRAY[{parent},{parent}]",
+                    f"ARRAY[[{parent}],[{parent}]]", f"array_fill({parent}::bigint, ARRAY[513])"):
+        sql(db, f"SELECT lakehouse.get_managed_read_additions('events', '{binding}', {invalid})", error="22023")
+    sql(db, f"SELECT lakehouse.grant_publication_send('{binding}', '{prefix}', 'us-east-1')")
+
     with login(db, owner) as before, login(db, owner) as between, login(db, owner) as fresh:
         before("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-        first_view = ledger_snapshot(before)
+        first_view = ledger_snapshot(before, binding)
         assert first_view[1] == {}, first_view
         sql(db, f"SET ROLE {role}; INSERT INTO events VALUES (20);")
         between("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-        second_view = ledger_snapshot(between)
+        second_view = ledger_snapshot(between, binding)
         first_id, = second_view[1]
         assert second_view[1] == {first_id: ([20], False)}, second_view
         sql(db, f"""
@@ -259,7 +312,7 @@ def check_visibility(db, role, owner, worker, approval, base, history, gateway, 
             COMMIT;
             BEGIN; SET LOCAL ROLE {role}; INSERT INTO events VALUES (98); ROLLBACK;
         """)
-        fresh_view = ledger_snapshot(fresh)
+        fresh_view = ledger_snapshot(fresh, binding)
         assert len(fresh_view[1]) == 2, fresh_view
         late_id, = fresh_view[1].keys() - {first_id}
         assert fresh_view[1] == {first_id: ([20], False), late_id: ([20], False)}, fresh_view
@@ -306,8 +359,18 @@ def check_visibility(db, role, owner, worker, approval, base, history, gateway, 
         snapshot = next(s for s in head["snapshots"] if str(s["snapshot-id"]) == child)
         assert head["table-uuid"] == table and str(snapshot["parent-snapshot-id"]) == parent
         observation = {key: approval[key] for key in ("authority_id", "incarnation_id", "ref_name")}
-        observation.update(anchor=parent, metadata=head)
-        assert ledger_snapshot(fresh)[1] == fresh_view[1]
+        observation.update(anchor=anchor, metadata=head)
+        assert ledger_snapshot(fresh, binding)[1] == fresh_view[1]
+        pending = ledger_additions(db, binding, child, parent)
+        assert pending == {parent: [], child: None}, pending
+        unknown = source, child, pending[child], []
+        for name, expected, view in (
+            ("old", (parent, [], [10]), first_view),
+            ("middle", (parent, [first_id], [10, 20]), second_view),
+            ("fresh", (parent, [first_id, late_id], [10, 20, 20]), fresh_view),
+        ):
+            check(worker, f"ledger-accepted-unfinalized-{name}", expected,
+                  source, observation, [unknown, base], view)
         lookup_hint = discover("lookup")
         assert run_worker(worker, db, operation, approval, lookup_hint | {"mode": "send"}) == "rediscover"
         assert discover("lookup") == lookup_hint and len(posts) == len(lookups) == 1
@@ -322,6 +385,22 @@ def check_visibility(db, role, owner, worker, approval, base, history, gateway, 
                            "members": [first_id, late_id]}, receipt
         assert len(posts) == 1
         assert lookups == [(route, "Bearer fixture-send"), (route, "Bearer fixture-lookup")], lookups
+        finalized = ledger_additions(db, binding, child, parent)
+        assert finalized == {parent: [], child: [first_id, late_id]}, finalized
+        wrong_parent = str(next(pin for pin in range(1, 4) if str(pin) not in (parent, child)))
+        unknown_edge = ledger_additions(db, binding, child, wrong_parent, parent)
+        assert unknown_edge == {parent: [], wrong_parent: None, child: None}, unknown_edge
+        partial = json.loads(sql(db, f"""
+            BEGIN;
+            DELETE FROM {MEM} WHERE operation_id='{operation}' AND seg_id={late_id};
+            SELECT json_object_agg(snapshot_id::text, additions)
+            FROM lakehouse.get_managed_read_additions('events', '{binding}', ARRAY[{child},{parent}]);
+            ROLLBACK;
+        """))
+        assert partial == {parent: [], child: None}, partial
+        print(json.dumps({"case": "managed-ledger-evidence", "anchor": parent, "head": child,
+                          "accepted_unfinalized": pending, "finalized": finalized,
+                          "partial_receipt": partial}, sort_keys=True), flush=True)
         discover(None)
         print(json.dumps({"case": "verified-worker-cut", "parent": parent, "pin": child,
                           "operation": operation, "members": receipt["members"],
@@ -329,7 +408,7 @@ def check_visibility(db, role, owner, worker, approval, base, history, gateway, 
                           "stale_wake_catalog_requests": 0, "wrong_mode_catalog_requests": 0,
                           "wrong_approval_catalog_requests": 0, "overbudget_catalog_requests": 0}, sort_keys=True),
               flush=True)
-        published = certify(tuple(receipt["source"]), receipt["pin"], set(receipt["members"]),
+        published = certify(tuple(receipt["source"]), receipt["pin"], set(finalized[child]),
                             namespace, [10, 20, 20])
         unknown = source, child, None, published[3]
         wrong = (authority, str(uuid4()), *source[2:]), child, set(), published[3]
@@ -350,19 +429,44 @@ def check_visibility(db, role, owner, worker, approval, base, history, gateway, 
         _, visible = second_view
         reclaimed = {seg_id: (None, published) for seg_id, (_, published) in visible.items()}
         assert_cut("missing-overlay-payload", "no_compatible_pin", candidates, (second_view[0], reclaimed))
-        assert_cut("accepted-before-local-completion", (child, [], [10, 20, 20]), candidates, fresh_view)
+        assert_cut("fresh-mvcc-with-finalized-evidence", (child, [], [10, 20, 20]), candidates, fresh_view)
         assert_cut("unknown-membership-no-output", "no_compatible_pin", [unknown], fresh_view)
         assert_cut("unknown-head-fallback", (parent, [first_id, late_id], [10, 20, 20]),
                    [unknown, base], fresh_view)
         assert_cut("replaced-binding-no-output", "binding_changed", [wrong, base], fresh_view)
 
-        assert ledger_snapshot(before) == first_view
-        assert ledger_snapshot(between) == second_view
-        completed = ledger_snapshot(fresh)
+        assert ledger_snapshot(before, binding) == first_view
+        assert ledger_snapshot(between, binding) == second_view
+        completed = ledger_snapshot(fresh, binding)
         assert completed[1] == {first_id: ([20], True), late_id: ([20], True)}, completed
         assert_cut("after-local-completion", (child, [], [10, 20, 20]), candidates, completed)
         assert_cut("retained-parent-after-completion", (parent, [first_id, late_id], [10, 20, 20]),
                    [base], completed)
+
+    def rotate(previous, generation, target_identity):
+        successor = str(uuid4())
+        sql(db, f"""
+            SELECT lakehouse.revoke_managed_capture('events', '{previous}', {generation - 1});
+            SELECT lakehouse.enroll_managed_capture('events', '{target_identity}', 'cut_catalog',
+                '{incarnation}', '{successor}', {generation}, '{authority}', '{table}', '{root}', 0, 0);
+        """)
+        return successor
+
+    successive = rotate(binding, 2, f"{namespace}.events")
+    assert ledger_additions(db, successive, child, parent) == finalized
+    sql(db, f"SELECT lakehouse.get_managed_read_visible_segments('events', '{binding}')", error="55000")
+    sql(db, f"""
+        BEGIN;
+        INSERT INTO {SEG}(relid, payload, row_count, authority_id, table_uuid, capture_binding_id)
+        SELECT 'events'::regclass, '[[8]]', 1, '{authority}', '{table}', '{successive}'
+        FROM generate_series(1, 16383);
+        SELECT lakehouse.get_managed_read_visible_segments('events', '{successive}');
+    """, error="54000")
+    changed = rotate(successive, 3, f"{namespace}.sibling")
+    restored = rotate(changed, 4, f"{namespace}.events")
+    sql(db, f"SELECT lakehouse.get_managed_read_visible_segments('events', '{restored}')", error="55000")
+    print(json.dumps({"case": "managed-ledger-generations", "unchanged_scope_preserved": True,
+                      "old_binding_rejected": True, "route_discontinuity_rejected": True}), flush=True)
 
 
 def main():
