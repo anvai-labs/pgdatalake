@@ -2,17 +2,15 @@
 
 use std::ptr;
 use std::sync::atomic::AtomicBool;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 
-use object_store::aws::AwsCredential;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use super::parse_digest_hex;
+use super::{parse_digest_hex, PgDatalakePublicationCredentialMaterial};
 use crate::catalog::{metadata::IcebergType, publication::PublicationIdentity};
 use crate::publication_transport::{
-    PublicationCredentials, PublicationLimits, PublicationPurpose, PublicationTarget,
-    ScopedPublisher,
+    PublicationLimits, PublicationPurpose, PublicationTarget, ScopedPublisher,
 };
 use crate::publication_worker::{
     prepare_publication_send, CapturedMember, ClaimState, NativeSendAuthorization,
@@ -23,7 +21,6 @@ pub const PG_DATALAKE_NATIVE_SEND_MAX_BYTES: usize = 8 * 1024 * 1024;
 pub const PG_DATALAKE_NATIVE_SEND_MAX_ROWS: usize = 65_536;
 const MAX_DESCRIPTOR_BYTES: usize = 16 * 1024;
 const MAX_SCHEMA_BYTES: usize = 64 * 1024;
-const MAX_CREDENTIAL_BYTES: usize = 4 * 1024;
 
 /// Purpose-specific material copied from an independently approved send grant.
 /// The target is that grant's bounded JSON descriptor, separate from the job.
@@ -31,15 +28,7 @@ const MAX_CREDENTIAL_BYTES: usize = 4 * 1024;
 pub struct PgDatalakeNativeSendCredentials {
     pub target: *const u8,
     pub target_len: usize,
-    pub catalog_token: *const u8,
-    pub catalog_token_len: usize,
-    pub access_key: *const u8,
-    pub access_key_len: usize,
-    pub secret_key: *const u8,
-    pub secret_key_len: usize,
-    pub session_token: *const u8,
-    pub session_token_len: usize,
-    pub expires_unix_seconds: u64,
+    pub material: PgDatalakePublicationCredentialMaterial,
 }
 
 #[repr(C)]
@@ -101,17 +90,6 @@ unsafe fn bounded_json<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(std::slice::from_raw_parts(bytes, len)).ok()
 }
 
-unsafe fn credential_string(value: *const u8, len: usize) -> Option<String> {
-    if value.is_null() || !(1..=MAX_CREDENTIAL_BYTES).contains(&len) {
-        return None;
-    }
-    let bytes = std::slice::from_raw_parts(value, len);
-    if bytes.contains(&0) {
-        return None;
-    }
-    Some(std::str::from_utf8(bytes).ok()?.to_owned())
-}
-
 unsafe fn prepare_native_send(
     input: &PgDatalakeNativeSendInputs,
 ) -> Option<PgDatalakePreparedSend> {
@@ -125,8 +103,6 @@ unsafe fn prepare_native_send(
         credentials.target_len,
         MAX_DESCRIPTOR_BYTES,
     )?;
-    let expires_at =
-        UNIX_EPOCH.checked_add(Duration::from_secs(credentials.expires_unix_seconds))?;
 
     if input.members.is_null() || !(1..=MAX_PUBLICATION_MEMBERS).contains(&input.member_count) {
         return None;
@@ -146,28 +122,7 @@ unsafe fn prepare_native_send(
     let publisher = ScopedPublisher::new(
         request.target,
         purpose,
-        PublicationCredentials {
-            target,
-            purpose,
-            expires_at,
-            catalog_bearer: credential_string(
-                credentials.catalog_token,
-                credentials.catalog_token_len,
-            )?,
-            objects: AwsCredential {
-                key_id: credential_string(credentials.access_key, credentials.access_key_len)?,
-                secret_key: credential_string(credentials.secret_key, credentials.secret_key_len)?,
-                token: if credentials.session_token.is_null() && credentials.session_token_len == 0
-                {
-                    None
-                } else {
-                    Some(credential_string(
-                        credentials.session_token,
-                        credentials.session_token_len,
-                    )?)
-                },
-            },
-        },
+        credentials.material.resolve(target, purpose)?,
         columns
             .into_iter()
             .map(|column| (column.name, column.r#type))

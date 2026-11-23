@@ -10,21 +10,17 @@
 
 #include "access/xact.h"
 #include "access/xlog.h"
-#include "catalog/pg_foreign_server_d.h"
 #include "catalog/pg_type_d.h"
-#include "commands/defrem.h"
 #include "executor/spi.h"
 #include "fmgr.h"
-#include "foreign/foreign.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
-#include "pg_datalake_core.h"
+#include "managed_credentials.h"
 #include "port/atomics.h"
 #include "postmaster/bgworker.h"
 #include "storage/dsm.h"
 #include "storage/ipc.h"
 #include "tcop/tcopprot.h"
-#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgrprotos.h"
 #include "utils/guc.h"
@@ -43,7 +39,7 @@ typedef struct ManagedLookupRequest
 	pg_uuid_t	operation;
 	int64		generation;
 	bool		reconcile;
-}			ManagedLookupRequest;
+} ManagedLookupRequest;
 
 StaticAssertDecl(sizeof(ManagedLookupRequest) <= BGW_EXTRALEN,
 				 "managed lookup request must fit in background worker registration");
@@ -53,14 +49,14 @@ typedef enum ManagedLookupOutcome
 	MANAGED_LOOKUP_PENDING,
 	MANAGED_LOOKUP_READY,
 	MANAGED_LOOKUP_ERROR,
-}			ManagedLookupOutcome;
+} ManagedLookupOutcome;
 
 typedef struct ManagedLookupReceipt
 {
 	pg_atomic_uint32 outcome;
 	int			sqlstate;
 	char		json[MANAGED_LOOKUP_RECEIPT_SIZE];
-}			ManagedLookupReceipt;
+} ManagedLookupReceipt;
 
 typedef struct ManagedLookupWork
 {
@@ -72,8 +68,8 @@ typedef struct ManagedLookupWork
 	pg_uuid_t	table;
 	int64		snapshot;
 	int64		generation;
-	PgDatalakeLookupCredentials credentials;
-}			ManagedLookupWork;
+	PgDatalakePublicationCredentialMaterial credentials;
+} ManagedLookupWork;
 
 PG_FUNCTION_INFO_V1(pg_lakehouse_preflight_managed_lookup);
 PG_FUNCTION_INFO_V1(pg_lakehouse_reconcile_managed_lookup);
@@ -85,7 +81,7 @@ PGDLLEXPORT void lakehouse_managed_lookup_main(Datum main_arg);
  * owned by SPI and carry only a small receipt out of this transaction.
  */
 static void
-load_retained_lookup(const ManagedLookupRequest * request, ManagedLookupReceipt * receipt)
+load_retained_lookup(const ManagedLookupRequest *request, ManagedLookupReceipt *receipt)
 {
 	static const char *query =
 		"SELECT owner_generation, verified_snapshot_id IS NOT NULL,"
@@ -161,8 +157,8 @@ load_retained_lookup(const ManagedLookupRequest * request, ManagedLookupReceipt 
  * options directly in the worker and keep them out of DSM and SQL text.
  */
 static void
-load_lookup_work(const ManagedLookupRequest * request, MemoryContext context,
-				 ManagedLookupWork * work)
+load_lookup_work(const ManagedLookupRequest *request, MemoryContext context,
+				 ManagedLookupWork *work)
 {
 	static const char *query =
 		"SELECT jsonb_build_object("
@@ -192,12 +188,10 @@ load_lookup_work(const ManagedLookupRequest * request, MemoryContext context,
 	HeapTuple	tuple;
 	TupleDesc	desc;
 	Datum		values[10];
-	UserMapping *mapping;
 	Oid			server;
 	int64		expires;
 	MemoryContext old_context;
 	char	   *scope;
-	ListCell   *cell;
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "managed lookup could not connect to SPI");
@@ -228,23 +222,6 @@ load_lookup_work(const ManagedLookupRequest * request, MemoryContext context,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("managed lookup scope or credential expiry is outside the supported bounds")));
 
-	/*
-	 * With USAGE (or ownership) the worker can inspect or modify its mapping.
-	 * A dedicated operator-owned lookup server makes substitution fail
-	 * closed.
-	 */
-	if (object_ownercheck(ForeignServerRelationId, server, request->role) ||
-		object_aclcheck(ForeignServerRelationId, server, request->role, ACL_USAGE) == ACLCHECK_OK)
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("managed lookup requires an operator-owned credential mapping")));
-
-	mapping = GetUserMapping(request->role, server);
-	if (mapping->umid != DatumGetObjectId(values[7]))
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("managed lookup credential mapping no longer matches its approval")));
-
 	old_context = MemoryContextSwitchTo(context);
 	work->scope = pstrdup(scope);
 	work->body = DatumGetByteaPCopy(values[1]);
@@ -254,34 +231,15 @@ load_lookup_work(const ManagedLookupRequest * request, MemoryContext context,
 	work->table = *DatumGetUUIDP(values[5]);
 	work->snapshot = DatumGetInt64(values[6]);
 	work->credentials.expires_unix_seconds = expires;
-	foreach(cell, mapping->options)
-	{
-		DefElem    *option = lfirst_node(DefElem, cell);
-		const char *value = defGetString(option);
-
-		if (strlen(value) > 4096)
-			ereport(ERROR,
-					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("managed lookup credential exceeds the supported length")));
-		if (strcmp(option->defname, "token") == 0)
-			work->credentials.catalog_token = pstrdup(value);
-		else if (strcmp(option->defname, "s3_access_key") == 0)
-			work->credentials.access_key = pstrdup(value);
-		else if (strcmp(option->defname, "s3_secret_key") == 0)
-			work->credentials.secret_key = pstrdup(value);
-	}
 	MemoryContextSwitchTo(old_context);
-	if (!work->credentials.catalog_token || !*work->credentials.catalog_token ||
-		!work->credentials.access_key || !*work->credentials.access_key ||
-		!work->credentials.secret_key || !*work->credentials.secret_key)
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("managed lookup requires complete catalog and object credentials")));
+
+	lakehouse_load_publication_material(&work->credentials, request->role, server,
+										DatumGetObjectId(values[7]), "lookup", context);
 	SPI_finish();
 }
 
 static int64
-advance_lookup_generation(const ManagedLookupRequest * request)
+advance_lookup_generation(const ManagedLookupRequest *request)
 {
 	Oid			types[] = {UUIDOID, INT8OID};
 	Datum		args[] = {UUIDPGetDatum(&request->operation), Int64GetDatum(request->generation)};
@@ -302,8 +260,8 @@ advance_lookup_generation(const ManagedLookupRequest * request)
 }
 
 static void
-finish_verified_lookup(const ManagedLookupRequest * request, ManagedLookupWork * work,
-					   ManagedLookupReceipt * receipt)
+finish_verified_lookup(const ManagedLookupRequest *request, ManagedLookupWork *work,
+					   ManagedLookupReceipt *receipt)
 {
 	Oid			types[] = {UUIDOID, INT8OID, UUIDOID, UUIDOID, BYTEAOID, INT8OID, BYTEAOID};
 	Datum		args[] = {UUIDPGetDatum(&request->operation), Int64GetDatum(work->generation),
