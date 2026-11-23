@@ -4220,3 +4220,199 @@ mod tests {
         unsafe { pg_datalake_delta_rows_close(h) };
     }
 }
+
+/// Status of a read-only lookup of one retained managed proposal.
+#[repr(C)]
+#[derive(Debug, PartialEq, Eq)]
+pub enum PgDatalakeManagedLookupStatus {
+    ManagedLookupInvalid,
+    ManagedLookupUnavailable,
+    ManagedLookupUnresolved,
+    ManagedLookupAccepted,
+}
+
+/// Dedicated lookup credential material. The caller owns these buffers.
+/// Never log, persist to a worker receipt, or derive this from ledger data.
+#[repr(C)]
+pub struct PgDatalakeLookupCredentials {
+    pub catalog_token: *const c_char,
+    pub access_key: *const c_char,
+    pub secret_key: *const c_char,
+    pub expires_unix_seconds: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct NativeLookupRequest {
+    target: crate::publication_transport::PublicationTarget,
+    operation_id: uuid::Uuid,
+    owner_generation: i64,
+    input_digest: String,
+    expected_parent: Option<i64>,
+    proposed_snapshot_id: i64,
+    proposal_digest: String,
+}
+
+fn parse_lookup_digest(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut digest = [0; 32];
+    for (i, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(digest)
+}
+
+/// Verify the retained request against the catalog and a bounded manifest read.
+/// Only the lookup credential purpose can be constructed at this boundary.
+///
+/// # Safety
+/// The request and body point to readable UTF-8 JSON and byte ranges of the
+/// supplied lengths. Credential strings are NUL-terminated and live for
+/// the call. No PostgreSQL callbacks occur inside Rust.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_lookup_managed_publication(
+    request: *const u8,
+    request_len: usize,
+    body: *const u8,
+    body_len: usize,
+    credentials: *const PgDatalakeLookupCredentials,
+) -> PgDatalakeManagedLookupStatus {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use crate::catalog::publication::{
+        AuthorizedPublication, PublicationIdentity, PublicationLookup,
+    };
+    use crate::publication_transport::{
+        PublicationCredentials, PublicationLimits, PublicationPurpose, ScopedPublisher,
+    };
+    use crate::publication_worker::{
+        ClaimState, PublicationCatalog, PublicationClaim, RetainedAttempt,
+    };
+    use PgDatalakeManagedLookupStatus::{
+        ManagedLookupAccepted, ManagedLookupInvalid, ManagedLookupUnavailable,
+        ManagedLookupUnresolved,
+    };
+
+    if request.is_null()
+        || !(1..=16384).contains(&request_len)
+        || body.is_null()
+        || !(1..=65536).contains(&body_len)
+        || credentials.is_null()
+    {
+        return ManagedLookupInvalid;
+    }
+
+    std::panic::catch_unwind(|| {
+        let request: NativeLookupRequest =
+            match serde_json::from_slice(std::slice::from_raw_parts(request, request_len)) {
+                Ok(value) => value,
+                Err(_) => return ManagedLookupInvalid,
+            };
+        let (Some(input_digest), Some(request_digest)) = (
+            parse_lookup_digest(&request.input_digest),
+            parse_lookup_digest(&request.proposal_digest),
+        ) else {
+            return ManagedLookupInvalid;
+        };
+        if request.owner_generation <= 0 || request.operation_id.is_nil() {
+            return ManagedLookupInvalid;
+        }
+        let identity = PublicationIdentity {
+            operation_id: request.operation_id,
+            table_uuid: request.target.table_uuid,
+            input_digest,
+        };
+        let intent = AuthorizedPublication {
+            identity,
+            expected_parent: request.expected_parent,
+            snapshot_id: request.proposed_snapshot_id,
+            request_digest,
+            request_body: std::slice::from_raw_parts(body, body_len),
+        };
+        if !intent.matches_retained_request() {
+            return ManagedLookupInvalid;
+        }
+        let credential = &*credentials;
+        let Some(expires_at) =
+            UNIX_EPOCH.checked_add(Duration::from_secs(credential.expires_unix_seconds))
+        else {
+            return ManagedLookupInvalid;
+        };
+        let claim = PublicationClaim {
+            identity,
+            binding: Some(request.target.binding),
+            generation: request.owner_generation,
+            state: ClaimState::Reserved(RetainedAttempt {
+                expected_parent: intent.expected_parent,
+                snapshot_id: intent.snapshot_id,
+                request_digest: intent.request_digest,
+                request_body: Some(intent.request_body.to_vec()),
+            }),
+        };
+        let Ok(publisher) = ScopedPublisher::new(
+            request.target.clone(),
+            PublicationPurpose::Lookup,
+            PublicationCredentials {
+                target: request.target,
+                purpose: PublicationPurpose::Lookup,
+                expires_at,
+                catalog_bearer: borrow_string(credential.catalog_token),
+                objects: object_store::aws::AwsCredential {
+                    key_id: borrow_string(credential.access_key),
+                    secret_key: borrow_string(credential.secret_key),
+                    token: None,
+                },
+            },
+            Vec::new(),
+            PublicationLimits {
+                captured_bytes: 0,
+                captured_rows: 0,
+                manifest_bytes: 1024 * 1024,
+                manifest_timeout: Duration::from_secs(4),
+            },
+        ) else {
+            return ManagedLookupInvalid;
+        };
+        match publisher.lookup(&claim, intent) {
+            Ok(PublicationLookup::Accepted { snapshot_id })
+                if snapshot_id == intent.snapshot_id =>
+            {
+                ManagedLookupAccepted
+            }
+            Ok(_) => ManagedLookupUnresolved,
+            Err(_) => ManagedLookupUnavailable,
+        }
+    })
+    .unwrap_or(ManagedLookupUnavailable)
+}
+
+#[cfg(test)]
+mod native_lookup_tests {
+    use super::*;
+
+    #[test]
+    fn native_lookup_rejects_unbounded_or_malformed_input() {
+        let malformed = b"{";
+        let body = b"{}";
+        let oversized = vec![b'a'; 16385];
+        let credentials = PgDatalakeLookupCredentials {
+            catalog_token: c"unused".as_ptr(),
+            access_key: c"unused".as_ptr(),
+            secret_key: c"unused".as_ptr(),
+            expires_unix_seconds: u64::MAX,
+        };
+        for request in [malformed.as_slice(), oversized.as_slice()] {
+            let status = unsafe {
+                pg_datalake_lookup_managed_publication(
+                    request.as_ptr(),
+                    request.len(),
+                    body.as_ptr(),
+                    body.len(),
+                    &raw const credentials,
+                )
+            };
+            assert_eq!(status, PgDatalakeManagedLookupStatus::ManagedLookupInvalid);
+        }
+    }
+}

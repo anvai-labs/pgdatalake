@@ -47,7 +47,7 @@ impl ClaimState {
 
 /// Immutable provenance from the captured members and durable claim.
 /// This is distinct from the mutable publisher owner generation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
 pub struct PublicationBindingIdentity {
     pub authority_id: Uuid,
     pub binding_id: Uuid,
