@@ -18,6 +18,10 @@ use pgdatalake_core::{
         },
         rest::{RestCatalog, RestError, StaticToken},
     },
+    managed_visibility::{
+        select_compatible_pin, ManagedPinCandidate, ManagedReadError, ManagedReadScope,
+        PinMembership, VisibleSegment,
+    },
     parquet::CellValue,
     publication_credentials::{
         PublicationCredentialError, PublicationCredentialGrant, PublicationCredentialMaterial,
@@ -561,7 +565,97 @@ fn issue_fixture_credentials(
     })
 }
 
+#[derive(Deserialize)]
+struct ManagedCutFixture {
+    scope: ManagedReadScope,
+    candidates: Vec<CutCandidate>,
+    visible: Vec<CutSegment>,
+}
+
+#[derive(Deserialize)]
+struct CutCandidate {
+    scope: ManagedReadScope,
+    #[serde(deserialize_with = "exact_bigint")]
+    pin: i64,
+    membership: CutMembership,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "proof", rename_all = "snake_case")]
+enum CutMembership {
+    Complete {
+        #[serde(deserialize_with = "exact_bigints")]
+        included: Vec<i64>,
+    },
+    Unknown,
+    Expired,
+}
+
+#[derive(Deserialize)]
+struct CutSegment {
+    #[serde(deserialize_with = "exact_bigint")]
+    segment_id: i64,
+    payload_retained: bool,
+}
+
+fn exact_bigint<'de, D: serde::Deserializer<'de>>(input: D) -> Result<i64, D::Error> {
+    String::deserialize(input)?
+        .parse()
+        .map_err(serde::de::Error::custom)
+}
+
+fn exact_bigints<'de, D: serde::Deserializer<'de>>(input: D) -> Result<Vec<i64>, D::Error> {
+    Vec::<String>::deserialize(input)?
+        .into_iter()
+        .map(|value| value.parse().map_err(serde::de::Error::custom))
+        .collect()
+}
+
+fn run_managed_cut() -> FixtureResult<()> {
+    let fixture: ManagedCutFixture = serde_json::from_reader(io::stdin().lock())?;
+    let candidates = fixture
+        .candidates
+        .iter()
+        .map(|candidate| ManagedPinCandidate {
+            scope: &candidate.scope,
+            pin: candidate.pin,
+            membership: match &candidate.membership {
+                CutMembership::Complete { included } => PinMembership::Complete(included),
+                CutMembership::Unknown => PinMembership::Unknown,
+                CutMembership::Expired => PinMembership::Expired,
+            },
+        })
+        .collect::<Vec<_>>();
+    let visible = fixture
+        .visible
+        .iter()
+        .map(|segment| VisibleSegment {
+            segment_id: segment.segment_id,
+            payload_retained: segment.payload_retained,
+        })
+        .collect::<Vec<_>>();
+    let output = match select_compatible_pin(&fixture.scope, &candidates, &visible) {
+        Ok(cut) => serde_json::json!({
+            "pin": cut.pin.to_string(),
+            "overlay_segment_ids": cut.overlay_segment_ids.iter().map(i64::to_string).collect::<Vec<_>>(),
+        }),
+        Err(err) => serde_json::json!({ "error": match err {
+            ManagedReadError::ScopeMismatch => "binding_changed",
+            ManagedReadError::InvalidProof => "invalid_proof",
+            ManagedReadError::NoCompatiblePin => "no_compatible_pin",
+        }}),
+    };
+    println!("{output}");
+    Ok(())
+}
+
 fn main() -> FixtureResult<()> {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--select-managed-cut")
+    {
+        return run_managed_cut();
+    }
     let mut fixture: Fixture = serde_json::from_reader(io::stdin().lock())?;
     let s3 = s3_options();
     let resolver = if fixture.admitted_transport {

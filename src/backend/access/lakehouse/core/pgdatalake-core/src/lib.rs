@@ -15,6 +15,7 @@
 pub mod cache;
 pub mod catalog;
 pub mod ffi;
+pub mod managed_visibility;
 pub mod manifest;
 pub mod parquet;
 pub mod publication_credentials;
