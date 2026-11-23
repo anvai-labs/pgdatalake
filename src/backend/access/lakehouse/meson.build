@@ -40,6 +40,7 @@ lakehouse_sources = files(fs.read('stock/SHARED_SOURCES').split())
 lakehouse_sources += files(
   'tableam.c',
   'publisher.c',
+  'managed_lookup.c',
   'managed_count.c',
 )
 
@@ -69,7 +70,7 @@ install_data(
    'lakehouse--1.3.sql', 'lakehouse--1.2--1.3.sql', 'lakehouse--1.3--1.4.sql',
    'lakehouse--1.4--1.5.sql', 'lakehouse--1.5--1.6.sql', 'lakehouse--1.6--1.7.sql',
    'lakehouse--1.7--1.8.sql', 'lakehouse--1.8--1.9.sql',
-   'lakehouse--1.9--1.10.sql'],
+   'lakehouse--1.9--1.10.sql', 'lakehouse--1.10--1.11.sql'],
   install_dir: dir_data_extension,
 )
 
