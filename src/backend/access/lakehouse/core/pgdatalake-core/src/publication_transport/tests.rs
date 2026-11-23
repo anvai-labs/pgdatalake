@@ -588,9 +588,10 @@ fn dropping_owned_preparation_keeps_only_create_only_objects() {
 fn native_prepare_owner_requires_exact_authorization_and_submits_once() {
     use crate::ffi::{
         pg_datalake_drop_managed_send, pg_datalake_prepare_managed_send,
-        pg_datalake_submit_managed_send, PgDatalakeNativeSendAuthorization,
-        PgDatalakeNativeSendCredentials, PgDatalakeNativeSendInputs, PgDatalakeNativeSendMember,
-        PgDatalakeNativeSendProposal, PgDatalakeNativeSendStatus,
+        pg_datalake_submit_managed_send, PgDatalakeCredentialBytes,
+        PgDatalakeNativeSendAuthorization, PgDatalakeNativeSendCredentials,
+        PgDatalakeNativeSendInputs, PgDatalakeNativeSendMember, PgDatalakeNativeSendProposal,
+        PgDatalakeNativeSendStatus, PgDatalakePublicationCredentialMaterial,
     };
     use std::{fmt::Write, mem::MaybeUninit};
 
@@ -644,18 +645,20 @@ fn native_prepare_owner_requires_exact_authorization_and_submits_once() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
+    let span = |bytes: &[u8]| PgDatalakeCredentialBytes {
+        data: bytes.as_ptr(),
+        len: bytes.len(),
+    };
     let mut credentials = PgDatalakeNativeSendCredentials {
         target: target_bytes.as_ptr(),
         target_len: target_bytes.len(),
-        catalog_token: b"catalog-token".as_ptr(),
-        catalog_token_len: b"catalog-token".len(),
-        access_key: b"enrolled-key".as_ptr(),
-        access_key_len: b"enrolled-key".len(),
-        secret_key: b"fixture-secret".as_ptr(),
-        secret_key_len: b"fixture-secret".len(),
-        session_token: b"send-session".as_ptr(),
-        session_token_len: b"send-session".len(),
-        expires_unix_seconds: expiry,
+        material: PgDatalakePublicationCredentialMaterial {
+            catalog_token: span(b"catalog-token"),
+            access_key: span(b"enrolled-key"),
+            secret_key: span(b"fixture-secret"),
+            session_token: span(b"send-session"),
+            expires_unix_seconds: expiry,
+        },
     };
     let mut input = PgDatalakeNativeSendInputs {
         request: request_bytes.as_ptr(),
@@ -697,20 +700,17 @@ fn native_prepare_owner_requires_exact_authorization_and_submits_once() {
     input.request = request_bytes.as_ptr();
     input.request_len = request_bytes.len();
 
-    credentials.expires_unix_seconds = 0;
+    credentials.material.expires_unix_seconds = 0;
     assert!(prepare(&input, &credentials).0.is_null());
-    credentials.expires_unix_seconds = expiry;
+    credentials.material.expires_unix_seconds = expiry;
     input.member_count = MAX_PUBLICATION_MEMBERS + 1;
     assert!(prepare(&input, &credentials).0.is_null());
     input.member_count = ffi_members.len();
     let oversized_token = [b'x'; 4097];
-    let approved_token = credentials.catalog_token;
-    let approved_len = credentials.catalog_token_len;
-    credentials.catalog_token = oversized_token.as_ptr();
-    credentials.catalog_token_len = oversized_token.len();
+    let approved_token = credentials.material.catalog_token;
+    credentials.material.catalog_token = span(&oversized_token);
     assert!(prepare(&input, &credentials).0.is_null());
-    credentials.catalog_token = approved_token;
-    credentials.catalog_token_len = approved_len;
+    credentials.material.catalog_token = approved_token;
     {
         let state = remote.state.lock().unwrap();
         assert!(state.reads.is_empty() && state.object_reads.is_empty());

@@ -13,7 +13,11 @@
 use std::ffi::{c_char, CStr, CString};
 
 mod native_send;
+mod publication_material;
 pub use native_send::*;
+pub use publication_material::{
+    PgDatalakeCredentialBytes, PgDatalakePublicationCredentialMaterial,
+};
 
 pub use crate::read_binding::PgDatalakeReadStatus;
 use crate::read_binding::{ReadBinding, ReadError, S3ReadRoot};
@@ -4254,16 +4258,6 @@ pub enum PgDatalakeManagedLookupStatus {
     ManagedLookupAccepted,
 }
 
-/// Dedicated lookup credential material. The caller owns these buffers.
-/// Never log, persist to a worker receipt, or derive this from ledger data.
-#[repr(C)]
-pub struct PgDatalakeLookupCredentials {
-    pub catalog_token: *const c_char,
-    pub access_key: *const c_char,
-    pub secret_key: *const c_char,
-    pub expires_unix_seconds: u64,
-}
-
 #[derive(serde::Deserialize)]
 struct NativeLookupRequest {
     target: crate::publication_transport::PublicationTarget,
@@ -4291,7 +4285,7 @@ fn parse_digest_hex(hex: &str) -> Option<[u8; 32]> {
 ///
 /// # Safety
 /// The request and body point to readable UTF-8 JSON and byte ranges of the
-/// supplied lengths. Credential strings are NUL-terminated and live for
+/// supplied lengths. Credential byte ranges are readable UTF-8 throughout
 /// the call. No PostgreSQL callbacks occur inside Rust.
 #[no_mangle]
 pub unsafe extern "C" fn pg_datalake_lookup_managed_publication(
@@ -4299,16 +4293,14 @@ pub unsafe extern "C" fn pg_datalake_lookup_managed_publication(
     request_len: usize,
     body: *const u8,
     body_len: usize,
-    credentials: *const PgDatalakeLookupCredentials,
+    credentials: *const PgDatalakePublicationCredentialMaterial,
 ) -> PgDatalakeManagedLookupStatus {
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::Duration;
 
     use crate::catalog::publication::{
         AuthorizedPublication, PublicationIdentity, PublicationLookup,
     };
-    use crate::publication_transport::{
-        PublicationCredentials, PublicationLimits, PublicationPurpose, ScopedPublisher,
-    };
+    use crate::publication_transport::{PublicationLimits, PublicationPurpose, ScopedPublisher};
     use crate::publication_worker::{
         ClaimState, PublicationCatalog, PublicationClaim, RetainedAttempt,
     };
@@ -4356,10 +4348,8 @@ pub unsafe extern "C" fn pg_datalake_lookup_managed_publication(
         if !intent.matches_retained_request() {
             return ManagedLookupInvalid;
         }
-        let credential = &*credentials;
-        let Some(expires_at) =
-            UNIX_EPOCH.checked_add(Duration::from_secs(credential.expires_unix_seconds))
-        else {
+        let purpose = PublicationPurpose::Lookup;
+        let Some(credential) = (&*credentials).resolve(request.target.clone(), purpose) else {
             return ManagedLookupInvalid;
         };
         let claim = PublicationClaim {
@@ -4374,19 +4364,9 @@ pub unsafe extern "C" fn pg_datalake_lookup_managed_publication(
             }),
         };
         let Ok(publisher) = ScopedPublisher::new(
-            request.target.clone(),
-            PublicationPurpose::Lookup,
-            PublicationCredentials {
-                target: request.target,
-                purpose: PublicationPurpose::Lookup,
-                expires_at,
-                catalog_bearer: borrow_string(credential.catalog_token),
-                objects: object_store::aws::AwsCredential {
-                    key_id: borrow_string(credential.access_key),
-                    secret_key: borrow_string(credential.secret_key),
-                    token: None,
-                },
-            },
+            request.target,
+            purpose,
+            credential,
             Vec::new(),
             PublicationLimits {
                 captured_bytes: 0,
@@ -4419,10 +4399,18 @@ mod native_lookup_tests {
         let malformed = b"{";
         let body = b"{}";
         let oversized = vec![b'a'; 16385];
-        let credentials = PgDatalakeLookupCredentials {
-            catalog_token: c"unused".as_ptr(),
-            access_key: c"unused".as_ptr(),
-            secret_key: c"unused".as_ptr(),
+        let present = PgDatalakeCredentialBytes {
+            data: b"unused".as_ptr(),
+            len: 6,
+        };
+        let credentials = PgDatalakePublicationCredentialMaterial {
+            catalog_token: present,
+            access_key: present,
+            secret_key: present,
+            session_token: PgDatalakeCredentialBytes {
+                data: std::ptr::null(),
+                len: 0,
+            },
             expires_unix_seconds: u64::MAX,
         };
         for request in [malformed.as_slice(), oversized.as_slice()] {

@@ -261,6 +261,40 @@ one-shot static fixture path. Scheduled polling, temporary hosted
 credentials, promoted-primary failover and managed overlay visibility
 have separate gates.
 
+### Native session-credential adapter
+
+Opt-in extension 1.17 adds the `lakehouse_publication_credentials`
+foreign-data wrapper for operator-owned credential servers. It has no data
+handler. The role-specific user mapping holds `purpose` (`send` or `lookup`),
+`token` (catalog bearer), `s3_access_key` and `s3_secret_key`, and an optional
+`s3_session_token`. Each credential value is bounded at 4 KiB. Options
+belong on the user mapping. Ordinary FDW mappings retain their original
+validator and static reader options.
+
+The existing Send and Lookup grants bind separate roles and exact mapping
+OIDs to the intended table binding. The native adapter requires the
+mapping's declared purpose to agree with the worker's purpose. Keep the
+server operator-owned, with no ownership or server USAGE for the worker.
+The grant expiry must be no later than either credential's expiry. Both
+workers use length-delimited credential material and the existing scoped
+SigV4 provider. Send rechecks the full material, including the session
+token, under the durable authorization locks. Rotation after preparation
+and before authorization discards the proposal without a POST. Reconcile
+a reserved attempt with a fresh, separately approved Lookup mapping.
+
+The native fixture preserves the existing static-mapping cases and
+repeats catalog reply loss with independent synthetic session tokens.
+A loopback recorder requires the exact signed session header and enrolled
+prefix for each purpose, and SeaweedFS verifies the forwarded signature
+and object operation. A missing token yields a 403 before any intent or
+catalog POST. Wrong-purpose approvals yield zero origin calls. Rotation
+between preparation and authorization leaves only unreferenced immutable
+objects. A valid Send and independent Lookup recover one accepted POST
+and the same exact rows after PostgreSQL restart. This qualifies native
+session-token transport and fencing in the fixture. Provider issuance,
+real cloud expiry and revocation, credential renewal and hosted policy
+qualification have separate gates.
+
 ### Discovery and dispatch
 
 Extension 1.9 adds two read-only keyset pages. Both accept a page size of 1 to 1,024. Start with a NULL cursor, advance using the last row even if held and wrap after an empty page. The page reports candidates from one database snapshot. Owners must still use the transactional claim, compare-and-advance and WAL authorization operations after a page is read.

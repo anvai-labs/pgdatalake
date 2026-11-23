@@ -5,9 +5,13 @@ import importlib
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
+from http.client import HTTPConnection
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import re
 import subprocess
-from threading import Event
+from threading import Event, Thread
 import time
 
 from publication_fixture import HDR, MEM, SEG, sql
@@ -22,6 +26,95 @@ DISPATCH = "lakehouse.dispatch_managed_publication_send"
 ATTEMPTS = "lakehouse.publication_attempts"
 WORKER = ("EXISTS (SELECT FROM pg_stat_activity WHERE datname=current_database() "
           "AND backend_type='lakehouse managed send dispatch'")
+
+
+PROFILE = "lakehouse_publication_credentials"
+SEND_SESSION = "fixture-send-session"
+LOOKUP_SESSION = "fixture-lookup-session"
+
+
+@contextmanager
+def scoped_session_store(root):
+    # Require the exact purpose-specific session headers before forwarding
+    # complete requests to the real S3 fixture for SigV4 and object policy.
+    prefix = "/" + root.removeprefix("s3://") + "/"
+    observations = []
+
+    class Gateway(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.forward()
+
+        def do_HEAD(self):
+            self.forward()
+
+        def do_PUT(self):
+            self.forward()
+
+        def forward(self):
+            signature = self.headers.get("Authorization", "")
+            match = re.search(r"\bCredential=([^/ ]+).*?SignedHeaders=([^, ]+)", signature)
+            key = match[1] if match else ""
+            covered = match[2].split(";") if match else []
+            token = self.headers.get("x-amz-security-token")
+            allowed = (
+                (key == "lakehouse-test" and token == SEND_SESSION)
+                or (key == "lakehouse-reader" and token == LOOKUP_SESSION and self.command != "PUT")
+            )
+            if not allowed or not self.path.startswith(prefix) or "x-amz-security-token" not in covered:
+                observations.append((self.command, key, 403))
+                self.send_error(403)
+                return
+
+            body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            connection = HTTPConnection("127.0.0.1", 9000, timeout=5)
+            try:
+                connection.request(self.command, self.path, body=body, headers=dict(self.headers))
+                origin = connection.getresponse()
+                response = origin.read()
+                observations.append((self.command, key, origin.status))
+                self.send_response(origin.status)
+                for name, value in origin.getheaders():
+                    if name.lower() not in {"connection", "transfer-encoding", "content-length"}:
+                        self.send_header(name, value)
+                length = origin.getheader("Content-Length", "0") if self.command == "HEAD" else str(len(response))
+                self.send_header("Content-Length", length)
+                self.end_headers()
+                if response:
+                    self.wfile.write(response)
+            finally:
+                connection.close()
+
+        def log_message(self, *_args):
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Gateway) as gateway:
+        thread = Thread(target=gateway.serve_forever)
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{gateway.server_port}", observations
+        finally:
+            gateway.shutdown()
+            thread.join()
+
+
+def install_session_mappings(db, role, lookup):
+    sql(db, f"""
+        CREATE SERVER session_send FOREIGN DATA WRAPPER {PROFILE};
+        CREATE SERVER session_lookup FOREIGN DATA WRAPPER {PROFILE};
+        CREATE USER MAPPING FOR {role} SERVER session_send OPTIONS (
+            purpose 'send', token 'fixture-send', s3_access_key 'lakehouse-test',
+            s3_secret_key 'lakehouse-test-password', s3_session_token '{SEND_SESSION}');
+        CREATE USER MAPPING FOR {lookup} SERVER session_lookup OPTIONS (
+            purpose 'lookup', token 'fixture-lookup', s3_access_key 'lakehouse-reader',
+            s3_secret_key 'lakehouse-reader-password', s3_session_token '{LOOKUP_SESSION}');
+    """)
+    assert sql(db, f"SELECT fdwhandler FROM pg_foreign_data_wrapper WHERE fdwname='{PROFILE}'") == "0"
+    sql(db, f"CREATE SERVER invalid_session_options FOREIGN DATA WRAPPER {PROFILE} "
+            "OPTIONS (s3_session_token 'fixture-unused')", error="HV00D")
+    sql(db, f"ALTER USER MAPPING FOR {role} SERVER prepare_credentials "
+            "OPTIONS (ADD s3_session_token 'fixture-unused')", error="HV00D")
+    sql(db, f"ALTER USER MAPPING FOR {role} SERVER session_send "
+            "OPTIONS (SET purpose 'invalid')", error="22023")
 
 
 def install(db, role, lookup, *, baseline):
@@ -114,7 +207,7 @@ def lost_authorization(db, role, call, read_retained):
     return retained
 
 
-def exercise(db, directory, role, lookup, *, lose_authorization):
+def exercise(db, directory, role, lookup, *, lose_authorization, temporary):
     table = f"iceberg.{db}.events"
     restart.trino(f"CREATE TABLE {table} (id bigint) WITH (format_version=2)")
     restart.trino(f"INSERT INTO {table} VALUES (10)")
@@ -139,12 +232,15 @@ def exercise(db, directory, role, lookup, *, lose_authorization):
         return original_request(method, path, body, headers)
 
     restart.catalog_request = audited
+    store = scoped_session_store(root) if temporary else nullcontext(("http://127.0.0.1:9000", []))
     try:
-        with cut.dropped_catalog_reply(route) as (endpoint, posts, reads):
+        with cut.dropped_catalog_reply(route) as (endpoint, posts, reads), store as (object_endpoint, objects):
             target = prepare.approved_target(db, endpoint, prefix, authority, remote, root, binding, incarnation)
+            target["object_endpoint"] = object_endpoint
+            send_server = "session_send" if temporary else "prepare_credentials"
             sql(db, f"""
                 CREATE SERVER source_catalog FOREIGN DATA WRAPPER lakehouse_fdw OPTIONS
-                  (endpoint '{endpoint}', warehouse 'smoke', s3_endpoint 'http://127.0.0.1:9000');
+                  (endpoint '{endpoint}', warehouse 'smoke', s3_endpoint '{object_endpoint}');
                 CREATE TABLE events (id bigint) USING lakehouse WITH (write_mode='staged');
                 SELECT lakehouse.enroll_managed_capture('events'::regclass, '{db}.events',
                     'source_catalog', '{incarnation}', '{binding}', 1, '{authority}', '{remote}', '{root}', 0, 0);
@@ -152,7 +248,7 @@ def exercise(db, directory, role, lookup, *, lose_authorization):
                 INSERT INTO {prepare.GRANTS}
                 SELECT '{binding}', umuser, umid, clock_timestamp() + interval '5 minutes',
                     '{json.dumps(target)}'::jsonb
-                FROM pg_user_mappings WHERE usename='{role}' AND srvname='prepare_credentials';
+                FROM pg_user_mappings WHERE usename='{role}' AND srvname='{send_server}';
             """)
             first = admission.capture(db, "events", 20, 20)
             sql(db, admission.managed_claim(op, first))
@@ -162,6 +258,34 @@ def exercise(db, directory, role, lookup, *, lose_authorization):
             sql(db, call, error="42501")
             assert not posts and not reads
             sql(db, f"GRANT EXECUTE ON FUNCTION {DISPATCH}(uuid,bigint) TO {role}")
+
+            if temporary:
+                sql(db, f"ALTER USER MAPPING FOR {role} SERVER session_send OPTIONS (SET purpose 'lookup')")
+                sql(db, call, error="42501")
+                assert not reads and not posts and not objects
+                sql(db, f"ALTER USER MAPPING FOR {role} SERVER session_send OPTIONS (SET purpose 'send')")
+                sql(db, f"ALTER USER MAPPING FOR {role} SERVER session_send OPTIONS (DROP s3_session_token)")
+                sql(db, call, error="55000")
+                assert len(reads) == 1 and not posts and not (
+                    sql(db, f"SELECT * FROM {ATTEMPTS} WHERE operation_id='{op}'"))
+                assert objects == [("GET", "lakehouse-test", 403)]
+                sql(db, f"ALTER USER MAPPING FOR {role} SERVER session_send "
+                        f"OPTIONS (ADD s3_session_token '{SEND_SESSION}')")
+
+                def rotate_session_after_preparation(_launch):
+                    sql(db, f"ALTER USER MAPPING FOR {role} SERVER session_send "
+                            f"OPTIONS (SET s3_session_token '{SEND_SESSION}-next')")
+
+                pause_provider(db, call, op, audited, rotate_session_after_preparation, "40001")
+                assert len(reads) == 2 and not posts
+                assert objects[1:] == [
+                    ("GET", "lakehouse-test", 206),
+                    ("PUT", "lakehouse-test", 200),
+                    ("PUT", "lakehouse-test", 200),
+                    ("PUT", "lakehouse-test", 200),
+                ]
+                sql(db, f"ALTER USER MAPPING FOR {role} SERVER session_send "
+                        f"OPTIONS (SET s3_session_token '{SEND_SESSION}')")
 
             if lose_authorization:
                 def cancel_before_authorization(launch):
@@ -197,7 +321,14 @@ def exercise(db, directory, role, lookup, *, lose_authorization):
                                    "snapshot_id": str(retained["proposed"]), "intent_xid": retained["intent_xid"]}
                 assert [status for status, _ in posts] == [200], posts
 
-            restart.approve_native_lookup(db, lookup, binding)
+            if temporary:
+                sql(db, f"""
+                    INSERT INTO lakehouse.publication_lookup_grants
+                    SELECT '{binding}', umuser, umid, clock_timestamp() + interval '5 minutes'
+                    FROM pg_user_mappings WHERE usename='{lookup}' AND srvname='session_lookup';
+                """)
+            else:
+                restart.approve_native_lookup(db, lookup, binding)
             recovery_start = time.monotonic()
             subprocess.run([os.getenv("PG_CTL", "pg_ctl"), "restart", "-D", str(directory),
                             "-m", "immediate", "-w", "-l", str(directory.parent / "server.log")],
@@ -212,6 +343,13 @@ def exercise(db, directory, role, lookup, *, lose_authorization):
             sql(db, f"DELETE FROM {prepare.GRANTS} WHERE binding_id='{binding}'")
             sql(db, call, error="42501")
             assert len(reads) == before
+            if temporary:
+                sql(db, f"ALTER USER MAPPING FOR {lookup} SERVER session_lookup OPTIONS (SET purpose 'send')")
+                look = f"SET ROLE {lookup}; SELECT {restart.NATIVE_LOOKUP}('{op}', {generation})"
+                before_lookup = (len(reads), len(objects))
+                sql(db, look, error="42501")
+                assert (len(reads), len(objects)) == before_lookup
+                sql(db, f"ALTER USER MAPPING FOR {lookup} SERVER session_lookup OPTIONS (SET purpose 'lookup')")
             lookup_start = time.monotonic()
             verified = json.loads(sql(db, f"SET ROLE {lookup}; SELECT {restart.NATIVE_LOOKUP}('{op}', {generation})"))
             lookup_ms = 1000 * (time.monotonic() - lookup_start)
@@ -231,12 +369,23 @@ def exercise(db, directory, role, lookup, *, lose_authorization):
                 assert len(posts) == 1
             assert restart.trino(f"SELECT id FROM {table} FOR VERSION AS OF {parent} ORDER BY id") == "10"
             assert reads[-1] == (route, "Bearer fixture-lookup")
+            if temporary:
+                assert objects[0] == ("GET", "lakehouse-test", 403)
+                assert objects[5:] == [
+                    ("GET", "lakehouse-test", 206),
+                    ("PUT", "lakehouse-test", 200),
+                    ("PUT", "lakehouse-test", 200),
+                    ("PUT", "lakehouse-test", 200),
+                    ("GET", "lakehouse-reader", 206),
+                ]
             evidence = {key: value for key, value in retained.items() if key != "body"}
             print(json.dumps({"case": "lost_authorization" if lose_authorization else "lost_catalog_reply",
                               "catalog_posts": len(posts), "catalog_gets": len(reads), "parent": str(parent),
                               "proposed": snapshot, "retained": evidence, "later_pending": late,
                               "sample_count": 1, "recovery_ms": round(recovery_ms, 3),
-                              "lookup_ms": round(lookup_ms, 3), "lookup_result": verified},
+                              "lookup_ms": round(lookup_ms, 3), "lookup_result": verified,
+                              "credential_profile": "temporary_session" if temporary else "static",
+                              "storage_calls": objects},
                              sort_keys=True), flush=True)
     finally:
         restart.catalog_request = original_request
@@ -246,6 +395,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--restart-fixture", required=True, type=Path)
     parser.add_argument("--baseline", action="store_true")
+    parser.add_argument("--temporary-only", action="store_true")
+    parser.add_argument("--credential-baseline", action="store_true")
     args = parser.parse_args()
     if not __debug__:
         raise RuntimeError("fixture requires assertions")
@@ -253,7 +404,10 @@ def main():
     admin = os.getenv("PGDATABASE", "postgres")
     assert Path(sql(admin, "SHOW data_directory")).resolve() == directory
     assert sql(admin, "SHOW fsync") == "on" and sql(admin, "SHOW listen_addresses") == ""
-    for lose_authorization in (True, False):
+    cases = [(False, True)] if args.temporary_only or args.credential_baseline else [
+        (True, False), (False, False), (False, True)
+    ]
+    for lose_authorization, temporary in cases:
         db = "native_dispatch_" + admission.identifier()[:8]
         role, lookup = f"{db}_send", f"{db}_lookup"
         sql(admin, f"CREATE DATABASE {db}")
@@ -262,9 +416,15 @@ def main():
             install(db, role, lookup, baseline=args.baseline)
             if args.baseline:
                 break
+            if args.credential_baseline:
+                install_session_mappings(db, role, lookup)
+                return
+            if temporary:
+                sql(db, "ALTER EXTENSION lakehouse UPDATE TO '1.17'")
+                install_session_mappings(db, role, lookup)
             restart.trino(f"CREATE SCHEMA iceberg.{db}")
             try:
-                exercise(db, directory, role, lookup, lose_authorization=lose_authorization)
+                exercise(db, directory, role, lookup, lose_authorization=lose_authorization, temporary=temporary)
             finally:
                 restart.trino(f"DROP TABLE IF EXISTS iceberg.{db}.events; DROP SCHEMA iceberg.{db}")
         finally:

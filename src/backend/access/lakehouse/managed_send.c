@@ -10,12 +10,9 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlog.h"
-#include "catalog/pg_foreign_server_d.h"
 #include "catalog/pg_type_d.h"
-#include "commands/defrem.h"
 #include "executor/spi.h"
 #include "fmgr.h"
-#include "foreign/foreign.h"
 #include "libpq/pqsignal.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
@@ -27,7 +24,6 @@
 #include "storage/latch.h"
 #include "tcop/pquery.h"
 #include "tcop/tcopprot.h"
-#include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/fmgrprotos.h"
 #include "utils/guc.h"
@@ -38,6 +34,7 @@
 #include "utils/wait_event.h"
 
 #include "lakehouse_tableam.h"
+#include "managed_credentials.h"
 #include "pg_datalake_core.h"
 
 #define MANAGED_SEND_HOLD_NAME "lakehouse managed send hold"
@@ -242,63 +239,6 @@ prepare_field(HeapTuple row, TupleDesc desc, int column)
 	return value;
 }
 
-static void
-load_prepare_credentials(PgDatalakeNativeSendCredentials *credentials, Oid role,
-						 Oid server, Oid mapping_id, MemoryContext context)
-{
-	UserMapping *mapping;
-	ListCell   *cell;
-
-	if (object_ownercheck(ForeignServerRelationId, server, role) ||
-		object_aclcheck(ForeignServerRelationId, server, role, ACL_USAGE) == ACLCHECK_OK)
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("managed publication preparation requires an operator-owned mapping")));
-
-	mapping = GetUserMapping(role, server);
-	if (mapping->umid != mapping_id)
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("managed publication credential mapping changed")));
-	foreach(cell, mapping->options)
-	{
-		DefElem    *option = lfirst_node(DefElem, cell);
-		const uint8 **field;
-		uintptr_t  *length;
-		const char *value;
-
-		if (strcmp(option->defname, "token") == 0)
-		{
-			field = &credentials->catalog_token;
-			length = &credentials->catalog_token_len;
-		}
-		else if (strcmp(option->defname, "s3_access_key") == 0)
-		{
-			field = &credentials->access_key;
-			length = &credentials->access_key_len;
-		}
-		else if (strcmp(option->defname, "s3_secret_key") == 0)
-		{
-			field = &credentials->secret_key;
-			length = &credentials->secret_key_len;
-		}
-		else
-			continue;
-
-		value = defGetString(option);
-		*length = strlen(value);
-		if (*length == 0 || *length > 4096)
-			ereport(ERROR,
-					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("managed publication credential length is outside the allowed bounds")));
-		*field = (const uint8 *) MemoryContextStrdup(context, value);
-	}
-	if (!credentials->catalog_token || !credentials->access_key || !credentials->secret_key)
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("managed publication preparation requires complete credentials")));
-}
-
 static int
 prepare_array(HeapTuple row, TupleDesc desc, int column, Oid type,
 			  Datum **values, bool **nulls)
@@ -400,8 +340,9 @@ load_prepare_work(ManagedSendHold *request, ManagedSendWork *work,
 	expiry = DatumGetInt64(prepare_field(row, desc, 6));
 	if (expiry <= 0)
 		elog(ERROR, "managed publication preparation returned an invalid credential expiry");
-	credentials->expires_unix_seconds = expiry;
-	load_prepare_credentials(credentials, request->role, work->server, work->mapping, context);
+	credentials->material.expires_unix_seconds = expiry;
+	lakehouse_load_publication_material(&credentials->material, request->role,
+										work->server, work->mapping, "send", context);
 	if (include_members)
 		load_prepare_members(row, desc, inputs, context);
 	else
@@ -443,28 +384,33 @@ same_bytes(const uint8 *left, uintptr_t left_len,
 	return left_len == right_len && (left_len == 0 || memcmp(left, right, left_len) == 0);
 }
 
+static bool
+same_credential(PgDatalakeCredentialBytes left, PgDatalakeCredentialBytes right)
+{
+	return same_bytes(left.data, left.len, right.data, right.len);
+}
+
 /* Scope, source layout and credentials must still agree under the WAL locks. */
 static bool
 same_send_work(const ManagedSendWork *original, const ManagedSendWork *current)
 {
+	const PgDatalakePublicationCredentialMaterial *first = &original->credentials.material;
+	const PgDatalakePublicationCredentialMaterial *second = &current->credentials.material;
+
 	return original->mapping == current->mapping &&
 		original->server == current->server &&
 		original->source_relid == current->source_relid &&
-		original->credentials.expires_unix_seconds == current->credentials.expires_unix_seconds &&
+		first->expires_unix_seconds == second->expires_unix_seconds &&
 		same_bytes(original->inputs.request, original->inputs.request_len,
 				   current->inputs.request, current->inputs.request_len) &&
 		same_bytes(original->inputs.schema, original->inputs.schema_len,
 				   current->inputs.schema, current->inputs.schema_len) &&
 		same_bytes(original->credentials.target, original->credentials.target_len,
 				   current->credentials.target, current->credentials.target_len) &&
-		same_bytes(original->credentials.catalog_token, original->credentials.catalog_token_len,
-				   current->credentials.catalog_token, current->credentials.catalog_token_len) &&
-		same_bytes(original->credentials.access_key, original->credentials.access_key_len,
-				   current->credentials.access_key, current->credentials.access_key_len) &&
-		same_bytes(original->credentials.secret_key, original->credentials.secret_key_len,
-				   current->credentials.secret_key, current->credentials.secret_key_len) &&
-		same_bytes(original->credentials.session_token, original->credentials.session_token_len,
-				   current->credentials.session_token, current->credentials.session_token_len);
+		same_credential(first->catalog_token, second->catalog_token) &&
+		same_credential(first->access_key, second->access_key) &&
+		same_credential(first->secret_key, second->secret_key) &&
+		same_credential(first->session_token, second->session_token);
 }
 
 static ManagedSendOutcome
