@@ -165,7 +165,7 @@ its pointer slot. SQL, DSM and WAL never carry the handle or credentials.
 
 The caller closes its PostgreSQL transaction before preparation and checks
 for cancellation after Rust returns. An in-flight immutable object write
-can complete during cancellation. The ABI exposes no submit operation.
+can complete during cancellation. Preparation and discard send no commit POSTs.
 The scoped provider fixture exercises this boundary with one catalog GET,
 one manifest GET, three create-only PUTs and zero commit POSTs. Parent 100
 stays current. The same test requires zero provider calls for wrong
@@ -210,6 +210,56 @@ catalog must see zero commit POSTs. Immutable prepared objects may remain
 unreferenced until normal cleanup. Use this diagnostic with a disposable or
 explicitly approved test target. The default extension and publication
 scheduler retain their existing activation gates.
+
+### Native one-shot dispatch
+
+Opt-in extension 1.16 adds `lakehouse.dispatch_managed_publication_send`
+for an acquired operation and owner generation. A trusted internal
+non-superuser needs the existing send authorization procedure and ledger
+transition privileges, the metadata-only scope loader, and the explicitly
+granted launcher. Keep the role separate from application and reader
+logins. The 1.14 preparation diagnostic retains its narrower grants. The
+initial adapter uses the same operator-owned static Send mapping as 1.14.
+
+The worker loads exact captured members, closes its PostgreSQL transaction
+and prepares one process-local Rust proposal. It then opens a short
+transaction to recheck the generation, current Send approval, exact mapping,
+source layout and approved scope. It holds the approval, mapping, foreign
+server, binding and claim locks until the authorization commits. The second
+load reads metadata and checks member digests under the existing ledger
+fence. The original payload bytes stay in the preparing worker.
+
+The same worker runs the top-level authorization portal with the exact
+parent, proposed snapshot, input digest, proposal digest and raw body.
+A synchronous-local PostgreSQL commit establishes the durable intent. The
+portal returns a verified transaction ID before any POST. The worker
+consumes its sole Rust owner outside PostgreSQL transaction and SPI state.
+The internal ABI compares the exact committed fields to the owned proposal
+and clears the owner before calling the provider once. PostgreSQL errors
+and cancellation are checked outside Rust. Recovered state and SQL
+receipts have lookup authority only.
+
+An acknowledged response and an unknown catalog outcome both require
+separately admitted read-only verification before finalization. A lost
+PostgreSQL acknowledgement leaves a reserved intent with zero POSTs. An
+expired Send credential may decline the attempt after the durable intent.
+The durable authorization commit is the boundary for ledger revocation.
+Revocation committed first makes the worker refuse authorization. A
+revocation committed after authorization leaves the original reservation
+for fresh Lookup reconciliation, even if the live worker has yet to send.
+A database approval change cannot recall that send. An immediate-disable
+contract needs independent network or provider-credential fencing. Repeat
+dispatch refuses retained operations before provider I/O.
+
+The [native fixture](../../../src/test/lakehouse/fixtures/native-managed-dispatch-check.py)
+forces cancellation before authorization, expiry and owner takeover during
+preparation, authorization reply loss and catalog acceptance reply loss. Its proxy
+compares the actual POST to the original WAL-flushed body before forwarding
+it. The fixture repeats the exact read-only lookup after physical PostgreSQL
+restart and keeps the later captured segment pending. This qualifies the
+one-shot static fixture path. Scheduled polling, temporary hosted
+credentials, promoted-primary failover and managed overlay visibility
+have separate gates.
 
 ### Discovery and dispatch
 

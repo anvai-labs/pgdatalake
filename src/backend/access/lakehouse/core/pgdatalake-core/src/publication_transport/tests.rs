@@ -585,11 +585,12 @@ fn dropping_owned_preparation_keeps_only_create_only_objects() {
 
 #[test]
 #[allow(unsafe_code)]
-fn native_prepare_exposes_exact_proposal_and_drops_without_post() {
+fn native_prepare_owner_requires_exact_authorization_and_submits_once() {
     use crate::ffi::{
         pg_datalake_drop_managed_send, pg_datalake_prepare_managed_send,
+        pg_datalake_submit_managed_send, PgDatalakeNativeSendAuthorization,
         PgDatalakeNativeSendCredentials, PgDatalakeNativeSendInputs, PgDatalakeNativeSendMember,
-        PgDatalakeNativeSendProposal,
+        PgDatalakeNativeSendProposal, PgDatalakeNativeSendStatus,
     };
     use std::{fmt::Write, mem::MaybeUninit};
 
@@ -735,12 +736,52 @@ fn native_prepare_exposes_exact_proposal_and_drops_without_post() {
     }
     assert!(handle.is_null());
 
+    {
+        let state = remote.state.lock().unwrap();
+        assert_eq!(state.reads, [ROUTE]);
+        assert_eq!(state.object_reads, [PARENT_PATH]);
+        assert_eq!(state.object_writes.len(), 3);
+        assert_eq!(state.posts, [] as [Value; 0]);
+        assert_eq!(state.catalog["metadata"]["current-snapshot-id"], 100);
+    }
+
+    let (mut mismatched, proposal) = prepare(&input, &credentials);
+    assert!(!mismatched.is_null());
+    let mut authorization = PgDatalakeNativeSendAuthorization {
+        operation_id: *claim.identity.operation_id.as_bytes(),
+        owner_generation: claim.generation,
+        input_digest: claim.identity.input_digest,
+        intent_xid: 42,
+        parent_is_null: false,
+        parent: 100,
+        snapshot: proposal.snapshot,
+        proposal_digest: [0; 32],
+    };
+    let refused =
+        unsafe { pg_datalake_submit_managed_send(&raw mut mismatched, &raw const authorization) };
+    assert_eq!(refused, PgDatalakeNativeSendStatus::ManagedSendRefused);
+    assert!(mismatched.is_null());
+    assert_eq!(remote.state.lock().unwrap().posts, [] as [Value; 0]);
+
+    let (mut owner, exact) = prepare(&input, &credentials);
+    assert!(!owner.is_null());
+    authorization.snapshot = exact.snapshot;
+    authorization.proposal_digest = exact.digest;
+    let (sent, replay) = unsafe {
+        (
+            pg_datalake_submit_managed_send(&raw mut owner, &raw const authorization),
+            pg_datalake_submit_managed_send(&raw mut owner, &raw const authorization),
+        )
+    };
+    assert!(owner.is_null());
+    assert_eq!(sent, PgDatalakeNativeSendStatus::ManagedSendUnknown);
+    assert_eq!(replay, PgDatalakeNativeSendStatus::ManagedSendRefused);
     let state = remote.state.lock().unwrap();
-    assert_eq!(state.reads, [ROUTE]);
-    assert_eq!(state.object_reads, [PARENT_PATH]);
-    assert_eq!(state.object_writes.len(), 3);
-    assert_eq!(state.posts, [] as [Value; 0]);
-    assert_eq!(state.catalog["metadata"]["current-snapshot-id"], 100);
+    assert_eq!(state.posts.len(), 1);
+    assert_eq!(
+        state.catalog["metadata"]["current-snapshot-id"],
+        exact.snapshot
+    );
 }
 
 #[test]

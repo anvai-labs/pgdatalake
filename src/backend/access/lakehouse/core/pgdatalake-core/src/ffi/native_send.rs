@@ -15,8 +15,8 @@ use crate::publication_transport::{
     ScopedPublisher,
 };
 use crate::publication_worker::{
-    prepare_publication_send, CapturedMember, ClaimState, PreparedManagedSend, PublicationClaim,
-    PublicationDispatchHint, MAX_PUBLICATION_MEMBERS,
+    prepare_publication_send, CapturedMember, ClaimState, NativeSendAuthorization,
+    PreparedManagedSend, PublicationClaim, PublicationDispatchHint, MAX_PUBLICATION_MEMBERS,
 };
 
 pub const PG_DATALAKE_NATIVE_SEND_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -217,7 +217,7 @@ unsafe fn prepare_native_send(
 
 /// Prepare outside a PostgreSQL transaction, write an exact borrowed view,
 /// and return its unique owner. Failure returns NULL with an empty view.
-/// Handles can only be dropped at this boundary. Preparation may finish
+/// An unconfirmed owner can be dropped without I/O. Preparation may finish
 /// immutable PUTs while the caller's cancellation is pending.
 ///
 /// # Safety
@@ -276,4 +276,81 @@ pub unsafe extern "C" fn pg_datalake_drop_managed_send(owner: *mut *mut PgDatala
             drop(Box::from_raw(handle));
         }));
     }
+}
+
+/// Exact worker observation after PostgreSQL confirmed the locally flushed COMMIT.
+#[repr(C)]
+pub struct PgDatalakeNativeSendAuthorization {
+    pub operation_id: [u8; 16],
+    pub owner_generation: i64,
+    pub input_digest: [u8; 32],
+    pub intent_xid: u32,
+    pub parent_is_null: bool,
+    pub parent: i64,
+    pub snapshot: i64,
+    pub proposal_digest: [u8; 32],
+}
+
+#[repr(C)]
+#[derive(Debug, PartialEq, Eq)]
+pub enum PgDatalakeNativeSendStatus {
+    ManagedSendRefused,
+    ManagedSendAcknowledged,
+    ManagedSendUnknown,
+}
+
+/// Consume the original owner after the same worker committed exact authorization.
+/// A provider error leaves a reserved attempt for read-only verification.
+///
+/// # Safety
+/// The owner slot must be writable and initialized by this process. If occupied,
+/// it holds the sole process-local owner from successful preparation. A non-null
+/// authorization pointer must be aligned and readable for the call. The trusted
+/// caller supplies it only after PostgreSQL confirmed the synchronous-local
+/// authorization transaction committed. The XID and matching fields cannot
+/// prove that transaction outside the PostgreSQL worker.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_submit_managed_send(
+    owner: *mut *mut PgDatalakePreparedSend,
+    authorization: *const PgDatalakeNativeSendAuthorization,
+) -> PgDatalakeNativeSendStatus {
+    use PgDatalakeNativeSendStatus::{
+        ManagedSendAcknowledged, ManagedSendRefused, ManagedSendUnknown,
+    };
+
+    let Some(owner) = owner.as_mut() else {
+        return ManagedSendRefused;
+    };
+    let handle = std::mem::replace(owner, ptr::null_mut());
+    if handle.is_null() {
+        return ManagedSendRefused;
+    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let prepared = Box::from_raw(handle).0;
+        let Some(authorization) = authorization.as_ref() else {
+            return ManagedSendRefused;
+        };
+        // PostgreSQL's first normal transaction ID is 3.
+        if authorization.intent_xid < 3
+            || (authorization.parent_is_null && authorization.parent != 0)
+        {
+            return ManagedSendRefused;
+        }
+        let Some(request) = prepared.into_authorized_request(&NativeSendAuthorization {
+            operation_id: Uuid::from_bytes(authorization.operation_id),
+            owner_generation: authorization.owner_generation,
+            input_digest: authorization.input_digest,
+            parent: (!authorization.parent_is_null).then_some(authorization.parent),
+            snapshot: authorization.snapshot,
+            proposal_digest: authorization.proposal_digest,
+        }) else {
+            return ManagedSendRefused;
+        };
+        if request.submit().is_ok() {
+            ManagedSendAcknowledged
+        } else {
+            ManagedSendUnknown
+        }
+    }))
+    .unwrap_or(ManagedSendUnknown)
 }

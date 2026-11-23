@@ -307,7 +307,29 @@ pub struct PreparedManagedSend {
     request: PreparedPublication,
 }
 
+pub(crate) struct NativeSendAuthorization {
+    pub operation_id: Uuid,
+    pub owner_generation: i64,
+    pub input_digest: [u8; 32],
+    pub parent: Option<i64>,
+    pub snapshot: i64,
+    pub proposal_digest: [u8; 32],
+}
+
 impl PreparedManagedSend {
+    pub(crate) fn into_authorized_request(
+        self,
+        authorization: &NativeSendAuthorization,
+    ) -> Option<PreparedPublication> {
+        (authorization.operation_id == self.identity.operation_id
+            && authorization.owner_generation == self.owner_generation
+            && authorization.input_digest == self.identity.input_digest
+            && authorization.parent == self.request.expected_parent()
+            && authorization.snapshot == self.request.snapshot_id()
+            && authorization.proposal_digest == self.request.request_digest())
+        .then_some(self.request)
+    }
+
     #[must_use]
     pub fn identity(&self) -> PublicationIdentity {
         self.identity
