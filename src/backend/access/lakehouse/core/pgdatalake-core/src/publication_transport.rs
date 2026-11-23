@@ -41,7 +41,7 @@ pub struct PublicationTarget {
 
 /// The operator resolves separate authority for an admitted send and for
 /// read-only verification of the binding that was retained with an intent.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub enum PublicationPurpose {
     Send,
     Lookup,
