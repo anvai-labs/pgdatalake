@@ -230,19 +230,26 @@ separately.
 
 | Evidence | What it can establish |
 | --- | --- |
-| Emulator or fixture | API, request/response and configuration behavior exercised against the named fixture and version. A desired replica or task count establishes control-plane behavior. |
+| Emulator or fixture | API, request/response and configuration behavior exercised against the named fixture and version. An accepted desired replica or task count establishes control-plane request behavior only; scaling claims additionally require the observed ready count. |
 | Local runtime | Actual PostgreSQL and extension startup, SQL results, routing, drain and replica changes exercised against the named local topology. |
 | Live provider | Service startup, identity and policy enforcement, network paths and capacity observed on the named provider and deployment profile. Provider-specific release claims require this evidence for that profile. |
 
-- Pin emulator versions and verify their distribution before CI execution.
-  Use isolated fixture endpoints and synthetic credentials. Record the
-  fixture version, tested artifact identity and observed results. Keep any
-  provider claims tied to their original receipt.
-- For a runtime scale milestone, count a reader as useful when an authorized
-  client returns the expected rows and multiplicities at the fixed Iceberg pin
-  within the declared workload budget. Record time to the first successful
-  query, queue and completion counts, origin requests, drain outcomes and
-  sample counts. Report p95 and p99 for sample sets that support them.
+- Pin emulator versions (by digest where the registry allows) and verify
+  their distribution before CI execution; existing fixture images move to
+  digest pins as their receipts are refreshed. Use isolated fixture
+  endpoints and synthetic credentials. Record the fixture version, tested
+  artifact identity and observed results. Keep any provider claims tied to
+  their original receipt.
+- For a scale milestone (the performance milestone defined in
+  [the release reassessment](16-release-reassessment-and-scale.md)), count a
+  reader as useful when an authorized client returns the expected rows and
+  multiplicities at the fixed Iceberg pin within the workload budget that
+  milestone declares. Record, in addition to that milestone's own
+  measurements, time to the first successful query, queue and completion
+  counts, origin requests, drain outcomes and sample counts; report p95 and
+  p99 where samples support them. The receipt itself follows
+  [the milestone TDD and smoke receipt format](10-testing.md
+  #milestone-tdd-and-smoke-receipts).
 - The core supplies the data-plane conformance tests and versioned artifacts.
   Operators own deployment and live-provider qualification.
   [Cloud profile contract](modules/09-cloud-profiles.md) ·
