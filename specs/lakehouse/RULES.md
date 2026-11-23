@@ -221,3 +221,29 @@ every tagged release.
 
 Skipping any step voids the checkpoint: the milestone is not done, the release
 does not ship, and the next milestone does not start.
+
+## 10. Cloud and runtime evidence
+
+Classify each claim in a test receipt by where the behavior was observed.
+A CI job that runs several kinds of checks records the evidence for each
+separately.
+
+| Evidence | What it can establish |
+| --- | --- |
+| Emulator or fixture | API, request/response and configuration behavior exercised against the named fixture and version. A desired replica or task count establishes control-plane behavior. |
+| Local runtime | Actual PostgreSQL and extension startup, SQL results, routing, drain and replica changes exercised against the named local topology. |
+| Live provider | Service startup, identity and policy enforcement, network paths and capacity observed on the named provider and deployment profile. Provider-specific release claims require this evidence for that profile. |
+
+- Pin emulator versions and verify their distribution before CI execution.
+  Use isolated fixture endpoints and synthetic credentials. Record the
+  fixture version, tested artifact identity and observed results. Keep any
+  provider claims tied to their original receipt.
+- For a runtime scale milestone, count a reader as useful when an authorized
+  client returns the expected rows and multiplicities at the fixed Iceberg pin
+  within the declared workload budget. Record time to the first successful
+  query, queue and completion counts, origin requests, drain outcomes and
+  sample counts. Report p95 and p99 for sample sets that support them.
+- The core supplies the data-plane conformance tests and versioned artifacts.
+  Operators own deployment and live-provider qualification.
+  [Cloud profile contract](modules/09-cloud-profiles.md) ·
+  [Core release receipts](modules/08a-core-release-gates.md)
