@@ -155,37 +155,15 @@ def run_worker(worker, db, operation, approval, hint, *, error=None, member_byte
 
 
 def run_native_lookup(db, role, operation, binding, generation, child, posts, lookups):
-    function = "lakehouse.reconcile_managed_publication_lookup"
+    function = trino_fixture.NATIVE_LOOKUP
     call = f"SET ROLE {role}; SELECT {function}('{operation}', {generation});"
     sql(db, "ALTER EXTENSION lakehouse UPDATE TO '1.11';")
     sql(db, f"SELECT {function}('{operation}', {generation});", error="42883")
-    sql(db, f"""
-        ALTER EXTENSION lakehouse UPDATE TO '1.12';
-        CREATE ROLE {role} LOGIN;
-        GRANT USAGE ON SCHEMA lakehouse TO {role};
-        GRANT EXECUTE ON FUNCTION lakehouse.load_managed_publication_job(uuid),
-            lakehouse.get_publication_lookup_binding(uuid),
-            lakehouse.advance_publication_generation(uuid, bigint),
-            lakehouse.finalize_publication(uuid, bigint, uuid, uuid, bytea, bigint, bytea) TO {role};
-        GRANT SELECT ON lakehouse.publication_binding_descriptors,
-            lakehouse.managed_capture_bindings, lakehouse.publication_attempts,
-            lakehouse.publication_lookup_grants, {HDR}, {MEM}, {SEG} TO {role};
-        GRANT UPDATE (owner_generation, verified_snapshot_id) ON {HDR} TO {role};
-        GRANT UPDATE (published, published_snapshot_id) ON {SEG} TO {role};
-        CREATE SERVER lookup_credentials FOREIGN DATA WRAPPER lakehouse_fdw
-            OPTIONS (endpoint 'http://127.0.0.1:1/catalog', warehouse 'smoke');
-        CREATE USER MAPPING FOR {role} SERVER lookup_credentials
-            OPTIONS (token 'fixture-lookup', s3_access_key 'lakehouse-reader',
-                     s3_secret_key 'lakehouse-reader-password');
-    """)
+    trino_fixture.install_native_lookup_role(db, role)
     sql(db, call, error="42501")
     sql(db, f"GRANT EXECUTE ON FUNCTION {function}(uuid, bigint) TO {role};")
     sql(db, call, error="42501")
-    sql(db, f"""
-        INSERT INTO lakehouse.publication_lookup_grants
-        SELECT '{binding}', umuser, umid, clock_timestamp() - interval '1 second'
-        FROM pg_user_mappings WHERE usename='{role}' AND srvname='lookup_credentials';
-    """)
+    trino_fixture.approve_native_lookup(db, role, binding, expired=True)
     sql(db, call, error="42501")
     assert sql(db, f"SELECT owner_generation FROM {HDR} WHERE operation_id='{operation}'") == str(generation)
     assert len(posts) == len(lookups) == 1, "unapproved or expired lookup touched the provider"

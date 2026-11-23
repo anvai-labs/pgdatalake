@@ -1,6 +1,7 @@
 """Join the PostgreSQL ledger and Rust publisher providers across a crash."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import http.client
 import json
@@ -100,7 +101,44 @@ def retained_intent(db, operation, first, start):
     return record
 
 
-def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_transport):
+NATIVE_LOOKUP = "lakehouse.reconcile_managed_publication_lookup"
+
+
+def install_native_lookup_role(db, role):
+    # A dedicated operator-owned credential mapping. The role has no server
+    # USAGE or ownership. It is trusted internal code, never a tenant role.
+    sql(db, f"""
+        ALTER EXTENSION lakehouse UPDATE TO '1.12';
+        CREATE ROLE {role} LOGIN;
+        GRANT USAGE ON SCHEMA lakehouse TO {role};
+        GRANT EXECUTE ON FUNCTION lakehouse.load_managed_publication_job(uuid),
+            lakehouse.get_publication_lookup_binding(uuid),
+            lakehouse.advance_publication_generation(uuid, bigint),
+            lakehouse.finalize_publication(uuid, bigint, uuid, uuid, bytea, bigint, bytea) TO {role};
+        GRANT SELECT ON lakehouse.publication_binding_descriptors,
+            lakehouse.managed_capture_bindings, lakehouse.publication_attempts,
+            lakehouse.publication_lookup_grants, {HDR}, {MEM}, {SEG} TO {role};
+        GRANT UPDATE (owner_generation, verified_snapshot_id) ON {HDR} TO {role};
+        GRANT UPDATE (published, published_snapshot_id) ON {SEG} TO {role};
+        CREATE SERVER lookup_credentials FOREIGN DATA WRAPPER lakehouse_fdw
+            OPTIONS (endpoint 'http://127.0.0.1:1/catalog', warehouse 'smoke');
+        CREATE USER MAPPING FOR {role} SERVER lookup_credentials
+            OPTIONS (token 'fixture-lookup', s3_access_key 'lakehouse-reader',
+                     s3_secret_key 'lakehouse-reader-password');
+    """)
+
+
+def approve_native_lookup(db, role, binding, *, expired=False):
+    expiry = "- interval '1 second'" if expired else "+ interval '90 seconds'"
+    sql(db, f"""
+        INSERT INTO lakehouse.publication_lookup_grants
+        SELECT '{binding}', umuser, umid, clock_timestamp() {expiry}
+        FROM pg_user_mappings WHERE usename='{role}' AND srvname='lookup_credentials';
+    """)
+
+
+def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_transport, native_lookup):
+
     table = f"iceberg.{namespace}.events"
     trino(f"CREATE TABLE {table} (id bigint) WITH (format_version=2); "
           f"INSERT INTO {table} VALUES 10")
@@ -113,6 +151,7 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
 
     binding, incarnation = str(uuid.uuid4()), str(uuid.uuid4())
     role = f"{db}_writer"
+    lookup_role = f"{db}_lookup"
     root = metadata["location"].rstrip("/")
     sql(db, "CREATE EXTENSION lakehouse; CREATE EXTENSION pg_walinspect;")
     assert Path(sql(db, "SHOW data_directory")).resolve() == data
@@ -122,6 +161,9 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
     release = threading.Event()
     stale_head = threading.Event()
     unavailable = threading.Event()
+    pause_lookup = threading.Event()
+    proof_requested = threading.Event()
+    release_proof = threading.Event()
     posts, lookups, errors = [], [], []
     requests, catalog_auth = [], []
     revoke_after_acceptance = admitted_transport and reply_loss == "http_504"
@@ -144,6 +186,11 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
                 if stale_head.is_set():
                     self.reply(200, old_reply)
                     return
+                if pause_lookup.is_set():
+                    proof_requested.set()
+                    if not release_proof.wait(timeout=10):
+                        self.reply(504, b"")
+                        return
             status, body = catalog_request("GET", self.path)
             self.reply(status, body)
 
@@ -354,7 +401,24 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
                            check=True, timeout=60)
             restart_ms = (time.monotonic() - started) * 1000
 
+            function = NATIVE_LOOKUP
+            if native_lookup:
+                install_native_lookup_role(db, lookup_role)
+                sql(db, f"GRANT EXECUTE ON FUNCTION {function}(uuid, bigint) TO {lookup_role};")
+                approve_native_lookup(db, lookup_role, binding)
+
+            def native_call(generation, *, error=None):
+                return sql(db, f"SET ROLE {lookup_role}; SELECT {function}('{operation}', {generation});",
+                           error=error)
+
             def recover(*, completed=False):
+                if native_lookup and not completed:
+                    hint = json.loads(wake("lookup"))["dispatch_hint"]
+                    result = json.loads(native_call(hint["owner_generation"]))
+                    if result["status"] == "verified":
+                        return f"verified {result['snapshot_id']} {result['members']}"
+                    states = {"unavailable": "lookup_unavailable", "unresolved": "acceptance_unproved"}
+                    return f"hold {states[result['status']]}"
                 wake_request = lookup_request if completed and admitted_transport else wake("lookup")
                 return subprocess.check_output([worker], input=wake_request, text=True, timeout=25).strip()
 
@@ -398,7 +462,8 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
                 rows = trino(f"SELECT id FROM {table} FOR VERSION AS OF {parent} ORDER BY id")
                 assert rows == "10"
                 print(json.dumps({
-                    "case": "authorization_ack_lost", "table_uuid": remote, "operation_id": operation,
+                    "case": "authorization_ack_lost", "lookup_driver": "native" if native_lookup else "rust-fixture",
+                    "table_uuid": remote, "operation_id": operation,
                     "parent": str(parent), "proposed": str(proposed_snapshot), "trino_rows": [int(rows)],
                     "reserved_member": first, "later_pending": late, "catalog_posts": len(posts),
                     "catalog_gets": len(lookups), "lookup_outcome": "acceptance_unproved",
@@ -408,6 +473,24 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
                     "recovery_generation": generation, "samples": 1, "restart_ms": round(restart_ms, 1),
                 }), flush=True)
                 return
+            raced = native_lookup and reply_loss == "crash"
+            if raced:
+                # Retire the native worker's ownership while it is outside
+                # PostgreSQL, waiting for otherwise-valid provider evidence.
+                generation = json.loads(wake("lookup"))["dispatch_hint"]["owner_generation"]
+                pause_lookup.set()
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    result = executor.submit(native_call, generation, error="40001")
+                    try:
+                        assert proof_requested.wait(timeout=10), "native lookup did not reach the provider"
+                        assert sql(db, f"SELECT lakehouse.advance_publication_generation("
+                                       f"'{operation}', {generation + 1})") == str(generation + 2)
+                    finally:
+                        pause_lookup.clear()
+                        release_proof.set()
+                    result.result(timeout=15)
+                assert sql(db, f"SELECT count(*) FROM {SEG} WHERE published") == "0"
+                assert len(posts) == 1
             started = time.monotonic()
             assert recover() == f"verified {proposed_snapshot} 1"
             recovery_ms = (time.monotonic() - started) * 1000
@@ -418,6 +501,9 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
             """
             completed = sql(db, row_versions)
             before = len(requests)
+            if native_lookup:
+                generation = int(sql(db, f"SELECT owner_generation FROM {HDR} WHERE operation_id='{operation}'"))
+                native_call(generation, error="55000")
             assert recover(completed=True) == f"complete {proposed_snapshot}"
             assert len(requests) == before
             assert sql(db, row_versions) == completed
@@ -443,10 +529,12 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
             assert trino(f"SELECT id FROM {table} FOR VERSION AS OF {proposed_snapshot} ORDER BY id") == "10\n20"
             if admitted_transport:
                 assert set(requests) == {route}, requests
-                assert catalog_auth[restart_requests:] == [("GET", "Bearer fixture-lookup")] * 3
+                assert catalog_auth[restart_requests:] == [("GET", "Bearer fixture-lookup")] * (3 + raced)
             capture_source = "seeded" if capture_adapter is None else "ordinary_sql"
             transport = "admitted" if admitted_transport else "legacy_fixture"
+            driver = "native" if native_lookup else "rust-fixture"
             print(f"bound worker: capture={capture_source} transport={transport} reply_loss={reply_loss} "
+                  f"lookup_driver={driver} fenced_racing_finalize={str(raced).lower()} "
                   f"base={parent} rows=[10], "
                   f"receipt={proposed_snapshot} rows=[10,20], "
                   f"catalog_posts={len(posts)} catalog_gets={len(requests)-len(posts)} "
@@ -455,6 +543,7 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
                   f"restart_ms={restart_ms:.1f} verify_and_finalize_ms={recovery_ms:.1f} samples=1")
         finally:
             release.set()
+            release_proof.set()
             gateway.shutdown()
             server.join(timeout=5)
 
@@ -467,7 +556,11 @@ def main():
                         help="use ordinary TableAM INSERT with the managed capture fixture adapter")
     parser.add_argument("--admitted-transport", action="store_true",
                         help="use the 1.10 managed ledger adapter and enrolled publisher transport")
+    parser.add_argument("--native-lookup", action="store_true",
+                        help="use opt-in native 1.12 for recovery after the fixture send")
     args = parser.parse_args()
+    if args.native_lookup and not args.admitted_transport:
+        parser.error("--native-lookup requires --admitted-transport")
     if args.admitted_transport and args.capture_adapter is None:
         parser.error("--admitted-transport requires --capture-adapter")
     if not __debug__:
@@ -485,11 +578,12 @@ def main():
         try:
             trino(f"CREATE SCHEMA iceberg.{name}")
             try:
-                run(name, name, data, worker, reply_loss, capture_adapter, args.admitted_transport)
+                run(name, name, data, worker, reply_loss, capture_adapter,
+                    args.admitted_transport, args.native_lookup)
             finally:
                 trino(f"DROP TABLE IF EXISTS iceberg.{name}.events; DROP SCHEMA iceberg.{name}")
         finally:
-            sql(admin, f"DROP DATABASE {name} WITH (FORCE); DROP ROLE IF EXISTS {name}_writer;")
+            sql(admin, f"DROP DATABASE {name} WITH (FORCE); DROP ROLE IF EXISTS {name}_writer, {name}_lookup;")
 
 
 if __name__ == "__main__":
