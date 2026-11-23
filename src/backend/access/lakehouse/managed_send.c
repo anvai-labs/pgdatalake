@@ -1,9 +1,6 @@
 /*
  * managed_send.c
- *    Native authorization barrier for a prepared managed publication.
- *
- * The one-shot hold retains an exact request. Prepare-only owns and drops a
- * native proposal without creating an intent. Neither operation can submit.
+ *    One-shot scoped managed preparation, authorization and dispatch.
  */
 
 #include "postgres.h"
@@ -45,16 +42,27 @@
 
 #define MANAGED_SEND_HOLD_NAME "lakehouse managed send hold"
 #define MANAGED_SEND_PREPARE_NAME "lakehouse managed send prepare"
+#define MANAGED_SEND_DISPATCH_NAME "lakehouse managed send dispatch"
 #define SEND_DIGEST_BYTES 32
 #define MAX_SEND_REQUEST 65536
 #define SEND_HOLD_TIMEOUT_MS 10000
 #define SEND_PREPARE_TIMEOUT_MS 20000
+
+typedef enum ManagedSendMode
+{
+	SEND_HOLD,
+	SEND_PREPARE,
+	SEND_DISPATCH,
+} ManagedSendMode;
 
 typedef enum ManagedSendOutcome
 {
 	MANAGED_SEND_PENDING,
 	MANAGED_SEND_HELD,
 	MANAGED_SEND_PREPARED_DISCARDED,
+	MANAGED_SEND_ACKNOWLEDGED,
+	MANAGED_SEND_REFUSED,
+	MANAGED_SEND_UNKNOWN,
 	MANAGED_SEND_ERROR,
 } ManagedSendOutcome;
 
@@ -64,7 +72,7 @@ typedef struct ManagedSendHold
 	Oid			database;
 	Oid			role;
 	pg_uuid_t	operation;
-	bool		prepare_only;
+	ManagedSendMode mode;
 	int64		generation;
 	int64		parent;
 	int64		snapshot;
@@ -78,6 +86,17 @@ typedef struct ManagedSendHold
 	TransactionId intent_xid;
 } ManagedSendHold;
 
+typedef struct ManagedSendWork
+{
+	PgDatalakeNativeSendInputs inputs;
+	PgDatalakeNativeSendCredentials credentials;
+	PgDatalakePreparedSend *owner;
+	Oid			mapping;
+	Oid			server;
+	Oid			source_relid;
+	bytea	   *claim_digest;
+} ManagedSendWork;
+
 typedef struct ManagedSendResult
 {
 	DestReceiver receiver;
@@ -86,6 +105,7 @@ typedef struct ManagedSendResult
 
 PG_FUNCTION_INFO_V1(pg_lakehouse_hold_managed_publication_send);
 PG_FUNCTION_INFO_V1(pg_lakehouse_prepare_managed_publication_send);
+PG_FUNCTION_INFO_V1(pg_lakehouse_dispatch_managed_publication_send);
 PGDLLEXPORT void lakehouse_managed_send_hold_main(Datum main_arg);
 
 static bool
@@ -155,8 +175,6 @@ commit_send_intent(ManagedSendHold *hold)
 		.xid = InvalidTransactionId,
 	};
 
-	SetCurrentStatementStartTimestamp();
-	StartTransactionCommand();
 	portal = CreateNewPortal();
 	portal->visible = false;
 	old_context = MemoryContextSwitchTo(portal->portalContext);
@@ -341,16 +359,19 @@ load_prepare_members(HeapTuple row, TupleDesc desc, PgDatalakeNativeSendInputs *
 }
 
 static void
-load_prepare_work(ManagedSendHold *request, PgDatalakeNativeSendInputs *inputs,
-				  PgDatalakeNativeSendCredentials *credentials, MemoryContext context)
+load_prepare_work(ManagedSendHold *request, ManagedSendWork *work,
+				  MemoryContext context, bool include_members)
 {
+	const char *query = include_members
+		? "SELECT * FROM lakehouse.load_native_send_preparation($1, $2)"
+		: "SELECT * FROM lakehouse.load_native_send_scope($1, $2)";
+	PgDatalakeNativeSendInputs *inputs = &work->inputs;
+	PgDatalakeNativeSendCredentials *credentials = &work->credentials;
 	Oid			types[] = {UUIDOID, INT8OID};
 	Datum		values[] = {UUIDPGetDatum(&request->operation), Int64GetDatum(request->generation)};
 	HeapTuple	row;
 	TupleDesc	desc;
 	Relation	relation;
-	Oid			mapping;
-	Oid			server;
 	int64		expiry;
 
 	SetCurrentStatementStartTimestamp();
@@ -360,7 +381,7 @@ load_prepare_work(ManagedSendHold *request, PgDatalakeNativeSendInputs *inputs,
 	PushActiveSnapshot(GetTransactionSnapshot());
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "managed publication preparation could not connect to SPI");
-	if (SPI_execute_with_args("SELECT * FROM lakehouse.load_native_send_preparation($1, $2)",
+	if (SPI_execute_with_args(query,
 							  lengthof(types), types, values, NULL, false, 1) != SPI_OK_SELECT ||
 		SPI_processed != 1)
 		elog(ERROR, "managed publication preparation could not load a bounded operation");
@@ -369,50 +390,137 @@ load_prepare_work(ManagedSendHold *request, PgDatalakeNativeSendInputs *inputs,
 	desc = SPI_tuptable->tupdesc;
 	inputs->request = copy_prepare_json(SPI_getvalue(row, desc, 1), context, &inputs->request_len);
 	credentials->target = copy_prepare_json(SPI_getvalue(row, desc, 2), context, &credentials->target_len);
-	relation = table_open(DatumGetObjectId(prepare_field(row, desc, 3)), AccessShareLock);
+	work->source_relid = DatumGetObjectId(prepare_field(row, desc, 3));
+	relation = table_open(work->source_relid, AccessShareLock);
 	inputs->schema = copy_prepare_json(lakehouse_build_schema_json(RelationGetDescr(relation)),
 									   context, &inputs->schema_len);
 	table_close(relation, NoLock);
-	mapping = DatumGetObjectId(prepare_field(row, desc, 4));
-	server = DatumGetObjectId(prepare_field(row, desc, 5));
+	work->mapping = DatumGetObjectId(prepare_field(row, desc, 4));
+	work->server = DatumGetObjectId(prepare_field(row, desc, 5));
 	expiry = DatumGetInt64(prepare_field(row, desc, 6));
 	if (expiry <= 0)
 		elog(ERROR, "managed publication preparation returned an invalid credential expiry");
 	credentials->expires_unix_seconds = expiry;
-	load_prepare_credentials(credentials, request->role, server, mapping, context);
-	load_prepare_members(row, desc, inputs, context);
+	load_prepare_credentials(credentials, request->role, work->server, work->mapping, context);
+	if (include_members)
+		load_prepare_members(row, desc, inputs, context);
+	else
+	{
+		MemoryContext previous = MemoryContextSwitchTo(context);
+
+		work->claim_digest = DatumGetByteaPCopy(prepare_field(row, desc, 7));
+		MemoryContextSwitchTo(previous);
+	}
 	inputs->credentials = credentials;
 
 	SPI_finish();
 	PopActiveSnapshot();
-	CommitTransactionCommand();
 }
 
 static void
-prepare_and_discard(ManagedSendHold *hold, MemoryContext context)
+prepare_send_work(ManagedSendHold *hold, ManagedSendWork *work,
+				  PgDatalakeNativeSendProposal *proposal, MemoryContext context)
 {
-	PgDatalakeNativeSendInputs inputs = {0};
-	PgDatalakeNativeSendCredentials credentials = {0};
-	PgDatalakeNativeSendProposal proposal;
-	PgDatalakePreparedSend *owner;
-	bool		prepared;
+	load_prepare_work(hold, work, context, true);
+	CommitTransactionCommand();
 
-	load_prepare_work(hold, &inputs, &credentials, context);
 	CHECK_FOR_INTERRUPTS();
-	owner = pg_datalake_prepare_managed_send(&inputs, &proposal);
-	prepared = owner != NULL;
-	hold->parent_isnull = proposal.parent_is_null;
-	hold->parent = proposal.parent;
-	hold->snapshot = proposal.snapshot;
-	hold->body_len = proposal.body_len;
-
-	/* Drop the only owner before any PostgreSQL ERROR or cancel can fire. */
-	pg_datalake_drop_managed_send(&owner);
-	CHECK_FOR_INTERRUPTS();
-	if (!prepared)
+	Assert(!IsTransactionState());
+	work->owner = pg_datalake_prepare_managed_send(&work->inputs, proposal);
+	if (work->owner == NULL)
+	{
+		CHECK_FOR_INTERRUPTS();
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("managed publication preparation did not produce a bounded proposal")));
+	}
+}
+
+static bool
+same_bytes(const uint8 *left, uintptr_t left_len,
+		   const uint8 *right, uintptr_t right_len)
+{
+	return left_len == right_len && (left_len == 0 || memcmp(left, right, left_len) == 0);
+}
+
+/* Scope, source layout and credentials must still agree under the WAL locks. */
+static bool
+same_send_work(const ManagedSendWork *original, const ManagedSendWork *current)
+{
+	return original->mapping == current->mapping &&
+		original->server == current->server &&
+		original->source_relid == current->source_relid &&
+		original->credentials.expires_unix_seconds == current->credentials.expires_unix_seconds &&
+		same_bytes(original->inputs.request, original->inputs.request_len,
+				   current->inputs.request, current->inputs.request_len) &&
+		same_bytes(original->inputs.schema, original->inputs.schema_len,
+				   current->inputs.schema, current->inputs.schema_len) &&
+		same_bytes(original->credentials.target, original->credentials.target_len,
+				   current->credentials.target, current->credentials.target_len) &&
+		same_bytes(original->credentials.catalog_token, original->credentials.catalog_token_len,
+				   current->credentials.catalog_token, current->credentials.catalog_token_len) &&
+		same_bytes(original->credentials.access_key, original->credentials.access_key_len,
+				   current->credentials.access_key, current->credentials.access_key_len) &&
+		same_bytes(original->credentials.secret_key, original->credentials.secret_key_len,
+				   current->credentials.secret_key, current->credentials.secret_key_len) &&
+		same_bytes(original->credentials.session_token, original->credentials.session_token_len,
+				   current->credentials.session_token, current->credentials.session_token_len);
+}
+
+static ManagedSendOutcome
+dispatch_prepared(ManagedSendHold *hold, ManagedSendWork *work,
+				  const PgDatalakeNativeSendProposal *proposal, MemoryContext context)
+{
+	ManagedSendWork current = {0};
+	PgDatalakeNativeSendAuthorization authorization;
+	ManagedSendHold *intent;
+	PgDatalakeNativeSendStatus status;
+
+	load_prepare_work(hold, &current, context, false);
+	if (!same_send_work(work, &current))
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("managed publication send scope or credentials changed during preparation")));
+
+	if (proposal->body_len < 1 || proposal->body_len > MAX_SEND_REQUEST ||
+		VARSIZE_ANY_EXHDR(current.claim_digest) != SEND_DIGEST_BYTES)
+		elog(ERROR, "managed publication send authorization exceeds its bounds");
+
+	/* Keep the exact request and the live Rust owner in this worker. */
+	intent = MemoryContextAllocZero(context, sizeof(*intent));
+	intent->operation = hold->operation;
+	intent->generation = hold->generation;
+	intent->parent_isnull = proposal->parent_is_null;
+	intent->parent = proposal->parent;
+	intent->snapshot = proposal->snapshot;
+	intent->body_len = proposal->body_len;
+	memcpy(intent->input_digest, VARDATA_ANY(current.claim_digest), SEND_DIGEST_BYTES);
+	memcpy(intent->proposal_digest, proposal->digest, SEND_DIGEST_BYTES);
+	memcpy(intent->body, proposal->body, proposal->body_len);
+
+	hold->intent_xid = commit_send_intent(intent);
+	CHECK_FOR_INTERRUPTS();
+	authorization = (PgDatalakeNativeSendAuthorization)
+	{
+		.owner_generation = intent->generation,
+			.intent_xid = hold->intent_xid,
+			.parent_is_null = intent->parent_isnull,
+			.parent = intent->parent,
+			.snapshot = intent->snapshot,
+	};
+	memcpy(authorization.operation_id, intent->operation.data, UUID_LEN);
+	memcpy(authorization.input_digest, intent->input_digest, SEND_DIGEST_BYTES);
+	memcpy(authorization.proposal_digest, intent->proposal_digest, SEND_DIGEST_BYTES);
+
+	/* The portal committed and released its locks. Rust does no PG callbacks. */
+	Assert(!IsTransactionState());
+	status = pg_datalake_submit_managed_send(&work->owner, &authorization);
+	CHECK_FOR_INTERRUPTS();
+	if (status == ManagedSendAcknowledged)
+		return MANAGED_SEND_ACKNOWLEDGED;
+	if (status == ManagedSendRefused)
+		return MANAGED_SEND_REFUSED;
+	return MANAGED_SEND_UNKNOWN;
 }
 
 void
@@ -421,12 +529,14 @@ lakehouse_managed_send_hold_main(Datum main_arg)
 	dsm_segment *segment = dsm_attach(DatumGetUInt32(main_arg));
 	ManagedSendHold *hold;
 	MemoryContext context;
+	ManagedSendWork *work;
 
 	if (segment == NULL)
 		proc_exit(0);
 	hold = dsm_segment_address(segment);
 	context = AllocSetContextCreate(TopMemoryContext, "managed publication send",
 									ALLOCSET_DEFAULT_SIZES);
+	work = MemoryContextAllocZero(context, sizeof(*work));
 
 	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
@@ -440,15 +550,38 @@ lakehouse_managed_send_hold_main(Datum main_arg)
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					 errmsg("managed publication send requires a non-superuser role")));
 
-		if (hold->prepare_only)
+		if (hold->mode == SEND_DISPATCH && !enableFsync)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("managed publication dispatch requires fsync")));
+
+		if (hold->mode == SEND_HOLD)
 		{
-			prepare_and_discard(hold, context);
-			outcome = MANAGED_SEND_PREPARED_DISCARDED;
+			SetCurrentStatementStartTimestamp();
+			StartTransactionCommand();
+			hold->intent_xid = commit_send_intent(hold);
+			outcome = MANAGED_SEND_HELD;
 		}
 		else
 		{
-			hold->intent_xid = commit_send_intent(hold);
-			outcome = MANAGED_SEND_HELD;
+			PgDatalakeNativeSendProposal proposal;
+
+			prepare_send_work(hold, work, &proposal, context);
+			hold->parent_isnull = proposal.parent_is_null;
+			hold->parent = proposal.parent;
+			hold->snapshot = proposal.snapshot;
+			hold->body_len = proposal.body_len;
+			if (hold->mode == SEND_DISPATCH)
+			{
+				CHECK_FOR_INTERRUPTS();
+				outcome = dispatch_prepared(hold, work, &proposal, context);
+			}
+			else
+			{
+				pg_datalake_drop_managed_send(&work->owner);
+				CHECK_FOR_INTERRUPTS();
+				outcome = MANAGED_SEND_PREPARED_DISCARDED;
+			}
 		}
 		pg_write_barrier();
 		pg_atomic_write_u32(&hold->outcome, outcome);
@@ -463,6 +596,7 @@ lakehouse_managed_send_hold_main(Datum main_arg)
 	}
 	PG_END_TRY();
 
+	pg_datalake_drop_managed_send(&work->owner);
 	MemoryContextDelete(context);
 	dsm_detach(segment);
 	proc_exit(0);
@@ -501,7 +635,7 @@ wait_for_send_worker(BackgroundWorkerHandle *handle, long timeout)
 }
 
 static Datum
-launch_managed_send_worker(FunctionCallInfo fcinfo, bool prepare_only)
+launch_managed_send_worker(FunctionCallInfo fcinfo, ManagedSendMode mode)
 {
 	dsm_segment *segment;
 	ManagedSendHold *hold;
@@ -524,7 +658,7 @@ launch_managed_send_worker(FunctionCallInfo fcinfo, bool prepare_only)
 				 errmsg("managed publication send requires a standalone read-write command without an assigned transaction ID on an active primary")));
 
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) ||
-		(!prepare_only && (PG_ARGISNULL(2) || PG_ARGISNULL(4) || PG_ARGISNULL(5) || PG_ARGISNULL(6))))
+		(mode == SEND_HOLD && (PG_ARGISNULL(2) || PG_ARGISNULL(4) || PG_ARGISNULL(5) || PG_ARGISNULL(6))))
 		ereport(ERROR,
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 				 errmsg("managed publication send requires a complete request")));
@@ -532,7 +666,7 @@ launch_managed_send_worker(FunctionCallInfo fcinfo, bool prepare_only)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("managed publication send requires a positive owner generation")));
-	if (!prepare_only)
+	if (mode == SEND_HOLD)
 	{
 		body_len = toast_raw_datum_size(PG_GETARG_DATUM(6)) - VARHDRSZ;
 		if (toast_raw_datum_size(PG_GETARG_DATUM(2)) != VARHDRSZ + SEND_DIGEST_BYTES ||
@@ -549,8 +683,8 @@ launch_managed_send_worker(FunctionCallInfo fcinfo, bool prepare_only)
 	hold->role = GetUserId();
 	hold->operation = *PG_GETARG_UUID_P(0);
 	hold->generation = PG_GETARG_INT64(1);
-	hold->prepare_only = prepare_only;
-	if (!prepare_only)
+	hold->mode = mode;
+	if (mode == SEND_HOLD)
 	{
 		hold->parent_isnull = PG_ARGISNULL(3);
 		hold->parent = hold->parent_isnull ? 0 : PG_GETARG_INT64(3);
@@ -562,7 +696,9 @@ launch_managed_send_worker(FunctionCallInfo fcinfo, bool prepare_only)
 	}
 	pg_atomic_init_u32(&hold->outcome, MANAGED_SEND_PENDING);
 
-	strlcpy(worker.bgw_name, prepare_only ? MANAGED_SEND_PREPARE_NAME : MANAGED_SEND_HOLD_NAME, BGW_MAXLEN);
+	strlcpy(worker.bgw_name, mode == SEND_HOLD ? MANAGED_SEND_HOLD_NAME :
+			(mode == SEND_PREPARE ? MANAGED_SEND_PREPARE_NAME : MANAGED_SEND_DISPATCH_NAME),
+			BGW_MAXLEN);
 	strlcpy(worker.bgw_type, worker.bgw_name, BGW_MAXLEN);
 	strlcpy(worker.bgw_library_name, "lakehouse", BGW_MAXLEN);
 	strlcpy(worker.bgw_function_name, "lakehouse_managed_send_hold_main", BGW_MAXLEN);
@@ -578,7 +714,7 @@ launch_managed_send_worker(FunctionCallInfo fcinfo, bool prepare_only)
 				 errmsg("could not register the managed publication send worker")));
 	PG_TRY();
 	{
-		status = wait_for_send_worker(handle, prepare_only ? SEND_PREPARE_TIMEOUT_MS : SEND_HOLD_TIMEOUT_MS);
+		status = wait_for_send_worker(handle, mode == SEND_HOLD ? SEND_HOLD_TIMEOUT_MS : SEND_PREPARE_TIMEOUT_MS);
 	}
 	PG_CATCH();
 	{
@@ -598,12 +734,27 @@ launch_managed_send_worker(FunctionCallInfo fcinfo, bool prepare_only)
 				(errcode(hold->sqlstate),
 				 errmsg("managed publication send worker refused the request")));
 
-	if (prepare_only)
+	if (mode == SEND_PREPARE)
 		result = DirectFunctionCall1(jsonb_in, CStringGetDatum(
 															   psprintf("{\"status\":\"prepared_discarded\",\"expected_parent\":%s,"
 																		"\"proposed_snapshot\":\"" INT64_FORMAT "\",\"proposal_bytes\":%zu}",
 																		hold->parent_isnull ? "null" : psprintf("\"" INT64_FORMAT "\"", hold->parent),
 																		hold->snapshot, hold->body_len)));
+	else if (mode == SEND_DISPATCH)
+	{
+		const char *status_name;
+
+		if (outcome == MANAGED_SEND_ACKNOWLEDGED)
+			status_name = "acknowledged";
+		else if (outcome == MANAGED_SEND_REFUSED)
+			status_name = "dispatch_refused";
+		else
+			status_name = "dispatch_unknown";
+		result = DirectFunctionCall1(jsonb_in, CStringGetDatum(
+															   psprintf("{\"status\":\"%s\",\"intent_xid\":\"%u\","
+																		"\"snapshot_id\":\"" INT64_FORMAT "\",\"lookup_only\":true}",
+																		status_name, hold->intent_xid, hold->snapshot)));
+	}
 	else
 		result = DirectFunctionCall1(jsonb_in, CStringGetDatum(
 															   psprintf("{\"status\":\"held\",\"intent_xid\":\"%u\",\"lookup_only\":true}",
@@ -616,11 +767,17 @@ launch_managed_send_worker(FunctionCallInfo fcinfo, bool prepare_only)
 Datum
 pg_lakehouse_hold_managed_publication_send(PG_FUNCTION_ARGS)
 {
-	return launch_managed_send_worker(fcinfo, false);
+	return launch_managed_send_worker(fcinfo, SEND_HOLD);
 }
 
 Datum
 pg_lakehouse_prepare_managed_publication_send(PG_FUNCTION_ARGS)
 {
-	return launch_managed_send_worker(fcinfo, true);
+	return launch_managed_send_worker(fcinfo, SEND_PREPARE);
+}
+
+Datum
+pg_lakehouse_dispatch_managed_publication_send(PG_FUNCTION_ARGS)
+{
+	return launch_managed_send_worker(fcinfo, SEND_DISPATCH);
 }
