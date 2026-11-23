@@ -325,6 +325,24 @@ object retention, statement-wide correctness and all runtime activation.
 
 #### SQL executor acceptance
 
+Status (2026-11-23): the first executor slice is wired in `tableam.c` —
+admission runs at scan_begin under the ledger owner's context for the
+checked role (`lakehouse.admit_managed_read`, grant table 1.18→1.19) and
+declines catalog-locally, with zero origin requests, for parallel plans,
+scan keys, RLS, inheritance, own staged writes and non-staged write modes.
+The cut itself installs on the first fetch: observe → fresh-proof frame
+(re-admission compare, certified addition chain, pending-head proof) →
+statement frame (registered snapshot: visible segments + payload
+retention) → compatible-pin selection → digest-verified overlay load →
+exact-pin plan. `lakehouse.managed_read_cut_evidence()` exposes the
+installed pin and overlay IDs of the current backend. DOCUMENTED GAP
+(until RTE-aware admission lands): scans derived from views and
+redirected permission identities (`checkAsUser`) are not detectable at
+scan_begin; the role-specific `purpose=read` credential mapping
+structurally prevents a definer view from widening admission, and the
+fresh-frame scope recheck rejects any grant change mid-scan. Bound COUNT
+keeps declining through `lakehouse_check_capture_read`.
+
 Use a v2 Lakekeeper table with parent pin `P` containing `[10]`. Hold one
 PostgreSQL snapshot before both source commits and another between them.
 Commit two segments `A` and `B`, each containing one row with value `20`.

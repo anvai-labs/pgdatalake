@@ -78,14 +78,16 @@ RETURNS TABLE(binding_id uuid, reader_role oid, mapping_id oid, server_id oid,
               incarnation_id uuid, authority_id uuid, table_uuid uuid,
               ref_name text, storage_root text, anchor_snapshot bigint,
               schema_id integer, spec_id integer, target_identity text,
-              catalog_endpoint text, catalog_prefix text, s3_region text)
+              catalog_endpoint text, catalog_prefix text, s3_region text,
+              s3_endpoint text)
 LANGUAGE sql VOLATILE STRICT SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp AS $$
     SELECT g.binding_id, g.reader_role, g.mapping_id, m.umserver,
            floor(extract(epoch FROM g.expires_at))::bigint,
            b.incarnation_id, b.authority_id, b.table_uuid, 'main'::text,
            b.storage_root, a.snapshot_id, b.schema_id, b.spec_id,
-           b.target_identity, b.catalog_endpoint, g.catalog_prefix, g.s3_region
+           b.target_identity, b.catalog_endpoint, g.catalog_prefix, g.s3_region,
+           b.object_endpoint
     FROM lakehouse.managed_capture_state s
     JOIN lakehouse.managed_read_grants g
       ON g.binding_id = s.active_binding_id AND g.reader_role = reader::oid
@@ -111,3 +113,40 @@ $$;
 REVOKE ALL ON FUNCTION lakehouse.admit_managed_read(regclass, regrole),
     lakehouse.grant_managed_read(uuid, regrole, oid, text, text, interval),
     lakehouse.revoke_managed_read(uuid, regrole) FROM PUBLIC;
+
+-- Retention of each lineage segment's sealed payload, read under the
+-- CALLER's statement snapshot (the overlay is STABLE there). select_cut
+-- refuses any cut whose overlay needs a reclaimed payload. Mirrors the
+-- guarded shape of get_managed_read_visible_segments.
+CREATE FUNCTION lakehouse.get_managed_read_segment_retention(target regclass, binding uuid)
+RETURNS TABLE(segment_id bigint, payload_retained boolean)
+LANGUAGE plpgsql STABLE SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    lineage uuid;
+    matched integer;
+BEGIN
+    SELECT s.incarnation_id INTO lineage FROM lakehouse.get_managed_read_scope(target, binding) s;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'managed read anchor is unavailable or its scope changed'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN QUERY
+        SELECT s.seg_id, s.payload IS NOT NULL
+        FROM lakehouse.lakehouse_delta_segments s
+        JOIN lakehouse.managed_capture_bindings b ON b.binding_id = s.capture_binding_id
+        WHERE s.relid = target AND s.capture_binding_id IS NOT NULL AND b.incarnation_id = lineage
+        ORDER BY s.seg_id LIMIT 16385;
+    GET DIAGNOSTICS matched = ROW_COUNT;
+    IF matched > 16384 THEN
+        RAISE EXCEPTION 'managed read visible segment limit exceeded' USING ERRCODE = '54000';
+    END IF;
+END $$;
+REVOKE ALL ON FUNCTION lakehouse.get_managed_read_segment_retention(regclass, uuid) FROM PUBLIC;
+
+-- Backend-local evidence of the last demand-time installed managed cut
+-- ({"pin": …, "overlay": […]}), for the fixture drill and operator
+-- debugging. NULL before the first bound scan of this backend.
+CREATE FUNCTION lakehouse.managed_read_cut_evidence() RETURNS jsonb
+AS 'MODULE_PATHNAME', 'lakehouse_managed_read_cut_evidence'
+LANGUAGE C VOLATILE PARALLEL UNSAFE;
+REVOKE ALL ON FUNCTION lakehouse.managed_read_cut_evidence() FROM PUBLIC;

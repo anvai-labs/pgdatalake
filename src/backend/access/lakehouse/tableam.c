@@ -37,6 +37,7 @@
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_inherits.h"
 #include "foreign/foreign.h"
 #include "commands/defrem.h"
 #include "commands/extension.h"
@@ -68,12 +69,16 @@
 #include "lakehouse.h"
 
 #include "utils/json.h"
+#include "utils/jsonb.h"
 #include "utils/numeric.h"
 #include "utils/typcache.h"
+#include "utils/rls.h"
+#include "utils/uuid.h"
 #include "varatt.h"
 
 #include "batch_fill.h"
 #include "lakehouse_tableam.h"
+#include "managed_credentials.h"
 
 /*
  * The 1.7 tables are optional. When present, only the extension-owned,
@@ -1690,6 +1695,32 @@ prune_scan_registry_above(SubTransactionId subid)
 
 /* ---------------- scan state ---------------- */
 
+/*
+ * One row of lakehouse.admit_managed_read: the operator-approved route,
+ * table incarnation and enrollment anchor for the checked role. Strings
+ * are copied into the scan context; the fresh-proof frame re-reads a
+ * second copy and compares it field by field.
+ */
+typedef struct ManagedReadAdmission
+{
+	pg_uuid_t	binding;
+	Oid			role;
+	Oid			mapping;
+	Oid			server;
+	pg_uuid_t	incarnation;
+	pg_uuid_t	authority;
+	pg_uuid_t	table_uuid;
+	int64		anchor;
+	int32		schema_id;
+	int32		spec_id;
+	char	   *target_identity;
+	char	   *storage_root;
+	char	   *catalog_endpoint;
+	char	   *catalog_prefix;
+	char	   *s3_region;
+	char	   *s3_endpoint;
+} ManagedReadAdmission;
+
 typedef struct LakehouseTableScanDescData
 {
 	TableScanDescData rs_base;
@@ -1735,10 +1766,27 @@ typedef struct LakehouseTableScanDescData
 	int			n_delta;
 	int			delta_pos;
 	bool		delta_loaded;
+
+	/*
+	 * managed cut (03-managed-visibility, "SQL executor acceptance"): the
+	 * demand-time compatible-pin cut for bound capture tables. Admission runs
+	 * at scan_begin (catalog-local declines, zero origin requests); the cut
+	 * itself is observed and planned on the first getnextslot, so every
+	 * failure precedes the first served row.
+	 */
+	bool		capture_bound;
+	bool		cut_installed;
+	int64		cut_pin;
+	int64	   *cut_overlay_ids;
+	int			n_cut_overlay;
+	struct ManagedReadObservation *read_observation;
+	ManagedReadAdmission admission;
 } LakehouseTableScanDescData;
 typedef LakehouseTableScanDescData *LakehouseTableScanDesc;
 
 static void load_delta_segments(LakehouseTableScanDesc scan, TupleDesc tupdesc);
+static void lakehouse_admit_managed_cut(LakehouseTableScanDesc scan);
+static void install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc);
 
 static void
 lakehouse_scan_common_setup(LakehouseTableScanDesc scan, Relation rel,
@@ -1811,6 +1859,22 @@ lakehouse_scan_common_setup(LakehouseTableScanDesc scan, Relation rel,
 			? wm_opts.write_mode
 			: lakehouse_write_mode;
 
+		if (scan->capture_bound)
+		{
+			if (wm != LAKEHOUSE_WRITE_MODE_STAGED)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("bound managed capture scans require the staged write mode")));
+
+			/*
+			 * Managed-cut bypass: no session and no tasks until the
+			 * demand-time cut plans the compatible pin exactly.
+			 */
+			scan->session = NULL;
+			scan->task_count = 0;
+			return;
+		}
+
 		if (wm == LAKEHOUSE_WRITE_MODE_STAGED)
 		{
 			scan->session = NULL;
@@ -1836,6 +1900,8 @@ lakehouse_scan_release(void *arg)
 {
 	LakehouseTableScanDesc scan = (LakehouseTableScanDesc) arg;
 
+	if (scan->read_observation != NULL)
+		pg_datalake_managed_read_observation_drop(&scan->read_observation);
 	pg_datalake_rows_close(scan->rows);
 	pg_datalake_scan_free(scan->session);
 	for (int i = 0; i < scan->n_delta; i++)
@@ -1849,7 +1915,6 @@ lakehouse_scan_begin(Relation rel, Snapshot snapshot,
 {
 	LakehouseTableScanDesc scan;
 
-	lakehouse_check_capture_read(RelationGetRelid(rel));
 	if (pscan != NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -1896,6 +1961,34 @@ lakehouse_scan_begin(Relation rel, Snapshot snapshot,
 					 errhint("SELECT lakehouse.attach_table('%s'::regclass, "
 							 "'namespace.table_name', endpoint => '...');",
 							 RelationGetRelationName(rel))));
+	}
+
+	{
+		pg_uuid_t	binding;
+
+		/*
+		 * Bound managed capture (03-managed-visibility, "Admission before the
+		 * native cut"): supported-shape declines are catalog-local — a
+		 * declined scan makes zero origin requests. Ordinary bound SQL was
+		 * refused outright before the managed cut existed.
+		 */
+		if (lookup_capture_binding(RelationGetRelid(rel), &binding))
+		{
+			if (has_subclass(RelationGetRelid(rel)))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("bound managed capture does not support inheritance scans")));
+			if (check_enable_rls(RelationGetRelid(rel), GetUserId(), false) != RLS_NONE)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("bound managed capture does not support row-level security scans")));
+			if (lakehouse_find_write_entry(RelationGetRelid(rel)) != NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("bound managed capture does not support scans with staged writes")));
+			scan->capture_bound = true;
+			lakehouse_admit_managed_cut(scan);
+		}
 	}
 
 	lakehouse_scan_common_setup(scan, rel, NULL);
@@ -1953,6 +2046,15 @@ lakehouse_scan_getnextslot(TableScanDesc bscan, ScanDirection direction,
 	int			i;
 
 	/* ScanDirection ignored: files iterate in stored order only */
+
+	/*
+	 * Demand-time managed cut: EXPLAIN and LIMIT 0 never reach this, and
+	 * every install failure precedes the first served row. Rescans and
+	 * portals keep the installed cut (zero re-admission, zero catalog
+	 * resolutions).
+	 */
+	if (scan->capture_bound && !scan->cut_installed)
+		install_managed_cut(scan, tupdesc);
 
 	for (;;)
 	{
@@ -2314,6 +2416,882 @@ load_delta_segments(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 	SPI_finish();
 }
 
+ /* ---------------- managed cut (03-managed-visibility) ---------------- */
+
+#define MANAGED_READ_MAX_PINS 512
+#define MANAGED_READ_MAX_MEMBERS 16384
+#define MANAGED_READ_MAX_OVERLAY 16384
+
+/* Backend-local evidence of the last installed cut (one line of JSON). */
+static char *managed_cut_evidence = NULL;
+
+static void
+managed_read_status_error(enum PgDatalakeReadStatus status, const char *errbuf,
+						  const char *summary)
+{
+	int			errcode_val = ERRCODE_FEATURE_NOT_SUPPORTED;
+
+	if (status == ReadChangedBinding || status == ReadPinUnavailable)
+		errcode_val = ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE;
+	ereport(ERROR,
+			(errcode(errcode_val),
+			 errmsg("%s", summary),
+			 errdetail("%s", errbuf[0] != '\0' ? errbuf : "the enrollment refused the request")));
+}
+
+static char *
+managed_cred_string(const PgDatalakeCredentialBytes * bytes)
+{
+	char	   *value;
+
+	if (bytes->data == NULL || bytes->len == 0)
+		return NULL;
+	value = palloc(bytes->len + 1);
+	memcpy(value, bytes->data, bytes->len);
+	value[bytes->len] = '\0';
+	return value;
+}
+
+/* Re-home the string fields of one admission row into `ctx`. */
+static void
+managed_read_admission_copy_strings(ManagedReadAdmission *a, MemoryContext ctx)
+{
+	MemoryContext old = MemoryContextSwitchTo(ctx);
+
+	if (a->target_identity)
+		a->target_identity = pstrdup(a->target_identity);
+	if (a->storage_root)
+		a->storage_root = pstrdup(a->storage_root);
+	if (a->catalog_endpoint)
+		a->catalog_endpoint = pstrdup(a->catalog_endpoint);
+	if (a->catalog_prefix)
+		a->catalog_prefix = pstrdup(a->catalog_prefix);
+	if (a->s3_region)
+		a->s3_region = pstrdup(a->s3_region);
+	if (a->s3_endpoint)
+		a->s3_endpoint = pstrdup(a->s3_endpoint);
+	MemoryContextSwitchTo(old);
+}
+
+/* Read one row of lakehouse.admit_managed_read into caller-owned memory. */
+static void
+managed_read_admission_fill(ManagedReadAdmission *a, HeapTuple tuple,
+							TupleDesc desc)
+{
+	bool		isnull;
+	Datum		val;
+	bytea	   *raw;
+
+	memset(a, 0, sizeof(*a));
+	val = SPI_getbinval(tuple, desc, 1, &isnull);
+	if (isnull)
+		elog(ERROR, "managed read admission lost its binding");
+	memcpy(&a->binding, DatumGetUUIDP(val), sizeof(pg_uuid_t));
+	val = SPI_getbinval(tuple, desc, 2, &isnull);
+	a->role = DatumGetObjectId(val);
+	val = SPI_getbinval(tuple, desc, 3, &isnull);
+	a->mapping = DatumGetObjectId(val);
+	val = SPI_getbinval(tuple, desc, 4, &isnull);
+	a->server = DatumGetObjectId(val);
+	val = SPI_getbinval(tuple, desc, 6, &isnull);
+	memcpy(&a->incarnation, DatumGetUUIDP(val), sizeof(pg_uuid_t));
+	val = SPI_getbinval(tuple, desc, 7, &isnull);
+	memcpy(&a->authority, DatumGetUUIDP(val), sizeof(pg_uuid_t));
+	val = SPI_getbinval(tuple, desc, 8, &isnull);
+	memcpy(&a->table_uuid, DatumGetUUIDP(val), sizeof(pg_uuid_t));
+	val = SPI_getbinval(tuple, desc, 11, &isnull);
+	a->anchor = DatumGetInt64(val);
+	val = SPI_getbinval(tuple, desc, 12, &isnull);
+	a->schema_id = DatumGetInt32(val);
+	val = SPI_getbinval(tuple, desc, 13, &isnull);
+	a->spec_id = DatumGetInt32(val);
+	val = SPI_getbinval(tuple, desc, 14, &isnull);
+	raw = isnull ? NULL : DatumGetByteaPP(val);
+	if (raw == NULL)
+		elog(ERROR, "managed read admission lost its identity");
+	a->target_identity = pnstrdup(VARDATA_ANY(raw), VARSIZE_ANY_EXHDR(raw));
+	val = SPI_getbinval(tuple, desc, 10, &isnull);
+	raw = isnull ? NULL : DatumGetByteaPP(val);
+	a->storage_root = raw == NULL ? NULL : pnstrdup(VARDATA_ANY(raw), VARSIZE_ANY_EXHDR(raw));
+	val = SPI_getbinval(tuple, desc, 15, &isnull);
+	raw = isnull ? NULL : DatumGetByteaPP(val);
+	a->catalog_endpoint = raw == NULL ? NULL : pnstrdup(VARDATA_ANY(raw), VARSIZE_ANY_EXHDR(raw));
+	val = SPI_getbinval(tuple, desc, 16, &isnull);
+	raw = isnull ? NULL : DatumGetByteaPP(val);
+	a->catalog_prefix = raw == NULL ? NULL : pnstrdup(VARDATA_ANY(raw), VARSIZE_ANY_EXHDR(raw));
+	val = SPI_getbinval(tuple, desc, 17, &isnull);
+	raw = isnull ? NULL : DatumGetByteaPP(val);
+	a->s3_region = raw == NULL ? NULL : pnstrdup(VARDATA_ANY(raw), VARSIZE_ANY_EXHDR(raw));
+	val = SPI_getbinval(tuple, desc, 18, &isnull);
+	raw = isnull ? NULL : DatumGetByteaPP(val);
+	a->s3_endpoint = raw == NULL ? NULL : pnstrdup(VARDATA_ANY(raw), VARSIZE_ANY_EXHDR(raw));
+}
+
+static bool
+managed_read_admission_equal(const ManagedReadAdmission *a,
+							 const ManagedReadAdmission *b)
+{
+	return memcmp(&a->binding, &b->binding, sizeof(pg_uuid_t)) == 0 &&
+		a->role == b->role &&
+		a->mapping == b->mapping &&
+		a->server == b->server &&
+		memcmp(&a->incarnation, &b->incarnation, sizeof(pg_uuid_t)) == 0 &&
+		memcmp(&a->authority, &b->authority, sizeof(pg_uuid_t)) == 0 &&
+		memcmp(&a->table_uuid, &b->table_uuid, sizeof(pg_uuid_t)) == 0 &&
+		a->anchor == b->anchor &&
+		a->schema_id == b->schema_id &&
+		a->spec_id == b->spec_id &&
+		strcmp(a->target_identity, b->target_identity) == 0 &&
+		strcmp(a->storage_root, b->storage_root) == 0 &&
+		strcmp(a->catalog_endpoint, b->catalog_endpoint) == 0 &&
+		strcmp(a->catalog_prefix, b->catalog_prefix) == 0 &&
+		strcmp(a->s3_region, b->s3_region) == 0 &&
+		strcmp(a->s3_endpoint, b->s3_endpoint) == 0;
+}
+
+/*
+ * Executor admission (plan step 4): run lakehouse.admit_managed_read under
+ * the ledger owner's security context for the CHECKED role. Zero rows
+ * declines catalog-locally with the historical 0A000 message, so the
+ * pre-grant baseline keeps failing exactly as before. No origin contact.
+ */
+static void
+lakehouse_admit_managed_cut(LakehouseTableScanDesc scan)
+{
+	Oid			relid = RelationGetRelid(scan->rs_base.rs_rd);
+	Oid			reader = GetUserId();
+	Oid			owner = capture_table_owner("managed_capture_state", true);
+	Oid			user;
+	int			sec_context;
+	MemoryContext scan_context = GetMemoryChunkContext(scan);
+	bool		admitted = false;
+
+	GetUserIdAndSecContext(&user, &sec_context);
+	SPI_connect();
+	PushActiveSnapshot(GetLatestSnapshot());
+	PG_TRY();
+	{
+		Oid			argtypes[2] = {OIDOID, OIDOID};
+		Datum		args[2] = {ObjectIdGetDatum(relid), ObjectIdGetDatum(reader)};
+		int			ret;
+
+		SetUserIdAndSecContext(owner, sec_context | SECURITY_LOCAL_USERID_CHANGE |
+							   SECURITY_RESTRICTED_OPERATION);
+		ret = SPI_execute_with_args("SELECT * FROM lakehouse.admit_managed_read($1, $2)",
+									2, argtypes, args, NULL, true, 1);
+		if (ret != SPI_OK_SELECT)
+			elog(ERROR, "could not read the managed read admission");
+		if (SPI_processed == 1)
+		{
+			managed_read_admission_fill(&scan->admission,
+										SPI_tuptable->vals[0],
+										SPI_tuptable->tupdesc);
+			/* strings die with the SPI context; re-home them first */
+			managed_read_admission_copy_strings(&scan->admission, scan_context);
+			admitted = true;
+		}
+	}
+	PG_FINALLY();
+	{
+		SetUserIdAndSecContext(user, sec_context);
+	}
+	PG_END_TRY();
+	PopActiveSnapshot();
+	SPI_finish();
+
+	if (!admitted)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("bound managed capture does not support table scans")));
+}
+
+/*
+ * Demand-time managed cut (plan step 5), the joined scan:
+ *
+ * 1. observe the enrolled catalog (the ONLY catalog contact) under the
+ *    purpose=read credential of the admitted mapping;
+ * 2. fresh-proof frame (owner switch, GetLatestSnapshot): re-run the
+ *    admission and compare every field, read the certified addition chain,
+ *    and prove an unknown pending head against this observation;
+ * 3. statement frame (owner switch, the REGISTERED statement snapshot):
+ *    visible segments and payload retention;
+ * 4. select the compatible pin (pure computation);
+ * 5. verify and load the overlay payloads under the same snapshot;
+ * 6. plan the selected pin exactly (consumes the observation).
+ *
+ * Runs before the first getnextslot row: every failure below aborts the
+ * statement with zero rows served.
+ */
+static void
+install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
+{
+	Oid			relid = RelationGetRelid(scan->rs_base.rs_rd);
+	MemoryContext scan_context = GetMemoryChunkContext(scan);
+	struct ManagedReadObservation *observation;
+	PgDatalakePublicationCredentialMaterial material;
+	PgDatalakeManagedReadRequest request;
+	PgDatalakeReadStatus status;
+	char		errbuf[1024];
+	char	   *catalog_token;
+	char	   *s3_access_key;
+	char	   *s3_secret_key;
+	char	   *namespace_name;
+	char	   *table_name;
+	char	   *schema_json;
+	char	   *dot;
+	int64	   *pins;
+	int64	  **pin_members;
+	int		   *pin_member_counts;
+	bool	   *pin_known;
+	int			pin_count;
+	int64	   *visible_ids = NULL;
+	bool	   *visible_retained = NULL;
+	int			n_visible = 0;
+	int64	   *overlay_ids = NULL;
+	int			n_overlay = 0;
+	int64		cut_pin = 0;
+	bool		has_pending = false;
+	pg_uuid_t	pending_operation;
+	uint8		pending_input_digest[32];
+	uint8		pending_proposal_digest[32];
+	int64		pending_expected_parent = 0;
+	int64		pending_snapshot = 0;
+	char	   *pending_body = NULL;
+	int			pending_body_len = 0;
+	int64	   *pending_seg_ids = NULL;
+	int32	   *pending_row_counts = NULL;
+	uint8	   *pending_digests = NULL;
+	int			pending_member_count = 0;
+	int			i;
+
+	/* everything this routine builds lives and dies with the scan */
+	MemoryContextSwitchTo(scan_context);
+	scan->cut_installed = true; /* never attempt twice, even on error paths */
+
+	/* ---- 1. observe ---- */
+	lakehouse_load_publication_material(&material, scan->admission.role,
+										scan->admission.server,
+										scan->admission.mapping,
+										"read", scan_context);
+	catalog_token = managed_cred_string(&material.catalog_token);
+	s3_access_key = managed_cred_string(&material.access_key);
+	s3_secret_key = managed_cred_string(&material.secret_key);
+
+	dot = strrchr(scan->admission.target_identity, '.');
+	if (dot == NULL || dot == scan->admission.target_identity ||
+		dot[1] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("managed read admission carries a malformed table identity"),
+				 errdetail("expected <namespace>.<table>, got \"%s\"",
+						   scan->admission.target_identity)));
+	namespace_name = pnstrdup(scan->admission.target_identity,
+							  dot - scan->admission.target_identity);
+	table_name = pstrdup(dot + 1);
+
+	memset(&request, 0, sizeof(request));
+	request.binding.expected_table_uuid =
+		DatumGetCString(DirectFunctionCall1(uuid_out,
+											UUIDPGetDatum(&scan->admission.table_uuid)));
+	request.binding.storage_root = scan->admission.storage_root;
+	request.binding.catalog_prefix = scan->admission.catalog_prefix;
+	request.binding.s3_region = scan->admission.s3_region;
+	request.catalog_endpoint = scan->admission.catalog_endpoint;
+	request.catalog_token = catalog_token;
+	request.namespace_ = namespace_name;
+	request.table = table_name;
+	request.s3_endpoint = scan->admission.s3_endpoint;
+	request.s3_access_key = s3_access_key;
+	request.s3_secret_key = s3_secret_key;
+	memcpy(request.authority_id, &scan->admission.authority, 16);
+	memcpy(request.incarnation_id, &scan->admission.incarnation, 16);
+	request.anchor_snapshot_id = scan->admission.anchor;
+	request.enrolled_schema_id = scan->admission.schema_id;
+
+	errbuf[0] = '\0';
+	observation = pg_datalake_managed_read_observe(&request, &status,
+												   errbuf, sizeof(errbuf));
+	if (observation == NULL)
+		managed_read_status_error(status, errbuf,
+								  "managed read could not observe the enrolled catalog");
+	scan->read_observation = observation;
+
+	pin_count = (int) pg_datalake_managed_read_pin_count(observation);
+	if (pin_count < 1 || pin_count > MANAGED_READ_MAX_PINS)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("managed read certified ancestry is empty")));
+	pins = palloc(sizeof(int64) * pin_count);
+	pin_members = palloc0(sizeof(int64 *) * pin_count);
+	pin_member_counts = palloc0(sizeof(int) * pin_count);
+	pin_known = palloc0(sizeof(bool) * pin_count);
+	for (i = 0; i < pin_count; i++)
+	{
+		pins[i] = pg_datalake_managed_read_pin_at(observation, i);
+		if (pins[i] <= 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("managed read certified ancestry is malformed")));
+	}
+
+	/* ---- 2. fresh-proof frame ---- */
+	{
+		Oid			owner = capture_table_owner("managed_capture_state", true);
+		Oid			reader = GetUserId();
+		Oid			user;
+		int			sec_context;
+
+		GetUserIdAndSecContext(&user, &sec_context);
+		SPI_connect();
+		PushActiveSnapshot(GetLatestSnapshot());
+		PG_TRY();
+		{
+			ManagedReadAdmission fresh;
+			Oid			argtypes[4];
+			Datum		args[4];
+			int			ret;
+
+			SetUserIdAndSecContext(owner, sec_context | SECURITY_LOCAL_USERID_CHANGE |
+								   SECURITY_RESTRICTED_OPERATION);
+
+			/* admission recheck: every field must still match */
+			argtypes[0] = OIDOID;
+			argtypes[1] = OIDOID;
+			args[0] = ObjectIdGetDatum(relid);
+			args[1] = ObjectIdGetDatum(reader);
+			ret = SPI_execute_with_args("SELECT * FROM lakehouse.admit_managed_read($1, $2)",
+										2, argtypes, args, NULL, true, 1);
+			if (ret != SPI_OK_SELECT)
+				elog(ERROR, "could not re-read the managed read admission");
+			if (SPI_processed != 1)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("managed read admission changed under the scan")));
+			managed_read_admission_fill(&fresh, SPI_tuptable->vals[0],
+										SPI_tuptable->tupdesc);
+			if (!managed_read_admission_equal(&fresh, &scan->admission))
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("managed read admission changed under the scan")));
+
+			/* certified addition chain, newest-first in pins[] order */
+			{
+				int64	   *cumulative = palloc(sizeof(int64) * MANAGED_READ_MAX_MEMBERS);
+				int			cumulative_len = 0;
+				ArrayType  *pin_array = construct_array_builtin((Datum *) pins, pin_count,
+																INT8OID);
+
+				argtypes[0] = OIDOID;
+				argtypes[1] = UUIDOID;
+				argtypes[2] = INT8ARRAYOID;
+				args[0] = ObjectIdGetDatum(relid);
+				args[1] = UUIDPGetDatum(&scan->admission.binding);
+				args[2] = PointerGetDatum(pin_array);
+				ret = SPI_execute_with_args(
+											"SELECT snapshot_id, additions FROM"
+											" lakehouse.get_managed_read_additions($1, $2, $3)",
+											3, argtypes, args, NULL, true, 0);
+				if (ret != SPI_OK_SELECT || SPI_processed != pin_count)
+					elog(ERROR, "could not read the managed read additions");
+
+				/*
+				 * Rows return anchor-first; pins[] is newest-first. A NULL
+				 * additions marks an unknown edge and every descendant.
+				 */
+				for (int r = 0; r < SPI_processed; r++)
+				{
+					int			p = pin_count - 1 - r;
+					bool		isnull;
+					Datum		additions = SPI_getbinval(SPI_tuptable->vals[r],
+														  SPI_tuptable->tupdesc,
+														  2, &isnull);
+
+					if (!isnull)
+					{
+						Datum	   *ids;
+						bool	   *nulls;
+						int			n;
+
+						deconstruct_array_builtin(DatumGetArrayTypeP(additions),
+												  INT8OID, &ids, &nulls, &n);
+						for (int k = 0; k < n; k++)
+						{
+							int64		id = DatumGetInt64(ids[k]);
+
+							if (nulls[k] || id <= 0 ||
+								cumulative_len >= MANAGED_READ_MAX_MEMBERS)
+								ereport(ERROR,
+										(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+										 errmsg("managed read membership chain is malformed")));
+							for (int c = 0; c < cumulative_len; c++)
+								if (cumulative[c] == id)
+									ereport(ERROR,
+											(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+											 errmsg("managed read membership chain repeats a segment")));
+							cumulative[cumulative_len++] = id;
+						}
+						pin_known[p] = true;
+						pin_members[p] = palloc(sizeof(int64) * cumulative_len);
+						memcpy(pin_members[p], cumulative,
+							   sizeof(int64) * cumulative_len);
+						pin_member_counts[p] = cumulative_len;
+					}
+				}
+			}
+
+			/* prove the pending head when its edge is unknown */
+			if (!pin_known[0] && pin_count >= 2 && pin_known[1])
+			{
+				argtypes[0] = OIDOID;
+				argtypes[1] = UUIDOID;
+				argtypes[2] = INT8OID;
+				argtypes[3] = INT8OID;
+				args[0] = ObjectIdGetDatum(relid);
+				args[1] = UUIDPGetDatum(&scan->admission.binding);
+				args[2] = Int64GetDatum(pins[0]);
+				args[3] = Int64GetDatum(pins[1]);
+				ret = SPI_execute_with_args(
+											"SELECT (value->>'operation_id')::uuid,"
+											" decode(value->>'input_digest', 'hex'),"
+											" (value->>'expected_parent')::bigint,"
+											" (value->>'snapshot_id')::bigint,"
+											" decode(value->>'proposal_digest', 'hex'),"
+											" decode(value->>'proposal_body', 'hex'),"
+											" value->'members'"
+											" FROM (SELECT lakehouse.get_managed_read_pending_head($1, $2, $3, $4)"
+											" AS value) q",
+											4, argtypes, args, NULL, true, 1);
+				if (ret != SPI_OK_SELECT)
+					elog(ERROR, "could not read the managed pending head");
+				if (SPI_processed == 1)
+				{
+					bool		isnull;
+					Datum		val;
+					bytea	   *raw;
+					Datum		members;
+
+					val = SPI_getbinval(SPI_tuptable->vals[0],
+										SPI_tuptable->tupdesc, 1, &isnull);
+					if (!isnull)
+					{
+						memcpy(&pending_operation, DatumGetUUIDP(val),
+							   sizeof(pg_uuid_t));
+						val = SPI_getbinval(SPI_tuptable->vals[0],
+											SPI_tuptable->tupdesc, 2, &isnull);
+						raw = isnull ? NULL : DatumGetByteaPP(val);
+						if (raw == NULL || VARSIZE_ANY_EXHDR(raw) != 32)
+							ereport(ERROR,
+									(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+									 errmsg("managed pending head carries a malformed input digest")));
+						memcpy(pending_input_digest, VARDATA_ANY(raw), 32);
+						val = SPI_getbinval(SPI_tuptable->vals[0],
+											SPI_tuptable->tupdesc, 3, &isnull);
+						pending_expected_parent = DatumGetInt64(val);
+						val = SPI_getbinval(SPI_tuptable->vals[0],
+											SPI_tuptable->tupdesc, 4, &isnull);
+						pending_snapshot = DatumGetInt64(val);
+						val = SPI_getbinval(SPI_tuptable->vals[0],
+											SPI_tuptable->tupdesc, 5, &isnull);
+						raw = isnull ? NULL : DatumGetByteaPP(val);
+						if (raw == NULL || VARSIZE_ANY_EXHDR(raw) != 32)
+							ereport(ERROR,
+									(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+									 errmsg("managed pending head carries a malformed proposal digest")));
+						memcpy(pending_proposal_digest, VARDATA_ANY(raw), 32);
+						val = SPI_getbinval(SPI_tuptable->vals[0],
+											SPI_tuptable->tupdesc, 6, &isnull);
+						if (isnull)
+							ereport(ERROR,
+									(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+									 errmsg("managed pending head lost its proposal body")));
+						raw = DatumGetByteaPP(val);
+						pending_body_len = VARSIZE_ANY_EXHDR(raw);
+						pending_body = palloc(pending_body_len + 1);
+						memcpy(pending_body, VARDATA_ANY(raw), pending_body_len);
+						pending_body[pending_body_len] = '\0';
+						members = SPI_getbinval(SPI_tuptable->vals[0],
+												SPI_tuptable->tupdesc, 7, &isnull);
+						if (isnull)
+							ereport(ERROR,
+									(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+									 errmsg("managed pending head lost its members")));
+						{
+							Oid			mtypes[1] = {JSONBOID};
+							Datum		margs[1] = {members};
+							int			mret;
+
+							mret = SPI_execute_with_args(
+														 "SELECT (m->>'segment_id')::bigint,"
+														 " (m->>'row_count')::integer,"
+														 " decode(m->>'payload_digest', 'hex')"
+														 " FROM jsonb_array_elements($1) m",
+														 1, mtypes, margs, NULL, true, 0);
+							if (mret != SPI_OK_SELECT || SPI_processed < 1)
+								ereport(ERROR,
+										(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+										 errmsg("managed pending head carries no members")));
+							pending_member_count = (int) SPI_processed;
+							pending_seg_ids = palloc(sizeof(int64) * pending_member_count);
+							pending_row_counts = palloc(sizeof(int32) * pending_member_count);
+							pending_digests = palloc(32 * pending_member_count);
+							for (int m = 0; m < pending_member_count; m++)
+							{
+								bytea	   *digest;
+
+								val = SPI_getbinval(SPI_tuptable->vals[m],
+													SPI_tuptable->tupdesc, 1, &isnull);
+								pending_seg_ids[m] = DatumGetInt64(val);
+								val = SPI_getbinval(SPI_tuptable->vals[m],
+													SPI_tuptable->tupdesc, 2, &isnull);
+								pending_row_counts[m] = DatumGetInt32(val);
+								val = SPI_getbinval(SPI_tuptable->vals[m],
+													SPI_tuptable->tupdesc, 3, &isnull);
+								digest = isnull ? NULL : DatumGetByteaPP(val);
+								if (digest == NULL || VARSIZE_ANY_EXHDR(digest) != 32)
+									ereport(ERROR,
+											(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+											 errmsg("managed pending head member carries a malformed digest")));
+								memcpy(pending_digests + 32 * m,
+									   VARDATA_ANY(digest), 32);
+							}
+							has_pending = true;
+						}
+					}
+				}
+			}
+		}
+		PG_FINALLY();
+		{
+			SetUserIdAndSecContext(user, sec_context);
+		}
+		PG_END_TRY();
+		PopActiveSnapshot();
+		SPI_finish();
+	}
+
+	/* pending-head proof: the observation's own metadata (origin contact) */
+	if (has_pending)
+	{
+		PgDatalakeManagedPendingProof proof;
+		PgDatalakeManagedPendingMember *members =
+			palloc(sizeof(PgDatalakeManagedPendingMember) * pending_member_count);
+		int64	   *included = palloc(sizeof(int64) * MANAGED_READ_MAX_MEMBERS);
+		uintptr_t	n_included;
+
+		for (int m = 0; m < pending_member_count; m++)
+		{
+			members[m].segment_id = pending_seg_ids[m];
+			members[m].row_count = pending_row_counts[m];
+			memcpy(members[m].payload_digest, pending_digests + 32 * m, 32);
+		}
+		memset(&proof, 0, sizeof(proof));
+		proof.parent_pin = pins[1];
+		proof.parent_members = pin_members[1];
+		proof.parent_member_count = pin_member_counts[1];
+		proof.schema_id = scan->admission.schema_id;
+		proof.spec_id = scan->admission.spec_id;
+		memcpy(proof.operation_id, &pending_operation, 16);
+		memcpy(proof.input_digest, pending_input_digest, 32);
+		proof.expected_parent = pending_expected_parent;
+		proof.snapshot_id = pending_snapshot;
+		memcpy(proof.request_digest, pending_proposal_digest, 32);
+		proof.request_body = (const uint8 *) pending_body;
+		proof.request_body_len = pending_body_len;
+		proof.members = members;
+		proof.member_count = pending_member_count;
+		proof.s3_endpoint = scan->admission.s3_endpoint;
+		proof.s3_access_key = s3_access_key;
+		proof.s3_secret_key = s3_secret_key;
+		proof.s3_region = scan->admission.s3_region;
+
+		errbuf[0] = '\0';
+		n_included = pg_datalake_managed_read_prove_pending(observation, &proof,
+															included,
+															MANAGED_READ_MAX_MEMBERS,
+															&status, errbuf,
+															sizeof(errbuf));
+		if (status != ReadOk)
+			managed_read_status_error(status, errbuf,
+									  "managed read could not prove the pending head");
+		if (n_included > 0)
+		{
+			pin_known[0] = true;
+			pin_members[0] = palloc(sizeof(int64) * n_included);
+			memcpy(pin_members[0], included, sizeof(int64) * n_included);
+			pin_member_counts[0] = (int) n_included;
+		}
+	}
+
+	/* ---- 3. statement frame: visible segments + retention ---- */
+	{
+		Oid			owner = capture_table_owner("managed_capture_state", true);
+		Oid			user;
+		int			sec_context;
+
+		GetUserIdAndSecContext(&user, &sec_context);
+		SPI_connect();
+		PushActiveSnapshot(scan->rs_base.rs_snapshot);
+		PG_TRY();
+		{
+			Oid			argtypes[2] = {OIDOID, UUIDOID};
+			Datum		args[2] = {ObjectIdGetDatum(relid),
+				UUIDPGetDatum(&scan->admission.binding)
+			};
+			int			ret;
+			int			retention_pos = 0;
+
+			SetUserIdAndSecContext(owner, sec_context | SECURITY_LOCAL_USERID_CHANGE |
+								   SECURITY_RESTRICTED_OPERATION);
+			ret = SPI_execute_with_args(
+										"SELECT segment_id FROM lakehouse.get_managed_read_visible_segments($1, $2)",
+										2, argtypes, args, NULL, true, 0);
+			if (ret != SPI_OK_SELECT)
+				elog(ERROR, "could not read the managed read visible segments");
+			if (SPI_processed > 0)
+			{
+				visible_ids = palloc(sizeof(int64) * SPI_processed);
+				visible_retained = palloc(sizeof(bool) * SPI_processed);
+				for (int v = 0; v < SPI_processed; v++)
+				{
+					bool		isnull;
+
+					visible_ids[v] = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[v],
+																 SPI_tuptable->tupdesc,
+																 1, &isnull));
+					visible_retained[v] = false;
+				}
+				n_visible = (int) SPI_processed;
+			}
+
+			/* merge retention flags (both sides ordered by seg_id) */
+			ret = SPI_execute_with_args(
+										"SELECT segment_id, payload_retained FROM"
+										" lakehouse.get_managed_read_segment_retention($1, $2)",
+										2, argtypes, args, NULL, true, 0);
+			if (ret != SPI_OK_SELECT)
+				elog(ERROR, "could not read the managed read segment retention");
+			for (int v = 0; v < n_visible; v++)
+			{
+				while (retention_pos < SPI_processed &&
+					   DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[retention_pos],
+												   SPI_tuptable->tupdesc, 1,
+												   NULL)) < visible_ids[v])
+					retention_pos++;
+				if (retention_pos < SPI_processed)
+				{
+					bool		isnull;
+					Datum		id = SPI_getbinval(SPI_tuptable->vals[retention_pos],
+												   SPI_tuptable->tupdesc, 1,
+												   &isnull);
+					Datum		kept = SPI_getbinval(SPI_tuptable->vals[retention_pos],
+													 SPI_tuptable->tupdesc, 2,
+													 &isnull);
+
+					if (!isnull && DatumGetInt64(id) == visible_ids[v])
+						visible_retained[v] = DatumGetBool(kept);
+				}
+			}
+		}
+		PG_FINALLY();
+		{
+			SetUserIdAndSecContext(user, sec_context);
+		}
+		PG_END_TRY();
+		PopActiveSnapshot();
+		SPI_finish();
+	}
+
+	/* ---- 4. select the compatible cut (pure) ---- */
+	{
+		PgDatalakeManagedCutCandidate *candidates =
+			palloc(sizeof(PgDatalakeManagedCutCandidate) * pin_count);
+
+		for (i = 0; i < pin_count; i++)
+		{
+			candidates[i].pin = pins[i];
+			candidates[i].membership = pin_known[i] ? 1 : 0;
+			candidates[i].members = pin_members[i];
+			candidates[i].member_count = pin_member_counts[i];
+		}
+		overlay_ids = palloc(sizeof(int64) * MANAGED_READ_MAX_OVERLAY);
+		errbuf[0] = '\0';
+		n_overlay = (int) pg_datalake_managed_read_select_cut(observation,
+															  candidates,
+															  pin_count,
+															  visible_ids,
+															  (const uint8 *) visible_retained,
+															  n_visible,
+															  &cut_pin,
+															  overlay_ids,
+															  MANAGED_READ_MAX_OVERLAY,
+															  &status, errbuf,
+															  sizeof(errbuf));
+		if (status != ReadOk)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("managed read found no compatible snapshot"),
+					 errdetail("%s", errbuf[0] != '\0' ? errbuf :
+							   "no certified pin is consistent with the visible ledger")));
+		scan->cut_pin = cut_pin;
+		scan->cut_overlay_ids = palloc(sizeof(int64) * n_overlay);
+		memcpy(scan->cut_overlay_ids, overlay_ids, sizeof(int64) * n_overlay);
+		scan->n_cut_overlay = n_overlay;
+	}
+
+	/* ---- 5. verify + load the overlay payloads (statement snapshot) ---- */
+	schema_json = lakehouse_build_schema_json(tupdesc);
+	if (n_overlay > 0)
+	{
+		/*
+		 * select_cut returns ascending IDs; enforce the loader's strict order
+		 * defensively before building the SQL array.
+		 */
+		for (i = 1; i < n_overlay; i++)
+			if (overlay_ids[i] <= overlay_ids[i - 1])
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("managed read overlay selection is unordered")));
+		{
+			Oid			owner = capture_table_owner("managed_capture_state", true);
+			Oid			user;
+			int			sec_context;
+
+			GetUserIdAndSecContext(&user, &sec_context);
+			SPI_connect();
+			PushActiveSnapshot(scan->rs_base.rs_snapshot);
+			PG_TRY();
+			{
+				ArrayType  *id_array = construct_array_builtin((Datum *) overlay_ids,
+															   n_overlay, INT8OID);
+				Oid			argtypes[3] = {OIDOID, UUIDOID, INT8ARRAYOID};
+				Datum		args[3] = {ObjectIdGetDatum(relid),
+					UUIDPGetDatum(&scan->admission.binding),
+					PointerGetDatum(id_array)
+				};
+				int			ret;
+
+				SetUserIdAndSecContext(owner, sec_context | SECURITY_LOCAL_USERID_CHANGE |
+									   SECURITY_RESTRICTED_OPERATION);
+				ret = SPI_execute_with_args(
+											"SELECT segment_id, payload_digest, payload, sha256(payload)"
+											" FROM lakehouse.load_managed_read_overlay($1, $2, $3, 65536, 8388608)",
+											3, argtypes, args, NULL, true, 0);
+				if (ret != SPI_OK_SELECT || SPI_processed != n_overlay)
+					ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("managed read overlay payload is unavailable in this snapshot")));
+				for (int o = 0; o < SPI_processed; o++)
+				{
+					bool		isnull;
+					Datum		val;
+					bytea	   *digest;
+					bytea	   *computed;
+					bytea	   *payload;
+					DeltaRowsHandle *rows;
+					int64		seg_id;
+
+					seg_id = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[o],
+														 SPI_tuptable->tupdesc,
+														 1, &isnull));
+					if (seg_id != overlay_ids[o])
+						ereport(ERROR,
+								(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+								 errmsg("managed read overlay returned unexpected segments")));
+					val = SPI_getbinval(SPI_tuptable->vals[o],
+										SPI_tuptable->tupdesc, 2, &isnull);
+					digest = isnull ? NULL : DatumGetByteaPP(val);
+					val = SPI_getbinval(SPI_tuptable->vals[o],
+										SPI_tuptable->tupdesc, 3, &isnull);
+					payload = isnull ? NULL : DatumGetByteaPP(val);
+					val = SPI_getbinval(SPI_tuptable->vals[o],
+										SPI_tuptable->tupdesc, 4, &isnull);
+					computed = isnull ? NULL : DatumGetByteaPP(val);
+					/* verify the sealed payload BEFORE it becomes rows */
+					if (digest == NULL || payload == NULL || computed == NULL ||
+						VARSIZE_ANY_EXHDR(digest) != 32 ||
+						VARSIZE_ANY_EXHDR(computed) != 32 ||
+						memcmp(VARDATA_ANY(digest), VARDATA_ANY(computed), 32) != 0)
+						ereport(ERROR,
+								(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+								 errmsg("managed read overlay payload digest mismatch"),
+								 errdetail("segment %lld failed its sealed payload verification",
+										   (long long) seg_id)));
+					rows = pg_datalake_delta_rows_open(TextDatumGetCString(PointerGetDatum(payload)),
+													   schema_json, NULL, 0);
+					if (rows == NULL)
+						ereport(ERROR,
+								(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+								 errmsg("managed read overlay payload could not be decoded")));
+					if (scan->n_delta == 0)
+						scan->delta_rows = palloc(sizeof(DeltaRowsHandle *));
+					else
+						scan->delta_rows = repalloc(scan->delta_rows,
+													sizeof(DeltaRowsHandle *) *
+													(scan->n_delta + 1));
+					scan->delta_rows[scan->n_delta++] = rows;
+				}
+			}
+			PG_FINALLY();
+			{
+				SetUserIdAndSecContext(user, sec_context);
+			}
+			PG_END_TRY();
+			PopActiveSnapshot();
+			SPI_finish();
+		}
+		scan->delta_loaded = true;
+		scan->delta_pos = 0;
+	}
+
+	/* ---- 6. plan the selected pin exactly (consumes the observation) ---- */
+	errbuf[0] = '\0';
+	scan->session = pg_datalake_managed_read_plan_exact(&scan->read_observation,
+														scan->cut_pin, &status,
+														errbuf, sizeof(errbuf));
+	if (scan->session == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("managed read could not plan the selected pin"),
+				 errdetail("%s", errbuf[0] != '\0' ? errbuf :
+						   "the selected snapshot failed its schema proof")));
+	scan->task_count = pg_datalake_scan_task_count(scan->session);
+	scan->rows = NULL;
+	scan->current_task = 0;
+
+	/* backend-local evidence for the fixture drill and operator debugging */
+	{
+		StringInfoData ev;
+
+		initStringInfo(&ev);
+		appendStringInfo(&ev, "{\"pin\": %lld, \"overlay\": [",
+						 (long long) scan->cut_pin);
+		for (i = 0; i < scan->n_cut_overlay; i++)
+			appendStringInfo(&ev, "%s%lld", i > 0 ? ", " : "",
+							 (long long) scan->cut_overlay_ids[i]);
+		appendStringInfoString(&ev, "]}");
+		if (managed_cut_evidence != NULL)
+			pfree(managed_cut_evidence);
+		managed_cut_evidence = MemoryContextStrdup(TopMemoryContext, ev.data);
+	}
+
+	MemoryContextSwitchTo(scan_context);
+}
+
+/*
+ * Read the last installed cut of THIS backend. NULL before the first
+ * demand-time install of a bound managed scan.
+ */
+PG_FUNCTION_INFO_V1(lakehouse_managed_read_cut_evidence);
+
+Datum
+lakehouse_managed_read_cut_evidence(PG_FUNCTION_ARGS)
+{
+	if (managed_cut_evidence == NULL)
+		PG_RETURN_NULL();
+	PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in,
+										CStringGetDatum(managed_cut_evidence)));
+}
+
 /*
  * Own-writes overlay: copy the tuple into the txn-scoped entry. Rows are
  * NOT pushed to the Rust writer here — staging is C-side only; rows
@@ -2390,7 +3368,7 @@ stage_slot(LakehouseWriteEntry *entry, TupleTableSlot *slot, TupleDesc tupdesc)
 
 /* The raw COW rewrite and UPDATE's row-version fetch both need a delete-free base. */
 static void
-check_cow_scan(ScanSession *session)
+check_cow_scan(ScanSession * session)
 {
 	if (pg_datalake_scan_has_deletes(session))
 		ereport(ERROR,
