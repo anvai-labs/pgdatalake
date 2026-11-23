@@ -233,7 +233,7 @@ def run(db, namespace, data, worker, reply_loss, capture_adapter, admitted_trans
                 if admitted_transport:
                     prefix = route.split("/namespaces/", 1)[0].removeprefix("/catalog/v1").lstrip("/")
                     sql(db, f"""
-                        ALTER EXTENSION lakehouse UPDATE TO '1.8';
+                        ALTER EXTENSION lakehouse UPDATE TO '1.10';
                         SELECT lakehouse.grant_publication_send('{binding}', '{prefix}', 'us-east-1');
                     """)
 
@@ -456,7 +456,7 @@ def main():
     parser.add_argument("--capture-adapter", type=Path,
                         help="use ordinary TableAM INSERT with the managed capture fixture adapter")
     parser.add_argument("--admitted-transport", action="store_true",
-                        help="use the durable 1.8 claim and enrolled publisher transport")
+                        help="use the 1.10 managed ledger adapter and enrolled publisher transport")
     args = parser.parse_args()
     if args.admitted_transport and args.capture_adapter is None:
         parser.error("--admitted-transport requires --capture-adapter")
