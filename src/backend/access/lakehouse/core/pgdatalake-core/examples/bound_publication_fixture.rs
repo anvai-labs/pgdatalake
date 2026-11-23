@@ -19,9 +19,12 @@ use pgdatalake_core::{
         rest::{RestCatalog, RestError, StaticToken},
     },
     parquet::CellValue,
+    publication_credentials::{
+        PublicationCredentialError, PublicationCredentialGrant, PublicationCredentialMaterial,
+        PublicationCredentialResolver,
+    },
     publication_transport::{
-        PublicationCredentials, PublicationLimits, PublicationPurpose, PublicationTarget,
-        ScopedPublisher,
+        PublicationLimits, PublicationPurpose, PublicationTarget, ScopedPublisher,
     },
     publication_worker::{
         drive_publication, reconcile_publication, CapturedMember, ClaimState, LedgerResult,
@@ -47,6 +50,7 @@ struct Fixture {
     admitted_transport: bool,
     #[serde(default)]
     lookup_only: bool,
+    approved_target: Option<BindingDescriptor>,
     #[serde(flatten)]
     legacy: Option<LegacyTarget>,
 }
@@ -94,6 +98,25 @@ struct BindingDescriptor {
     table_name: String,
     object_endpoint: String,
     s3_region: String,
+}
+
+impl From<BindingDescriptor> for PublicationTarget {
+    fn from(descriptor: BindingDescriptor) -> Self {
+        Self {
+            binding: descriptor.identity.into(),
+            table_uuid: descriptor.table_uuid,
+            table_root: descriptor.storage_root,
+            schema_id: descriptor.schema_id,
+            spec_id: descriptor.spec_id,
+            ref_name: descriptor.ref_name,
+            catalog_endpoint: descriptor.catalog_endpoint,
+            catalog_prefix: descriptor.catalog_prefix,
+            namespace: descriptor.namespace_components,
+            table_name: descriptor.table_name,
+            object_endpoint: descriptor.object_endpoint,
+            s3_region: descriptor.s3_region,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -335,6 +358,7 @@ struct FixtureCatalog<'a> {
     target: &'a Fixture,
     writer: Option<CatalogClient>,
     scoped: OnceCell<ScopedPublisher>,
+    resolver: Option<PublicationCredentialResolver>,
 }
 
 impl FixtureCatalog<'_> {
@@ -344,43 +368,12 @@ impl FixtureCatalog<'_> {
         purpose: PublicationPurpose,
     ) -> FixtureResult<ScopedPublisher> {
         let descriptor: BindingDescriptor = serde_json::from_str(&self.target.sql(query)?)?;
-        // The live fixture uses different read and write principals. Both
-        // are disposable SeaweedFS users configured by the test profile.
-        let (bearer, key, secret) = match purpose {
-            PublicationPurpose::Send => {
-                ("fixture-send", "lakehouse-test", "lakehouse-test-password")
-            }
-            PublicationPurpose::Lookup => (
-                "fixture-lookup",
-                "lakehouse-reader",
-                "lakehouse-reader-password",
-            ),
-        };
-        let target = PublicationTarget {
-            binding: descriptor.identity.into(),
-            table_uuid: descriptor.table_uuid,
-            table_root: descriptor.storage_root,
-            schema_id: descriptor.schema_id,
-            spec_id: descriptor.spec_id,
-            ref_name: descriptor.ref_name,
-            catalog_endpoint: descriptor.catalog_endpoint,
-            catalog_prefix: descriptor.catalog_prefix,
-            namespace: descriptor.namespace_components,
-            table_name: descriptor.table_name,
-            object_endpoint: descriptor.object_endpoint,
-            s3_region: descriptor.s3_region,
-        };
-        let credentials = PublicationCredentials {
-            target: target.clone(),
-            purpose,
-            expires_at: std::time::SystemTime::now() + Duration::from_secs(60),
-            catalog_bearer: bearer.into(),
-            objects: object_store::aws::AwsCredential {
-                key_id: key.into(),
-                secret_key: secret.into(),
-                token: None,
-            },
-        };
+        let target = descriptor.into();
+        let credentials = self
+            .resolver
+            .as_ref()
+            .ok_or("fixture needs independent credential approval")?
+            .resolve(&target, purpose, issue_fixture_credentials)?;
         Ok(ScopedPublisher::new(
             target,
             purpose,
@@ -512,11 +505,69 @@ impl PublicationCatalog for FixtureCatalog<'_> {
     }
 }
 
+fn issue_fixture_credentials(
+    grant: &PublicationCredentialGrant,
+) -> Result<PublicationCredentialMaterial, PublicationCredentialError> {
+    let (bearer, key, secret) = match (
+        grant.catalog_credential_ref.as_str(),
+        grant.object_credential_ref.as_str(),
+    ) {
+        ("fixture-send", "lakehouse-test") => {
+            ("fixture-send", "lakehouse-test", "lakehouse-test-password")
+        }
+        ("fixture-lookup", "lakehouse-reader") => (
+            "fixture-lookup",
+            "lakehouse-reader",
+            "lakehouse-reader-password",
+        ),
+        _ => return Err(PublicationCredentialError::Unavailable),
+    };
+    let expires_at = std::time::SystemTime::now() + Duration::from_secs(60);
+    Ok(PublicationCredentialMaterial {
+        catalog_bearer: bearer.into(),
+        catalog_expires_at: expires_at,
+        objects: object_store::aws::AwsCredential {
+            key_id: key.into(),
+            secret_key: secret.into(),
+            token: None,
+        },
+        object_expires_at: expires_at,
+    })
+}
+
 fn main() -> FixtureResult<()> {
-    let fixture: Fixture = serde_json::from_reader(io::stdin().lock())?;
+    let mut fixture: Fixture = serde_json::from_reader(io::stdin().lock())?;
     let s3 = s3_options();
+    let resolver = if fixture.admitted_transport {
+        let target: PublicationTarget = fixture
+            .approved_target
+            .take()
+            .ok_or("admitted test worker requires an independent approved target")?
+            .into();
+        let expires_at = std::time::SystemTime::now() + Duration::from_secs(90);
+        Some(PublicationCredentialResolver::new(
+            [
+                (PublicationPurpose::Send, "fixture-send", "lakehouse-test"),
+                (
+                    PublicationPurpose::Lookup,
+                    "fixture-lookup",
+                    "lakehouse-reader",
+                ),
+            ]
+            .map(|(purpose, catalog, objects)| PublicationCredentialGrant {
+                target: target.clone(),
+                purpose,
+                catalog_credential_ref: catalog.into(),
+                object_credential_ref: objects.into(),
+                expires_at,
+            }),
+        )?)
+    } else {
+        None
+    };
     let catalog = FixtureCatalog {
         target: &fixture,
+        resolver,
         scoped: OnceCell::new(),
         writer: if fixture.admitted_transport || fixture.lookup_only {
             None
