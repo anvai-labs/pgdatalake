@@ -52,7 +52,7 @@ then made one accepted catalog POST. A separately signed Lookup recovered
 the exact intent across restart and Trino read `[10,20,20]` at
 `4744071831784341871`. The later `[30]` stayed staged. Source and intent
 WAL were `0/02A60118` and `0/02A62448` in that local sample.
-[Credential adapter](modules/04b-scoped-send-admission.md#native-session-credential-mappings)
+[Credential adapter](modules/04b-scoped-send-admission.md#native-session-credential-adapter)
 
 ### Next managed visibility join
 
