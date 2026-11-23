@@ -142,10 +142,9 @@ def verified_membership(db, operation):
     return json.loads(document)
 
 
-def run_worker(worker, db, operation, approval, *, lookup_only=False, error=None,
-               member_byte_budget=None):
+def run_worker(worker, db, operation, approval, hint, *, error=None, member_byte_budget=None):
     request = {"database": db, "operation_id": operation, "admitted_transport": True,
-               "lookup_only": lookup_only, "approved_target": approval,
+               "dispatch_hint": hint, "approved_target": approval,
                "member_byte_budget": member_byte_budget}
     result = subprocess.run([worker], input=json.dumps(request), timeout=35, text=True, capture_output=True)
     if error:
@@ -224,18 +223,29 @@ def check_visibility(db, role, owner, worker, approval, base, history, gateway):
         candidates = sql(db, "SELECT segment_id, binding_id, eligible FROM "
                          "lakehouse.discover_managed_publication_segments(NULL, 16) ORDER BY segment_id")
         assert candidates == f"{first_id}|{binding}|t\n{late_id}|{binding}|t", candidates
-        discover = ("SELECT operation_id, binding_id, mode FROM "
-                    "lakehouse.discover_managed_publication_claims(NULL, 16)")
+        def discover(mode):
+            row = sql(db, "SELECT row_to_json(c) FROM lakehouse.discover_managed_publication_claims(NULL, 16) c")
+            if mode is None:
+                assert not row, row
+                return None
+            hint = json.loads(row)
+            assert (hint["operation_id"], hint["binding_id"], hint["mode"]) == (operation, binding, mode), hint
+            return hint
+
         sql(db, f"SELECT lakehouse.claim_managed_publication('{operation}', ARRAY[{first_id},{late_id}]::bigint[])")
-        assert sql(db, discover) == f"{operation}|{binding}|send"
-        run_worker(worker, db, operation, approval, member_byte_budget=1,
+        old_hint = discover("send")
+        run_worker(worker, db, operation, approval, old_hint, member_byte_budget=1,
                    error="managed publication exceeds its member budget")
+        hint = discover("send")
+        assert hint["owner_generation"] > old_hint["owner_generation"], (hint, old_hint)
+        assert run_worker(worker, db, operation, approval, old_hint) == "rediscover"
+        assert discover("send") == hint, "stale send wake advanced the owner"
         assert not posts and not lookups
         run_worker(worker, db, operation, approval | {"storage_root": root.rstrip("/") + "-wrong"},
-                   error="publication credentials lack matching approval")
+                   hint, error="publication credentials lack matching approval")
         assert not posts and not lookups
         assert sql(db, f"SELECT count(*) FROM lakehouse.publication_attempts WHERE operation_id='{operation}'") == "0"
-        assert run_worker(worker, db, operation, approval) == "hold dispatch_unknown"
+        assert run_worker(worker, db, operation, approval, discover("send")) == "hold dispatch_unknown"
         assert len(posts) == 1 and 200 <= posts[0][0] < 300
         child = trino(history)
         assert child != parent
@@ -251,18 +261,21 @@ def check_visibility(db, role, owner, worker, approval, base, history, gateway):
         snapshot = next(s for s in head["snapshots"] if str(s["snapshot-id"]) == child)
         assert head["table-uuid"] == table and str(snapshot["parent-snapshot-id"]) == parent
         assert ledger_snapshot(fresh)[1] == fresh_view[1]
-        assert sql(db, discover) == f"{operation}|{binding}|lookup"
+        lookup_hint = discover("lookup")
+        assert run_worker(worker, db, operation, approval, lookup_hint | {"mode": "send"}) == "rediscover"
+        assert discover("lookup") == lookup_hint and len(posts) == len(lookups) == 1
 
-        assert run_worker(worker, db, operation, approval, lookup_only=True) == f"verified {child} 2"
+        assert run_worker(worker, db, operation, approval, lookup_hint) == f"verified {child} 2"
         receipt = verified_membership(db, operation)
         assert receipt == {"pin": child, "binding": binding, "source": list(source),
                            "members": [first_id, late_id]}, receipt
         assert len(posts) == 1
         assert lookups == [(route, "Bearer fixture-send"), (route, "Bearer fixture-lookup")], lookups
-        assert sql(db, discover) == ""
+        discover(None)
         print(json.dumps({"case": "verified-worker-cut", "parent": parent, "pin": child,
                           "operation": operation, "members": receipt["members"],
                           "catalog_posts": len(posts), "catalog_gets": len(lookups),
+                          "stale_wake_catalog_requests": 0, "wrong_mode_catalog_requests": 0,
                           "wrong_approval_catalog_requests": 0, "overbudget_catalog_requests": 0}, sort_keys=True),
               flush=True)
         published = certify(tuple(receipt["source"]), receipt["pin"], set(receipt["members"]),
