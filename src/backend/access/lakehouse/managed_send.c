@@ -17,19 +17,23 @@
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
+#include "portability/instr_time.h"
 #include "postmaster/bgworker.h"
 #include "storage/dsm.h"
 #include "storage/ipc.h"
+#include "storage/latch.h"
 #include "tcop/pquery.h"
 #include "tcop/tcopprot.h"
 #include "utils/fmgrprotos.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "utils/uuid.h"
+#include "utils/wait_event.h"
 
 #define MANAGED_SEND_HOLD_NAME "lakehouse managed send hold"
 #define SEND_DIGEST_BYTES 32
 #define MAX_SEND_REQUEST 65536
+#define SEND_HOLD_TIMEOUT_MS 10000
 
 typedef enum ManagedSendOutcome
 {
@@ -214,6 +218,38 @@ lakehouse_managed_send_hold_main(Datum main_arg)
 	proc_exit(0);
 }
 
+static BgwHandleStatus
+wait_for_send_hold(BackgroundWorkerHandle *handle)
+{
+	instr_time	started;
+
+	INSTR_TIME_SET_CURRENT(started);
+	for (;;)
+	{
+		BgwHandleStatus status;
+		pid_t		pid;
+		instr_time	elapsed;
+		double		remaining;
+
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+		status = GetBackgroundWorkerPid(handle, &pid);
+		if (status == BGWH_STOPPED || status == BGWH_POSTMASTER_DIED)
+			return status;
+
+		INSTR_TIME_SET_CURRENT(elapsed);
+		INSTR_TIME_SUBTRACT(elapsed, started);
+		remaining = SEND_HOLD_TIMEOUT_MS - INSTR_TIME_GET_MILLISEC(elapsed);
+		if (remaining <= 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_QUERY_CANCELED),
+					 errmsg("managed publication send hold timed out waiting for the worker")));
+		if (WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+					  (long) remaining + 1, WAIT_EVENT_BGWORKER_SHUTDOWN) & WL_POSTMASTER_DEATH)
+			return BGWH_POSTMASTER_DIED;
+	}
+}
+
 Datum
 pg_lakehouse_hold_managed_publication_send(PG_FUNCTION_ARGS)
 {
@@ -230,10 +266,12 @@ pg_lakehouse_hold_managed_publication_send(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("managed publication send hold requires a non-superuser role")));
-	if (RecoveryInProgress() || XactReadOnly || IsTransactionBlock() || IsSubTransaction())
+	/* The launcher must not own row locks or uncommitted ledger writes. */
+	if (RecoveryInProgress() || XactReadOnly || IsTransactionBlock() || IsSubTransaction() ||
+		TransactionIdIsValid(GetTopTransactionIdIfAny()))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("managed publication send hold requires a standalone read-write command on an active primary")));
+				 errmsg("managed publication send hold requires a standalone read-write command without an assigned transaction ID on an active primary")));
 
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2) ||
 		PG_ARGISNULL(4) || PG_ARGISNULL(5) || PG_ARGISNULL(6))
@@ -280,7 +318,7 @@ pg_lakehouse_hold_managed_publication_send(PG_FUNCTION_ARGS)
 				 errmsg("could not register the managed publication send hold worker")));
 	PG_TRY();
 	{
-		status = WaitForBackgroundWorkerShutdown(handle);
+		status = wait_for_send_hold(handle);
 	}
 	PG_CATCH();
 	{

@@ -12,15 +12,15 @@ use std::{
 use pgdatalake_core::{
     catalog::{
         commit::PreparedPublication,
-        metadata::IcebergType,
+        metadata::{IcebergType, TableMetadata},
         publication::{
             AuthorizedPublication, PublicationIdentity, PublicationLookup, PublicationStorage,
         },
         rest::{RestCatalog, RestError, StaticToken},
     },
     managed_visibility::{
-        select_compatible_pin, ManagedPinCandidate, ManagedReadError, ManagedReadScope,
-        PinMembership, VisibleSegment,
+        ManagedAncestry, ManagedCatalogObservation, ManagedPinCandidate, ManagedReadError,
+        ManagedReadScope, PinMembership, VisibleSegment,
     },
     parquet::CellValue,
     publication_credentials::{
@@ -424,7 +424,7 @@ impl PublicationCatalog for FixtureCatalog<'_> {
         &self,
         claim: &PublicationClaim,
         members: &[CapturedMember],
-    ) -> Result<PreparedPublication<'_>, StorageError> {
+    ) -> Result<PreparedPublication, StorageError> {
         if self.target.admitted_transport {
             let catalog = self
                 .admitted_publisher(
@@ -568,8 +568,19 @@ fn issue_fixture_credentials(
 #[derive(Deserialize)]
 struct ManagedCutFixture {
     scope: ManagedReadScope,
+    catalog: CutCatalogObservation,
     candidates: Vec<CutCandidate>,
     visible: Vec<CutSegment>,
+}
+
+#[derive(Deserialize)]
+struct CutCatalogObservation {
+    authority_id: Uuid,
+    incarnation_id: Uuid,
+    ref_name: String,
+    #[serde(deserialize_with = "exact_bigint")]
+    anchor: i64,
+    metadata: TableMetadata,
 }
 
 #[derive(Deserialize)]
@@ -634,7 +645,16 @@ fn run_managed_cut() -> FixtureResult<()> {
             payload_retained: segment.payload_retained,
         })
         .collect::<Vec<_>>();
-    let output = match select_compatible_pin(&fixture.scope, &candidates, &visible) {
+    let catalog = &fixture.catalog;
+    let observation = ManagedCatalogObservation {
+        authority_id: catalog.authority_id,
+        incarnation_id: catalog.incarnation_id,
+        ref_name: &catalog.ref_name,
+        metadata: &catalog.metadata,
+    };
+    let cut = ManagedAncestry::certify(&fixture.scope, catalog.anchor, observation)
+        .and_then(|ancestry| ancestry.select(&candidates, &visible));
+    let output = match cut {
         Ok(cut) => serde_json::json!({
             "pin": cut.pin.to_string(),
             "overlay_segment_ids": cut.overlay_segment_ids.iter().map(i64::to_string).collect::<Vec<_>>(),
@@ -642,6 +662,8 @@ fn run_managed_cut() -> FixtureResult<()> {
         Err(err) => serde_json::json!({ "error": match err {
             ManagedReadError::ScopeMismatch => "binding_changed",
             ManagedReadError::InvalidProof => "invalid_proof",
+            ManagedReadError::AncestryUnavailable => "ancestry_unavailable",
+            ManagedReadError::AncestryLimitExceeded => "ancestry_limit_exceeded",
             ManagedReadError::NoCompatiblePin => "no_compatible_pin",
         }}),
     };

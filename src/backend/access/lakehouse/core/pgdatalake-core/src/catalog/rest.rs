@@ -4,6 +4,7 @@
 //! `TokenProvider` (`OAuth2` client-credentials flow with proactive refresh
 //! lands in the next slice; `SigV4` profiles after that).
 
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -93,16 +94,17 @@ fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
 }
 
 /// HTTP client for one REST catalog endpoint.
+#[derive(Clone)]
 pub struct RestCatalog {
     pub(crate) endpoint: String,
-    pub(crate) tokens: Box<dyn TokenProvider>,
+    pub(crate) tokens: Arc<dyn TokenProvider>,
     pub(crate) inner: reqwest::blocking::Client,
     // Reads follow approved redirects. Commit POSTs may be sent only once.
     scoped: bool,
-    commit_client: std::sync::OnceLock<Result<reqwest::blocking::Client, String>>,
+    commit_client: Arc<OnceLock<Result<reqwest::blocking::Client, String>>>,
     /// Table-route prefix from the config response (`overrides.prefix` in
     /// the Iceberg REST spec); set via `with_prefix()` or `fetch_config()`.
-    pub(crate) prefix: std::sync::Mutex<Option<String>>,
+    pub(crate) prefix: Arc<Mutex<Option<String>>>,
 }
 
 /// Wire type for the config response; alias to the domain type.
@@ -177,14 +179,14 @@ impl RestCatalog {
     ) -> Result<Self, RestError> {
         Ok(Self {
             endpoint: endpoint.trim_end_matches('/').to_string(),
-            tokens,
+            tokens: tokens.into(),
             scoped,
-            commit_client: std::sync::OnceLock::new(),
+            commit_client: Arc::default(),
             inner: client
                 .timeout(Duration::from_secs(30))
                 .build()
                 .map_err(|e| RestError::Http(e.to_string()))?,
-            prefix: std::sync::Mutex::new(None),
+            prefix: Arc::default(),
         })
     }
 

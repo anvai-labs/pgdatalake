@@ -1,16 +1,22 @@
 //! One operation step for explicitly admitted staged append workers.
 
-use std::{error::Error, fmt};
+use std::{
+    error::Error,
+    fmt,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use crate::catalog::{
     commit::PreparedPublication,
     publication::{AuthorizedPublication, PublicationIdentity, PublicationLookup},
     rest::RestError,
 };
+use crate::publication_transport::ScopedPublisher;
 use crate::storage::StorageError;
 use uuid::Uuid;
 
 pub type LedgerResult<T> = Result<T, Box<dyn Error>>;
+pub(crate) const MAX_PUBLICATION_MEMBERS: usize = 1024;
 
 pub struct CapturedMember {
     pub segment_id: i64,
@@ -110,7 +116,7 @@ pub trait PublicationCatalog {
         &self,
         claim: &PublicationClaim,
         members: &[CapturedMember],
-    ) -> Result<PreparedPublication<'_>, StorageError>;
+    ) -> Result<PreparedPublication, StorageError>;
 
     fn lookup(
         &self,
@@ -165,8 +171,10 @@ fn stage<T, E: Into<Box<dyn Error>>>(
 
 fn members_match(claim: &PublicationClaim, members: &[CapturedMember]) -> bool {
     if members.is_empty()
-        || members.len() > 1024
-        || members.iter().any(|member| member.row_count <= 0)
+        || members.len() > MAX_PUBLICATION_MEMBERS
+        || members
+            .iter()
+            .any(|member| member.segment_id <= 0 || member.row_count <= 0)
         || members
             .windows(2)
             .any(|pair| pair[0].segment_id >= pair[1].segment_id)
@@ -276,14 +284,84 @@ fn load_dispatch_hint(
         return Ok(None);
     }
     let claim = load_operation(ledger, hint.operation_id)?;
-    if claim.generation != hint.owner_generation
-        || claim
-            .binding
-            .is_none_or(|binding| binding.binding_id != hint.binding_id)
-    {
+    if !hint_matches_claim(hint, &claim) {
         return Ok(None);
     }
     Ok(Some(claim))
+}
+
+fn hint_matches_claim(hint: PublicationDispatchHint, claim: &PublicationClaim) -> bool {
+    claim.identity.operation_id == hint.operation_id
+        && claim.generation == hint.owner_generation
+        && claim
+            .binding
+            .is_some_and(|binding| binding.binding_id == hint.binding_id)
+}
+
+/// An owned process-local proposal. A shared view exposes the exact bytes for
+/// WAL authorization. The proposal exposes no submit operation at this boundary.
+pub struct PreparedManagedSend {
+    identity: PublicationIdentity,
+    owner_generation: i64,
+    binding: Option<PublicationBindingIdentity>,
+    request: PreparedPublication,
+}
+
+impl PreparedManagedSend {
+    #[must_use]
+    pub fn identity(&self) -> PublicationIdentity {
+        self.identity
+    }
+
+    #[must_use]
+    pub fn owner_generation(&self) -> i64 {
+        self.owner_generation
+    }
+
+    #[must_use]
+    pub fn binding(&self) -> Option<PublicationBindingIdentity> {
+        self.binding
+    }
+
+    #[must_use]
+    pub fn request(&self) -> &PreparedPublication {
+        &self.request
+    }
+
+    fn intent(&self) -> AuthorizedPublication<'_> {
+        AuthorizedPublication {
+            identity: self.identity,
+            expected_parent: self.request.expected_parent(),
+            snapshot_id: self.request.snapshot_id(),
+            request_digest: self.request.request_digest(),
+            request_body: self.request.request_body(),
+        }
+    }
+}
+
+/// Prepare one acquired generation using its exact job and member observations.
+/// The caller releases PostgreSQL locks before this call and later revalidates
+/// the unchanged claim in the standalone WAL authorization transaction. This
+/// call may read the catalog and create immutable objects. Cancellation before
+/// or after transport preparation discards any local proposal. No commit POST
+/// occurs and a cancellation never promotes prepared objects into a snapshot.
+pub fn prepare_publication_send(
+    catalog: &ScopedPublisher,
+    admitted: PublicationDispatchHint,
+    claim: &PublicationClaim,
+    members: &[CapturedMember],
+    cancelled: &AtomicBool,
+) -> Result<PreparedManagedSend, WorkerFailure> {
+    if admitted.mode != PublicationDispatchMode::Send || !hint_matches_claim(admitted, claim) {
+        return stage(
+            Err::<_, &str>("publication prepare observation does not match the acquired owner"),
+            "prepare_unsent",
+        );
+    }
+    stage(catalog.check_member_budget(members), "load_members")?;
+    prepare_unsent(catalog, claim, members, || {
+        cancelled.load(Ordering::Relaxed)
+    })
 }
 
 /// Try an admitted send wake. If its hint is stale or an intent is retained
@@ -395,29 +473,15 @@ fn drive_unsent(
     claim: &PublicationClaim,
 ) -> Result<WorkerOutcome, WorkerFailure> {
     let members = stage(ledger.members(claim), "load_members")?;
-    if !members_match(claim, &members) {
-        return stage(
-            Err::<_, &str>("captured members do not match the claimed input digest"),
-            "load_members",
-        );
-    }
-    let prepared = stage(catalog.prepare(claim, &members), "prepare_unsent")?;
-    let body = prepared.request_body().to_vec();
-    let intent = AuthorizedPublication {
-        identity: claim.identity,
-        expected_parent: prepared.expected_parent(),
-        snapshot_id: prepared.snapshot_id(),
-        request_digest: prepared.request_digest(),
-        request_body: &body,
-    };
-    if !intent.matches_retained_request() {
-        return stage(
-            Err::<_, &str>("prepared request does not match the claim"),
-            "prepare_unsent",
-        );
-    }
+    let prepared = prepare_unsent(catalog, claim, &members, || false)?;
+    let intent = prepared.intent();
     stage(ledger.authorize(claim, intent), "authorization_unconfirmed")?;
-    match prepared.submit() {
+    let body = intent.request_body.to_vec();
+    let intent = AuthorizedPublication {
+        request_body: &body,
+        ..intent
+    };
+    match prepared.request.submit() {
         Ok(_) => verify(ledger, claim, intent, catalog.lookup(claim, intent)),
         Err(error @ RestError::Conflict(_)) => Ok(WorkerOutcome::Pending(
             PendingReason::DispatchConflict(error),
@@ -426,6 +490,55 @@ fn drive_unsent(
             error,
         ))),
     }
+}
+
+fn prepare_unsent(
+    catalog: &impl PublicationCatalog,
+    claim: &PublicationClaim,
+    members: &[CapturedMember],
+    cancelled: impl Fn() -> bool,
+) -> Result<PreparedManagedSend, WorkerFailure> {
+    if claim.generation <= 0
+        || claim.identity.operation_id.is_nil()
+        || !matches!(claim.state, ClaimState::Unsent)
+    {
+        return stage(
+            Err::<_, &str>("publication preparation requires an unsent claim with a valid owner"),
+            "prepare_unsent",
+        );
+    }
+    if cancelled() {
+        return stage(
+            Err::<_, &str>("publication preparation cancelled"),
+            "prepare_unsent",
+        );
+    }
+    if !members_match(claim, members) {
+        return stage(
+            Err::<_, &str>("captured members do not match the claimed input digest"),
+            "load_members",
+        );
+    }
+    let request = stage(catalog.prepare(claim, members), "prepare_unsent")?;
+    if cancelled() {
+        return stage(
+            Err::<_, &str>("publication preparation cancelled"),
+            "prepare_unsent",
+        );
+    }
+    let prepared = PreparedManagedSend {
+        identity: claim.identity,
+        owner_generation: claim.generation,
+        binding: claim.binding,
+        request,
+    };
+    if !prepared.intent().matches_retained_request() {
+        return stage(
+            Err::<_, &str>("prepared request does not match the claim"),
+            "prepare_unsent",
+        );
+    }
+    Ok(prepared)
 }
 
 #[cfg(test)]
@@ -500,7 +613,7 @@ mod tests {
             &self,
             _claim: &PublicationClaim,
             _members: &[CapturedMember],
-        ) -> Result<PreparedPublication<'_>, StorageError> {
+        ) -> Result<PreparedPublication, StorageError> {
             panic!("dispatch must not prepare")
         }
 

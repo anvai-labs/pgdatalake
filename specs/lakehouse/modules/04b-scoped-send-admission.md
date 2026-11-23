@@ -82,6 +82,14 @@ membership and persists the prepared request and its digests. Its synchronous
 local commit precedes the returned intent XID. The launcher transfers at most
 64 KiB of prepared bytes and carries no provider credentials in shared memory.
 
+The launcher command must run standalone on an active primary with no assigned
+transaction ID. It returns `55000` before starting a worker if the surrounding
+command assigned an XID, which can happen in autocommit SQL. A monotonic
+10-second launcher deadline applies even with `statement_timeout` disabled.
+On cancellation or deadline expiry, the launcher requests worker termination
+and returns `57014`. Resolve an uncertain outcome by lookup. The procedure can
+already have committed when a receipt is lost.
+
 The worker stops after the transaction and reports the held intent as
 lookup-only. Keep it in a controlled operator context. Holding an unsent intent
 reserves the operation and requires later lookup or operator reconciliation.
@@ -97,6 +105,40 @@ record, preserve the later segment and discover the held operation for lookup.
 A repeated attempt cannot authorize another send. Tying this barrier to a
 one-use prepared provider submit capability, independently issued credentials
 and native polling has a separate gate. [Native barrier fixture](../../../src/test/lakehouse/fixtures/native-managed-send-hold-check.py)
+
+### Scoped native send preparation
+
+`prepare_publication_send` is the Rust boundary for a future native dispatcher.
+Load the exact acquired job and bounded member payloads from PostgreSQL and
+release the ledger transaction before calling it. The send observation names
+the acquired operation, binding and owner generation. Compare it to the job
+before provider work. The scoped transport compares the immutable binding and
+table UUID to its independently admitted `Send` credential bundle. Refuse a
+reserved or complete job, expired lease, misordered or changed member payloads
+and a batch above its byte, row or member budget.
+
+The owned `PreparedManagedSend` keeps the original catalog client and route in
+the current process. Its shared request view exposes the exact bounded body,
+digest, parent and proposed snapshot for the eventual standalone authorization.
+The handle has no public submit method. Dropping it or observing cancellation
+before or after preparation sends zero catalog commit POSTs. An in-flight
+request may finish before cancellation is observed. Immutable prepared objects
+can remain unreferenced after cancellation or a stale authorization; their
+retention and cleanup follow the existing writer object policy.
+
+The existing Rust driver still consumes its prepared request only after the
+ledger confirms the exact committed authorization. A future native dispatcher
+must recheck the current grant and generation at that same transaction boundary
+and consume the original in-memory request in the same process. Treat serialized
+bytes, the hold receipt and a restarted worker as lookup-only. The native C
+executor and its two reply-loss drills have separate gates.
+
+The provider test drops a prepared handle after the transport is released and
+separately cancels during the third create-only PUT. Each case observes one
+catalog GET, one manifest GET, three object PUTs and zero catalog POSTs. The
+parent remains pinned at snapshot 100. Stale generation, wrong scope or purpose,
+expired credentials, changed members, oversize and initial cancellation observe
+zero requests. [Scoped transport tests](../../../src/backend/access/lakehouse/core/pgdatalake-core/src/publication_transport/tests.rs)
 
 ### Discovery and dispatch
 

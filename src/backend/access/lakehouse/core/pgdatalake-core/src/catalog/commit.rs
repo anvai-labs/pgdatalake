@@ -144,8 +144,8 @@ struct CommitTableRequest<'a> {
 
 /// An immutable append request associated with its original catalog client
 /// and route. Store its request digest in the ledger before consuming it.
-pub struct PreparedPublication<'a> {
-    catalog: &'a RestCatalog,
+pub struct PreparedPublication {
+    catalog: RestCatalog,
     prefix: Option<String>,
     url: String,
     payload: Vec<u8>,
@@ -153,7 +153,7 @@ pub struct PreparedPublication<'a> {
     snapshot_id: i64,
 }
 
-impl PreparedPublication<'_> {
+impl PreparedPublication {
     #[must_use]
     pub fn expected_parent(&self) -> Option<i64> {
         self.expected_parent
@@ -293,7 +293,7 @@ impl RestCatalog {
         mut snapshot: Snapshot,
         identity: PublicationIdentity,
         manifest_list_digest: [u8; 32],
-    ) -> Result<PreparedPublication<'_>, RestError> {
+    ) -> Result<PreparedPublication, RestError> {
         let spec_id = validate_staged_base(base, identity.table_uuid)?;
         let main = base.refs.get("main");
         let expected_parent = base.current_snapshot_id;
@@ -363,7 +363,7 @@ impl RestCatalog {
         }
         let prefix = self.prefix.lock().expect("prefix mutex poisoned").clone();
         Ok(PreparedPublication {
-            catalog: self,
+            catalog: self.clone(),
             url: self.commit_url(namespace, table, prefix.as_deref()),
             prefix,
             expected_parent,

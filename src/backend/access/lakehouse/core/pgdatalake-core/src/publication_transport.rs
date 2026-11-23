@@ -14,7 +14,8 @@ use crate::catalog::publication::{
 use crate::catalog::rest::{RestCatalog, RestError, TokenProvider};
 use crate::catalog::types::LoadTableResult;
 use crate::publication_worker::{
-    CapturedMember, PublicationBindingIdentity, PublicationCatalog, PublicationClaim,
+    CapturedMember, ClaimState, PublicationBindingIdentity, PublicationCatalog, PublicationClaim,
+    MAX_PUBLICATION_MEMBERS,
 };
 use crate::read_binding::{checked_endpoint, valid_component, valid_path, S3ReadRoot};
 use crate::snapshot_write::{write_bounded_snapshot, NewDataFile, SnapshotParams};
@@ -115,6 +116,7 @@ pub struct ScopedPublisher {
     objects: S3Options,
     s3_credentials: AwsCredentialProvider,
     purpose: PublicationPurpose,
+    expires_at: SystemTime,
     columns: Vec<(String, IcebergType)>,
     limits: PublicationLimits,
 }
@@ -213,6 +215,7 @@ impl ScopedPublisher {
                 expires_at: credentials.expires_at,
             }),
             purpose,
+            expires_at: credentials.expires_at,
             columns,
             limits,
         })
@@ -241,6 +244,42 @@ impl ScopedPublisher {
             return Err(RestError::Conflict(
                 "claim differs from the enrolled publication binding".into(),
             ));
+        }
+        Ok(())
+    }
+
+    fn check_send_lease(&self) -> Result<(), StorageError> {
+        if self.purpose != PublicationPurpose::Send || SystemTime::now() >= self.expires_at {
+            return Err(StorageError::ReadDenied(
+                "publication preparation requires current send credentials".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_member_budget(
+        &self,
+        members: &[CapturedMember],
+    ) -> Result<(), StorageError> {
+        let over_budget = || {
+            StorageError::Config("captured publication exceeds the configured batch limits".into())
+        };
+        if members.is_empty() || members.len() > MAX_PUBLICATION_MEMBERS {
+            return Err(over_budget());
+        }
+        let mut bytes = 0usize;
+        let mut row_count = 0usize;
+        for member in members {
+            bytes = bytes.saturating_add(member.payload.len());
+            if member.row_count <= 0 {
+                return Err(StorageError::Decode(
+                    "invalid captured segment row count".into(),
+                ));
+            }
+            row_count = row_count.saturating_add(member.row_count as usize);
+        }
+        if row_count > self.limits.captured_rows || bytes > self.limits.captured_bytes {
+            return Err(over_budget());
         }
         Ok(())
     }
@@ -306,26 +345,6 @@ impl ScopedPublisher {
             });
         }
 
-        let mut bytes = 0usize;
-        let mut row_count = 0usize;
-        for member in members {
-            bytes = bytes.saturating_add(member.payload.len());
-            if member.row_count <= 0 {
-                return Err(StorageError::Decode(
-                    "invalid captured segment row count".into(),
-                ));
-            }
-            row_count = row_count.saturating_add(member.row_count as usize);
-        }
-        if row_count == 0
-            || row_count > self.limits.captured_rows
-            || bytes > self.limits.captured_bytes
-        {
-            return Err(StorageError::Config(
-                "captured publication exceeds the configured batch limits".into(),
-            ));
-        }
-
         let mut writer = BatchWriter::new(columns.clone())?;
         for member in members {
             let rows: Vec<serde_json::Value> = serde_json::from_slice(&member.payload)
@@ -363,13 +382,18 @@ impl PublicationCatalog for ScopedPublisher {
         &self,
         claim: &PublicationClaim,
         members: &[CapturedMember],
-    ) -> Result<PreparedPublication<'_>, StorageError> {
-        if self.purpose != PublicationPurpose::Send {
-            return Err(StorageError::ReadDenied(
-                "lookup credentials cannot prepare a publication".into(),
+    ) -> Result<PreparedPublication, StorageError> {
+        self.check_send_lease()?;
+        if claim.generation <= 0
+            || claim.identity.operation_id.is_nil()
+            || !matches!(claim.state, ClaimState::Unsent)
+        {
+            return Err(StorageError::Conflict(
+                "publication preparation requires an unsent claim with a valid owner".into(),
             ));
         }
         self.check_claim(claim).map_err(storage_error)?;
+        self.check_member_budget(members)?;
         let base = self
             .target_metadata(self.load().map_err(storage_error)?)
             .map_err(storage_error)?;
@@ -440,6 +464,7 @@ impl PublicationCatalog for ScopedPublisher {
             },
             self.limits.manifest_bytes,
         )?;
+        self.check_send_lease()?;
         self.catalog
             .prepare_staged_append(
                 &self.namespace(),
