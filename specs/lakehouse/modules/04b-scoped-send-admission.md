@@ -106,6 +106,40 @@ A repeated attempt cannot authorize another send. Tying this barrier to a
 one-use prepared provider submit capability, independently issued credentials
 and native polling has a separate gate. [Native barrier fixture](../../../src/test/lakehouse/fixtures/native-managed-send-hold-check.py)
 
+### Scoped native send preparation
+
+`prepare_publication_send` is the Rust boundary for a future native dispatcher.
+Load the exact acquired job and bounded member payloads from PostgreSQL and
+release the ledger transaction before calling it. The send observation names
+the acquired operation, binding and owner generation. Compare it to the job
+before provider work. The scoped transport compares the immutable binding and
+table UUID to its independently admitted `Send` credential bundle. Refuse a
+reserved or complete job, expired lease, misordered or changed member payloads
+and a batch above its byte, row or member budget.
+
+The owned `PreparedManagedSend` keeps the original catalog client and route in
+the current process. Its shared request view exposes the exact bounded body,
+digest, parent and proposed snapshot for the eventual standalone authorization.
+The handle has no public submit method. Dropping it or observing cancellation
+before or after preparation sends zero catalog commit POSTs. An in-flight
+request may finish before cancellation is observed. Immutable prepared objects
+can remain unreferenced after cancellation or a stale authorization; their
+retention and cleanup follow the existing writer object policy.
+
+The existing Rust driver still consumes its prepared request only after the
+ledger confirms the exact committed authorization. A future native dispatcher
+must recheck the current grant and generation at that same transaction boundary
+and consume the original in-memory request in the same process. Treat serialized
+bytes, the hold receipt and a restarted worker as lookup-only. The native C
+executor and its two reply-loss drills have separate gates.
+
+The provider test drops a prepared handle after the transport is released and
+separately cancels during the third create-only PUT. Each case observes one
+catalog GET, one manifest GET, three object PUTs and zero catalog POSTs. The
+parent remains pinned at snapshot 100. Stale generation, wrong scope or purpose,
+expired credentials, changed members, oversize and initial cancellation observe
+zero requests. [Scoped transport tests](../../../src/backend/access/lakehouse/core/pgdatalake-core/src/publication_transport/tests.rs)
+
 ### Discovery and dispatch
 
 Extension 1.9 adds two read-only keyset pages. Both accept a page size of 1 to 1,024. Start with a NULL cursor, advance using the last row even if held and wrap after an empty page. The page reports candidates from one database snapshot. Owners must still use the transactional claim, compare-and-advance and WAL authorization operations after a page is read.

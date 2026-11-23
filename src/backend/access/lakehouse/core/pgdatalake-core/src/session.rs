@@ -188,7 +188,7 @@ impl CatalogClient {
         new_files: &[crate::snapshot_write::NewDataFile],
         identity: crate::catalog::publication::PublicationIdentity,
         manifest_budget: (u64, std::time::Duration),
-    ) -> Result<crate::catalog::commit::PreparedPublication<'_>, crate::storage::StorageError> {
+    ) -> Result<crate::catalog::commit::PreparedPublication, crate::storage::StorageError> {
         use crate::catalog::commit::validate_staged_base;
         use crate::catalog::publication::{scoped_manifest_location, scoped_object_location};
         use crate::catalog::rest::RestError;

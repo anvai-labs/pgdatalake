@@ -1,12 +1,18 @@
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Response, Server};
 
 use super::*;
 use crate::catalog::publication::{sha256, PublicationIdentity};
-use crate::publication_worker::{ClaimState, RetainedAttempt};
+use crate::publication_worker::{
+    prepare_publication_send, ClaimState, PublicationDispatchHint, PublicationDispatchMode,
+    RetainedAttempt,
+};
 
 const ROUTE: &str = "/catalog/v1/enrolled/namespaces/nested%1Forders/tables/events";
 const ROOT: &str = "s3://fixture/warehouse/events";
@@ -182,6 +188,25 @@ fn member() -> CapturedMember {
     }
 }
 
+fn acquired_send() -> (PublicationDispatchHint, PublicationClaim) {
+    let mut claim = claim();
+    // PostgreSQL member digest for segment 11, one row, and payload [[20]].
+    claim.identity.input_digest = [
+        0xc2, 0x80, 0x8a, 0xc4, 0xad, 0x23, 0x61, 0x15, 0xd6, 0x2c, 0x85, 0xff, 0xd4, 0x83, 0x32,
+        0x63, 0xd2, 0x02, 0x0e, 0x97, 0xcf, 0xec, 0x41, 0x77, 0x5b, 0xe6, 0x1b, 0x3e, 0xa6, 0x85,
+        0x67, 0xcc,
+    ];
+    (
+        PublicationDispatchHint {
+            operation_id: claim.identity.operation_id,
+            binding_id: claim.binding.unwrap().binding_id,
+            owner_generation: claim.generation,
+            mode: PublicationDispatchMode::Send,
+        },
+        claim,
+    )
+}
+
 fn loaded() -> Value {
     json!({
         "metadata-location": format!("{ROOT}/metadata/v1.json"),
@@ -223,6 +248,7 @@ struct RemoteState {
     catalog_redirect: bool,
     object_redirect: bool,
     post_redirect: bool,
+    cancel_after_three_puts: Option<Arc<AtomicBool>>,
 }
 
 struct FakeProviders {
@@ -309,6 +335,11 @@ impl FakeProviders {
                         req.as_reader().read_to_end(&mut body).unwrap();
                         assert!(state.objects.insert(path.clone(), body).is_none());
                         state.object_writes.push(path);
+                        if let Some(cancelled) = &state.cancel_after_three_puts {
+                            if state.object_writes.len() == 3 {
+                                cancelled.store(true, Ordering::Relaxed);
+                            }
+                        }
                         empty().with_header(header("ETag", "\"created\""))
                     }
                     (&Method::Get, _) if path.starts_with(OBJECT_PATH) => {
@@ -419,6 +450,145 @@ fn refuses_wrong_claim_and_provider_identity_before_object_io() {
     assert!(
         state.posts.is_empty() && state.object_reads.is_empty() && state.object_writes.is_empty()
     );
+}
+
+#[test]
+fn refuses_reserved_and_invalid_owner_at_prepare() {
+    let remote = FakeProviders::start();
+    let publisher = publisher(target(&remote.endpoint())).unwrap();
+    let mut invalid = claim();
+    invalid.generation = 0;
+    assert!(matches!(
+        publisher.prepare(&invalid, &[member()]),
+        Err(StorageError::Conflict(_))
+    ));
+
+    let mut reserved = claim();
+    reserved.state = ClaimState::Reserved(RetainedAttempt {
+        expected_parent: Some(100),
+        snapshot_id: 101,
+        request_digest: [0; 32],
+        request_body: None,
+    });
+    assert!(matches!(
+        publisher.prepare(&reserved, &[member()]),
+        Err(StorageError::Conflict(_))
+    ));
+    let state = remote.state.lock().unwrap();
+    assert_eq!(state.reads, [] as [String; 0]);
+    assert_eq!(state.object_reads, [] as [String; 0]);
+    assert_eq!(state.object_writes, [] as [String; 0]);
+    assert_eq!(state.posts, [] as [Value; 0]);
+}
+
+#[test]
+fn preparation_refuses_stale_owner_wrong_scope_oversize_expiry_and_cancellation() {
+    let remote = FakeProviders::start();
+    let approved_target = target(&remote.endpoint());
+    let mut publisher = publisher(approved_target.clone()).unwrap();
+    let lookup = publisher_for(approved_target, PublicationPurpose::Lookup).unwrap();
+    let cancelled = AtomicBool::new(false);
+    let (hint, mut claim) = acquired_send();
+    let stale = PublicationDispatchHint {
+        owner_generation: hint.owner_generation - 1,
+        ..hint
+    };
+    assert!(prepare_publication_send(&publisher, stale, &claim, &[member()], &cancelled).is_err());
+    assert!(prepare_publication_send(&lookup, hint, &claim, &[member()], &cancelled).is_err());
+
+    claim.binding.as_mut().unwrap().binding_generation += 1;
+    assert!(prepare_publication_send(&publisher, hint, &claim, &[member()], &cancelled).is_err());
+    claim.binding.as_mut().unwrap().binding_generation -= 1;
+
+    let mut changed_member = member();
+    changed_member.payload = b"[[99]]".to_vec();
+    assert!(matches!(
+        prepare_publication_send(&publisher, hint, &claim, &[changed_member], &cancelled),
+        Err(error) if error.stage == "load_members"
+    ));
+    let mut over_budget = member();
+    over_budget.payload.resize(1025, b' ');
+    assert!(matches!(
+        prepare_publication_send(&publisher, hint, &claim, &[over_budget], &cancelled),
+        Err(error) if error.stage == "load_members" && error.to_string().contains("batch limits")
+    ));
+    let member = member();
+    cancelled.store(true, Ordering::Relaxed);
+    assert!(matches!(
+        prepare_publication_send(&publisher, hint, &claim, std::slice::from_ref(&member), &cancelled),
+        Err(error) if error.to_string().contains("cancelled")
+    ));
+    cancelled.store(false, Ordering::Relaxed);
+    publisher.expires_at = UNIX_EPOCH;
+    assert!(matches!(
+        prepare_publication_send(&publisher, hint, &claim, &[member], &cancelled),
+        Err(error) if error.to_string().contains("current send credentials")
+    ));
+
+    let state = remote.state.lock().unwrap();
+    assert_eq!(state.reads, [] as [String; 0]);
+    assert_eq!(state.object_reads, [] as [String; 0]);
+    assert_eq!(state.object_writes, [] as [String; 0]);
+    assert_eq!(state.posts, [] as [Value; 0]);
+}
+
+#[test]
+fn dropping_owned_preparation_keeps_only_create_only_objects() {
+    let remote = FakeProviders::start();
+    let (hint, claim) = acquired_send();
+    let prepared = {
+        let publisher = publisher(target(&remote.endpoint())).unwrap();
+        prepare_publication_send(
+            &publisher,
+            hint,
+            &claim,
+            &[member()],
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+    };
+    // The proposal outlives the transport, and its view is read-only.
+    let request = prepared.request();
+    let exact = AuthorizedPublication {
+        identity: prepared.identity(),
+        expected_parent: request.expected_parent(),
+        snapshot_id: request.snapshot_id(),
+        request_digest: request.request_digest(),
+        request_body: request.request_body(),
+    };
+    assert_eq!(prepared.owner_generation(), hint.owner_generation);
+    assert_eq!(prepared.binding(), claim.binding);
+    assert_eq!(exact.expected_parent, Some(100));
+    assert!(exact.snapshot_id > 0 && exact.snapshot_id != 100);
+    assert!((1..=64 * 1024).contains(&exact.request_body.len()));
+    assert!(exact.matches_retained_request());
+    drop(prepared);
+
+    let state = remote.state.lock().unwrap();
+    assert_eq!(state.reads, [ROUTE]);
+    assert_eq!(state.object_reads, [PARENT_PATH]);
+    assert_eq!(state.object_writes.len(), 3);
+    assert_eq!(state.posts, [] as [Value; 0]);
+    assert_eq!(state.catalog["metadata"]["current-snapshot-id"], 100);
+}
+
+#[test]
+fn cancellation_during_last_prepare_put_yields_no_proposal_or_post() {
+    let remote = FakeProviders::start();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    remote.state.lock().unwrap().cancel_after_three_puts = Some(cancelled.clone());
+    let publisher = publisher(target(&remote.endpoint())).unwrap();
+    let (hint, claim) = acquired_send();
+    assert!(matches!(
+        prepare_publication_send(&publisher, hint, &claim, &[member()], &cancelled),
+        Err(error) if error.to_string().contains("cancelled")
+    ));
+    let state = remote.state.lock().unwrap();
+    assert_eq!(state.reads, [ROUTE]);
+    assert_eq!(state.object_reads, [PARENT_PATH]);
+    assert_eq!(state.object_writes.len(), 3);
+    assert_eq!(state.posts, [] as [Value; 0]);
+    assert_eq!(state.catalog["metadata"]["current-snapshot-id"], 100);
 }
 
 #[test]

@@ -424,7 +424,7 @@ impl PublicationCatalog for FixtureCatalog<'_> {
         &self,
         claim: &PublicationClaim,
         members: &[CapturedMember],
-    ) -> Result<PreparedPublication<'_>, StorageError> {
+    ) -> Result<PreparedPublication, StorageError> {
         if self.target.admitted_transport {
             let catalog = self
                 .admitted_publisher(
