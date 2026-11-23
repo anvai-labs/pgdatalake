@@ -198,6 +198,7 @@ jobs:
             --admitted-transport
           python3 src/test/lakehouse/fixtures/publication-discovery-check.py
           python3 src/test/lakehouse/fixtures/publication-ledger-load-check.py
+          python3 src/test/lakehouse/fixtures/native-managed-lookup-check.py --restart-fixture "$PGHOST/data"
           python3 src/test/lakehouse/fixtures/managed-cut-check.py \
             --worker "$rust_target/release/examples/bound_publication_fixture" --expect-runtime-red
 
