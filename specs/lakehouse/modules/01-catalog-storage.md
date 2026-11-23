@@ -11,6 +11,35 @@ Use the [per-cloud adapter contracts](09-cloud-profiles.md) for authority, crede
 3. Classify commit outcomes and provide operation lookup to the publisher. A verified successful result includes the UUID/ref and committed snapshot. A CAS rejection means the caller can replan against a fresh verified base. A failed connection after the commit may have been accepted yields unknown. Reconcile the exact operation marker on the intended table/ref or report insufficient evidence.
 4. Qualify Lakekeeper first. Stage Glue/EMR, Unity and Snowflake in per-profile changes. Publish a capability table for format version, auth, create/load/commit, credential refresh, object access and operation evidence. Fail an unverified capability before making mutations.
 
+## Bounded observation for enrolled reads
+
+The enrolled read adapter uses one explicit `loadTable` route and decodes
+only the metadata object pointer. The response body has an 8 MiB limit
+and a four-second HTTP deadline that covers headers and the body. The
+scoped catalog client disables HTTP replay, redirect following and
+ambient proxies. In-line metadata and credential overrides supply no
+authority for this profile.
+
+The adapter checks the pointer against the independently enrolled S3
+root before making a storage request. A cache-bypassing ranged read
+requires one complete metadata object within 8 MiB, with an independent
+four-second deadline covering the SDK request and body. Gzip expansion
+also stops at 8 MiB. The decoded object must match the enrolled table UUID
+and root and use Iceberg v2. The ceilings apply to this scoped profile
+and can cause a provider-unavailable response for a large inventory.
+
+The internal `ReadBinding::observe` method returns the metadata with its
+same bound S3 scope. The caller can inspect this snapshot inventory and
+consume the observation to plan one exact snapshot without loading the
+catalog or metadata object again. The managed reader can build its ancestry
+proof over the same borrowed metadata once its PostgreSQL authority and
+membership adapters are joined. Stock FDW planning continues to use the
+observed current schema. Managed visibility must prove the selected pin's
+schema and its compatibility with the bound PostgreSQL source before
+enabling a managed scan. Manifest and data access retain their existing
+root checks. These budgets cover the metadata phase. PostgreSQL controls
+the statement deadline.
+
 ## Prepared staged append
 
 The Rust catalog provider packages a writer-produced append snapshot into one immutable REST request. It uses the claim's table UUID, operation UUID and input digest, plus validated Iceberg v2 metadata for an unpartitioned table on `main`. The request asserts table UUID, exact branch head (explicit null for an empty ref), schema ID and default spec ID. It carries `pgdatalake.operation-id`, `pgdatalake.input-sha256` and `pgdatalake.manifest-list-sha256` in the snapshot summary. The writer computes the manifest-list digest over the same bytes it uploads.
