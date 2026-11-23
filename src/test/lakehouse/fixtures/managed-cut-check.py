@@ -22,7 +22,7 @@ EXPIRED = object()
 SCOPE_FIELDS = ("authority_id", "table_uuid", "ref_name", "incarnation_id", "storage_root")
 
 
-def select_cut(worker, source, candidates, visible):
+def select_cut(worker, source, catalog, candidates, visible):
     def membership(included):
         if included is EXPIRED:
             return {"proof": "expired"}
@@ -32,6 +32,7 @@ def select_cut(worker, source, candidates, visible):
 
     request = {
         "scope": dict(zip(SCOPE_FIELDS, source, strict=True)),
+        "catalog": catalog,
         "candidates": [
             {"scope": dict(zip(SCOPE_FIELDS, scope, strict=True)), "pin": pin,
              "membership": membership(included)}
@@ -76,9 +77,9 @@ def certify(scope, pin, included, namespace, expected):
     return scope, pin, included, rows
 
 
-def check(worker, name, expected, scope, candidates, observation):
+def check(worker, name, expected, scope, catalog, candidates, observation):
     pg_snapshot, visible = observation
-    result = select_cut(worker, scope, candidates, visible)
+    result = select_cut(worker, scope, catalog, candidates, visible)
     assert result == expected, (name, result, expected, pg_snapshot, visible)
     print(json.dumps({"case": name, "pg_snapshot": pg_snapshot,
                       "visible_ids": list(visible), "result": result}, sort_keys=True), flush=True)
@@ -304,6 +305,8 @@ def check_visibility(db, role, owner, worker, approval, base, history, gateway, 
         _, _, head = trino_fixture.enrolled_metadata(namespace)
         snapshot = next(s for s in head["snapshots"] if str(s["snapshot-id"]) == child)
         assert head["table-uuid"] == table and str(snapshot["parent-snapshot-id"]) == parent
+        observation = {key: approval[key] for key in ("authority_id", "incarnation_id", "ref_name")}
+        observation.update(anchor=parent, metadata=head)
         assert ledger_snapshot(fresh)[1] == fresh_view[1]
         lookup_hint = discover("lookup")
         assert run_worker(worker, db, operation, approval, lookup_hint | {"mode": "send"}) == "rediscover"
@@ -333,30 +336,33 @@ def check_visibility(db, role, owner, worker, approval, base, history, gateway, 
         expired_parent = (source, parent, EXPIRED, [])
         candidates = [published, base]
 
-        check(worker, "before-both-commits", (parent, [], [10]), source, candidates, first_view)
-        check(worker, "mixed-batch-between-commits", (parent, [first_id], [10, 20]), source,
-              candidates, second_view)
-        check(worker, "missing-compatible-parent", "no_compatible_pin", source, [published], second_view)
-        check(worker, "expired-compatible-parent", "no_compatible_pin", source,
-              [published, expired_parent], second_view)
+        def assert_cut(name, expected, candidates, view, catalog=observation):
+            check(worker, name, expected, source, catalog, candidates, view)
+
+        assert_cut("before-both-commits", (parent, [], [10]), candidates, first_view)
+        assert_cut("mixed-batch-between-commits", (parent, [first_id], [10, 20]), candidates, second_view)
+        assert_cut("missing-compatible-parent", "no_compatible_pin", [published], second_view)
+        assert_cut("expired-compatible-parent", "no_compatible_pin", [published, expired_parent], second_view)
+        without_parent = head | {"snapshots": [s for s in head["snapshots"] if str(s["snapshot-id"]) != parent]}
+        assert_cut("provider-missing-anchor", "ancestry_unavailable", candidates, second_view,
+                   observation | {"metadata": without_parent})
+        assert_cut("invalid-candidate-order", "invalid_proof", [base, published], second_view)
         _, visible = second_view
         reclaimed = {seg_id: (None, published) for seg_id, (_, published) in visible.items()}
-        check(worker, "missing-overlay-payload", "no_compatible_pin", source, candidates,
-              (second_view[0], reclaimed))
-        check(worker, "accepted-before-local-completion", (child, [], [10, 20, 20]), source,
-              candidates, fresh_view)
-        check(worker, "unknown-membership-no-output", "no_compatible_pin", source, [unknown], fresh_view)
-        check(worker, "unknown-head-fallback", (parent, [first_id, late_id], [10, 20, 20]), source,
-              [unknown, base], fresh_view)
-        check(worker, "replaced-binding-no-output", "binding_changed", source, [wrong, base], fresh_view)
+        assert_cut("missing-overlay-payload", "no_compatible_pin", candidates, (second_view[0], reclaimed))
+        assert_cut("accepted-before-local-completion", (child, [], [10, 20, 20]), candidates, fresh_view)
+        assert_cut("unknown-membership-no-output", "no_compatible_pin", [unknown], fresh_view)
+        assert_cut("unknown-head-fallback", (parent, [first_id, late_id], [10, 20, 20]),
+                   [unknown, base], fresh_view)
+        assert_cut("replaced-binding-no-output", "binding_changed", [wrong, base], fresh_view)
 
         assert ledger_snapshot(before) == first_view
         assert ledger_snapshot(between) == second_view
         completed = ledger_snapshot(fresh)
         assert completed[1] == {first_id: ([20], True), late_id: ([20], True)}, completed
-        check(worker, "after-local-completion", (child, [], [10, 20, 20]), source, candidates, completed)
-        check(worker, "retained-parent-after-completion", (parent, [first_id, late_id], [10, 20, 20]), source,
-              [base], completed)
+        assert_cut("after-local-completion", (child, [], [10, 20, 20]), candidates, completed)
+        assert_cut("retained-parent-after-completion", (parent, [first_id, late_id], [10, 20, 20]),
+                   [base], completed)
 
 
 def main():

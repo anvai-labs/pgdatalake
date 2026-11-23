@@ -86,24 +86,52 @@ PostgreSQL view before local completion. After both source commits the child
 contains `[10,20,20]`. The middle snapshot uses the retained parent and the
 one visible member, yielding `[10,20]`. The old snapshot yields `[10]`.
 
-The shared Rust `select_compatible_pin` routine now selects the cut in this
-fixture. It accepts the enrolled authority, table UUID, incarnation, ref and
-storage root, certified ancestry candidates, and the visible PostgreSQL segment
-IDs including whether their exact payloads remain available. Candidate states
-distinguish complete membership, unknown proof and expired pins. The selector
-checks exact IDs and monotone append membership across the complete candidates.
+The shared Rust ancestry adapter and cut selector make the decision in this
+fixture. The fixture passes the real Lakekeeper `loadTable` metadata and the
+approved route identity, with the pre-publication pin as a fixture enrollment
+anchor. The selector consumes visible PostgreSQL segment IDs and whether their
+exact payloads remain available. Candidate states distinguish complete
+membership, unknown proof and expired pins. The selector checks exact IDs and
+monotone append membership across the complete candidates.
 It refuses a changed scope, contradictory proof, or the absence of a usable
 cut. An older pin is usable only if each needed overlay payload remains
 available. The output is one exact pin and sorted segment IDs. The fixture
 compares its row multiset with the independent oracle and the pinned external
 engine. [Selector](../../../src/backend/access/lakehouse/core/pgdatalake-core/src/managed_visibility.rs)
 
-The caller still owns certified ancestry and retained-lineage membership.
-TableAM must hold the chosen pin and local payloads through execution, integrate
-own-command visibility and prove the whole statement pin vector before first
-output. The fixture continues to require `0A000` from the bound SQL path. Held
-snapshots exercise the selector under real MVCC and leave application Repeatable
-Read support unqualified.
+#### Certified retained ancestry
+
+The initial adapter certifies one Iceberg v2 `main` observation through a
+positive retained enrollment pin. Its caller supplies the authority and local
+incarnation from the approved route. It compares the reported table UUID and
+root to the enrolled values and requires the explicit `main` branch to agree
+with the reported current snapshot. It follows actual `parent-snapshot-id`
+links with strictly decreasing sequence numbers, scoped manifest-list paths and
+append summaries above the anchor. Snapshot order and numeric ID magnitude
+have no bearing on ancestry. The bounds are 4,096 snapshot records and 512
+chain pins, including the head and anchor. The adapter refuses missing or
+detached anchors, duplicates and contradictory links, with no usable partial
+chain on failure. The live fixture removes the parent record from the observed
+metadata and also reverses candidate order to check both refusals before row
+assembly. [Iceberg snapshots and references](https://iceberg.apache.org/spec/#snapshots)
+
+The successful adapter accepts membership only in the certified chain's order.
+An omitted pin has no usable membership. The fixture derives its accepted
+child membership from the verified ledger receipt and proves the empty anchor
+against its own initial contents. To enable a production scan, persist the
+enrollment anchor and support a bounded metadata read through the approved
+route. Protect snapshot/object retention for the selected pin and hold local
+payloads through execution. The ledger must independently prove complete
+retained-lineage membership, including publications accepted before local
+finalization. A catalog append label alone supplies no membership proof. A
+v2 table without a retained enrollment snapshot needs a separate empty-base
+contract. Reanchoring beyond the supported history horizon needs a durable
+checkpoint with complete membership.
+
+TableAM must additionally integrate own-command visibility and prove the whole
+statement pin vector before first output. The fixture continues to require
+`0A000` from the bound SQL path. Held snapshots exercise the selector under
+real MVCC and leave application Repeatable Read support unqualified.
 
 - Run the managed overlay vectors with a fake published view and ledger membership responses. Verify older base/new ledger, new base/stale ledger, future operation and unknown-membership cases. Assert exact rows, including duplicates.
 - Run `mixed-visibility-claim` through pin selection and ordinary SQL scans. Two segments share one verified publication. A reader between their source commits falls back to the retained parent and adds just its visible segment. Dropping that parent gives an explicit consistency error. A reader after both commits can use the published pin directly.

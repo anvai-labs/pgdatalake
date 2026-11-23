@@ -5,6 +5,10 @@ use std::collections::BTreeSet;
 use serde::Deserialize;
 use uuid::Uuid;
 
+mod ancestry;
+
+pub use ancestry::{ManagedAncestry, ManagedCatalogObservation};
+
 /// The enrolled remote ref and local capture lineage. A lineage spans
 /// capture binding generations while its incarnation and remote scope agree.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -14,6 +18,16 @@ pub struct ManagedReadScope {
     pub incarnation_id: Uuid,
     pub ref_name: String,
     pub storage_root: String,
+}
+
+impl ManagedReadScope {
+    fn is_valid(&self) -> bool {
+        !self.authority_id.is_nil()
+            && !self.table_uuid.is_nil()
+            && !self.incarnation_id.is_nil()
+            && !self.ref_name.is_empty()
+            && !self.storage_root.is_empty()
+    }
 }
 
 /// Catalog and ledger evidence for one candidate on the certified ancestry.
@@ -51,25 +65,20 @@ pub struct ManagedReadCut {
 pub enum ManagedReadError {
     ScopeMismatch,
     InvalidProof,
+    AncestryUnavailable,
+    AncestryLimitExceeded,
     NoCompatiblePin,
 }
 
-/// Consume bounded observations from the catalog and one statement snapshot.
-/// The caller certifies ancestry and supplies candidates newest first. The
-/// selector checks identity, uniqueness and monotone append membership before
-/// returning a pin and segment IDs. The caller holds the chosen pin and local
-/// payloads through scan execution and accounts separately for own commands.
-pub fn select_compatible_pin(
+/// Check exact segment identities and monotone append membership in a chain
+/// already certified by `ManagedAncestry`. The caller holds the chosen pin
+/// and local payloads through execution and accounts for own commands.
+fn select_compatible_pin(
     scope: &ManagedReadScope,
     candidates: &[ManagedPinCandidate<'_>],
     visible: &[VisibleSegment],
 ) -> Result<ManagedReadCut, ManagedReadError> {
-    if scope.authority_id.is_nil()
-        || scope.table_uuid.is_nil()
-        || scope.incarnation_id.is_nil()
-        || scope.ref_name.is_empty()
-        || scope.storage_root.is_empty()
-    {
+    if !scope.is_valid() {
         return Err(ManagedReadError::InvalidProof);
     }
 
