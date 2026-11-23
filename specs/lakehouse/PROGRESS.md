@@ -2,10 +2,11 @@
 
 ## Current dependency order
 
-The merged predecessor for this integration is public #88 at
-`32dc215a402312739bbd7b38caf693144f7d2067`. Its
+Public #89 at `0dc85911759b8880aa59424289c174d473719e5c` qualifies the
+purpose-scoped native session credential adapter. Public #88 at
+`32dc215a402312739bbd7b38caf693144f7d2067` qualifies the accepted-child proof. Its
 [native CI](https://github.com/anvai-labs/pgdatalake/actions/runs/45187258595)
-verifies the accepted-child proof in the lost-reply fixture. Public #87
+runs the lost-reply fixture. Public #87
 qualifies both one-shot reply-loss cases on one primary. Public #86 adds
 the opt-in 1.15 read evidence schema. Public #85 supplies the
 [stock and prepare-only CI receipt](https://github.com/anvai-labs/pgdatalake/actions/runs/45139266582).
@@ -15,7 +16,7 @@ PG19.0. The managed writer and its visibility proof can advance separately.
 
 | Track | Established evidence | Next dependency and exit |
 |---|---|---|
-| Stock reader, 01/02/06 | #53 supplies execution-time FDW COUNT and same-pin fallback. #54/#58/#61 cover effective mapping, enrolled root, real SQL logins, rotation and revocation. #70 runs the [TLS smoke](../../src/test/lakehouse/fixtures/stock-scoped-tls.sh) for those reads and reconnect on verified PG-wire with SCRAM. | The ordinary external pilot needs a deployed client-network, login and grant-generation test. Governed provider identity follows its own gate. Preserve ordinary/pinned count and denied-sibling controls. [External client handoff](modules/10-downstream-handoff.md#external-postgresql-client-handoff) |
+| Stock reader, 01/02/06 | #53 supplies execution-time FDW COUNT and same-pin fallback. #54/#58/#61 cover effective mapping, enrolled root, real SQL logins, rotation and revocation. #70 runs the [TLS smoke](../../src/test/lakehouse/fixtures/stock-scoped-tls.sh) for those reads and reconnect on verified PG-wire with SCRAM. | The scoped reader now bounds catalog and metadata reads and reuses the approved observation for exact-pin planning. The ordinary external pilot needs a deployed client-network, login and grant-generation test. Governed provider identity follows its own gate. Preserve ordinary/pinned count and denied-sibling controls. [External client handoff](modules/10-downstream-handoff.md#external-postgresql-client-handoff) |
 | Governed tables, 01/02/06/08 | #67–69 define BI reuse, provider scope and a verifier for 12 positive SQL executions and six refusals. Current governed results come from synthetic evidence. | Implement and run one provider's protected plan on a real enrolled table. Require exact source pin, actual consumption, masks and distinct effective scopes. Only then qualify reuse and multiple readers. [Verifier](modules/06c-governed-published-read.md) |
 | Managed send and recovery, 01/04 | #75–79 qualified discovery, scoped credentials, bounded ledger loads, stale-work refusal and native lookup/finalize after WAL restart. #80 qualified a native WAL authorization hold with zero provider requests and a lookup-only receipt. #81 rejects assigned launcher XIDs, bounds ledger-lock waits and qualifies a process-local Rust prepare handle that can be dropped without a catalog POST. #83 adds the [C preparation ABI](modules/04b-scoped-send-admission.md#process-local-native-preparation-abi), which exposes the exact bounded proposal. #85’s opt-in native 1.14 diagnostic joins role-bound static Send credentials to it after closing the ledger transaction, then discards the proposal. Opt-in 1.16 [dispatches once](modules/04b-scoped-send-admission.md#native-one-shot-dispatch) through the live handle after durable authorization and proves both reply-loss barriers with the static mapping fixture. Opt-in 1.17 supplies separate purpose-checked native session credentials and rejects mapping rotation during preparation. | Qualify actual provider issuance, renewal and revocation, hard-disable fencing, bounded polling and primary promotion. Keep recovered attempts lookup-only. [Publisher handoff](modules/04b-scoped-send-admission.md#native-worker-integration) |
 | Managed read visibility, 01/03 | #80 qualified the compatible-pin selector under three PostgreSQL snapshots. #81 certifies bounded Iceberg v2 explicit-`main` parent links with real Lakekeeper metadata. #84 rewinds retained cursors and fixes a missing staged rescan result. Opt-in 1.15 persists a pristine enrollment anchor and reads finalized membership separately from the statement-visible segment IDs. At the lost-reply barrier the independent read-only verifier can now prove the unfinalized child from one observed catalog head, exact WAL proposal, bounded manifest digest and sealed membership. | Join that verifier to a scoped native metadata/ledger load and retain exact overlay payloads under the executor snapshot. Select the whole statement pin vector before first output. Prove stable rescan and expiry refusal before enabling a serial append scan. TableAM SQL and COUNT remain gated. [Visibility contract](modules/03-managed-visibility.md#certified-retained-ancestry) |
@@ -53,6 +54,27 @@ the exact intent across restart and Trino read `[10,20,20]` at
 `4744071831784341871`. The later `[30]` stayed staged. Source and intent
 WAL were `0/02A60118` and `0/02A62448` in that local sample.
 [Credential adapter](modules/04b-scoped-send-admission.md#native-session-credential-adapter)
+
+### Bounded observation for scoped reads
+
+An exact-pin scoped read resolves one approved REST metadata pointer and
+loads one size-bounded metadata object. The planner consumes that same
+observation. Scoped reads allow up to 8 MiB for each body and four seconds
+per origin request. Gzip expansion shares the metadata byte limit. Oversized
+or stalled metadata fails before manifest reads. Current-schema mapping
+continues to serve the stock path. Managed execution still needs to prove
+the selected pin's compatibility with the enrolled source schema.
+
+On the parent, a valid oversized catalog envelope returned
+`[10,20,30]`. The candidate returned `08000` after one catalog call and zero
+object requests. An oversized gzip expansion returned `08000` after one
+catalog call and one metadata object request. Trino and stock PostgreSQL
+agreed on `[10,20,20,30]` at `7887953748271609562`, `[10,20,30]` at
+`6364289661650475664` and sibling `[90,90,99]` at
+`3088841630106092750`, with 7, 9 and 7 object calls respectively and zero
+forbidden-root requests. Single-sample SQL latencies were 25.048, 28.032
+and 24.333 ms. These are local Lakekeeper/S3 fixture observations.
+[Scoped observation interface](modules/01-catalog-storage.md)
 
 ### Next managed visibility join
 

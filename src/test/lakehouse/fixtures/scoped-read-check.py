@@ -1,6 +1,7 @@
 """Exercise a bound S3 read with an independent catalog and object recorder."""
 import argparse
 import contextlib
+import gzip
 import http.client
 import http.server
 from importlib import import_module
@@ -37,7 +38,12 @@ def recorder(callback):
                     self.send_header(name, value)
             self.end_headers()
             if self.command != "HEAD":
-                self.wfile.write(data)
+                try:
+                    self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError):
+                    # A client enforcing a response-size limit can close
+                    # the connection immediately after reading the headers.
+                    pass
 
         def log_message(self, *_args):
             pass
@@ -83,6 +89,8 @@ def exercise(db, parent, child, prefix, route, enrolled):
     catalog_requests = []
     redirect_requests = []
     state = {"case": "allowed"}
+    # Include valid JSON above the scoped wire and expansion budgets.
+    padding = "x" * (8 * 1024 * 1024)
 
     def redirect_target(method, path, _headers):
         redirect_requests.append((method, path))
@@ -102,7 +110,10 @@ def exercise(db, parent, child, prefix, route, enrolled):
             result = enrolled | {"config": {"s3.endpoint": forbidden, "s3.region": "wrong"}}
             if case == "sibling-metadata":
                 result["metadata-location"] = root + "-old/metadata/invalid.metadata.json"
-            return 200, [("Content-Type", "application/json")], json.dumps(result).encode()
+            if case == "oversized-catalog":
+                result["metadata"] = result["metadata"] | {"fixture-padding": padding}
+            body = json.dumps(result).encode()
+            return 200, [("Content-Type", "application/json"), ("Content-Length", str(len(body)))], body
 
         def object_response(method, path, headers):
             object_requests.append((method, path))
@@ -112,19 +123,29 @@ def exercise(db, parent, child, prefix, route, enrolled):
             if path == metadata_path:
                 if case == "storage-redirect":
                     return 307, [("Location", forbidden + metadata_path)], b""
-                if case in ("changed-uuid", "changed-root", "sibling-manifest-list"):
+                if case in ("changed-uuid", "changed-root", "sibling-manifest-list", "oversized-gzip"):
                     body = json.loads(json.dumps(metadata))
                     if case == "changed-uuid":
                         body["table-uuid"] = str(uuid.uuid4())
                     elif case == "changed-root":
                         body["location"] = root + "-old"
-                    else:
+                    elif case == "sibling-manifest-list":
                         for snap in body["snapshots"]:
                             snap["manifest-list"] = root + "-old/metadata/invalid.avro"
+                    else:
+                        body["fixture-padding"] = padding
                     data = json.dumps(body).encode()
-                    return 200, [("Content-Length", str(len(data))),
-                                 ("Last-Modified", "Sat, 21 Nov 2026 14:00:00 GMT"),
-                                 ("ETag", '"test"')], data
+                    if case == "oversized-gzip":
+                        data = gzip.compress(data)
+                    reply_headers = [("Content-Length", str(len(data))),
+                                     ("Last-Modified", "Sat, 21 Nov 2026 14:00:00 GMT"),
+                                     ("ETag", '"test"')]
+                    if headers.get("Range"):
+                        assert headers["Range"].startswith("bytes=0-")
+                        assert int(headers["Range"].removeprefix("bytes=0-")) >= len(data) - 1
+                        reply_headers.append(("Content-Range", f"bytes 0-{len(data) - 1}/{len(data)}"))
+                        return 206, reply_headers, data
+                    return 200, reply_headers, data
 
             # Preserve the Host and signed S3 headers so the store sees the
             # original request.
@@ -157,6 +178,7 @@ def exercise(db, parent, child, prefix, route, enrolled):
                 assert object_requests and all(
                     path.startswith(root_path + "/") for _, path in object_requests
                 ), object_requests
+                assert object_requests.count(("GET", metadata_path)) == 1, object_requests
                 print(f"{name}: {len(object_requests)} scoped storage requests", flush=True)
 
             state["case"] = "warm-then-sibling"
@@ -184,6 +206,8 @@ def exercise(db, parent, child, prefix, route, enrolled):
                 ("sibling-manifest-list", "42501", True),
                 ("catalog-redirect", "08000", False),
                 ("storage-redirect", "08000", True),
+                ("oversized-catalog", "08000", False),
+                ("oversized-gzip", "08000", True),
             ):
                 state["case"] = case
                 catalog_requests.clear()
@@ -192,6 +216,10 @@ def exercise(db, parent, child, prefix, route, enrolled):
                 assert catalog_requests == [("GET", route)], (case, catalog_requests)
                 expected = [("GET", metadata_path)] if expect_metadata else []
                 assert object_requests == expected, (case, object_requests)
+                if case.startswith("oversized-"):
+                    print(json.dumps({"case": case, "sqlstate": sqlstate, "pins": [str(parent), str(child)],
+                                      "catalog_calls": len(catalog_requests), "object_calls": len(object_requests)},
+                                     sort_keys=True), flush=True)
 
             state["case"] = "allowed"
             catalog_requests.clear()

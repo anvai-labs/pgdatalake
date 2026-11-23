@@ -414,13 +414,11 @@ impl StorageIo {
         use object_store::{GetOptions, GetRange};
         let Some(probe_end) = max_bytes.checked_add(1).filter(|_| max_bytes > 0) else {
             return Err(StorageError::Config(
-                "invalid object digest byte limit".into(),
+                "invalid object read byte limit".into(),
             ));
         };
         if deadline.is_zero() {
-            return Err(StorageError::Config(
-                "invalid object digest deadline".into(),
-            ));
+            return Err(StorageError::Config("invalid object read deadline".into()));
         }
         let path = Self::full_path(key);
         let options = GetOptions {
@@ -435,19 +433,19 @@ impl StorageIo {
                         .await
                         .map_err(|error| match error {
                             object_store::Error::NotFound { .. } => {
-                                StorageError::NotFound("manifest list is unavailable".into())
+                                StorageError::NotFound("scoped object is unavailable".into())
                             }
-                            _ => StorageError::Http("could not read manifest list".into()),
+                            _ => StorageError::Http("could not read scoped object".into()),
                         })?;
                 let expected = result.meta.size;
                 if expected > max_bytes {
                     return Err(StorageError::Config(
-                        "manifest list exceeds the object digest byte limit".into(),
+                        "scoped object exceeds the byte limit".into(),
                     ));
                 }
                 if result.range != (0..expected) {
                     return Err(StorageError::Decode(
-                        "manifest list response is incomplete".into(),
+                        "scoped object response is incomplete".into(),
                     ));
                 }
                 let mut stream = result.into_stream();
@@ -456,21 +454,21 @@ impl StorageIo {
                     std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await
                 {
                     let chunk = chunk
-                        .map_err(|_| StorageError::Http("could not stream manifest list".into()))?;
+                        .map_err(|_| StorageError::Http("could not stream scoped object".into()))?;
                     remaining = remaining.checked_sub(chunk.len() as u64).ok_or_else(|| {
-                        StorageError::Decode("manifest list exceeds its reported size".into())
+                        StorageError::Decode("scoped object exceeds its reported size".into())
                     })?;
                     consume(&chunk);
                 }
                 if remaining != 0 {
                     return Err(StorageError::Decode(
-                        "manifest list response is truncated".into(),
+                        "scoped object response is truncated".into(),
                     ));
                 }
                 Ok(())
             })
             .await
-            .map_err(|_| StorageError::Http("manifest list read deadline exceeded".into()))?
+            .map_err(|_| StorageError::Http("scoped object read deadline exceeded".into()))?
         })
     }
 
@@ -527,6 +525,39 @@ pub fn fetch_metadata(
     let bytes = io.get_bytes(metadata_location_key)?;
     let bytes = maybe_gunzip(bytes)?;
     serde_json::from_slice(&bytes).map_err(|e| StorageError::Decode(e.to_string()))
+}
+
+/// Read one complete metadata object, including an expansion cap for gzip.
+pub(crate) fn fetch_metadata_bounded(
+    io: &StorageIo,
+    key: &str,
+    max_bytes: usize,
+    deadline: std::time::Duration,
+) -> Result<TableMetadata, StorageError> {
+    use std::io::Read;
+
+    let probe_limit = u64::try_from(max_bytes)
+        .ok()
+        .and_then(|limit| limit.checked_add(1))
+        .ok_or_else(|| StorageError::Config("invalid scoped metadata byte limit".into()))?;
+    let bytes = io.get_bytes_bounded(key, probe_limit - 1, deadline)?;
+    let bytes = if bytes.starts_with(&[0x1f, 0x8b]) {
+        let mut expanded = Vec::new();
+        flate2::read::MultiGzDecoder::new(&bytes[..])
+            .take(probe_limit)
+            .read_to_end(&mut expanded)
+            .map_err(|_| StorageError::Decode("invalid gzip scoped metadata".into()))?;
+        if expanded.len() > max_bytes {
+            return Err(StorageError::Config(
+                "scoped metadata expansion exceeds its size limit".into(),
+            ));
+        }
+        expanded
+    } else {
+        bytes
+    };
+    serde_json::from_slice(&bytes)
+        .map_err(|_| StorageError::Decode("invalid scoped metadata JSON".into()))
 }
 
 /// Gzip magic 0x1f 0x8b; plain JSON passes through untouched.
@@ -686,6 +717,37 @@ mod tests {
             md.format_version,
             crate::catalog::metadata::FormatVersion::V3
         );
+    }
+
+    #[test]
+    fn scoped_metadata_caps_both_object_bytes_and_gzip_expansion() {
+        use std::io::Write;
+
+        test_allow_local_stores();
+        let dir = tempfile::tempdir().unwrap();
+        let location = parse_location(&format!("file://{}", dir.path().display())).unwrap();
+        let io = StorageIo::open(&location, None).unwrap();
+        let metadata = format!(
+            r#"{{"format-version":2,"table-uuid":"9c12d441-03fe-11ed-8122-d358e75d12eb",
+                 "location":"s3://warehouse/events","padding":"{}"}}"#,
+            "x".repeat(4096)
+        );
+        let mut writer = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        writer.write_all(metadata.as_bytes()).unwrap();
+        let compressed = writer.finish().unwrap();
+        assert!(compressed.len() < 256);
+        io.put_bytes("expanded.json", compressed).unwrap();
+        io.put_bytes("oversized.json", metadata.into_bytes())
+            .unwrap();
+
+        let deadline = std::time::Duration::from_secs(2);
+        for (key, diagnostic) in [
+            ("expanded.json", "expansion exceeds"),
+            ("oversized.json", "byte limit"),
+        ] {
+            let error = fetch_metadata_bounded(&io, key, 256, deadline).unwrap_err();
+            assert!(matches!(error, StorageError::Config(reason) if reason.contains(diagnostic)));
+        }
     }
 
     #[test]

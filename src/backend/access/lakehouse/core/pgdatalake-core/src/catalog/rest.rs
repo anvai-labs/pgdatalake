@@ -4,6 +4,7 @@
 //! `TokenProvider` (`OAuth2` client-credentials flow with proactive refresh
 //! lands in the next slice; `SigV4` profiles after that).
 
+use std::io::Read;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -166,6 +167,7 @@ impl RestCatalog {
             tokens,
             reqwest::blocking::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
                 .no_proxy(),
             true,
         )
@@ -237,6 +239,62 @@ impl RestCatalog {
         table: &str,
         prefix: Option<&str>,
     ) -> Result<super::types::LoadTableResult, RestError> {
+        self.get_table_response(namespace, table, prefix, None)?
+            .json()
+            .map_err(|e| RestError::Decode(e.to_string()))
+    }
+
+    /// Resolve only the object pointer. Delegated credentials and inline
+    /// metadata in the REST envelope cannot change a scoped read's authority.
+    pub(crate) fn load_scoped_metadata_location(
+        &self,
+        namespace: &[&str],
+        table: &str,
+        prefix: Option<&str>,
+        max_bytes: usize,
+        deadline: Duration,
+    ) -> Result<String, RestError> {
+        #[derive(Deserialize)]
+        struct MetadataPointer {
+            #[serde(rename = "metadata-location")]
+            location: String,
+        }
+
+        if !self.scoped || deadline.is_zero() || max_bytes == 0 {
+            return Err(RestError::Http("invalid scoped catalog load budget".into()));
+        }
+        let limit = u64::try_from(max_bytes)
+            .ok()
+            .and_then(|bytes| bytes.checked_add(1))
+            .ok_or_else(|| RestError::Http("invalid scoped catalog load budget".into()))?;
+        let too_large =
+            || RestError::Decode("scoped catalog response exceeds its size limit".into());
+        let response = self.get_table_response(namespace, table, prefix, Some(deadline))?;
+        if response
+            .content_length()
+            .is_some_and(|length| length >= limit)
+        {
+            return Err(too_large());
+        }
+        let mut bytes = Vec::new();
+        response.take(limit).read_to_end(&mut bytes).map_err(|_| {
+            RestError::Http("scoped catalog body read failed or exceeded its deadline".into())
+        })?;
+        if bytes.len() > max_bytes {
+            return Err(too_large());
+        }
+        let pointer: MetadataPointer = serde_json::from_slice(&bytes)
+            .map_err(|_| RestError::Decode("invalid scoped catalog metadata pointer".into()))?;
+        Ok(pointer.location)
+    }
+
+    fn get_table_response(
+        &self,
+        namespace: &[&str],
+        table: &str,
+        prefix: Option<&str>,
+        timeout: Option<Duration>,
+    ) -> Result<reqwest::blocking::Response, RestError> {
         let ns = namespace
             .iter()
             .map(|c| urlencoding::encode(c))
@@ -249,16 +307,15 @@ impl RestCatalog {
             prefix.map_or_default(|p| format!("/{p}")),
             urlencoding::encode(table),
         );
-        let resp = self
-            .inner
-            .get(&url)
-            .bearer_auth(
-                self.tokens
-                    .token()
-                    .map_err(|e| RestError::Http(format!("token provider: {e}")))?,
-            )
-            .send()
-            .map_err(|e| RestError::Http(e.to_string()))?;
+        let mut request = self.inner.get(&url).bearer_auth(
+            self.tokens
+                .token()
+                .map_err(|e| RestError::Http(format!("token provider: {e}")))?,
+        );
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
+        let resp = request.send().map_err(|e| RestError::Http(e.to_string()))?;
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND {
             return Err(RestError::NotFound(format!(
@@ -272,9 +329,7 @@ impl RestCatalog {
                 redact_url(&url)
             )));
         }
-        let wire: super::types::LoadTableResult =
-            resp.json().map_err(|e| RestError::Decode(e.to_string()))?;
-        Ok(wire)
+        Ok(resp)
     }
 
     /// `POST /v1/{prefix}/namespaces` — createNamespace; 409 (already
@@ -639,6 +694,76 @@ mod tests {
         let err = catalog.load_table(&["ns"], "gone").unwrap_err();
         server_thread.join().unwrap();
         assert!(matches!(err, RestError::NotFound(_)), "{err}");
+    }
+
+    #[test]
+    fn scoped_metadata_pointer_caps_declared_and_streamed_responses() {
+        use std::io::Cursor;
+
+        for known_length in [true, false] {
+            let fixture = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}", fixture.server_addr().to_ip().unwrap());
+            let worker = std::thread::spawn(move || {
+                let request = fixture.recv().unwrap();
+                assert_eq!(request.url(), "/v1/fixed/namespaces/ns/tables/events");
+                let body = format!(
+                    r#"{{"metadata-location":"s3://warehouse/events/metadata/md.json","metadata":"{}"}}"#,
+                    "x".repeat(2048)
+                );
+                let len = known_length.then_some(body.len());
+                let _ = request.respond(tiny_http::Response::new(
+                    200.into(),
+                    vec![],
+                    Cursor::new(body),
+                    len,
+                    None,
+                ));
+            });
+
+            let catalog =
+                RestCatalog::new_scoped(&endpoint, Box::new(StaticToken("test".into()))).unwrap();
+            let error = catalog
+                .load_scoped_metadata_location(
+                    &["ns"],
+                    "events",
+                    Some("fixed"),
+                    256,
+                    Duration::from_secs(2),
+                )
+                .unwrap_err();
+            assert!(
+                matches!(error, RestError::Decode(ref reason) if reason.contains("size limit"))
+            );
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn scoped_metadata_pointer_deadline_covers_the_body() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (finished, completed) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut headers = [0u8; 2048];
+            assert!(stream.read(&mut headers).unwrap() > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 60\r\n\r\n{\"metadata-location\":")
+                .unwrap();
+            assert!(completed.recv_timeout(Duration::from_secs(3)).is_ok());
+        });
+
+        let catalog =
+            RestCatalog::new_scoped(&endpoint, Box::new(StaticToken("test".into()))).unwrap();
+        let error = catalog
+            .load_scoped_metadata_location(&["ns"], "events", None, 256, Duration::from_millis(250))
+            .unwrap_err();
+        finished.send(()).unwrap();
+        assert!(matches!(error, RestError::Http(ref reason) if reason.contains("deadline")));
+        worker.join().unwrap();
     }
 
     /// Non-2xx responses surface as Http errors with the status code.
