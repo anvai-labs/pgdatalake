@@ -23,7 +23,7 @@ use crate::writer::{parse_row_json, BatchWriter, WriteColumn};
 
 /// Immutable target facts provided by trusted enrollment, independently of
 /// the catalog response. Each worker gets the original descriptor on replay.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct PublicationTarget {
     pub binding: PublicationBindingIdentity,
     pub table_uuid: Uuid,
@@ -175,9 +175,8 @@ impl ScopedPublisher {
             || credentials.objects.token.as_ref().is_some_and(|token| {
                 token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_graphic())
             })
-            || columns.is_empty()
-            || limits.captured_bytes == 0
-            || limits.captured_rows == 0
+            || (purpose == PublicationPurpose::Send
+                && (columns.is_empty() || limits.captured_bytes == 0 || limits.captured_rows == 0))
             || limits.manifest_bytes == 0
             || limits.manifest_bytes == u64::MAX
             || limits.manifest_timeout.is_zero()

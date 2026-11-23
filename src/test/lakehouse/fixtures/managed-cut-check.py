@@ -154,7 +154,60 @@ def run_worker(worker, db, operation, approval, hint, *, error=None, member_byte
     return result.stdout.strip()
 
 
-def exercise(db, namespace, role, owner, worker, expect_runtime_red):
+def run_native_lookup(db, role, operation, binding, generation, child, posts, lookups):
+    function = "lakehouse.reconcile_managed_publication_lookup"
+    call = f"SET ROLE {role}; SELECT {function}('{operation}', {generation});"
+    sql(db, "ALTER EXTENSION lakehouse UPDATE TO '1.11';")
+    sql(db, f"SELECT {function}('{operation}', {generation});", error="42883")
+    sql(db, f"""
+        ALTER EXTENSION lakehouse UPDATE TO '1.12';
+        CREATE ROLE {role} LOGIN;
+        GRANT USAGE ON SCHEMA lakehouse TO {role};
+        GRANT EXECUTE ON FUNCTION lakehouse.load_managed_publication_job(uuid),
+            lakehouse.get_publication_lookup_binding(uuid),
+            lakehouse.advance_publication_generation(uuid, bigint),
+            lakehouse.finalize_publication(uuid, bigint, uuid, uuid, bytea, bigint, bytea) TO {role};
+        GRANT SELECT ON lakehouse.publication_binding_descriptors,
+            lakehouse.managed_capture_bindings, lakehouse.publication_attempts,
+            lakehouse.publication_lookup_grants, {HDR}, {MEM}, {SEG} TO {role};
+        GRANT UPDATE (owner_generation, verified_snapshot_id) ON {HDR} TO {role};
+        GRANT UPDATE (published, published_snapshot_id) ON {SEG} TO {role};
+        CREATE SERVER lookup_credentials FOREIGN DATA WRAPPER lakehouse_fdw
+            OPTIONS (endpoint 'http://127.0.0.1:1/catalog', warehouse 'smoke');
+        CREATE USER MAPPING FOR {role} SERVER lookup_credentials
+            OPTIONS (token 'fixture-lookup', s3_access_key 'lakehouse-reader',
+                     s3_secret_key 'lakehouse-reader-password');
+    """)
+    sql(db, call, error="42501")
+    sql(db, f"GRANT EXECUTE ON FUNCTION {function}(uuid, bigint) TO {role};")
+    sql(db, call, error="42501")
+    sql(db, f"""
+        INSERT INTO lakehouse.publication_lookup_grants
+        SELECT '{binding}', umuser, umid, clock_timestamp() - interval '1 second'
+        FROM pg_user_mappings WHERE usename='{role}' AND srvname='lookup_credentials';
+    """)
+    sql(db, call, error="42501")
+    assert sql(db, f"SELECT owner_generation FROM {HDR} WHERE operation_id='{operation}'") == str(generation)
+    assert len(posts) == len(lookups) == 1, "unapproved or expired lookup touched the provider"
+
+    sql(db, f"""
+        UPDATE lakehouse.publication_lookup_grants
+           SET expires_at=clock_timestamp() + interval '90 seconds'
+         WHERE binding_id='{binding}';
+        SELECT lakehouse.revoke_publication_send('{binding}');
+    """)
+    sql(db, f"SET ROLE {role}; SELECT {function}('{operation}', {generation - 1});", error="40001")
+    assert len(posts) == len(lookups) == 1, "stale native lookup touched the provider"
+    result = json.loads(sql(db, call))
+    assert result == {"status": "verified", "owner_generation": str(generation + 1),
+                      "snapshot_id": child, "members": 2}, result
+    print(json.dumps({"case": "native_lookup_reconciled", "snapshot_id": child,
+                      "catalog_posts": len(posts), "catalog_gets": len(lookups),
+                      "send_grant_revoked": True, "no_mapping_or_expired_sqlstate": "42501",
+                      "stale_sqlstate": "40001"}, sort_keys=True), flush=True)
+
+
+def exercise(db, namespace, role, owner, worker, expect_runtime_red, native_lookup):
     relation = f"iceberg.{namespace}.events"
     trino(f"CREATE TABLE {relation} (id bigint) WITH (format_version=2)")
     trino(f"INSERT INTO {relation} VALUES (10)")
@@ -171,14 +224,14 @@ def exercise(db, namespace, role, owner, worker, expect_runtime_red):
     with dropped_catalog_reply(route) as (endpoint, posts, lookups):
         approval = trino_fixture.approved_target(namespace, endpoint, prefix, authority, table,
                                                   root.rstrip("/"), binding, incarnation)
-        check_visibility(db, role, owner, worker, approval, base, history, (route, posts, lookups))
+        check_visibility(db, role, owner, worker, approval, base, history, (route, posts, lookups), native_lookup)
 
     if expect_runtime_red:
         sql(db, f"SET ROLE {role}; SELECT count(id) FROM events", error="0A000")
         print("bound SQL overlay remains gated with 0A000", flush=True)
 
 
-def check_visibility(db, role, owner, worker, approval, base, history, gateway):
+def check_visibility(db, role, owner, worker, approval, base, history, gateway, native_lookup):
     route, posts, lookups = gateway
     source, parent, _, _ = base
     authority, table, _ = source
@@ -265,7 +318,11 @@ def check_visibility(db, role, owner, worker, approval, base, history, gateway):
         assert run_worker(worker, db, operation, approval, lookup_hint | {"mode": "send"}) == "rediscover"
         assert discover("lookup") == lookup_hint and len(posts) == len(lookups) == 1
 
-        assert run_worker(worker, db, operation, approval, lookup_hint) == f"verified {child} 2"
+        if native_lookup:
+            run_native_lookup(db, role + "_lookup", operation, binding, lookup_hint["owner_generation"],
+                              child, posts, lookups)
+        else:
+            assert run_worker(worker, db, operation, approval, lookup_hint) == f"verified {child} 2"
         receipt = verified_membership(db, operation)
         assert receipt == {"pin": child, "binding": binding, "source": list(source),
                            "members": [first_id, late_id]}, receipt
@@ -309,6 +366,8 @@ def main():
     parser.add_argument("--worker", required=True, type=Path)
     parser.add_argument("--expect-runtime-red", action="store_true",
                         help="assert that ordinary managed SQL remains gated")
+    parser.add_argument("--native-lookup", action="store_true",
+                        help="recover lost reply with the native 1.12 worker")
     args = parser.parse_args()
     if not __debug__:
         raise RuntimeError("the cut fixture requires Python assertions")
@@ -320,10 +379,11 @@ def main():
         sql("postgres", f"CREATE DATABASE {namespace} TEMPLATE template0 ENCODING 'UTF8' LOCALE 'C'")
         try:
             sql(namespace, f"CREATE ROLE {role}")
-            exercise(namespace, namespace, role, owner, args.worker.resolve(), args.expect_runtime_red)
+            exercise(namespace, namespace, role, owner, args.worker.resolve(),
+                     args.expect_runtime_red, args.native_lookup)
         finally:
             sql("postgres", f"DROP DATABASE {namespace}")
-            sql("postgres", f"DROP ROLE IF EXISTS {role}")
+            sql("postgres", f"DROP ROLE IF EXISTS {role}_lookup, {role}")
     finally:
         trino(f"DROP TABLE IF EXISTS iceberg.{namespace}.events")
         trino(f"DROP SCHEMA iceberg.{namespace}")
