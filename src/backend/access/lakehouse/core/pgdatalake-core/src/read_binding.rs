@@ -100,12 +100,18 @@ impl S3ReadRoot {
         uri: &str,
         s3: &S3Options,
     ) -> Result<(StorageIo, String), StorageError> {
-        let key = format!("{}{}", self.prefix, self.relative_path(uri)?);
-        let location = Location::S3 {
-            bucket: self.bucket.clone(),
-            key: key.clone(),
+        let location = self.object_location(uri)?;
+        let Location::S3 { key, .. } = &location else {
+            unreachable!("validated S3 root");
         };
-        Ok((StorageIo::open_bound_s3(&location, s3)?, key))
+        Ok((StorageIo::open_bound_s3(&location, s3)?, key.clone()))
+    }
+
+    pub(crate) fn object_location(&self, uri: &str) -> Result<Location, StorageError> {
+        Ok(Location::S3 {
+            bucket: self.bucket.clone(),
+            key: format!("{}{}", self.prefix, self.relative_path(uri)?),
+        })
     }
 }
 

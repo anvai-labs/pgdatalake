@@ -19,7 +19,10 @@ use pgdatalake_core::{
         rest::{RestCatalog, RestError, StaticToken},
     },
     parquet::CellValue,
-    publication_transport::{PublicationLimits, PublicationTarget, ScopedPublisher},
+    publication_transport::{
+        PublicationCredentials, PublicationLimits, PublicationPurpose, PublicationTarget,
+        ScopedPublisher,
+    },
     publication_worker::{
         drive_publication, reconcile_publication, CapturedMember, ClaimState, LedgerResult,
         PendingReason, PublicationBindingIdentity, PublicationCatalog, PublicationClaim,
@@ -335,27 +338,53 @@ struct FixtureCatalog<'a> {
 }
 
 impl FixtureCatalog<'_> {
-    fn admitted_publisher(&self, query: &str) -> FixtureResult<ScopedPublisher> {
+    fn admitted_publisher(
+        &self,
+        query: &str,
+        purpose: PublicationPurpose,
+    ) -> FixtureResult<ScopedPublisher> {
         let descriptor: BindingDescriptor = serde_json::from_str(&self.target.sql(query)?)?;
-        let keys = s3_options();
-        Ok(ScopedPublisher::new(
-            PublicationTarget {
-                binding: descriptor.identity.into(),
-                table_uuid: descriptor.table_uuid,
-                table_root: descriptor.storage_root,
-                schema_id: descriptor.schema_id,
-                spec_id: descriptor.spec_id,
-                ref_name: descriptor.ref_name,
-                catalog_endpoint: descriptor.catalog_endpoint,
-                catalog_prefix: descriptor.catalog_prefix,
-                namespace: descriptor.namespace_components,
-                table_name: descriptor.table_name,
-                object_endpoint: descriptor.object_endpoint,
-                s3_region: descriptor.s3_region,
+        // The live fixture uses different read and write principals. Both
+        // are disposable SeaweedFS users configured by the test profile.
+        let (bearer, key, secret) = match purpose {
+            PublicationPurpose::Send => {
+                ("fixture-send", "lakehouse-test", "lakehouse-test-password")
+            }
+            PublicationPurpose::Lookup => (
+                "fixture-lookup",
+                "lakehouse-reader",
+                "lakehouse-reader-password",
+            ),
+        };
+        let target = PublicationTarget {
+            binding: descriptor.identity.into(),
+            table_uuid: descriptor.table_uuid,
+            table_root: descriptor.storage_root,
+            schema_id: descriptor.schema_id,
+            spec_id: descriptor.spec_id,
+            ref_name: descriptor.ref_name,
+            catalog_endpoint: descriptor.catalog_endpoint,
+            catalog_prefix: descriptor.catalog_prefix,
+            namespace: descriptor.namespace_components,
+            table_name: descriptor.table_name,
+            object_endpoint: descriptor.object_endpoint,
+            s3_region: descriptor.s3_region,
+        };
+        let credentials = PublicationCredentials {
+            target: target.clone(),
+            purpose,
+            expires_at: std::time::SystemTime::now() + Duration::from_secs(60),
+            catalog_bearer: bearer.into(),
+            objects: object_store::aws::AwsCredential {
+                key_id: key.into(),
+                secret_key: secret.into(),
+                token: None,
             },
-            Box::new(StaticToken(String::new())),
-            keys.access_key_id.expect("fixture access key"),
-            keys.secret_access_key.expect("fixture secret key"),
+        };
+        Ok(ScopedPublisher::new(
+            target,
+            purpose,
+            credentials,
             vec![("id".into(), IcebergType::Long)],
             PublicationLimits {
                 captured_bytes: 1024 * 1024,
@@ -375,10 +404,13 @@ impl PublicationCatalog for FixtureCatalog<'_> {
     ) -> Result<PreparedPublication<'_>, StorageError> {
         if self.target.admitted_transport {
             let catalog = self
-                .admitted_publisher(&format!(
-                "SELECT row_to_json(d) FROM lakehouse.get_publication_send_binding('{}', {}) AS d;",
-                claim.identity.operation_id, claim.generation,
-            ))
+                .admitted_publisher(
+                    &format!(
+                        "SELECT row_to_json(d) FROM lakehouse.get_publication_send_binding('{}', {}) AS d;",
+                        claim.identity.operation_id, claim.generation,
+                    ),
+                    PublicationPurpose::Send,
+                )
                 .map_err(|error| {
                     StorageError::Config(format!("fixture send admission: {error}"))
                 })?;
@@ -453,10 +485,13 @@ impl PublicationCatalog for FixtureCatalog<'_> {
     ) -> Result<PublicationLookup, RestError> {
         if self.target.admitted_transport {
             return self
-                .admitted_publisher(&format!(
-                "SELECT row_to_json(d) FROM lakehouse.get_publication_lookup_binding('{}') AS d;",
-                claim.identity.operation_id,
-            ))
+                .admitted_publisher(
+                    &format!(
+                        "SELECT row_to_json(d) FROM lakehouse.get_publication_lookup_binding('{}') AS d;",
+                        claim.identity.operation_id,
+                    ),
+                    PublicationPurpose::Lookup,
+                )
                 .map_err(|error| RestError::Http(format!("fixture lookup admission: {error}")))?
                 .lookup(claim, intent);
         }
