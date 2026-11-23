@@ -252,6 +252,40 @@ snapshot and cut. Add distinct telemetry for the compatibility refusal,
 origin timeout and oversized proof so operators can distinguish a safe
 refusal from a slow authorized read.
 
+#### Admission before the native cut
+
+The first executor slice supports a direct, serial, append-only base scan.
+Use statement-owned state after PostgreSQL's normal permission checks.
+Derive the checked role from the scanned RTE's permission information.
+Decline redirected permission identities, views, RLS, inheritance, joins,
+parallel plans and unsupported own-command state before any origin request
+until each has a separate qualified path. Plain EXPLAIN opens no objects.
+Repeat permission and grant checks for each prepared execution.
+
+An operator-approved Read enrollment binds the exact managed incarnation,
+current capture generation, checked role, catalog route, table UUID,
+`main` anchor, source shape and root. Resolve the scoped credential for that
+role. Do not accept a PUBLIC mapping or a Send or Lookup grant. Treat a
+same-OID mapping replacement as a credential change. A fixture holding the
+ledger owner role cannot qualify this gate. Acquire and compare current and
+original-snapshot scope before catalog access. Keep the execution relation
+lock while verifying scope. Recheck the read grant and exact scope before
+installing the cut.
+
+Use one bounded Rust observation. Take the fresh committed proof snapshot
+after observing the catalog so the proof can see the already-durable
+intent for the observed candidate. Use explicit read-only SPI snapshots
+and copy the bounded result before ending the SPI frame. The separate
+fresh snapshot supplies finalized edges and the pending intent. The
+registered executor snapshot supplies only visible segment metadata and
+selected payload bytes. Restore the role, resource owner and snapshot
+state on errors and release all owned handles. The first native smoke
+must fail on the unchanged `0A000` baseline, then pass the lost-reply
+fixture through normal SQL under an admitted reader role. Wrong or stale
+grants must issue zero catalog and object requests. Exercise a nested SPI
+caller and prove the next ordinary statement retains its original role
+and snapshot after a forced proof error.
+
 #### Native observation and exact-pin open
 
 The internal C ABI starts with `pg_datalake_managed_read_observe` after
