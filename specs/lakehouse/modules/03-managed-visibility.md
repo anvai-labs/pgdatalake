@@ -173,17 +173,84 @@ unknown. A missing complete parent prevents proof. The test compares the
 retained ledger before and after the decisions and then separately reconciles
 through the publication lookup worker.
 
-This fixture qualifies the pending-head verifier and cut selection without
-enabling the TableAM executor. The operator fixture supplies the read-only
-ledger observation. Production still needs a scoped accessor, a bounded
-catalog adapter reused for scan planning, and object and payload retention.
-Reanchoring beyond the retained history horizon needs a durable membership
-checkpoint.
+#### Scoped ledger reads
+
+Opt-in extension 1.18 separates two private accessors. The fixture runs them as
+the extension owner against the authorized relation and binding. Both operate
+with caller privileges and revoke execution from PUBLIC. Application SQL roles
+get neither publication evidence nor payloads through these entry points.
+
+The caller runs `get_managed_read_pending_head` with a fresh committed ledger
+snapshot after observing the certified catalog head. It returns the one scoped
+pending attempt and up to 1,024 sealed member identities, or NULL when the
+edge has no unique evidence. It supplies bytes to the read-only verifier and
+does not prove remote acceptance. The caller, rather than the stable SQL
+function, supplies snapshot freshness.
+
+After the selector chooses the overlay, the caller runs
+`load_managed_read_overlay` under the original statement data snapshot. The
+same snapshot covers scope, budget checks and payload loading. The loader
+accepts up to 16,384 strictly ascending exact IDs and returns all their payloads
+with sealed digests. It refuses an invisible or missing member or a batch over
+the caller's row or byte budget. The current maximum is 65,536 rows and 8 MiB.
+Neither the finalization status nor a newer source commit changes that
+snapshot's visible bytes. The held-snapshot fixture loads the exact chosen
+IDs and checks the resulting bytes again after native finalization.
+
+This fixture qualifies the two ledger reads and their snapshot roles. The
+overlay accessor sees binding state through the data snapshot. During
+rotation, a fresh read refuses the old binding and a held older snapshot
+refuses the successor. The accessor alone cannot detect a later committed
+revocation of the binding it still sees. The executor must identify the
+latest active binding and compare it with the original statement's scope
+before loading bytes.
+
+The executor must copy selected payloads into scan-owned memory and verify
+SHA-256 of each copied payload against the sealed expected digest before
+emitting any row. Rescans use the retained copy. The C executor also needs
+to consume the shared [bounded observation](01-catalog-storage.md) and secure
+a retained object lease or equivalent provider proof. Reanchoring beyond retained history needs a
+durable membership checkpoint.
 
 TableAM must additionally integrate own-command visibility and prove the whole
 statement pin vector before first output. The fixture continues to require
 `0A000` from the bound SQL path. Held snapshots exercise the selector under
 real MVCC and leave application Repeatable Read support unqualified.
+
+#### Native statement cut boundary
+
+Start with one supported serial append-only base relation. The executor
+keeps the PostgreSQL statement snapshot and normal permission checks. A
+trusted, fixed SQL ledger call can read private proof data as the ledger
+owner after those checks. Do not select storage credentials as that owner.
+Derive the approved reader binding from the authorized relation and
+current enrollment. Require the original snapshot to recognize that scope.
+Both checks must succeed even after a prepared plan, credential rotation
+or binding invalidation. Decline unsupported query shapes before output
+until every bound relation can be preflighted as one statement cut.
+
+Use one scoped catalog observation for certification and scan planning.
+Obtain current binding, finalized edges and the one pending candidate with
+a bounded fresh committed ledger observation. Restore the original executor
+snapshot before loading visible segments and payloads. Copy the bounded
+proof and payload data out of SPI before remote I/O. Rust only receives
+owned or call-scoped values. PostgreSQL error cleanup stays on the C side.
+Verify the payload bytes against the selected sealed digests and the
+chosen pin against the enrolled source shape before installing the scan
+state. A missing compatible pin, scope mismatch, unavailable payload
+or unproved shape prevents the first row. Keep the legacy published-flag
+loader outside this path.
+
+The retained scan state owns the immutable pin, the ordered overlay
+members, decoded readers and their resource lifetimes. Rescan rewinds its
+base and overlay readers without another catalog resolution or ledger
+selection. EndScan and the executor's error path release both. Portals
+continue using their installed cut across fetches. Object retention
+must protect the selected pin for the supported portal lifetime. Bound
+COUNT continues to decline until it can preserve the same privileges,
+snapshot and cut. Add distinct telemetry for the compatibility refusal,
+origin timeout and oversized proof so operators can distinguish a safe
+refusal from a slow authorized read.
 
 #### SQL executor acceptance
 

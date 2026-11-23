@@ -26,7 +26,8 @@ SCOPE_FIELDS = ("authority_id", "table_uuid", "ref_name", "incarnation_id", "sto
 MAX_CATALOG_BYTES = 2 * 1024 * 1024
 
 
-def select_cut(worker, source, catalog, candidates, visible, *, pending_head=None, reader_object_endpoint=None):
+def select_cut(worker, source, catalog, candidates, visible, *, pending_head=None,
+               reader_object_endpoint=None, load_overlay=None):
     def membership(included):
         if included is EXPIRED:
             return {"proof": "expired"}
@@ -58,8 +59,11 @@ def select_cut(worker, source, catalog, candidates, visible, *, pending_head=Non
     overlay_ids = [int(seg_id) for seg_id in cut["overlay_segment_ids"]]
     base, = (rows for _, candidate, _, rows in candidates if candidate == pin)
     rows = list(base)
-    for seg_id in overlay_ids:
-        rows.extend(visible[seg_id][0])
+    payloads = load_overlay(overlay_ids) if load_overlay is not None else [
+        visible[seg_id][0] for seg_id in overlay_ids
+    ]
+    for payload in payloads:
+        rows.extend(payload)
     return pin, overlay_ids, sorted(rows)
 
 
@@ -89,56 +93,38 @@ def ledger_additions(db, binding, *pins):
 
 
 def retained_pending_head(db, binding, child, parent):
-    # A committed observation separate from the caller's original scan
-    # snapshot. This fixture selects from the private ledger as its operator.
-    # Readers must eventually get the same evidence via a scoped adapter.
     value = sql(db, f"""
         BEGIN READ ONLY;
-        WITH scoped AS (
-            SELECT * FROM lakehouse.get_managed_read_scope('events', '{binding}')
-        ), possible AS (
-            SELECT a.*, c.owner_generation AS current_owner, c.input_digest,
-                   c.verified_snapshot_id, b.schema_id, b.spec_id, b.authority_id, b.table_uuid,
-                   b.incarnation_id, b.storage_root
-            FROM lakehouse.publication_attempts a
-            JOIN {HDR} c ON c.operation_id = a.operation_id
-            JOIN lakehouse.managed_capture_bindings b ON b.binding_id = a.capture_binding_id
-            JOIN scoped s ON b.incarnation_id = s.incarnation_id
-            WHERE a.proposed_snapshot_id = {child} AND a.capture_binding_id IS NOT NULL
-              AND c.capture_binding_id = a.capture_binding_id
-              AND c.relid = 'events'::regclass
-              AND (c.authority_id, c.table_uuid) = (s.authority_id, s.table_uuid)
-            LIMIT 2
-        )
-        SELECT json_build_object(
-            'scope', json_build_object('authority_id', p.authority_id, 'table_uuid', p.table_uuid,
-                'ref_name', 'main', 'incarnation_id', p.incarnation_id, 'storage_root', p.storage_root),
-            'schema_id', p.schema_id, 'spec_id', p.spec_id,
-            'operation_id', p.operation_id, 'input_digest', encode(p.input_digest, 'hex'),
-            'expected_parent', p.expected_parent::text, 'snapshot_id', p.proposed_snapshot_id::text,
-            'proposal_digest', encode(p.proposal_digest, 'hex'), 'proposal_body', encode(p.proposal_body, 'hex'),
-            'current_owner', p.current_owner, 'intent_owner', p.owner_generation, 'members', batch.members)
-        FROM possible p
-        CROSS JOIN LATERAL (
-            SELECT count(*) AS n, bool_and(m.capture_binding_id = p.capture_binding_id
-                AND m.published IS FALSE AND m.published_snapshot_id IS NULL
-                AND octet_length(m.payload_digest) = 32) AS held,
-                json_agg(json_build_object('segment_id', m.seg_id::text, 'row_count', m.row_count,
-                    'payload_digest', encode(m.payload_digest, 'hex')) ORDER BY m.seg_id) AS members
-            FROM (
-                SELECT pm.seg_id, s.capture_binding_id, s.row_count, s.published,
-                       s.published_snapshot_id, s.payload_digest
-                FROM {MEM} pm LEFT JOIN {SEG} s USING (seg_id)
-                WHERE pm.operation_id = p.operation_id
-                ORDER BY pm.seg_id LIMIT 1025
-            ) m
-        ) batch
-        WHERE (SELECT count(*) FROM possible) = 1 AND p.expected_parent = {parent}
-          AND p.verified_snapshot_id IS NULL AND octet_length(p.proposal_body) BETWEEN 1 AND 65536
-          AND batch.n BETWEEN 1 AND 1024 AND batch.held IS TRUE;
+        SELECT lakehouse.get_managed_read_pending_head('events', '{binding}', {child}, {parent});
         ROLLBACK;
     """)
     return json.loads(value) if value else None
+
+
+def overlay_call(binding, ids, *, target="events", max_rows=65536, max_bytes=8388608):
+    requested = f"ARRAY[{','.join(str(i) for i in ids)}]::bigint[]"
+    return (f"lakehouse.load_managed_read_overlay('{target}', '{binding}', "
+            f"{requested}, {max_rows}, {max_bytes})")
+
+
+def overlay_bytes(session, binding, ids):
+    result, = session(f"""
+        SELECT coalesce(json_agg(json_build_array(segment_id, row_count, encode(payload_digest, 'hex'),
+               encode(payload, 'hex')) ORDER BY segment_id), '[]'::json)
+        FROM {overlay_call(binding, ids)}
+    """)
+    rows = json.loads(result)
+    assert [row[0] for row in rows] == ids, rows
+    for _, row_count, digest, body in rows:
+        payload = bytes.fromhex(body)
+        assert hashlib.sha256(payload).hexdigest() == digest
+        assert len(json.loads(payload)) == row_count
+    return rows
+
+
+def load_overlay(session, binding, ids):
+    return [[row[0] for row in json.loads(bytes.fromhex(body))]
+            for _, _, _, body in overlay_bytes(session, binding, ids)]
 
 
 def bounded_table_get(address, route, bearer=None):
@@ -339,7 +325,7 @@ def check_visibility(db, role, owner, worker, approval, base, history, gateway, 
         '{authority}', '{table}', '{root}', 0, 0, {{anchor}})"""
     prior_binding, prior_lineage = (str(uuid4()) for _ in range(2))
     sql(db, f"""
-        CREATE EXTENSION lakehouse VERSION '1.15';
+        CREATE EXTENSION lakehouse VERSION '1.18';
         DROP EXTENSION lakehouse;
         CREATE EXTENSION lakehouse;
         ALTER EXTENSION lakehouse UPDATE TO '1.14';
@@ -387,6 +373,15 @@ def check_visibility(db, role, owner, worker, approval, base, history, gateway, 
     for invalid in ("NULL::bigint[]", "'{}'::bigint[]", f"ARRAY[{parent},{parent}]",
                     f"ARRAY[[{parent}],[{parent}]]", f"array_fill({parent}::bigint, ARRAY[513])"):
         sql(db, f"SELECT lakehouse.get_managed_read_additions('events', '{binding}', {invalid})", error="22023")
+    sql(db, "ALTER EXTENSION lakehouse UPDATE TO '1.17'")
+    sql(db, f"SELECT * FROM {overlay_call(binding, [])}", error="42883")
+    sql(db, "ALTER EXTENSION lakehouse UPDATE TO '1.18'")
+    for accessor in (overlay_call(binding, []),
+                     f"lakehouse.get_managed_read_pending_head('events', '{binding}', 2, 1)"):
+        sql(db, f"SET ROLE {role}; SELECT * FROM {accessor}", error="42501")
+    assert not sql(db, f"SELECT * FROM {overlay_call(binding, [])}")
+    sql(db, f"SELECT * FROM {overlay_call(binding, [], target='prior_events')}", error="55000")
+    sql(db, f"SELECT lakehouse.get_managed_read_pending_head('prior_events', '{binding}', 2, 1)", error="55000")
     sql(db, f"SELECT lakehouse.grant_publication_send('{binding}', '{prefix}', 'us-east-1')")
 
     with login(db, owner) as before, login(db, owner) as between, login(db, owner) as fresh:
@@ -405,10 +400,27 @@ def check_visibility(db, role, owner, worker, approval, base, history, gateway, 
             COMMIT;
             BEGIN; SET LOCAL ROLE {role}; INSERT INTO events VALUES (98); ROLLBACK;
         """)
+        fresh("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
         fresh_view = ledger_snapshot(fresh, binding)
         assert len(fresh_view[1]) == 2, fresh_view
         late_id, = fresh_view[1].keys() - {first_id}
         assert fresh_view[1] == {first_id: ([20], False), late_id: ([20], False)}, fresh_view
+
+        held_middle = overlay_bytes(between, binding, [first_id])
+        held_fresh = overlay_bytes(fresh, binding, [first_id, late_id])
+        assert load_overlay(fresh, binding, [first_id, late_id]) == [[20], [20]]
+        assert all(bytes.fromhex(row[3]) == b"[[20]]" for row in held_fresh)
+        for invalid in ([0], [first_id, first_id], [late_id, first_id]):
+            sql(db, f"SELECT * FROM {overlay_call(binding, invalid)}", error="22023")
+        for cap in ({"max_rows": 1}, {"max_bytes": 1}):
+            sql(db, f"SELECT * FROM {overlay_call(binding, [first_id, late_id], **cap)}", error="54000")
+        for cap in ({"max_rows": 65537}, {"max_bytes": 8388609}):
+            sql(db, f"SELECT * FROM {overlay_call(binding, [], **cap)}", error="22023")
+        sql(db, f"SELECT * FROM {overlay_call(binding, [first_id, late_id + 1])}", error="55000")
+        between("SAVEPOINT invisible_payload")
+        between(f"SELECT * FROM {overlay_call(binding, [first_id, late_id])}", sqlstate="55000")
+        between("ROLLBACK TO SAVEPOINT invisible_payload")
+        assert overlay_bytes(between, binding, [first_id]) == held_middle
 
         operation = str(uuid4())
         candidates = sql(db, "SELECT segment_id, binding_id, eligible FROM "
@@ -464,19 +476,22 @@ def check_visibility(db, role, owner, worker, approval, base, history, gateway, 
         candidate = retained_pending_head(db, binding, child, parent)
         assert candidate and candidate["operation_id"] == operation, candidate
         assert [int(member["segment_id"]) for member in candidate["members"]] == [first_id, late_id]
+        assert fresh(f"""SELECT lakehouse.get_managed_read_pending_head(
+            'events', '{binding}', {child}, {parent}) IS NULL""") == ["t"]
         fallback = (parent, [first_id, late_id], [10, 20, 20])
         manifest = snapshot["manifest-list"]
         with reader_manifest_probe(manifest) as (reader_object_endpoint, requests, probe_state):
-            def check_head(name, expected, view, proof, candidates=None):
+            def check_head(name, expected, view, proof, candidates=None, session=fresh):
                 check(worker, name, expected, source, observation, candidates or [unknown, base], view,
-                      pending_head=proof, reader_object_endpoint=reader_object_endpoint)
+                      pending_head=proof, reader_object_endpoint=reader_object_endpoint,
+                      load_overlay=lambda ids: load_overlay(session, binding, ids))
 
-            for name, expected, view in (
-                ("old", (parent, [], [10]), first_view),
-                ("middle", (parent, [first_id], [10, 20]), second_view),
-                ("fresh", (child, [], [10, 20, 20]), fresh_view),
+            for name, expected, view, session in (
+                ("old", (parent, [], [10]), first_view, before),
+                ("middle", (parent, [first_id], [10, 20]), second_view, between),
+                ("fresh", (child, [], [10, 20, 20]), fresh_view, fresh),
             ):
-                check_head(f"ledger-accepted-unfinalized-{name}", expected, view, candidate)
+                check_head(f"ledger-accepted-unfinalized-{name}", expected, view, candidate, session=session)
             exact_request = ("GET", "/" + manifest.removeprefix("s3://"), "bytes=0-1048576")
             assert requests == [exact_request] * 3, requests
             check_head("pending-head-missing-member", fallback, fresh_view,
@@ -568,11 +583,21 @@ def check_visibility(db, role, owner, worker, approval, base, history, gateway, 
 
         assert ledger_snapshot(before, binding) == first_view
         assert ledger_snapshot(between, binding) == second_view
+        assert not retained_pending_head(db, binding, child, parent)
+        assert overlay_bytes(between, binding, [first_id]) == held_middle
+        assert overlay_bytes(fresh, binding, [first_id, late_id]) == held_fresh
+        fresh("COMMIT")
         completed = ledger_snapshot(fresh, binding)
         assert completed[1] == {first_id: ([20], True), late_id: ([20], True)}, completed
         assert_cut("after-local-completion", (child, [], [10, 20, 20]), candidates, completed)
         assert_cut("retained-parent-after-completion", (parent, [first_id, late_id], [10, 20, 20]),
                    [base], completed)
+        assert overlay_bytes(fresh, binding, [first_id, late_id]) == held_fresh
+        print(json.dumps({"case": "read-only-overlay-payloads", "retained_segments": [first_id, late_id],
+                          "held_and_fresh_payloads_match": True, "held_middle_unchanged": True,
+                          "original_data_snapshot_has_pending_intent": False,
+                          "pending_evidence_after_finalize": None, "over_budget_sqlstate": "54000",
+                          "invisible_members_sqlstate": "55000"}, sort_keys=True), flush=True)
 
     def rotate(previous, generation, target_identity):
         successor = str(uuid4())
@@ -583,9 +608,16 @@ def check_visibility(db, role, owner, worker, approval, base, history, gateway, 
         """)
         return successor
 
-    successive = rotate(binding, 2, f"{namespace}.events")
+    with login(db, owner) as old_scope:
+        old_scope("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        assert overlay_bytes(old_scope, binding, [first_id, late_id]) == held_fresh
+        successive = rotate(binding, 2, f"{namespace}.events")
+        old_scope(f"SELECT * FROM {overlay_call(successive, [first_id])}", sqlstate="55000")
     assert ledger_additions(db, successive, child, parent) == finalized
     sql(db, f"SELECT lakehouse.get_managed_read_visible_segments('events', '{binding}')", error="55000")
+    sql(db, f"SELECT * FROM {overlay_call(binding, [first_id])}", error="55000")
+    with login(db, owner) as successor:
+        assert overlay_bytes(successor, successive, [first_id, late_id]) == held_fresh
     sql(db, f"""
         BEGIN;
         INSERT INTO {SEG}(relid, payload, row_count, authority_id, table_uuid, capture_binding_id)
@@ -596,8 +628,10 @@ def check_visibility(db, role, owner, worker, approval, base, history, gateway, 
     changed = rotate(successive, 3, f"{namespace}.sibling")
     restored = rotate(changed, 4, f"{namespace}.events")
     sql(db, f"SELECT lakehouse.get_managed_read_visible_segments('events', '{restored}')", error="55000")
+    sql(db, f"SELECT * FROM {overlay_call(restored, [first_id])}", error="55000")
     print(json.dumps({"case": "managed-ledger-generations", "unchanged_scope_preserved": True,
-                      "old_binding_rejected": True, "route_discontinuity_rejected": True}), flush=True)
+                      "old_binding_rejected": True, "successor_refused_by_held_snapshot": True,
+                      "route_discontinuity_rejected": True}), flush=True)
 
 
 def main():
