@@ -140,6 +140,38 @@ parent remains pinned at snapshot 100. Stale generation, wrong scope or purpose,
 expired credentials, changed members, oversize and initial cancellation observe
 zero requests. [Scoped transport tests](../../../src/backend/access/lakehouse/core/pgdatalake-core/src/publication_transport/tests.rs)
 
+### Process-local native preparation ABI
+
+The generated C header exposes `pg_datalake_prepare_managed_send` and
+`pg_datalake_drop_managed_send`. The native caller supplies committed copies
+of one acquired unsent job, its source column layout and its ordered members.
+The request JSON carries `target`, `operation_id`, `owner_generation`,
+`input_digest` as 64 hex characters, and the independently observed
+`observation` with mode, operation, binding and owner generation. The
+credential adapter separately supplies the approved send target, expiry and
+catalog and object credentials, including an optional SigV4 session token.
+The Rust transport compares the two targets before provider I/O. The native
+caller owns role-specific credential enrollment and purpose checks.
+
+Each descriptor is limited to 16 KiB and the schema to 64 KiB. A preparation
+accepts at most 1,024 members, 65,536 rows and 8 MiB of capture payload. The
+member payloads use the existing UTF-8 JSON capture format. A refused
+preparation clears the result view and returns no owner. On success, the
+view borrows the exact request bytes and exposes the parent, proposed
+snapshot and SHA-256 digest. Copy what authorization needs while the
+owner lives. Drop consumes the owner in the preparing process and clears
+its pointer slot. SQL, DSM and WAL never carry the handle or credentials.
+
+The caller closes its PostgreSQL transaction before preparation and checks
+for cancellation after Rust returns. An in-flight immutable object write
+can complete during cancellation. The ABI exposes no submit operation.
+The scoped provider fixture exercises this boundary with one catalog GET,
+one manifest GET, three create-only PUTs and zero commit POSTs. Parent 100
+stays current. The same test requires zero provider calls for wrong
+credential scope, stale ownership, expired credentials and excess members.
+This qualifies the preparation and lifetime boundary. One-shot native
+authorization and dispatch still require the two reply-loss drills below.
+
 ### Discovery and dispatch
 
 Extension 1.9 adds two read-only keyset pages. Both accept a page size of 1 to 1,024. Start with a NULL cursor, advance using the last row even if held and wrap after an empty page. The page reports candidates from one database snapshot. Owners must still use the transactional claim, compare-and-advance and WAL authorization operations after a page is read.
