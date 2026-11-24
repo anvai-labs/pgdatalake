@@ -16,3 +16,37 @@ The first guard refuses the whole source snapshot when the scan plan contains de
 - Existing deleted row plus a separate target delete, then a change to the file's delete set with its data path still live. Use `cow-delete-safe`. Verify no resurrection and no change after a declined rewrite.
 - Two writes touching the same file, independent-file changes, abort after upload, table replacement and compatible append retry. Check exact historical and current row IDs with an independent reader.
 - Width/churn canaries report files/bytes rewritten, retained manifests and logical rows affected. Any future DV writer needs explicit lineage, maintenance, and cross-engine decode gates.
+
+### Boundary contracts (qualified COW profile — implemented)
+
+The routing contract, error-code table and the operations/fragmentation
+caveat live in [spec 18 §3a–§3c](../18-anvai-lake-dml.md#3a-direct-cow-routing-contract-qualified-profile--implemented-boundary-tested).
+The boundary fixture pins them through SQL against an independent Trino
+oracle: [cow-boundary-check.py](../../../src/test/lakehouse/fixtures/cow-boundary-check.py)
+
+| # | Case | Asserts |
+|---|---|---|
+| T1 | managed DELETE/UPDATE of published rows, no concurrency | exact read-back; Trino agrees at the new snapshot; a pinned older snapshot still returns the original rows |
+| T3 | mixed transaction: staged INSERTs + tombstoned published row | one overwrite at commit; every row exactly once; control: mutating a same-transaction row → `55000` |
+| T5 | zero-row DELETE/UPDATE | no new snapshot, rows unchanged |
+| T6 | FDW write-refusal control | INSERT/UPDATE/DELETE on an external foreign table → core `0A000`, no new snapshot |
+| T7 | savepoint rollback of a COW mutation | row restored, no tombstone residue, no new snapshot |
+| T8 | delete-bearing snapshot refusal | `0A000` before any rewrite request |
+| T9 | committed-unpublished rows (staged append) | direct UPDATE/DELETE refuses `55000` ("cannot resolve row identity") until the publisher drains |
+
+Concurrent-conflict (`40001`) and neighboring-delete-resurrection controls
+remain in [cow-delete-guard.sh](../../../src/test/lakehouse/fixtures/cow-delete-guard.sh).
+
+### Future bands (gated, unchanged)
+
+- **DV write (slice V3)** — [spec 14 §3](../14-v3-conformance.md): Rust
+  puffin/roaring encoder, first-row-id handling, `write_mode=merge_on_read`
+  plumbing, cross-engine decode gates. The reader side (V1) is landed, so a
+  DV-writing table is readable before it is writable by us.
+- **FDW external writes** — per-statement direct Iceberg COW/DV commits
+  without publication coalescing; changes the FDW's read-only-by-
+  construction posture and the stock package surface, so it carries its own
+  packaging gates ([06-sql-and-packaging](06-sql-and-packaging.md)).
+- **Compaction / optimize (M4)** — reclaims the COW fragmentation that
+  [spec 18 §3b](../18-anvai-lake-dml.md#3b-operations-fragmentation-and-maintenance-explicit-caveat)
+  documents; until then the caveat binds operators, not correctness.
