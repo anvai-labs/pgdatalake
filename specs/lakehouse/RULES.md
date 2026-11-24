@@ -145,6 +145,19 @@ outside the table, stop and redesign — or raise it in a spec revision first.
   change that contradicts a spec must update the spec in the same commit.
 - CI must be green before merge into `lakehouse-dev` (fast tier, doc 10 §1) —
   verified via `gh run list --workflow datalake-ci` (§1a CI validity rule).
+- **Adversarial review gate (binding, amended 2026-11-23).** Every PR or
+  merge candidate into `lakehouse-dev` gets an **adversarial review by a
+  clean-context subagent at xhigh effort** before it can merge. The
+  reviewer must attempt to falsify the diff's claims against the code,
+  run the affected fixtures/suites empirically, and report a verdict
+  ("CLEAN — merge approved" / "NOT CLEAN — findings") with numbered,
+  file:line findings. **Merge only when the verdict is CLEAN and CI is
+  green on the head. Otherwise address EVERY identified item — code,
+  spec, or doc — rerun the affected verification, and repeat review
+  until both gates hold.** The author does not review their own diff;
+  review context must not include the author's reasoning. Merge
+  mechanics: the repo has PRs disabled — merge = local squash onto
+  `lakehouse-dev` with the `(#NN)` title convention, after the gates.
 - Never force-push `main` or `lakehouse-dev` after they're shared.
 
 ## 6. Secrets & data
