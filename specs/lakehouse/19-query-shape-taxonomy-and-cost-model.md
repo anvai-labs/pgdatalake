@@ -53,6 +53,40 @@ New GUC-gated capture (`lakehouse.query_stats` view; default off, session-settab
 
 `lakehouse_perf.py` gains `--telemetry`: one JSON line per query run (fingerprint, timings, counters, resources) appended to a dataset file. No new infrastructure; receipts discipline unchanged.
 
+### 4a. Persistence and consent (L0.5)
+
+Telemetry persists in **extension-internal, tenant-owned** tables — same posture as the staged-delta store (created by the extension script, `REVOKE ALL FROM PUBLIC`, no catalog visibility without explicit grant):
+
+- **Latest records stay in heap**: `lakehouse.query_stats` (captured_at, dbid, userid, queryid, rows, total_ms, foreign_scans), retention-bounded by `lakehouse.telemetry_retention` (default 100k rows). Capture runs as the table owner (RI-trigger user-context switch) so unprivileged invokers are captured without grants. Flush at `XACT_EVENT_POST_COMMIT` — telemetry failure can never roll committed work back.
+- **Aged records go to object store**: `lakehouse.flush_query_stats()` drains the heap table into the tenant's own managed Iceberg archive table (`lakehouse.query_stats_archive`, `USING lakehouse` + `attach_table`) and publishes via `publish_table` — tenant-specific by construction (their catalog, their warehouse).
+- **Operator sharing is consent-gated, never implicit**: the single-row `lakehouse.telemetry_consent` ledger records granted/endpoint/granted_by/granted_at/shared_at. `share_query_stats_with_operator()` fails closed (55000) until an admin calls `grant_operator_telemetry(endpoint)`. Users always train on their own patterns (query_stats is theirs); the operator trains on fleet data only across consented tenants. Consent tiers (follow-up): aggregate stats (counts, sizes, NDV, tiers, op counters) form the default shareable set; column min/max values and value lists stay tenant-local unless the grant explicitly includes them.
+
+### 4b. Physical and storage statistics catalogue (L0 collector)
+
+Feeds families D (overfetch/pruning) and E (cardinality) and the cost model's currency. All collected from structures the core already parses (Iceberg manifests, Parquet footers) — **zero additional origin requests beyond the scan itself**.
+
+Per-snapshot table stats (`lakehouse.table_stats`):
+
+| Field | Feeds |
+|---|---|
+| row_count, data-file count, delete-file count/bytes, file size min/avg/total | E cardinality; D pruning benefit |
+| **manifest-list + per-manifest bytes/counts** | the lists-vs-gets tradeoff: planning GETs scale with manifest count — visible before any manifest-cache slice |
+| partition fields + transforms vs regular columns | pruning tier 0 (manifest-level) |
+| column count, avg row width (Parquet footer), total bytes | wide/narrow → projection pushdown + batch-transport value (family C) |
+
+Per-column stats (`lakehouse.column_stats`): NDV (where Iceberg collected it), null count, min/max presence, datatype class, and the derived **filterability tier**: T0 partition (manifest prune) · T1 high-NDV+min/max (row-group prune) · T2 enum-like (NDV/rows ≪ 1, dictionary/value-set prune) · T3 temporal/boolean · T4 nested or metrics-absent (unfilterable). Raw min/max values stay tenant-local (§4a consent tiers); only the tier and aggregates enter the shareable set.
+
+Storage-op telemetry per scan (extends the #66 canary counters, recorded into query_stats): ListObjects count, GetObject count **by kind** (manifest-list, manifest, footer, data-range, DV), bytes per kind, latency p50/p90, **object storage tier** (from storage-class headers), and avoided-bytes/GETs vs the unpruned baseline. A per-deployment pricing table (GUC) turns counters into a cost-per-query currency alongside time — a Glacier range-GET prices retrieval fees and latency differently from Standard, which the L1 model must respect.
+
+### 4c. Slice interdependencies (binding order)
+
+1. `feat/spec-19-cbo-taxonomy` (this spec) — the contract.
+2. **Query-stats capture** (L0, branch `feat/telemetry-stats`): internal table + hooks + retention + flush/share/consent. Depends on: this spec. Blocks: everything below.
+3. **Physical stats collector** (L0): `table_stats`/`column_stats` tables + snapshot-scoped collection at first scan per snapshot. Depends on: 2 (persistence + consent machinery). Blocks: D-remedy (pruning), E-remedy (stats).
+4. **Full-sweep qualification with telemetry** — populates the taxonomy empirically (q4/q6 confirm/refute family B). Depends on: 2 (+3 for D/E labels). Blocks: L1 fit.
+5. **L1 parametric model** — depends on: 4's dataset. Blocks: L2.
+6. **L2 ONNX selector** — depends on: 5's residuals justifying it (§3 rule 3).
+
 ## 5. Remedy registry (L1)
 
 Each entry: matcher (deterministic, fail-safe declines), rewrite (equivalence proof obligation), telemetry signature it targets, decline behavior (SubPlan kept). Entry 1 is the landed pullup; entry 2 (hashed EXPR SubPlans) carries the next proof obligation — NULL-semantics parity table per operator, mirroring the pullup's §"Equivalence cases". Transport (C) and pruning (D) land as their own slices; E is a stats slice. The registry is the only place ML may later influence: **the model ranks entries; it never bypasses the matcher.**
