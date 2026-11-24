@@ -215,6 +215,8 @@ def exercise(db, namespace, writer, reader, owner, worker):
                                 state = json.loads(
                                     scanner("SELECT lakehouse.managed_read_cut_evidence()")[0])
                                 assert state["pin"] == int(pin), state
+                                assert state["overlay"] == [int(i) for i in overlay], state
+                            assert len(reads) - count_reads == 3, reads[count_reads:]
                             print(json.dumps({"case": "managed-count-cut",
                                               "counts": [1, 2, 3],
                                               "reader_catalog_gets":
