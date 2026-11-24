@@ -192,6 +192,11 @@ jobs:
           export PGHOST="$RUNNER_TEMP/cow-smoke" PGPORT=52592 PGUSER=postgres PGDATABASE=postgres
           mkdir -m 700 "$PGHOST"
           initdb -D "$PGHOST/data" -A trust -U "$PGUSER" --no-locale
+          # NOTE: lakehouse.so is preloaded so planner-hook fixtures see
+          # the hook in every backend (fresh psql per fixture call cannot
+          # warm one up). This couples every fixture in the job to
+          # library load success; the publisher worker stays off so
+          # publication fixtures keep controlling its lifecycle.
           pg_ctl -D "$PGHOST/data" -l "$PGHOST/server.log" -o "-k $PGHOST -p $PGPORT -c listen_addresses='' -c shared_preload_libraries=lakehouse -c lakehouse.publisher_enabled=off" -w start
           trap 'pg_ctl -D "$PGHOST/data" -m fast -w stop' EXIT
           python3 src/test/lakehouse/fixtures/publication-claim-check.py --live --restart-fixture "$PGHOST/data"

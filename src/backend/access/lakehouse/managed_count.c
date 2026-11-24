@@ -32,13 +32,12 @@
 #include "executor/spi.h"
 #include "storage/lmgr.h"
 #include "fmgr.h"
+#include "utils/typcache.h"
 #include "miscadmin.h"
 #include "nodes/parsenodes.h"
 #include "nodes/makefuncs.h"
 #include "optimizer/clauses.h"
 #include "optimizer/optimizer.h"
-#include "optimizer/optimizer.h"
-#include "varatt.h"
 #include "optimizer/planner.h"
 #include "parser/parsetree.h"
 #include "nodes/nodeFuncs.h"
@@ -242,20 +241,21 @@ rewrite_to_managed_count(Query *parse, Oid relid, bool bound)
  * ---------------------------------------------------------------------------
  * Shape: c1.t > (SELECT avg(c2.x) * k FROM cte c2 WHERE c2.key = c1.key)
  * where cte is a CTE of THIS query whose body scans a foreign table,
- * referenced multiply (c1 is a CTE Scan of the same CTE). The subplan
- * re-scans the materialized CTE tuplestore per outer row — O(outer x
- * ctr). Rewrite: pull the aggregate into a grouped subquery over the
- * same CTE (one grouped pass) joined LEFT on the correlation keys; the
- * outer comparison references the joined avg column. Left join +
- * NULL-avg preserves the empty/NULL-match semantics of the SubPlan
- * exactly.
+ * referenced multiply (c1 is a CTE Scan of the same CTE), correlated by
+ * btree-equality conjuncts only. The subplan re-scans the materialized
+ * CTE tuplestore per outer row — O(outer x ctr). Rewrite: pull the
+ * aggregate into a grouped subquery over the same CTE (one grouped
+ * pass) joined INNER on the correlation keys; the outer comparison
+ * references the joined aggregate column, and its strictness makes
+ * INNER equivalent to the SubPlan's NULL-on-no-match semantics exactly.
  *
  * Decline (fail-safe, SubPlan kept): volatile functions, non-equality
  * or multi-level correlation, subselects with group/having/limit/
- * window/DML, targetlist correlation outside the aggregate, parallel
- * mode. Gate: only CTEs whose body scans a foreign table (the
- * per-row cost is catastrophic there; local heap CTEs keep stock
- * planning).
+ * window/DML/TargetSRF, correlated targetlist Vars or sublinks,
+ * non-strict outer comparison, OR/NOT-wrapped sublinks, correlated
+ * alias off the top-level fromlist, parallel mode. Gate: only CTEs
+ * whose body scans a foreign table (the per-row cost is catastrophic
+ * there; local heap CTEs keep stock planning).
  */
 typedef struct AggPullupContext
 {
@@ -270,7 +270,6 @@ typedef struct AggPullupContext
 	List	   *corr_resnos;	/* grouped-subquery resnos of corr cols */
 	List	   *corr_inner_attnos;	/* inner attnos per correlated equality */
 	List	   *corr_outer_attnos;	/* outer attnos, same order */
-	List	   *corr_eqops;		/* equality operator per correlated equality */
 	List	   *corr_types;		/* Var type per correlated col */
 	List	   *corr_typmods;
 	List	   *corr_collids;
@@ -344,10 +343,14 @@ replace_sublink_mutator(Node *node, void *context)
 }
 
 /*
- * The correlated-equality pattern: one side an OUTER Var (level 1 on
+ * The correlated-EQUALITY pattern: one side an OUTER Var (level 1 on
  * the outer CTE alias), the other an INNER Var (level 0 on the
- * subselect's own CTE alias). Fills the outer attribute number and the
- * inner Var (for its type data) when the OpExpr matches.
+ * subselect's own CTE alias), joined by the type's btree equality
+ * operator. Inequality, disequality or any other boolean operator
+ * changes the grouped-subquery semantics (union-of-partitions vs
+ * single-partition averages, row fan-out) and declines. Fills the
+ * outer attribute number and the inner Var (for its type data) when
+ * the OpExpr matches.
  */
 static bool
 is_corr_equality(OpExpr *op, int outer_rtindex, int inner_rtindex,
@@ -355,6 +358,8 @@ is_corr_equality(OpExpr *op, int outer_rtindex, int inner_rtindex,
 {
 	Node	   *a;
 	Node	   *b;
+	Oid			a_type;
+	TypeCacheEntry *tce;
 
 	if (!IsA(op, OpExpr) || list_length(op->args) != 2 ||
 		op->opresulttype != BOOLOID)
@@ -362,6 +367,16 @@ is_corr_equality(OpExpr *op, int outer_rtindex, int inner_rtindex,
 
 	a = linitial(op->args);
 	b = lsecond(op->args);
+
+	/*
+	 * the operator must be the equality operator of the args' comparison
+	 * type: exprType of the pre-unwrap arg (RelabelType reports its own
+	 * result type, e.g. text for varchar = varchar resolved to texteq)
+	 */
+	a_type = exprType(a);
+	tce = lookup_type_cache(a_type, TYPECACHE_EQ_OPR);
+	if (tce->eq_opr == InvalidOid || op->opno != tce->eq_opr)
+		return false;
 
 	/*
 	 * look through binary-coercibility relabels (varchar = varchar resolves
@@ -396,17 +411,39 @@ is_corr_equality(OpExpr *op, int outer_rtindex, int inner_rtindex,
 
 /*
  * Subselect shape gate: CMD_SELECT, single RTE_CTE from item resolving
- * to a CTE of this query whose body scans a foreign table, no
- * group/having/limit/window/distinct/setops, no volatile functions,
- * single targetlist entry holding an aggregate with no outer-level
- * Vars outside it, WHERE = conjuncts of correlated equalities only
- * (>= 1).
+ * to a CTE of this (top-level) query whose body scans a foreign table,
+ * no group/having/limit/window/distinct/setops/TargetSRF, no volatile
+ * functions, single targetlist entry holding an aggregate with no
+ * outer-level Vars and no sublinks inside it, WHERE = conjuncts of
+ * correlated equalities only (>= 1).
  */
 static bool
 decl(int line)
 {
 	elog(DEBUG1, "agg-pullup: declined at line %d", line);
 	return false;
+}
+
+/*
+ * Decline detector for the subselect targetlist: any Var above the
+ * subselect's own level (correlated targetlist — pull_var_clause would
+ * ERROR before our decline could fire) or any SubLink (nested scalar
+ * subqueries change the aggregated value's independence). expression_tree_walker
+ * does not descend into SubLink subselects, which is what we want.
+ */
+static bool
+tle_has_outer_var_or_sublink_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+		return ((Var *) node)->varlevelsup != 0;
+	if (IsA(node, SubLink))
+		return true;
+	if (IsA(node, Query))
+		return false;			/* do not descend into subqueries */
+	return expression_tree_walker(node, tle_has_outer_var_or_sublink_walker,
+								  context);
 }
 
 static bool
@@ -417,7 +454,6 @@ match_agg_sublink_shape(SubLink *sl, Query *parse, AggPullupContext *ctx)
 	RangeTblEntry *rte;
 	Node	   *where;
 	Node	   *te_expr;
-	List	   *all_vars;
 	List	   *agg_vars;
 	ListCell   *lc;
 	ListCell   *lc2;
@@ -431,7 +467,6 @@ match_agg_sublink_shape(SubLink *sl, Query *parse, AggPullupContext *ctx)
 	ctx->cte_name = NULL;
 	ctx->corr_inner_attnos = NIL;
 	ctx->corr_outer_attnos = NIL;
-	ctx->corr_eqops = NIL;
 	ctx->corr_types = NIL;
 	ctx->corr_typmods = NIL;
 	ctx->corr_collids = NIL;
@@ -444,7 +479,8 @@ match_agg_sublink_shape(SubLink *sl, Query *parse, AggPullupContext *ctx)
 		sq->groupClause != NIL || sq->havingQual != NULL ||
 		sq->windowClause != NIL || sq->limitOffset != NULL ||
 		sq->limitCount != NULL || sq->setOperations != NULL ||
-		sq->distinctClause != NIL || sq->jointree == NULL ||
+		sq->distinctClause != NIL || sq->hasTargetSRFs ||
+		sq->jointree == NULL ||
 		list_length(sq->jointree->fromlist) != 1 ||
 		!sq->hasAggs)
 		return decl(__LINE__);
@@ -452,6 +488,14 @@ match_agg_sublink_shape(SubLink *sl, Query *parse, AggPullupContext *ctx)
 	rtr = linitial_node(RangeTblRef, sq->jointree->fromlist);
 	rte = rt_fetch(rtr->rtindex, sq->rtable);
 	if (rte == NULL || rte->rtekind != RTE_CTE)
+		return decl(__LINE__);
+
+	/*
+	 * the CTE must resolve to THIS query's list (one level up from the
+	 * subselect): a name-shadowing inner WITH would bind differently, and its
+	 * copied RTE could not be re-homed (M2/13-review)
+	 */
+	if (rte->ctelevelsup != 1 || sq->cteList != NIL)
 		return decl(__LINE__);
 
 	/* the referenced CTE must be one of this query's CTEs */
@@ -509,18 +553,12 @@ match_agg_sublink_shape(SubLink *sl, Query *parse, AggPullupContext *ctx)
 		if (te->resjunk)
 			return decl(__LINE__);
 		te_expr = (Node *) te->expr;
+		/* decline before pull_var_clause can ERROR on upper-level Vars */
+		if (tle_has_outer_var_or_sublink_walker(te_expr, NULL))
+			return decl(__LINE__);
 		agg_vars = pull_var_clause(te_expr, PVC_INCLUDE_AGGREGATES);
 		if (agg_vars == NIL)
 			return decl(__LINE__);
-		all_vars = pull_var_clause(te_expr, PVC_RECURSE_AGGREGATES |
-								   PVC_INCLUDE_PLACEHOLDERS);
-		foreach(lc, all_vars)
-		{
-			Var		   *v = lfirst_node(Var, lc);
-
-			if (v->varlevelsup != 0)
-				return decl(__LINE__);
-		}
 		ctx->agg_type = exprType(te_expr);
 		ctx->agg_typmod = exprTypmod(te_expr);
 		ctx->agg_collid = exprCollation(te_expr);
@@ -541,8 +579,6 @@ match_agg_sublink_shape(SubLink *sl, Query *parse, AggPullupContext *ctx)
 				!is_corr_equality((OpExpr *) c, ctx->outer_rtindex,
 								  ctx->inner_rtindex, &oa, &inner_var))
 				return decl(__LINE__);
-			ctx->corr_eqops = lappend_oid(ctx->corr_eqops,
-										  ((OpExpr *) c)->opno);
 			ctx->corr_eqexprs = lappend(ctx->corr_eqexprs,
 										copyObject(c));
 			ctx->corr_inner_attnos = lappend_int(ctx->corr_inner_attnos,
@@ -561,8 +597,6 @@ match_agg_sublink_shape(SubLink *sl, Query *parse, AggPullupContext *ctx)
 		if (!is_corr_equality((OpExpr *) where, ctx->outer_rtindex,
 							  ctx->inner_rtindex, &oa, &inner_var))
 			return decl(__LINE__);
-		ctx->corr_eqops = lappend_oid(ctx->corr_eqops,
-									  ((OpExpr *) where)->opno);
 		ctx->corr_eqexprs = lappend(ctx->corr_eqexprs,
 									copyObject(where));
 		ctx->corr_inner_attnos = lappend_int(ctx->corr_inner_attnos,
@@ -634,7 +668,7 @@ set_agg_varno_walker(Node *node, void *context)
 		return false;
 	}
 	if (IsA(node, Query))
-		return true;			/* do not descend into subqueries */
+		return false;			/* skip nested subqueries, keep walking */
 	return expression_tree_walker(node, set_agg_varno_walker, context);
 }
 
@@ -677,7 +711,14 @@ pullup_cte_agg_sublinks(Query *parse)
 			}
 		}
 	}
-	else if (IsA(parse->jointree->quals, BoolExpr))
+
+	/*
+	 * B2/13-review: only an AND-BoolExpr is safe to walk. An OR containing
+	 * the sublink keeps rows the inner join would drop (TRUE OR NULL), and
+	 * NOT has the same hazard through three-valued logic; decline both.
+	 */
+	else if (IsA(parse->jointree->quals, BoolExpr) &&
+			 ((BoolExpr *) parse->jointree->quals)->boolop == AND_EXPR)
 	{
 		ListCell   *a;
 
@@ -708,6 +749,48 @@ pullup_cte_agg_sublinks(Query *parse)
 	}
 	if (candidate == NULL)
 		return;
+
+	/*
+	 * B1/13-review: the outer comparison must be a STRICT operator. The
+	 * inner-join equivalence rests on `compare(t, NULL)` dropping the row
+	 * exactly as a non-match does; a non-strict operator could keep such rows
+	 * and the rewrite would lose them.
+	 */
+	set_opfuncid(candidate);
+	if (!func_strict(candidate->opfuncid))
+	{
+		elog(DEBUG1, "agg-pullup: declined: outer comparison operator is not strict");
+		return;
+	}
+
+	/*
+	 * B3/13-review: the join must be attached to the member that actually
+	 * carries the correlated alias. Attaching to llast(fromlist) breaks
+	 * whenever the correlated RTE is not the last member (ON quals would
+	 * reference a rel outside the join subtree -> lateral-reference
+	 * assert/error).
+	 */
+	{
+		ListCell   *fc;
+		bool		found_member = false;
+
+		foreach(fc, parse->jointree->fromlist)
+		{
+			Node	   *m = lfirst(fc);
+
+			if (IsA(m, RangeTblRef) && ((RangeTblRef *) m)->rtindex == ctx.outer_rtindex)
+			{
+				found_member = true;
+				break;
+			}
+		}
+		if (!found_member)
+		{
+			elog(DEBUG1, "agg-pullup: declined: correlated CTE alias is not a "
+				 "top-level fromlist member");
+			return;
+		}
+	}
 
 	/*
 	 * build the grouped subquery: the pulled aggregate (resno 1) plus the
@@ -750,9 +833,15 @@ pullup_cte_agg_sublinks(Query *parse)
 
 		sgc = makeNode(SortGroupClause);
 		sgc->tleSortGroupRef = gte->ressortgroupref;
+
+		/*
+		 * grouping needs only the equality operator; ordering ops are not
+		 * required (hash-only types like point would ERROR on needLT/needGT)
+		 */
+		sgc->sortop = InvalidOid;
 		get_sort_group_operators(list_nth_oid(ctx.corr_types, i - 1),
-								 true, true, true,
-								 &sgc->sortop, &sgc->eqop, NULL,
+								 false, true, false,
+								 NULL, &sgc->eqop, NULL,
 								 &sgc->hashable);
 		sgc->nulls_first = false;
 		groupcls = lappend(groupcls, sgc);
@@ -777,29 +866,24 @@ pullup_cte_agg_sublinks(Query *parse)
 		for (i = 1; i <= list_length(ctx.corr_types); i++)
 			colnames = lappend(colnames,
 							   makeString(psprintf("corr%d", i)));
-		nrte->alias = nrte->eref = makeAlias("agg_pullup", colnames);
+		nrte->alias = makeAlias("agg_pullup", colnames);
+		nrte->eref = copyObject(nrte->alias);
 	}
 	nrte->inFromCl = true;
 	parse->rtable = lappend(parse->rtable, nrte);
 	ctx.new_rtindex = list_length(parse->rtable);
 
 	/*
-	 * LEFT JOIN the grouped subquery on the correlated equalities. The
-	 * grouped subquery's output columns are: resno 1 = the pulled aggregate,
-	 * resnos 2.. = the correlated columns in ctx order.
+	 * JOIN_INNER the grouped subquery on the correlated equalities: the
+	 * SubPlan yields NULL on no match and `compare(t, NULL)` drops the row,
+	 * which is exactly what a non-matching inner join does (the outer
+	 * operator is checked strict above). INNER also keeps the planner's
+	 * outer-join removal machinery out of the rewritten tree. Output columns:
+	 * resno 1 = the pulled aggregate, resnos 2.. = the correlated columns in
+	 * ctx order.
 	 */
 	j = makeNode(JoinExpr);
-
-	/*
-	 * JOIN_INNER, not JOIN_LEFT: the original SubPlan yields NULL when no CTE
-	 * row matches the correlation, and `t > NULL` drops the row — the same
-	 * outcome as a non-matching inner join. The comparison qual is strict on
-	 * the joined column, so LEFT and INNER are equivalent here, and INNER
-	 * keeps the planner's outer-join removal machinery out of the rewritten
-	 * tree.
-	 */
 	j->jointype = JOIN_INNER;
-	j->larg = llast(parse->jointree->fromlist);
 	j->rarg = (Node *) makeNode(RangeTblRef);
 	((RangeTblRef *) j->rarg)->rtindex = ctx.new_rtindex;
 	j->alias = NULL;
@@ -832,17 +916,23 @@ pullup_cte_agg_sublinks(Query *parse)
 	}
 
 	/*
-	 * swap the last fromlist member (the outer CTE alias scan) for the join
-	 * node; the join's ON references the earlier member, which the planner
-	 * accepts within the same FROM scope
+	 * swap the correlated alias's fromlist member (verified above) for the
+	 * join node; the join's ON references only its own children
 	 */
 	{
-		Node	   *last = llast(parse->jointree->fromlist);
+		ListCell   *fc;
 
-		parse->jointree->fromlist =
-			list_delete_last(parse->jointree->fromlist);
-		parse->jointree->fromlist = lappend(parse->jointree->fromlist, j);
-		(void) last;
+		foreach(fc, parse->jointree->fromlist)
+		{
+			Node	   *m = lfirst(fc);
+
+			if (IsA(m, RangeTblRef) && ((RangeTblRef *) m)->rtindex == ctx.outer_rtindex)
+			{
+				j->larg = m;
+				lfirst(fc) = j;
+				break;
+			}
+		}
 	}
 
 	/* swap the matched SubLink for a Var over the grouped subquery */
