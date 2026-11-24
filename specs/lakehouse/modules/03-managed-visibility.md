@@ -405,3 +405,29 @@ joins and managed COUNT through their own gates.
 - Run `mixed-visibility-claim` through pin selection and ordinary SQL scans. Two segments share one verified publication. A reader between their source commits falls back to the retained parent and adds just its visible segment. Dropping that parent gives an explicit consistency error. A reader after both commits can use the published pin directly.
 - SQL regression for 65 relations, nested SAVEPOINT rollback, prepared plans, ordinary roles/RLS, mode change, relid reuse and catalog outage. Isolate a provably empty offline case to exercise staged reads during an outage.
 - Two sessions plus a controlled publication barrier verify one compatible cut per statement, stable rescans and no lost or double-counted rows. Compare COUNT fast path against the ordinary scan. Gate higher isolation levels separately.
+
+#### RC statement-isolation campaign (landed 2026-11-24)
+
+The Read Committed campaign lives in the lost-reply drill as the
+`rc-statement-campaign` case (autocommit reader session — each
+statement its own transaction, the true RC shape):
+
+- **rc1/rc2 — fresh cut per statement, stable conservative outcome.**
+  After an external Trino publication moves the head past the certified
+  child, each subsequent statement re-installs (one observation GET
+  each) and lands on the SAME conservative retained-parent fallback
+  with its proven overlay — external rows are unprovable and stay
+  excluded until a qualified publication proves them. The pin is stable
+  across statements; the per-statement freshness is in the re-install.
+- **rc3 — latch-style stall, no lost or double-counted rows.** A cursor
+  over a self-join suspends the statement after the cuts install; the
+  head moves; the resumed statement keeps its installed cuts (zero
+  re-resolutions) and the join multiset equals the resolved view's
+  multiset squared (M[v]² pairs per value v — the overlay's
+  duplicate-valued rows are distinct rows and pair accordingly). Each
+  scan descriptor deterministically resolves its own identical cut
+  under the statement snapshot (two observation GETs for a self-join);
+  a shared per-statement cut cache is a follow-up optimization band.
+- The RR held-transaction counterpart is the drill's held-snapshot trio
+  plus the rescan-retained-cut case (same fixture); the two campaigns
+  together cover both isolation postures of the release candidate.
