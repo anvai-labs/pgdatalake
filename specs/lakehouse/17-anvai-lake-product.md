@@ -62,6 +62,15 @@ Track patch size, changed core files, catalog/ABI impact, merge conflicts, hours
 
 The current FDW registers scan and planning hooks, with no foreign modification callbacks. It is the **published-state read path** and a useful independent cross-check. For synchronous publication, prefer qualifying the existing COW append path and offering a bounded publish-and-wait operation for staged batches. The latter should wait for a specific durable receipt and return its snapshot ID or a timeout with the receipt available for polling. Treat writable FDW or an explicit direct-append API as a separate scope with its own transaction, permissions, `COPY`, cancellation and abort tests. Keep the initial interoperability promise to append workloads. Qualify shared-writer UPDATE/DELETE, compaction and schema evolution separately.
 
+**Honest write-posture comparison** (against engines that expose Iceberg
+writes): managed tables publish changes as **batched atomic snapshots** —
+staged locally, one catalog commit per publication — and support direct
+COW UPDATE/DELETE on the qualified profile, whose rewrite debt is an
+operator-managed fragmentation trade ([routing contract and
+caveat](18-anvai-lake-dml.md#3a-direct-cow-routing-contract-qualified-profile--implemented-boundary-tested));
+the FDW is reads-only today, and its future direct-write mode would commit
+per statement **without** publication coalescing — simpler, not cheaper.
+
 Adopt one catalog as authority per physical table. Register aliases and consumers against the same table UUID, with storage access from each engine. Compare pinned results and metadata through the catalog. Avoid multiple independent catalogs writing the same storage prefix. For coexistence with external writers, read the published base plus only those locally visible segments absent from that base. Publication must be idempotent by durable operation ID, including after a lost response. External time travel sees historical published snapshots; pending rows are a local transaction feature. [Publication correctness and remaining gates](16-release-reassessment-and-scale.md#publishing-must-reconcile-remote-success-with-local-visibility)
 
 ## 4. Publication by size or age

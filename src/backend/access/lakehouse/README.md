@@ -104,6 +104,30 @@ manifests/Parquet. This is why `EXPLAIN` and `LIMIT 0` are zero-request.
    open statement: cursor + nested loop whose *inner* side is the scan).
 4. **release:** drops the read observation, closes delta handles.
 
+### COW mutations (UPDATE/DELETE on published rows)
+
+`lakehouse_tuple_update` / `lakehouse_tuple_delete` (tableam.c) capture a
+**tombstone** of the observed file/ordinal — UPDATE also stages the
+replacement row — and PRE-COMMIT (`lakehouse_xact_callback`) rebuilds each
+touched file without the tombstoned rows and commits **one overwrite
+snapshot** (`pg_datalake_write_commit_overwrite`) with assert-ref
+requirements. Outcome codes: `0A000` unsupported profile (delete-bearing
+source snapshot, mutating a row inserted in the same transaction, FOR
+UPDATE, two-phase); `40001` the commit base moved — the concurrent external
+writer wins, no partial state; `40003` ambiguous remote commit
+(lookup-only recovery, never re-appends). Routing-by-inspection ("does the
+row live in the base or in staged rows?") decides *which* subsystem handles
+the row; the commit assertion decides whether it *may* — a pre-read alone
+is TOCTOU-unsafe.
+
+**Operator caveat:** every COW mutation rewrites the files it touches.
+Mutation volume grows dead bytes and file counts until compaction/optimize
+lands (M4). Reads stay exactly correct at every snapshot — this is an
+administration concern (the heap-bloat→vacuum trade, in Iceberg form), not
+a correctness limit. Batch point mutations; watch small-file debt.
+Contracts: [spec 18 §3a–3c](../../../specs/lakehouse/18-anvai-lake-dml.md);
+boundary fixture: `cow-boundary-check.py`.
+
 Error codes: 0A000 unsupported shape / unadmitted · 42501 grant structure
 rejected · 55000 admission/scope changed under the scan or no compatible cut ·
 54000 budgets exceeded. **Segments are sealed** — the 55000-consistency shape

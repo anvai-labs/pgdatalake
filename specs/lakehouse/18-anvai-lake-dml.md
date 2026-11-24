@@ -53,6 +53,78 @@ A file path and row ordinal identify an immutable physical row only for a specif
 
 **Delete here means absent from the selected current snapshot.** Historical snapshots, tags, exported copies, PostgreSQL WAL and backups can still retain the row. A purge workflow requires its own retention policy, snapshot-expiry and object cleanup checks, and a completion receipt. A consumer pinned to an old version remains a valid historical reader until that version is retired according to policy.
 
+### 3a. Direct COW routing contract (qualified profile — implemented, boundary-tested)
+
+The qualified single-table, delete-free profile implements the following
+routing contract. An inspection of *where a row lives* — published base file
+or transaction-local staged row — decides which subsystem handles it, and
+correctness comes from the commit assertion, never from the inspection alone:
+
+- **UPDATE of a published row** is a tombstone of the observed file/ordinal
+  plus a staged replacement row, committed as **one overwrite snapshot at
+  PRE-COMMIT** (survivors and same-transaction staged rows ride the same
+  commit). The application never sees two half-applied versions.
+- **Routing-by-inspection is TOCTOU-unsafe by itself.** Between observing the
+  row and committing, another writer can delete or rewrite it. The protection
+  is the commit requirement set (`AssertRefSnapshotId` on the observed base),
+  not the pre-read: a moved base fails the commit with the conflict outcome
+  below, and the concurrent external writer wins. "Check-then-post" is
+  therefore implemented as *prepare-against-the-pinned-base, assert-on-commit*.
+- **Zero-row mutation is a no-op.** The executor invokes the AM mutation
+  callback only for rows it actually touches, so a `DELETE`/`UPDATE` matching
+  zero rows produces no write entry, no catalog request, and no new snapshot.
+  Boundary test T5 pins zero catalog POSTs and an unchanged remote snapshot.
+- **Mixed transactions.** A transaction may stage INSERTs and tombstone
+  published rows together; one overwrite at commit contains survivors plus
+  the staged rows, each row exactly once (T3 pins zero duplication). Rows
+  inserted in the same transaction remain unaddressable for mutation —
+  "cannot modify a row inserted in this transaction", `55000` — because they
+  have no published identity to tombstone yet.
+- **Error-code table** (pinned; fixtures assert SQLSTATE exactly):
+
+| Outcome | SQLSTATE | Meaning |
+|---|---|---|
+| Unsupported mutation profile | `0A000` | delete-bearing source snapshot; `SELECT … FOR UPDATE` (M3); two-phase prepare with pending writes |
+| Unaddressable row | `55000` | row produced by this transaction's INSERT (no published identity yet); tid outside the pinned snapshot's tasks |
+| Commit base moved / concurrent external writer won | `40001` | assert-ref conflict before acknowledgment; no partial state; standard PostgreSQL retry guidance applies |
+| Ambiguous remote commit | `40003` | catalog state unknown (lost/ambiguous reply); recovery is lookup-only and never re-appends |
+
+  Boundary fixture: `src/test/lakehouse/fixtures/cow-boundary-check.py`
+  (T1 happy path with old-snapshot read-back, T3 mixed transaction, T5
+  zero-row no-op, T7 savepoint rollback, T8 delete-bearing refusal);
+  concurrent-conflict and neighboring-delete-resurrection controls remain in
+  `cow-delete-guard.sh`. [TableAM write callbacks](../../src/backend/access/lakehouse/tableam.c) · [Overwrite commit ABI](../../src/backend/access/lakehouse/core/pgdatalake-core/src/ffi.rs)
+
+### 3b. Operations: fragmentation and maintenance (explicit caveat)
+
+Every COW mutation rewrites each file it touches. Mutation volume therefore
+grows dead bytes, file counts and small-file debt in the Iceberg layout even
+though **reads stay exactly correct** (the cut plus delete resolution yields
+identical rows at every pin). This is an **administration concern, not an
+accuracy or capability limitation** — the same trade every delete-capable
+database makes (heap bloat → vacuum; here: rewrite debt → compaction).
+Operator guidance until `lakehouse.optimize` / compaction lands (M4,
+[spec 08](08-maintenance.md)):
+
+- batch point mutations; avoid single-row COW in hot loops (use ordinary
+  heap + outbox for highly mutable state, §5);
+- watch file counts and rewritten-bytes in the publication metrics (§6,
+  "small-file debt" is already a per-profile metric);
+- plan a post-migration compaction pass when the workload's mutation phase
+  ends. Historical snapshots retain the pre-rewrite files until snapshot
+  expiry retires them.
+
+### 3c. External FDW writes: fail-closed by construction
+
+The FDW registers scan routines only — no `PlanForeignModify` /
+`ExecForeignInsert/Update/Delete` — so writes to external Iceberg foreign
+tables are refused by core PostgreSQL with `0A000` ("cannot insert into
+foreign table" and the analogous update/delete errors) before any catalog
+request. That refusal is the contract for this profile, with a named
+fail-closed control (boundary test T6). Direct external writes (per-statement
+Iceberg COW/DV commits, no publication coalescing) are a separately gated
+future band — [module 05](modules/05-iceberg-mutations.md).
+
 ## 4. Customer journeys and thought experiments
 
 | Journey | Expected experience | Advantage and cost |
