@@ -22,7 +22,7 @@ Entry points (from the repo root, via the root `Makefile` forward):
 The S3 store is SeaweedFS (`chrislusf/seaweedfs`) — MinIO deleted its Docker
 Hub images in Sept 2026; see the Superseded note in specs/lakehouse/10-testing.md §1.
 
-`meson setup build -Ddatalake=enabled && ninja` at the repo root builds the
+`meson setup build -Ddatalake=enabled -Dcassert=true && ninja` at the repo root builds the
 server + the `lakehouse` extension; see specs/lakehouse/12-roadmap.md for the
 milestone gates and specs/lakehouse/RULES.md §9 for the smoke-test ceremony.
 
