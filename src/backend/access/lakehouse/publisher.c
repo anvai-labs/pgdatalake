@@ -16,6 +16,7 @@
 #include "pgstat.h"
 #include "postmaster/bgworker.h"
 #include "executor/spi.h"
+#include "funcapi.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "libpq/pqsignal.h"
@@ -267,15 +268,20 @@ sleep_cycle:
 }
 
 
-PG_FUNCTION_INFO_V1(pg_lakehouse_publish_staged);
-
-Datum
-pg_lakehouse_publish_staged(PG_FUNCTION_ARGS)
+/*
+ * Shared drain core (foreground flush + the SQL entry points): claim,
+ * emit, ONE commit, exact-cardinality ledger flip. Returns the count of
+ * published segments and, when anything was published, the catalog's
+ * accepted snapshot id (verified by construction: the commit returned
+ * success). Same failures as before, unchanged.
+ */
+static void
+publish_staged_core(Oid relid, int *published_count_out, int64 *snapshot_id_out)
 {
-	Oid			relid = PG_GETARG_OID(0);
 	Relation	rel;
 	LakehouseWriteEntry *entry = NULL;
 	int			published_count = 0;
+	int64		snapshot_id = 0;
 	int			ret;
 	MemoryContext cb_ctx = CurrentMemoryContext;
 	char		errbuf[1024];
@@ -376,6 +382,7 @@ pg_lakehouse_publish_staged(PG_FUNCTION_ARGS)
 						(errcode(lakehouse_commit_errcode(entry)),
 						 errmsg("lakehouse: publisher commit failed: %s", errbuf)));
 			snap_id = pg_datalake_write_last_snapshot_id(entry->ws);
+			snapshot_id = snap_id;
 			pg_datalake_write_commit_result_free(loc);
 
 			/*
@@ -416,5 +423,59 @@ pg_lakehouse_publish_staged(PG_FUNCTION_ARGS)
 	table_close(rel, AccessShareLock);
 	MemoryContextSwitchTo(cb_ctx);
 
+	*published_count_out = published_count;
+	*snapshot_id_out = snapshot_id;
+}
+
+PG_FUNCTION_INFO_V1(pg_lakehouse_publish_staged);
+
+Datum
+pg_lakehouse_publish_staged(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	int			published_count = 0;
+	int64		snapshot_id = 0;
+
+	publish_staged_core(relid, &published_count, &snapshot_id);
 	PG_RETURN_INT32(published_count);
+}
+
+PG_FUNCTION_INFO_V1(pg_lakehouse_publish_table);
+
+/*
+ * Foreground flush with a typed receipt (spec 17 §3 publish-and-wait,
+ * serverless flush-before-shutdown): drains the relation's unpublished
+ * staged segments synchronously and returns the verified snapshot.
+ * state: 'no change' | 'published'.
+ */
+Datum
+pg_lakehouse_publish_table(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	int			published_count = 0;
+	int64		snapshot_id = 0;
+	TupleDesc	tupdesc;
+	HeapTuple	tuple;
+	Datum		values[3];
+	bool		nulls[3];
+
+	publish_staged_core(relid, &published_count, &snapshot_id);
+
+	TypeFuncClass ftype = get_call_result_type(fcinfo, NULL, &tupdesc);
+
+	if (ftype != TYPEFUNC_COMPOSITE)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("publish_table expects a composite return type")));
+	BlessTupleDesc(tupdesc);
+
+	values[0] = Int32GetDatum(published_count);
+	nulls[0] = false;
+	values[1] = Int64GetDatum(snapshot_id);
+	nulls[1] = snapshot_id == 0;
+	values[2] = CStringGetTextDatum(snapshot_id == 0 ? "no change" : "published");
+	nulls[2] = false;
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
 }
