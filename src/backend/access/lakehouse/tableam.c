@@ -3271,6 +3271,10 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 						DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[v],
 													SPI_tuptable->tupdesc,
 													2, &isnull));
+					if (isnull)
+						ereport(ERROR,
+								(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+								 errmsg("managed COUNT found a visible segment without row_count")));
 					visible_retained[v] = false;
 				}
 				n_visible = (int) SPI_processed;
@@ -3507,6 +3511,17 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 	{
 		int64		total = 0;
 
+		/*
+		 * The elision contract (ffi.rs): record_count is pre-delete, so a
+		 * delete-bearing plan MUST decline. Unreachable today — capture
+		 * publications are INSERT-only — but fail closed for any future
+		 * writer that publishes deletes into certified pins.
+		 */
+		if (pg_datalake_scan_has_deletes(scan->session))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("managed COUNT is unsupported on a snapshot with Iceberg deletes")));
+
 		for (int t = 0; t < scan->task_count; t++)
 			total += pg_datalake_scan_task_rows(scan->session, t);
 
@@ -3554,17 +3569,15 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
  * "managed COUNT"): run the demand-time cut install with for_count set —
  * the statement frame captures the overlay ledger row_count and the plan
  * contributes the published base's Parquet-metadata task rows, both
- * disjoint by construction — then release the cut. Returns false (caller
- * raises the ordinary 0A000) when the relation is not capture-bound;
- * admission's declines (unsupported shape, unadmitted) ereport exactly
- * as the scan path does.
+ * disjoint by construction — then release the cut. Returns the exact
+ * multiplicity; non-bound relations, unsupported shapes and unadmitted
+ * roles ereport exactly as the scan path does.
  */
-bool
-lakehouse_managed_cut_count(Oid relid, int64 *count_out)
+int64
+lakehouse_managed_cut_count(Oid relid)
 {
 	Relation	rel;
 	LakehouseTableScanDesc scan;
-	int64		count = 0;
 
 	if (IsInParallelMode())
 		ereport(ERROR,
@@ -3592,9 +3605,23 @@ lakehouse_managed_cut_count(Oid relid, int64 *count_out)
 
 	PG_TRY();
 	{
+		LakehouseOptions wm_opts;
+		int			wm;
+
 		lakehouse_admit_managed_cut(scan);
+
+		/* same refusal as the scan path (common_setup's bound bypass) */
+		memset(&wm_opts, 0, sizeof(wm_opts));
+		decode_lakehouse_reloptions(rel, &wm_opts);
+		wm = (wm_opts.write_mode != 0)
+			? wm_opts.write_mode
+			: lakehouse_write_mode;
+		if (wm != LAKEHOUSE_WRITE_MODE_STAGED)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("bound managed capture scans require the staged write mode")));
+
 		install_managed_cut(scan, RelationGetDescr(rel));
-		count = scan->cut_count;
 	}
 	PG_FINALLY();
 	{
@@ -3604,8 +3631,7 @@ lakehouse_managed_cut_count(Oid relid, int64 *count_out)
 	}
 	PG_END_TRY();
 
-	*count_out = count;
-	return true;
+	return scan->cut_count;
 }
 
 /*

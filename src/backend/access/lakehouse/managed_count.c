@@ -290,12 +290,7 @@ lakehouse_managed_count_cut(PG_FUNCTION_ARGS)
 		aclcheck_error(aclresult, OBJECT_TABLE, get_rel_name(relid));
 
 	LockRelationOid(relid, AccessShareLock);
-	if (!lakehouse_managed_cut_count(relid, &result))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("bound managed capture does not support table scans")));
-
-	PG_RETURN_INT64(result);
+	PG_RETURN_INT64(lakehouse_managed_cut_count(relid));
 }
 
 
