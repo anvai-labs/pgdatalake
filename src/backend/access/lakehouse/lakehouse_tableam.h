@@ -125,6 +125,8 @@ lakehouse_commit_errcode(LakehouseWriteEntry *entry)
 
 extern Oid	lakehouse_am_oid(void);
 extern void install_lakehouse_count_exec(void);
+extern void install_lakehouse_telemetry(void);
+extern void lakehouse_telemetry_guc_init(void);
 extern void lakehouse_check_capture_read(Oid relid);
 extern bool lakehouse_rel_is_capture_bound(Oid relid);
 extern int64 lakehouse_managed_cut_count(Oid relid);
