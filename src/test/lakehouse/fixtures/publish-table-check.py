@@ -63,6 +63,7 @@ def main():
                 head1 = trino(f'SELECT snapshot_id FROM iceberg.{ns}.'
                               f'"events$history" ORDER BY made_current_at DESC LIMIT 1').strip()
                 assert head1 != head0, (head0, head1)
+                assert int(snap) == int(head1), (snap, head1)
                 rows = trino(f"SELECT id FROM {table} ORDER BY id").strip()
                 assert rows == "10", rows
 
@@ -77,8 +78,6 @@ def main():
                 sql("postgres", f"DROP DATABASE {name} WITH (FORCE)")
         finally:
             trino(f"DROP TABLE IF EXISTS {table}; DROP SCHEMA iceberg.{ns}")
-    finally:
-        pass
 
 
 if __name__ == "__main__":
