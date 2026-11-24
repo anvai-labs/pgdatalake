@@ -185,7 +185,8 @@ def dropped_catalog_reply(route):
             if self.path != route:
                 self.send_error(404)
                 return
-            if purpose not in ("Bearer fixture-send", "Bearer fixture-lookup", "Bearer fixture-cut"):
+            if purpose not in ("Bearer fixture-send", "Bearer fixture-lookup",
+                               "Bearer fixture-cut", "Bearer fixture-read"):
                 self.send_error(403)
                 return
             if purpose == "Bearer fixture-cut":

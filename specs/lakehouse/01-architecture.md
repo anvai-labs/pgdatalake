@@ -70,7 +70,12 @@ exception-safety across `ereport`).
 
 *(Mermaid renders on GitHub; module names are the real ones in the tree —
 Rust under `src/backend/access/lakehouse/core/pgdatalake-core/src/`, C
-under `src/backend/access/lakehouse/`.)*
+under `src/backend/access/lakehouse/`. A current file-by-file source map,
+the end-to-end read paths, snapshot rules and a troubleshooting playbook
+live in [`src/backend/access/lakehouse/README.md`](../../src/backend/access/lakehouse/README.md)
+— that map supersedes this section where the tree has grown since
+2026-11-20, e.g. `managed_count.c`, `managed_credentials.c`,
+`managed_send.c`, `managed_lookup.c` and the `fdw_plan`/`fdw_exec` split.)*
 
 ```mermaid
 flowchart TB

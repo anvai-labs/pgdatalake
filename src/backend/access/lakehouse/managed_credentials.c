@@ -79,10 +79,12 @@ parse_credential_options(List *options, bool dedicated, const char **values)
 				 errmsg("managed publication requires complete catalog and object credentials")));
 	if (dedicated &&
 		(values[CREDENTIAL_PURPOSE] == NULL ||
-		 (strcmp(values[CREDENTIAL_PURPOSE], "send") != 0 && strcmp(values[CREDENTIAL_PURPOSE], "lookup") != 0)))
+		 (strcmp(values[CREDENTIAL_PURPOSE], "send") != 0 &&
+		  strcmp(values[CREDENTIAL_PURPOSE], "lookup") != 0 &&
+		  strcmp(values[CREDENTIAL_PURPOSE], "read") != 0)))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("publication credential purpose must be send or lookup")));
+				 errmsg("publication credential purpose must be send, lookup or read")));
 }
 
 Datum
@@ -118,7 +120,7 @@ copy_credential(const char *value, MemoryContext context)
 }
 
 void
-lakehouse_load_publication_material(PgDatalakePublicationCredentialMaterial *material,
+lakehouse_load_publication_material(PgDatalakePublicationCredentialMaterial * material,
 									Oid role, Oid server_id, Oid mapping_id,
 									const char *purpose, MemoryContext context)
 {
