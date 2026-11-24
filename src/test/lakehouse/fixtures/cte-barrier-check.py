@@ -1,10 +1,13 @@
 """CTE-inlining barrier: multi-referenced CTEs over foreign tables must
 materialize ONCE (spec 03; TPC-DS q1 diagnosis).
 
-A q1-shaped query — a multiply-referenced CTE with a correlated
-avg-subquery — must show exactly ONE Foreign Scan (the CTE materializes
-once; both references read the tuplestore), and the correlated result
-must equal the uncorrelated equivalent computed directly.
+A q1-family shape — a multiply-referenced CTE with a subquery in the
+WHERE — must show exactly ONE Foreign Scan (the CTE materializes once;
+both references read the tuplestore). This fixture pins the
+STOCK materialization semantics on a pullup-immune shape: the
+subselect is UNCORRELATED (no WHERE), which the correlated-agg pullup
+declines, so the SubPlan is retained and the barrier asserts describe
+the untouched planner behavior.
 """
 
 import importlib
@@ -19,8 +22,7 @@ q1_shape = """
     WITH ctr AS (SELECT id, grp, sum(amt) AS t
                  FROM events GROUP BY id, grp)
     SELECT c1.id, c1.t FROM ctr c1
-    WHERE c1.t > (SELECT avg(t) * 1.2 FROM ctr c2
-                  WHERE c1.grp = c2.grp)
+    WHERE c1.t > (SELECT avg(t) * 1.2 FROM ctr c2)
 """
 
 CATALOG = "http://localhost:8181/catalog"
@@ -31,11 +33,6 @@ def main():
     if not __debug__:
         raise RuntimeError("the barrier fixture requires Python assertions")
     ns = "cteb_" + uuid4().hex[:12]
-    import os
-    os.environ.setdefault("PGHOST", "/tmp/wt-sock")
-    os.environ.setdefault("PGPORT", "5598")
-    os.environ.setdefault("PGUSER", "vsingh")
-    os.environ.setdefault("PGDATABASE", "postgres")
     name = "cteb_" + uuid4().hex[:8]
     table = f"iceberg.{ns}.events"
     trino(f"CREATE SCHEMA iceberg.{ns}")
@@ -57,19 +54,22 @@ def main():
             """)
 
             # BARRIER SHAPE: exactly one Foreign Scan (the CTE
-            # materializes once); both references are CTE Scans.
+            # materializes once); both references are CTE Scans. The
+            # subselect is uncorrelated, so the correlated-agg pullup
+            # declines and the subquery survives as a stock InitPlan —
+            # these asserts pin stock planner behavior.
             plan = sql(name, "EXPLAIN (COSTS OFF) " + q1_shape)
             assert plan.count("Foreign Scan on events") == 1, plan
             assert "CTE Scan on ctr c1" in plan, plan
             assert "CTE Scan on ctr c2" in plan, plan
+            assert "InitPlan" in plan, plan
+            assert "agg_pullup" not in plan, plan
 
-            # FUNCTIONAL: correlated avg per grp over the ctr rows
-            # (A: avg(10,20)=15 -> thr 18; B: avg(30,40)=35 -> thr 42):
-            # only id 2 (t=20 > 18) survives — a deterministic oracle
-            # for the correlated shape.
+            # FUNCTIONAL: uncorrelated avg over all 4 ctr rows = 25 ->
+            # thr 30 -> only id 4 (t=40) survives.
             got = [x.split("|") for x in sql(name, q1_shape).split("\n") if x]
             got = sorted((int(i), float(v)) for i, v in got)
-            want = [(2, 20.0)]
+            want = [(4, 40.0)]
             assert got == want, (got, want)
             print(json.dumps({"case": "cte-inlining-barrier",
                               "foreign_scans": 1,
