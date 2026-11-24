@@ -3603,8 +3603,9 @@ capture_tombstone(Relation rel, ItemPointer tid)
 				 errmsg("lakehouse: %s cannot resolve row identity for DELETE/UPDATE",
 						RelationGetRelationName(rel)),
 				 errdetail("The tid was not produced by a live managed scan of this relation "
-						   "in this transaction (rows staged by an earlier INSERT in the same "
-						   "transaction are not yet addressable).")));
+						   "in this transaction; rows inserted in the same transaction, or "
+						   "committed but not yet published under staged append, are not "
+						   "addressable for mutation.")));
 	check_cow_scan(scan->session);
 	if (ItemPointerGetOffsetNumber(tid) == 0)
 		ereport(ERROR,
@@ -3903,7 +3904,12 @@ lakehouse_tuple_lock(Relation rel, ItemPointer tid, Snapshot snapshot,
 					 LockWaitPolicy wait_policy, uint8 flags,
 					 TM_FailureData *tmfd)
 {
-	LAKEHOUSE_UNSUPPORTED("row locking (SELECT ... FOR UPDATE)", "29");
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("lakehouse: row locking (SELECT ... FOR UPDATE) is not "
+					"supported on managed tables yet"),
+			 errdetail("Managed row locking arrives with the M3 publication "
+					   "and MVCC milestone (spec 18 §5).")));
 	return TM_Ok;				/* unreachable */
 }
 
