@@ -111,10 +111,13 @@ manifests/Parquet. This is why `EXPLAIN` and `LIMIT 0` are zero-request.
 replacement row — and PRE-COMMIT (`lakehouse_xact_callback`) rebuilds each
 touched file without the tombstoned rows and commits **one overwrite
 snapshot** (`pg_datalake_write_commit_overwrite`) with assert-ref
-requirements. Outcome codes: `0A000` unsupported profile (delete-bearing
-source snapshot, mutating a row inserted in the same transaction, FOR
-UPDATE, two-phase); `40001` the commit base moved — the concurrent external
-writer wins, no partial state; `40003` ambiguous remote commit
+requirements.
+
+Outcome codes: `0A000` unsupported profile (delete-bearing source snapshot,
+`SELECT … FOR UPDATE`, two-phase); `55000` unaddressable row (inserted in
+this transaction, or committed-unpublished under staged append); `40001`
+the commit base moved — the concurrent external writer wins, no partial
+state; `40003` ambiguous remote commit
 (lookup-only recovery, never re-appends). Routing-by-inspection ("does the
 row live in the base or in staged rows?") decides *which* subsystem handles
 the row; the commit assertion decides whether it *may* — a pre-read alone

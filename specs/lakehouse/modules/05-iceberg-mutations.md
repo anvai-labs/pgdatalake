@@ -27,11 +27,12 @@ oracle: [cow-boundary-check.py](../../../src/test/lakehouse/fixtures/cow-boundar
 | # | Case | Asserts |
 |---|---|---|
 | T1 | managed DELETE/UPDATE of published rows, no concurrency | exact read-back; Trino agrees at the new snapshot; a pinned older snapshot still returns the original rows |
-| T3 | mixed transaction: staged INSERTs + tombstoned published row | one overwrite at commit; every row exactly once; control: mutating a same-transaction row → `0A000` |
-| T5 | zero-row DELETE/UPDATE | no catalog POST, no new snapshot, rows unchanged |
+| T3 | mixed transaction: staged INSERTs + tombstoned published row | one overwrite at commit; every row exactly once; control: mutating a same-transaction row → `55000` |
+| T5 | zero-row DELETE/UPDATE | no new snapshot, rows unchanged |
 | T6 | FDW write-refusal control | INSERT/UPDATE/DELETE on an external foreign table → core `0A000`, zero catalog requests |
-| T7 | savepoint rollback of a COW mutation | row restored, no tombstone residue, zero catalog POSTs, remote snapshot unchanged |
+| T7 | savepoint rollback of a COW mutation | row restored, no tombstone residue, no new snapshot |
 | T8 | delete-bearing snapshot refusal | `0A000` before any catalog request |
+| T9 | committed-unpublished rows (staged append) | direct UPDATE/DELETE refuses `55000` ("cannot resolve row identity") until the publisher drains |
 
 Concurrent-conflict (`40001`) and neighboring-delete-resurrection controls
 remain in [cow-delete-guard.sh](../../../src/test/lakehouse/fixtures/cow-delete-guard.sh).

@@ -157,8 +157,8 @@ def t7(db, ns):
 def t8(db, ns):
     """Delete-bearing source snapshot refuses before any rewrite."""
     trino(f"DELETE FROM iceberg.{ns}.events WHERE id = 20")
-    assert trino(f"SELECT count(*) FROM iceberg.{ns}."
-                 f"\"events$files\" WHERE content = 1").strip() >= "1"
+    assert int(trino(f"SELECT count(*) FROM iceberg.{ns}."
+                     f"\"events$files\" WHERE content = 1").strip()) >= 1
     sql(db, f"CREATE TABLE t8 (id bigint) USING lakehouse")
     sql(db, f"SELECT lakehouse.attach_table('t8'::regclass, "
             f"'{ns}.events', 'cow_catalog')")

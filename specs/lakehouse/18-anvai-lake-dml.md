@@ -73,7 +73,9 @@ correctness comes from the commit assertion, never from the inspection alone:
 - **Zero-row mutation is a no-op.** The executor invokes the AM mutation
   callback only for rows it actually touches, so a `DELETE`/`UPDATE` matching
   zero rows produces no write entry, no catalog request, and no new snapshot.
-  Boundary test T5 pins zero catalog POSTs and an unchanged remote snapshot.
+  Boundary test T5 pins the observable outcome: rows unchanged and no new
+  snapshot (the write-entry code path makes the zero-request property
+  structural).
 - **Mixed transactions.** A transaction may stage INSERTs and tombstone
   published rows together; one overwrite at commit contains survivors plus
   the staged rows, each row exactly once (T3 pins zero duplication). Rows
