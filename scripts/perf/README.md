@@ -1,6 +1,13 @@
 # perf-lakehouse harness (spec 10 §5)
 
 Drivers for the performance gates and the §5.1/§5.2 recorded comparisons.
+Suites (`--suite`): `tpcds` (SF=10, q1–q3, scale variants via
+--tpcds-schema/--tpcds-ns), `tpch` (SF=1 q1–q10; fixture via
+`gen_tpch.py` + `write_tpch_iceberg.py`), `write` (staged INSERT /
+publisher drain / direct INSERT / COW UPDATE through pgwire), `scan`.
+TPC-DS generators: `gen_tpcds.py` (duckdb dsdgen) + the iceberg loader
+`write_tpch_iceberg.py` (env TPCH_SRC/TPCH_NS — it loads any parquet
+dir into any namespace).
 
 ## What runs where
 

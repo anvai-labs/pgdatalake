@@ -18,6 +18,14 @@ Suites:
   tpcds  TPC-DS q1–q3 full-scale (SF=10 fixture, 28.8M-row store_sales):
          the §5.1/§5.2 comparison set — q3 is the row-transport canary
          that perf fix #1 (columnar batch reads, #5/#17) targeted.
+         Scale variants attach into a dedicated schema via
+         --tpcds-schema/--tpcds-ns/--expected-store-sales.
+  tpch   TPC-H q1–q10 at SF=1 (duckdb dbgen fixture, 6M-row lineitem):
+         joins, subplans and aggregates against an external Iceberg
+         fixture; the DDL attaches on first use.
+  write  managed write path through pgwire: staged INSERT throughput
+         (the §5 bulk-load baseline), publisher drain lag, direct-mode
+         hot-path INSERT commit and COW UPDATE throughput.
   scan   single-file projection/aggregate microbench (small, fast).
 
 Usage:
@@ -36,9 +44,15 @@ import psycopg2
 REPO = Path(__file__).resolve().parents[2]
 DEFAULT_DDL = REPO / "scripts" / "perf" / "tpcds" / "ddl.sql"
 DEFAULT_QUERIES = REPO / "scripts" / "perf" / "tpcds" / "queries"
+DEFAULT_TPCH_DDL = REPO / "scripts" / "perf" / "tpch" / "ddl.sql"
+DEFAULT_TPCH_QUERIES = REPO / "scripts" / "perf" / "tpch" / "queries"
 
 # q1/q2/q3 = the recorded §5.1 comparison set
 TPCDS_QUERIES = ["query1", "query2", "query3"]
+
+# TPC-H SF=1 (duckdb dbgen): the full 22-branch lineitem fact
+TPCH_QUERIES = [f"query{i}" for i in range(1, 11)]
+TPCH_SF1_LINEITEM_ROWS = 6_001_215
 
 SCAN_DDL = """
 DROP TABLE IF EXISTS perf_scan CASCADE;
@@ -104,9 +118,7 @@ def timed(cur, sql: str, timeout_s: int) -> float:
     cur.execute(f"SET statement_timeout = {timeout_s * 1000}")
     t0 = time.perf_counter()
     try:
-        cur.execute(sql)
-        while cur.nextset():  # drain multi-statement payloads
-            pass
+        cur.execute(sql)  # single-statement files; psycopg2 has no nextset on pgwire
     except psycopg2.errors.QueryCanceled:
         raise SystemExit(f"TIMEOUT after {timeout_s}s: {sql[:60]}...")
     return time.perf_counter() - t0
@@ -227,16 +239,30 @@ def run_tpcds_suite(conn, args):
     cur = conn.cursor()
     # foreign tables are attached UNPREFIXED (that is how the shipped
     # query files reference them); args.tpcds_ns names the ICEBERG
-    # namespace only
-    cur.execute(f"SELECT count(*) FROM store_sales")
+    # namespace only. A non-public --tpcds-schema hosts scale variants
+    # (convention: tpcds_sf1) beside the unprefixed SF=10 fixture.
+    if args.tpcds_schema != "public":
+        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {args.tpcds_schema}")
+        cur.execute(f"SET search_path = {args.tpcds_schema}, public")
+    cur.execute("SELECT to_regclass('store_sales') IS NULL")
+    if cur.fetchone()[0]:
+        ddl_text = Path(args.ddl).read_text()
+        if args.tpcds_ns != "tpcds":
+            ddl_text = ddl_text.replace("table 'tpcds.",
+                                        f"table '{args.tpcds_ns}.")
+        cur.execute(ddl_text)
+        conn.commit()
+        if args.tpcds_schema != "public":
+            cur.execute(f"SET search_path = {args.tpcds_schema}, public")
+    cur.execute("SELECT count(*) FROM store_sales")
     n = cur.fetchone()[0]
-    if n == 28_800_991:
-        print("NOTICE: TPC-DS fixture exists and VERIFIED "
-              "(store_sales rows=28,800,991) — reusing, no generation")
+    if n == args.expected_store_sales:
+        print(f"NOTICE: TPC-DS fixture exists and VERIFIED "
+              f"(store_sales rows={n}) — reusing, no generation")
     else:
-        print(f"WARNING: store_sales rows={n} != 28,800,991 — the SF=10 "
-              "fixture is stale or wrong; regenerate with "
-              "scripts/gen_tpcds.py + write_tpcds_iceberg.py before "
+        print(f"WARNING: store_sales rows={n} != {args.expected_store_sales} "
+              "— the fixture is stale or wrong; regenerate with "
+              "scripts/perf/gen_tpcds.py + the iceberg loader before "
               "trusting these numbers")
     rows = []
     for q in TPCDS_QUERIES:
@@ -247,9 +273,161 @@ def run_tpcds_suite(conn, args):
     return rows
 
 
+def run_tpch_suite(conn, args):
+    cur = conn.cursor()
+    # the TPC-H tables live in schema tpch (customer collides with the
+    # TPC-DS fixture's customer); the shipped query files stay unprefixed
+    cur.execute("SET search_path = tpch, public")
+    # attach on first use; the iceberg namespace names the fixture
+    cur.execute("SELECT to_regclass('tpch.lineitem') IS NULL")
+    if cur.fetchone()[0]:
+        cur.execute(Path(args.tpch_ddl).read_text())
+        conn.commit()
+        cur.execute("SET search_path = tpch, public")
+    cur.execute("SELECT count(*) FROM lineitem")
+    n = cur.fetchone()[0]
+    if n == TPCH_SF1_LINEITEM_ROWS:
+        print(f"NOTICE: TPC-H fixture exists and VERIFIED "
+              f"(lineitem rows={n}) — reusing, no generation")
+    else:
+        print(f"WARNING: lineitem rows={n} != {TPCH_SF1_LINEITEM_ROWS} — "
+              "the SF=1 fixture is stale or wrong; regenerate with "
+              "scripts/perf/gen_tpch.py + scripts/perf/write_tpch_iceberg.py "
+              "before trusting these numbers")
+    rows = []
+    for q in TPCH_QUERIES:
+        sql = (Path(args.tpch_queries) / f"{q}.sql").read_text()
+        runs, med = measure(cur, sql, args.timeout, warmup=args.warmup)
+        print(f"{q}: runs={['%.1f' % r for r in runs]} median={med:.1f}s")
+        rows.append((q, med))
+    return rows
+
+
+WRITE_REMOTE_SETUP = """
+from pyiceberg.catalog import load_catalog
+from pyiceberg.exceptions import NoSuchTableError
+from pyiceberg.schema import Schema
+from pyiceberg.types import LongType, NestedField, StringType
+cat = load_catalog("smoke", type="rest", uri=%r, warehouse="smoke",
+                   **{"s3.endpoint": %r,
+                      "s3.addressing-style": "path",
+                      "s3.access-key-id": "lakehouse-test",
+                      "s3.secret-access-key": "lakehouse-test-password"})
+try:
+    cat.create_namespace("perfwr")
+except Exception:
+    pass
+for TABLE in ("perfwr.write_bench", "perfwr.write_cow"):
+    try:
+        cat.drop_table(TABLE)
+    except NoSuchTableError:
+        pass
+    schema = Schema(NestedField(1, "id", LongType(), required=False),
+                    NestedField(2, "payload", StringType(), required=False))
+    cat.create_table(TABLE, schema=schema, properties={"format-version": "2"})
+print("CREATED")
+"""
+
+
+def run_write_suite(conn, args):
+    """Measure the managed WRITE path through pgwire (§5 bulk-load
+    baseline) on TWO tables, because the modes answer different
+    questions: the staged-append table measures local INSERT throughput
+    and publisher drain lag (its delta-only scan deliberately serves no
+    published rows, spec 18 §1); the direct-mode table measures a hot-
+    path INSERT commit and the COW UPDATE of published rows."""
+    import subprocess
+    code = WRITE_REMOTE_SETUP % (args.catalog_uri, args.s3_endpoint)
+    subprocess.run(
+        ["docker", "run", "--rm", "-i", "--network", args.docker_net,
+         "-v", f"{args.pdi_venv}:/venv",
+         "-e", f"PYTHONPATH=/venv/lib/{args.pdi_py_minor}/site-packages",
+         "python:3.12-slim", "python3", "-"],
+        input=code, check=True, text=True, capture_output=True)
+
+    cur = conn.cursor()
+    cur.execute("SET statement_timeout = %s", [args.timeout * 1000])
+    cur.execute("DROP TABLE IF EXISTS perf_write CASCADE")
+    cur.execute("DROP TABLE IF EXISTS perf_cow CASCADE")
+    cur.execute("""CREATE TABLE perf_write (id bigint, payload text)
+                   USING lakehouse WITH (write_mode='staged')""")
+    cur.execute("CREATE TABLE perf_cow (id bigint, payload text) "
+                "USING lakehouse")
+    cur.execute("SELECT lakehouse.attach_table('perf_write', "
+                "'perfwr.write_bench', 'smoke_server')")
+    cur.execute("SELECT lakehouse.attach_table('perf_cow', "
+                "'perfwr.write_cow', 'smoke_server')")
+    conn.commit()
+
+    n = args.write_rows
+    ins = (f"INSERT INTO perf_write SELECT g, 'payload-' || md5(g::text) "
+           f"FROM generate_series(1, {n}) g;")
+    t0 = time.monotonic()
+    cur.execute(ins)
+    conn.commit()
+    ins_s = time.monotonic() - t0
+
+    # verify through the staged (delta-only) scan BEFORE the publisher
+    # drains; after publication the local scan serves nothing by design
+    cur.execute("SELECT count(*) FROM perf_write")
+    got = cur.fetchone()[0]
+    if got != n:
+        raise SystemExit(f"staged INSERT verification FAILED "
+                         f"(count={got}, want={n})")
+
+    # wait for the publisher worker to drain (a synchronous flush command
+    # would replace this poll — named band, spec 17 §3 publish-and-wait)
+    t0 = time.monotonic()
+    while True:
+        cur.execute("SELECT count(*) FROM lakehouse.lakehouse_delta_segments "
+                    "WHERE relid = 'perf_write'::regclass AND NOT published")
+        pending = cur.fetchone()[0]
+        if pending == 0:
+            break
+        if time.monotonic() - t0 > args.publish_timeout:
+            raise SystemExit(f"publisher did not drain {pending} staged "
+                             f"segment(s) within {args.publish_timeout}s")
+        time.sleep(2)
+    pub_s = time.monotonic() - t0
+    print(f"insert: {n} rows in {ins_s:.2f}s -> {n / ins_s / 1e3:.0f}k rows/s "
+          f"(staged)")
+    print(f"publish: drained in {pub_s:.2f}s")
+
+    m = min(args.write_rows, 100_000)
+    t0 = time.monotonic()
+    cur.execute(f"INSERT INTO perf_cow SELECT g, 'payload-' || md5(g::text) "
+                f"FROM generate_series(1, {m}) g")
+    conn.commit()
+    cow_ins_s = time.monotonic() - t0
+    cur.execute("SELECT count(*) FROM perf_cow")
+    got = cur.fetchone()[0]
+    if got != m:
+        raise SystemExit(f"direct INSERT verification FAILED "
+                         f"(count={got}, want={m})")
+
+    t0 = time.monotonic()
+    cur.execute("UPDATE perf_cow SET payload = payload || '-u' "
+                "WHERE id % 10 = 0")
+    conn.commit()
+    upd_s = time.monotonic() - t0
+    cur.execute("SELECT count(*) FROM perf_cow")
+    got = cur.fetchone()[0]
+    if got != m:
+        raise SystemExit(f"COW UPDATE verification FAILED "
+                         f"(count={got}, want={m})")
+    print(f"direct insert: {m} rows in {cow_ins_s:.2f}s -> "
+          f"{m / cow_ins_s / 1e3:.0f}k rows/s (hot-path commit)")
+    print(f"update: {m // 10} rows in {upd_s:.2f}s -> "
+          f"{m / 10 / upd_s / 1e3:.0f}k rows/s (COW)")
+    return [("staged_insert_rows_per_s", n / ins_s), ("publish_lag_s", pub_s),
+            ("direct_insert_rows_per_s", m / cow_ins_s),
+            ("update_rows_per_s", m / 10 / upd_s)]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--suite", choices=["tpcds", "scan"], default="tpcds")
+    ap.add_argument("--suite", choices=["tpcds", "tpch", "scan", "write"],
+                    default="tpcds")
     ap.add_argument("--dsn", default="postgres://postgres@localhost:52021/postgres")
     ap.add_argument("--timeout", type=int, default=1200,
                     help="per-run statement timeout (s)")
@@ -269,6 +447,18 @@ def main():
                     help="fixture namespace; convention for NEW fixtures: "
                          "tpcds_sf<N> so scales never collide (existing "
                          "M1 fixture lives in 'tpcds' at SF=10)")
+    ap.add_argument("--tpcds-schema", default="public",
+                    help="schema hosting the attached foreign tables "
+                         "(use a dedicated schema for scale variants)")
+    ap.add_argument("--expected-store-sales", type=int, default=28_800_991,
+                    help="verify count for the fixture's store_sales table")
+    ap.add_argument("--tpch-ddl", default=str(DEFAULT_TPCH_DDL))
+    ap.add_argument("--tpch-queries", default=str(DEFAULT_TPCH_QUERIES))
+    ap.add_argument("--write-rows", type=int, default=1_000_000,
+                    help="rows for the write suite's staged INSERT")
+    ap.add_argument("--publish-timeout", type=int, default=600,
+                    help="max seconds to wait for the publisher to drain "
+                         "staged segments before the COW UPDATE")
     ap.add_argument("--queries", default=str(DEFAULT_QUERIES))
     ap.add_argument("--oracle", help="independent pinned oracle JSON for qualified TPC-DS timings")
     ap.add_argument("--receipt", help="output JSON receipt for the qualified run")
@@ -306,8 +496,14 @@ def main():
     cur.execute("SELECT lakehouse.version()")
     print(f"engine: {cur.fetchone()[0]}")
 
-    rows = run_tpcds_suite(conn, args) if args.suite == "tpcds" \
-        else run_scan_suite(conn, args)
+    if args.suite == "tpcds":
+        rows = run_tpcds_suite(conn, args)
+    elif args.suite == "tpch":
+        rows = run_tpch_suite(conn, args)
+    elif args.suite == "write":
+        rows = run_write_suite(conn, args)
+    else:
+        rows = run_scan_suite(conn, args)
 
     print("\n| query | median (s) |")
     print("|---|---|")
