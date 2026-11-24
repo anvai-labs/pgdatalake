@@ -428,8 +428,8 @@ decl(int line)
  * Decline detector for the subselect targetlist: any Var above the
  * subselect's own level (correlated targetlist — pull_var_clause would
  * ERROR before our decline could fire) or any SubLink (nested scalar
- * subqueries change the aggregated value's independence). expression_tree_walker
- * does not descend into SubLink subselects, which is what we want.
+ * subqueries change the aggregated value's independence). We return
+ * true AT the SubLink node, so its subselect is never entered.
  */
 static bool
 tle_has_outer_var_or_sublink_walker(Node *node, void *context)
@@ -812,7 +812,6 @@ pullup_cte_agg_sublinks(Query *parse)
 	agg_te = copyObject(te);
 	agg_te->resno = 1;
 	agg_te->resname = "agg";
-	agg_te->expr = (Expr *) copyObject(agg_te->expr);
 	set_agg_varno_walker((Node *) agg_te->expr, NULL);
 	gq->targetList = lappend(gq->targetList, agg_te);
 	ctx.agg_resno = 1;
