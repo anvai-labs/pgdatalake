@@ -244,7 +244,7 @@ def run_tpcds_suite(conn, args):
     if args.tpcds_schema != "public":
         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {args.tpcds_schema}")
         cur.execute(f"SET search_path = {args.tpcds_schema}, public")
-    cur.execute("SELECT to_regclass('store_sales') IS NULL")
+    cur.execute(f"SELECT to_regclass('{args.tpcds_schema}.store_sales') IS NULL")
     if cur.fetchone()[0]:
         ddl_text = Path(args.ddl).read_text()
         if args.tpcds_ns != "tpcds":
@@ -296,7 +296,10 @@ def run_tpch_suite(conn, args):
               "before trusting these numbers")
     rows = []
     for q in TPCH_QUERIES:
-        sql = (Path(args.tpch_queries) / f"{q}.sql").read_text()
+        try:
+            sql = (Path(args.tpch_queries) / f"{q}.sql").read_text()
+        except FileNotFoundError:
+            raise SystemExit(f"missing query file: {args.tpch_queries}/{q}.sql")
         runs, med = measure(cur, sql, args.timeout, warmup=args.warmup)
         print(f"{q}: runs={['%.1f' % r for r in runs]} median={med:.1f}s")
         rows.append((q, med))
@@ -346,6 +349,13 @@ def run_write_suite(conn, args):
         input=code, check=True, text=True, capture_output=True)
 
     cur = conn.cursor()
+    cur.execute("SELECT to_regclass('smoke_server') IS NULL OR "
+                "NOT EXISTS (SELECT 1 FROM pg_foreign_server "
+                "WHERE srvname = 'smoke_server')")
+    if cur.fetchone()[0]:
+        raise SystemExit("the write suite needs a 'smoke_server' foreign "
+                         "server in the target database (see the tpcds "
+                         "setup in scripts/perf/tpcds/ddl.sql preamble)")
     cur.execute("SET statement_timeout = %s", [args.timeout * 1000])
     cur.execute("DROP TABLE IF EXISTS perf_write CASCADE")
     cur.execute("DROP TABLE IF EXISTS perf_cow CASCADE")
