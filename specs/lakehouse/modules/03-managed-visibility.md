@@ -333,14 +333,21 @@ scan keys, RLS, inheritance, own staged writes and non-staged write modes.
 Before the observation makes any request, install runs a zero-origin
 statement-scope preflight: a reader whose registered snapshot predates a
 binding rotation fails with the consistency error before the first
-origin contact. Admission returns a mapping-options fingerprint and the
-fresh-proof frame compares it field by field, so a same-OID mapping
-replacement is a detected credential change. The pending-head proof is
+origin contact. Admission returns a canonical jsonb mapping-options
+fingerprint. The fresh-proof frame does NOT re-run
+`admit_managed_read`: the function is VOLATILE, so a SQL function body
+executes with `GetTransactionSnapshot()` (executor/functions.c) — in a
+REPEATABLE READ scan that is the held snapshot, which would keep a
+mid-window revocation invisible no matter which snapshot the caller
+pushes. Instead the frame queries the grant row directly under the
+registered fresh snapshot and refuses revocation, expiry, a swapped
+mapping and a same-OID credential-option change (the jsonb
+fingerprint), before any row is served. The pending-head proof is
 head-only (the #88 verifier resolves the attempt against the certified
 head): once the provider head moves past the accepted child, the cut
 falls back to the retained parent with the full overlay. The cut itself
 installs on the first fetch: preflight → observe → fresh-proof frame
-(re-admission compare, certified addition chain, pending-head proof) →
+(direct grant recheck, certified addition chain, pending-head proof) →
 statement frame (registered snapshot: visible segments + payload
 retention) → compatible-pin selection → digest-verified overlay load →
 exact-pin plan. `lakehouse.managed_read_cut_evidence()` exposes the
@@ -349,9 +356,9 @@ DOCUMENTED GAP (until RTE-aware admission lands): scans derived from
 views and redirected permission identities (`checkAsUser`) are not
 detectable at scan_begin; the role-specific `purpose=read` credential
 mapping structurally prevents a definer view from widening admission
-(the invoker's identity admits), and the fresh-frame scope recheck
-rejects mapping rotation, revocation, prefix, region and option
-changes mid-scan. Bound COUNT keeps declining through
+(the invoker's identity admits), and the fresh-frame recheck rejects
+mapping rotation, revocation, prefix, region and option changes
+mid-scan. Bound COUNT keeps declining through
 `lakehouse_check_capture_read`. NOT IMPLEMENTED in this slice, tracked
 for the governed-reads band: the retained object lease / provider proof
 across portal lifetime, and distinct telemetry for the compatibility

@@ -120,8 +120,7 @@ SET search_path = pg_catalog, pg_temp AS $$
            b.storage_root, a.snapshot_id, b.schema_id, b.spec_id,
            b.target_identity, b.catalog_endpoint, g.catalog_prefix, g.s3_region,
            b.object_endpoint,
-           md5(coalesce((SELECT string_agg(opt, '|' ORDER BY opt)
-                         FROM unnest(m.umoptions) opt), ''))
+           md5(coalesce(to_jsonb(m.umoptions)::text, 'null'))
     FROM lakehouse.managed_capture_state s
     JOIN lakehouse.managed_read_grants g
       ON g.binding_id = s.active_binding_id AND g.reader_role = reader::oid

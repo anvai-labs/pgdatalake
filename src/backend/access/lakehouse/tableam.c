@@ -2541,29 +2541,6 @@ managed_read_admission_fill(ManagedReadAdmission *a, HeapTuple tuple,
 	a->mapping_fingerprint = raw == NULL ? NULL : pnstrdup(VARDATA_ANY(raw), VARSIZE_ANY_EXHDR(raw));
 }
 
-static bool
-managed_read_admission_equal(const ManagedReadAdmission *a,
-							 const ManagedReadAdmission *b)
-{
-	return memcmp(&a->binding, &b->binding, sizeof(pg_uuid_t)) == 0 &&
-		a->role == b->role &&
-		a->mapping == b->mapping &&
-		a->server == b->server &&
-		memcmp(&a->incarnation, &b->incarnation, sizeof(pg_uuid_t)) == 0 &&
-		memcmp(&a->authority, &b->authority, sizeof(pg_uuid_t)) == 0 &&
-		memcmp(&a->table_uuid, &b->table_uuid, sizeof(pg_uuid_t)) == 0 &&
-		a->anchor == b->anchor &&
-		a->schema_id == b->schema_id &&
-		a->spec_id == b->spec_id &&
-		strcmp(a->target_identity, b->target_identity) == 0 &&
-		strcmp(a->storage_root, b->storage_root) == 0 &&
-		strcmp(a->catalog_endpoint, b->catalog_endpoint) == 0 &&
-		strcmp(a->catalog_prefix, b->catalog_prefix) == 0 &&
-		strcmp(a->s3_region, b->s3_region) == 0 &&
-		strcmp(a->s3_endpoint, b->s3_endpoint) == 0 &&
-		strcmp(a->mapping_fingerprint, b->mapping_fingerprint) == 0;
-}
-
 /*
  * Executor admission (plan step 4): run lakehouse.admit_managed_read under
  * the ledger owner's security context for the CHECKED role. Zero rows
@@ -2854,7 +2831,7 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 		fresh_snapshot = RegisterSnapshot(GetLatestSnapshot());
 		PG_TRY();
 		{
-			ManagedReadAdmission fresh;
+			bool		recheck_null = false;
 			Oid			argtypes[4];
 			Datum		args[4];
 			int			ret;
@@ -2862,22 +2839,51 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 			SetUserIdAndSecContext(owner, sec_context | SECURITY_LOCAL_USERID_CHANGE |
 								   SECURITY_RESTRICTED_OPERATION);
 
-			/* admission recheck: every field must still match */
-			argtypes[0] = OIDOID;
+			/*
+			 * admission recheck: the operator's read decision must still
+			 * stand.  admit_managed_read is VOLATILE, so its body executes
+			 * with GetTransactionSnapshot() (executor/functions.c) — in a
+			 * REPEATABLE READ scan that is the held snapshot, which would
+			 * keep a mid-window revocation invisible no matter which snapshot
+			 * the caller pushes.  Query the grant row directly under the
+			 * registered fresh snapshot instead: revocation, expiry, a
+			 * swapped mapping and a same-OID credential-option change
+			 * (canonical jsonb fingerprint) all refuse here. Binding
+			 * rotation, lineage and shape drift are covered by the
+			 * statement-scope preflight's dual scope probes.
+			 */
+			argtypes[0] = UUIDOID;
 			argtypes[1] = OIDOID;
-			args[0] = ObjectIdGetDatum(relid);
+			argtypes[2] = OIDOID;
+			argtypes[3] = TEXTOID;
+			args[0] = UUIDPGetDatum(&scan->admission.binding);
 			args[1] = ObjectIdGetDatum(reader);
-			ret = SPI_execute_with_args("SELECT * FROM lakehouse.admit_managed_read($1, $2)",
-										2, argtypes, args, NULL, true, 1);
-			if (ret != SPI_OK_SELECT)
-				elog(ERROR, "could not re-read the managed read admission");
-			if (SPI_processed != 1)
+			args[2] = ObjectIdGetDatum(scan->admission.mapping);
+			args[3] = CStringGetTextDatum(scan->admission.mapping_fingerprint);
+			{
+				SPIPlanPtr	plan = SPI_prepare(
+											   "SELECT NOT g.revoked AND g.expires_at > clock_timestamp()"
+											   " AND g.mapping_id = $3"
+											   " AND md5(coalesce(to_jsonb(m.umoptions)::text, 'null')) = $4"
+											   " FROM lakehouse.managed_read_grants g"
+											   " JOIN pg_user_mapping m ON m.oid = g.mapping_id"
+											   "  AND m.umuser = g.reader_role"
+											   " WHERE g.binding_id = $1 AND g.reader_role = $2",
+											   4, argtypes);
+
+				if (plan == NULL)
+					elog(ERROR, "could not prepare the managed read recheck");
+				ret = SPI_execute_snapshot(plan, args, NULL,
+										   fresh_snapshot, InvalidSnapshot,
+										   true, false, 1);
+			}
+			if (ret != SPI_OK_SELECT || SPI_processed != 1)
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						 errmsg("managed read admission changed under the scan")));
-			managed_read_admission_fill(&fresh, SPI_tuptable->vals[0],
-										SPI_tuptable->tupdesc);
-			if (!managed_read_admission_equal(&fresh, &scan->admission))
+			if (!DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+											SPI_tuptable->tupdesc, 1,
+											&recheck_null)) || recheck_null)
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						 errmsg("managed read admission changed under the scan")));

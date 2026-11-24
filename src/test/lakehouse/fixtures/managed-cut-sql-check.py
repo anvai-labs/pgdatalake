@@ -239,6 +239,38 @@ def exercise(db, namespace, writer, reader, owner, worker):
                             fresh_r("CLOSE drill")
                             print(json.dumps({"case": "rescan-retained-cut", "head_moved_to": head_after,
                                               "catalog_resolutions": 0}), flush=True)
+
+                            # Mid-window revocation: admission ran at
+                            # DECLARE (ExecutorStart); revoke the grant
+                            # before the first FETCH. The cut install's
+                            # fresh-snapshot re-admission must see the
+                            # revocation — a held REPEATABLE READ snapshot
+                            # must not keep it invisible — and refuse
+                            # before any row is served. Exactly one
+                            # observation GET is spent; zero rows.
+                            fresh_r("DECLARE midwin CURSOR FOR "
+                                    "SELECT id FROM events ORDER BY id")
+                            midwin_reads = len(reads)
+                            import os as _os
+                            if _os.getenv("DRILL_DEBUG"):
+                                print("REVOKE:", sql(db, f"""
+                                    SELECT lakehouse.revoke_managed_read('{binding}', '{reader}'),
+                                           txid_current()::text AS revoke_xid"""), flush=True)
+                                print("ROW_VERSIONS:", sql(db, f"""
+                                    SELECT xmin::text::bigint AS ver, revoked
+                                    FROM lakehouse.managed_read_grants
+                                    WHERE binding_id='{binding}'"""), flush=True)
+                                print("ADMIN_ADMIT:", sql(db,
+                                    "SELECT count(*) FROM "
+                                    f"lakehouse.admit_managed_read('events'::regclass, "
+                                    f"'{reader}'::regrole)"), flush=True)
+                            else:
+                                sql(db, f"SELECT lakehouse.revoke_managed_read('{binding}', '{reader}')")
+                            fresh_r("FETCH ALL IN midwin", sqlstate="55000")
+                            assert len(reads) - midwin_reads == 1, reads[midwin_reads:]
+                            print(json.dumps({"case": "midwindow-revocation",
+                                              "reader_catalog_gets": 1, "rows_served": 0}),
+                                  flush=True)
                             fresh_r("COMMIT")
 
                         # Release the held snapshots (their AccessShare
