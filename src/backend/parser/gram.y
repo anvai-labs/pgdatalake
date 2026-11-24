@@ -552,7 +552,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <ielem>	index_elem index_elem_options
 %type <selem>	stats_param
 %type <node>	table_ref
-%type <node>	lakehouse_time_travel opt_lakehouse_time_travel
+%type <node>	lakehouse_time_travel
 %type <jexpr>	joined_table
 %type <range>	relation_expr
 %type <range>	extended_relation_expr

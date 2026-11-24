@@ -1800,9 +1800,13 @@ typedef struct LakehouseTableScanDescData
 	bool		capture_bound;
 	bool		cut_installed;
 	bool		cut_proved;
+	bool		for_count;		/* metadata-only COUNT: skip payload loads */
+	int64		cut_count;		/* for_count: task rows + overlay row_count */
 	int64		cut_pin;
 	int64	   *cut_overlay_ids;
 	int			n_cut_overlay;
+	int64	   *overlay_row_counts; /* per visible segment (statement frame) */
+	int			n_overlay_row_counts;
 	struct ManagedReadObservation *read_observation;
 	ManagedReadAdmission admission;
 } LakehouseTableScanDescData;
@@ -3236,7 +3240,7 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 								   SECURITY_RESTRICTED_OPERATION);
 			{
 				SPIPlanPtr	plan = SPI_prepare(
-											   "SELECT segment_id FROM lakehouse.get_managed_read_visible_segments($1, $2)",
+											   "SELECT segment_id, row_count FROM lakehouse.get_managed_read_visible_segments($1, $2)",
 											   2, argtypes);
 
 				if (plan == NULL)
@@ -3253,6 +3257,9 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 												 sizeof(int64) * SPI_processed);
 				visible_retained = MemoryContextAlloc(scan_context,
 													  sizeof(bool) * SPI_processed);
+				scan->overlay_row_counts = MemoryContextAlloc(scan_context,
+															  sizeof(int64) * SPI_processed);
+				scan->n_overlay_row_counts = (int) SPI_processed;
 				for (int v = 0; v < SPI_processed; v++)
 				{
 					bool		isnull;
@@ -3260,6 +3267,14 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 					visible_ids[v] = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[v],
 																 SPI_tuptable->tupdesc,
 																 1, &isnull));
+					scan->overlay_row_counts[v] =
+						DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[v],
+													SPI_tuptable->tupdesc,
+													2, &isnull));
+					if (isnull)
+						ereport(ERROR,
+								(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+								 errmsg("managed COUNT found a visible segment without row_count")));
 					visible_retained[v] = false;
 				}
 				n_visible = (int) SPI_processed;
@@ -3352,7 +3367,7 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 
 	/* ---- 5. verify + load the overlay payloads (statement snapshot) ---- */
 	schema_json = lakehouse_build_schema_json(tupdesc);
-	if (n_overlay > 0)
+	if (n_overlay > 0 && !scan->for_count)
 	{
 		/*
 		 * select_cut returns ascending IDs; enforce the loader's strict order
@@ -3485,6 +3500,46 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 	scan->rows = NULL;
 	scan->current_task = 0;
 
+	/*
+	 * Metadata-only COUNT (for_count): the cut's two parts are disjoint by
+	 * construction — published base rows come from the plan's Parquet
+	 * metadata (no data-file reads) and overlay members from the ledger
+	 * row_count captured in the statement frame — so the sum is the
+	 * resolved scan's exact multiplicity.
+	 */
+	if (scan->for_count)
+	{
+		int64		total = 0;
+
+		/*
+		 * The elision contract (ffi.rs): record_count is pre-delete, so a
+		 * delete-bearing plan MUST decline. Unreachable today — capture
+		 * publications are INSERT-only — but fail closed for any future
+		 * writer that publishes deletes into certified pins.
+		 */
+		if (pg_datalake_scan_has_deletes(scan->session))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("managed COUNT is unsupported on a snapshot with Iceberg deletes")));
+
+		for (int t = 0; t < scan->task_count; t++)
+			total += pg_datalake_scan_task_rows(scan->session, t);
+
+		/*
+		 * Only the cut's overlay members count: a segment outside the
+		 * selected overlay is either already in the base pin or not part of
+		 * this statement's view.
+		 */
+		for (int o = 0; o < scan->n_cut_overlay; o++)
+			for (int v = 0; v < scan->n_overlay_row_counts; v++)
+				if (scan->cut_overlay_ids[o] == visible_ids[v])
+				{
+					total += scan->overlay_row_counts[v];
+					break;
+				}
+		scan->cut_count = total;
+	}
+
 	/* backend-local evidence for the fixture drill and operator debugging */
 	{
 		StringInfoData ev;
@@ -3502,7 +3557,81 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 		managed_cut_evidence = MemoryContextStrdup(TopMemoryContext, ev.data);
 	}
 
+	/* the fast path is done: no payload readers, no own-writes overlay */
+	if (scan->for_count)
+		return;
+
 	MemoryContextSwitchTo(scan_context);
+}
+
+/*
+ * Metadata-only COUNT fast path for one capture-bound relation (spec 03,
+ * "managed COUNT"): run the demand-time cut install with for_count set —
+ * the statement frame captures the overlay ledger row_count and the plan
+ * contributes the published base's Parquet-metadata task rows, both
+ * disjoint by construction — then release the cut. Returns the exact
+ * multiplicity; non-bound relations, unsupported shapes and unadmitted
+ * roles ereport exactly as the scan path does.
+ */
+int64
+lakehouse_managed_cut_count(Oid relid)
+{
+	Relation	rel;
+	LakehouseTableScanDesc scan;
+
+	if (IsInParallelMode())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("bound managed capture does not support parallel scans")));
+	if (has_subclass(relid))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("bound managed capture does not support inheritance scans")));
+	if (check_enable_rls(relid, GetUserId(), false) != RLS_NONE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("bound managed capture does not support row-level security scans")));
+	if (lakehouse_find_write_entry(relid) != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("bound managed capture does not support scans with staged writes")));
+
+	rel = RelationIdGetRelation(relid);
+	scan = palloc0(sizeof(LakehouseTableScanDescData));
+	scan->rs_base.rs_rd = rel;
+	scan->rs_base.rs_snapshot = GetTransactionSnapshot();
+	scan->capture_bound = true;
+	scan->for_count = true;
+
+	PG_TRY();
+	{
+		LakehouseOptions wm_opts;
+		int			wm;
+
+		lakehouse_admit_managed_cut(scan);
+
+		/* same refusal as the scan path (common_setup's bound bypass) */
+		memset(&wm_opts, 0, sizeof(wm_opts));
+		decode_lakehouse_reloptions(rel, &wm_opts);
+		wm = (wm_opts.write_mode != 0)
+			? wm_opts.write_mode
+			: lakehouse_write_mode;
+		if (wm != LAKEHOUSE_WRITE_MODE_STAGED)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("bound managed capture scans require the staged write mode")));
+
+		install_managed_cut(scan, RelationGetDescr(rel));
+	}
+	PG_FINALLY();
+	{
+		lakehouse_scan_release(scan);
+		RelationClose(rel);
+		pfree(scan);
+	}
+	PG_END_TRY();
+
+	return scan->cut_count;
 }
 
 /*
