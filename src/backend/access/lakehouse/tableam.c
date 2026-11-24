@@ -3523,7 +3523,13 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 					 errmsg("managed COUNT is unsupported on a snapshot with Iceberg deletes")));
 
 		for (int t = 0; t < scan->task_count; t++)
-			total += pg_datalake_scan_task_rows(scan->session, t);
+		{
+			int64		rows = pg_datalake_scan_task_rows(scan->session, t);
+
+			elog(DEBUG1, "managed-cut-debug: count task %d rows %lld",
+				 t, (long long) rows);
+			total += rows;
+		}
 
 		/*
 		 * Only the cut's overlay members count: a segment outside the
@@ -3538,6 +3544,8 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 					break;
 				}
 		scan->cut_count = total;
+		elog(DEBUG1, "managed-cut-debug: count total %lld overlay_members %d",
+			 (long long) total, scan->n_cut_overlay);
 	}
 
 	/* backend-local evidence for the fixture drill and operator debugging */
@@ -3578,6 +3586,7 @@ lakehouse_managed_cut_count(Oid relid)
 {
 	Relation	rel;
 	LakehouseTableScanDesc scan;
+	int64		count = 0;
 
 	if (IsInParallelMode())
 		ereport(ERROR,
@@ -3622,6 +3631,7 @@ lakehouse_managed_cut_count(Oid relid)
 					 errmsg("bound managed capture scans require the staged write mode")));
 
 		install_managed_cut(scan, RelationGetDescr(rel));
+		count = scan->cut_count;
 	}
 	PG_FINALLY();
 	{
@@ -3631,7 +3641,12 @@ lakehouse_managed_cut_count(Oid relid)
 	}
 	PG_END_TRY();
 
-	return scan->cut_count;
+	/*
+	 * Return the saved value, NOT scan->cut_count: the chunk was pfreed
+	 * above, and a cassert build poisons freed memory with 0x7f — the CI
+	 * drill caught exactly that as a snapshot-id-sized count.
+	 */
+	return count;
 }
 
 /*
