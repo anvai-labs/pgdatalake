@@ -178,6 +178,30 @@ def t8(db, ns):
     print(json.dumps({"case": "t8-delete-bearing-refusal"}), flush=True)
 
 
+def t9(db, ns):
+    """Committed-unpublished rows (staged append) are unaddressable for
+    direct mutation: no published base exists to rewrite yet."""
+    sql(db, f"CREATE TABLE t9 (id bigint) USING lakehouse "
+            f"WITH (write_mode='staged')")
+    sql(db, f"SELECT lakehouse.attach_table('t9'::regclass, "
+            f"'{ns}.events', 'cow_catalog')")
+    sql(db, "INSERT INTO t9 VALUES (42)")
+    sql(db, "DO $$ BEGIN\n"
+            "    DELETE FROM t9 WHERE id = 42;\n"
+            "    RAISE EXCEPTION 'control failed: unpublished-row DELETE accepted';\n"
+            "EXCEPTION WHEN object_not_in_prerequisite_state THEN\n"
+            "    IF SQLERRM NOT LIKE '%cannot resolve row identity%' THEN RAISE; END IF;\n"
+            "END $$;\n"
+            "DO $$ BEGIN\n"
+            "    UPDATE t9 SET id = 43 WHERE id = 42;\n"
+            "    RAISE EXCEPTION 'control failed: unpublished-row UPDATE accepted';\n"
+            "EXCEPTION WHEN object_not_in_prerequisite_state THEN\n"
+            "    IF SQLERRM NOT LIKE '%cannot resolve row identity%' THEN RAISE; END IF;\n"
+            "END $$")
+    assert rows(db, "t9") == "42", rows(db, "t9")
+    print(json.dumps({"case": "t9-unpublished-row-mutation-refusal"}), flush=True)
+
+
 def main():
     if not __debug__:
         raise RuntimeError("the boundary fixture requires Python assertions")
@@ -198,7 +222,8 @@ def main():
                       f"OPTIONS (s3_access_key 'lakehouse-test', "
                       f"s3_secret_key 'lakehouse-test-password')")
             for case, sub in (("t1", "t1"), ("t3", "t3"), ("t5", "t5"),
-                              ("t6", None), ("t7", "t7"), ("t8", "t8")):
+                              ("t6", None), ("t7", "t7"), ("t8", "t8"),
+                              ("t9", "t9")):
                 sub_ns = f"{ns}_{case}"
                 trino(f"CREATE SCHEMA iceberg.{sub_ns}")
                 try:
