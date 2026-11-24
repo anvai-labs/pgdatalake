@@ -213,8 +213,10 @@ a retained object lease or equivalent provider proof. Reanchoring beyond retaine
 durable membership checkpoint.
 
 TableAM must additionally integrate own-command visibility and prove the whole
-statement pin vector before first output. The fixture continues to require
-`0A000` from the bound SQL path. Held snapshots exercise the selector under
+statement pin vector before first output. The baseline `0A000` from the bound
+SQL path still holds for unadmitted and unsupported shapes; admitted scans
+serve the cut since the executor slice landed (2026-11-23, status above).
+Held snapshots exercise the selector under
 real MVCC and leave application Repeatable Read support unqualified.
 
 #### Native statement cut boundary
