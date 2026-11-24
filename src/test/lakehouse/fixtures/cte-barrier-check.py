@@ -56,6 +56,10 @@ def main():
                     OPTIONS (table '{ns}.events');
             """)
 
+            # warmup: load the library + install the planner hook in
+            # this backend before planning the q1 shape
+            sql(name, "SELECT count(*) FROM events")
+
             # BARRIER SHAPE: exactly one Foreign Scan (the CTE
             # materializes once); both references are CTE Scans.
             plan = sql(name, "EXPLAIN (COSTS OFF) " + q1_shape)
