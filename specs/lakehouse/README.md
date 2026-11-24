@@ -57,15 +57,19 @@ and [shared contracts](modules/00-integration-contracts.md).
 | [09-security.md](09-security.md) | Credentials, auth per cloud, RBAC mapping |
 | [10-testing.md](10-testing.md) | Test strategy: MinIO/Azurite/fake-gcs, regression suites |
 | [11-related-work.md](11-related-work.md) | Prior art: pg_lake, pg_duckdb, Aurora, PXF, DuckDB Iceberg |
-| [12-roadmap.md](12-roadmap.md) | Phased milestones M0–M5 with acceptance criteria |
-| [16-release-reassessment-and-scale.md](16-release-reassessment-and-scale.md) | Current review status, release gates, and scalable execution design |
+| [12-roadmap.md](12-roadmap.md) | Phased milestones M0–M5 with acceptance criteria (live status in [PROGRESS.md](PROGRESS.md)) |
+| [13-implementation-review.md](13-implementation-review.md) | Original review baseline (archived; current gates in 16 and modules/08a) |
+| [14-v3-conformance.md](14-v3-conformance.md) | Iceberg v3 policy: single authority for DV/variant slices and migrations |
+| [15-staged-writes-and-caching.md](15-staged-writes-and-caching.md) | Staged-delta/WAL/caching design (implemented; modules own per-slice status) |
+| [16-release-reassessment-and-scale.md](16-release-reassessment-and-scale.md) | Release-gate decision and reassessment history |
 | [17-anvai-lake-product.md](17-anvai-lake-product.md) | Product packaging, adoption, and publication latency |
-| [18-anvai-lake-dml.md](18-anvai-lake-dml.md) | DML UX, delete formats, MVCC, and cross-engine visibility gates |
+| [18-anvai-lake-dml.md](18-anvai-lake-dml.md) | DML UX, delete formats, MVCC, and cross-engine visibility gates (authoritative MVCC semantics; 07 defers here) |
+| [PROGRESS.md](PROGRESS.md) | **Live** progress tracker: dependency order, evidence, milestone status |
 | [Core release contracts](modules/06a-release-contract.md) | Self-hosting, versioned artifacts and downstream compatibility |
 | [Cloud profiles](modules/09-cloud-profiles.md) | AWS, Azure and Google Cloud data-plane contracts and independent qualification |
-| [13-implementation-review.md](13-implementation-review.md) | FDW and managed Iceberg release blockers, verified findings, and implementation acceptance tests |
 | [RULES.md](RULES.md) | Fork discipline: branching, upstream sync, patch rules, code style |
-| [HANDOFF.md](HANDOFF.md) | State snapshot for the next working session |
+| [Internals & troubleshooting](../../src/backend/access/lakehouse/README.md) | **Engineer entry point**: source-file map, both read paths end to end, snapshot rules, SPI safety, fixture runbooks, debugging playbook |
+| [HANDOFF.md](HANDOFF.md) / [HANDOFF-TAKEOVER.md](HANDOFF-TAKEOVER.md) | Archived session-state logs (2026-11-19 / 2026-11-21); content in git history |
 
 ## Status
 

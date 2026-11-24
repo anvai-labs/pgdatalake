@@ -2,6 +2,12 @@
 
 **Decision for `perf-release` at `eb8e3602179` (2026-11-21). Hold release qualification.** Ranged and projected reads, lazy projected batches and the typed batch ABI are sound directions. The new COUNT paths and staged publisher need correctness work before their timings or guarantees can qualify a release. M3 remains in progress. This document updates the status of [the original review](13-implementation-review.md) and sets acceptance criteria for the next performance milestone.
 
+*(2026-11-23 note: the managed-cut executor slice — bound TableAM SQL
+admission and the compatible-pin cut — landed after this reassessment
+on `feat/managed-cut-scan` (PR #93, extensions 1.18→1.19). Release
+qualification remains held; live progress is [PROGRESS.md](PROGRESS.md),
+gates are [modules/08a](modules/08a-core-release-gates.md).)*
+
 ## Evidence
 
 - Local `cargo test --locked --offline -p pgdatalake-core` passed 118 tests with one manual benchmark ignored. Tests cover consecutive append history assembly, conflict handling, projection and byte reuse, and v3 deletion-vector fixtures.

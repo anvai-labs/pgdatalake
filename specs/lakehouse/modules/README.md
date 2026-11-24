@@ -13,6 +13,21 @@ Start with the module you are implementing and [the shared contracts](00-integra
 | Heap CDC ingestion | [07-heap-cdc](07-heap-cdc.md) | Candidate connector and its checkpoint store | Replay-safe append log from deterministic transaction batches |
 | Qualification | [08-qualification](08-qualification.md) | Fixtures, milestone smoke, CI orchestration and performance runner | Shared fixtures and a result/measurement receipt |
 
+Cross-cutting module specs (owned by their work package, indexed here for
+discoverability): [BI reuse](02a-bi-reuse.md) (02),
+[capture binding](03b-managed-capture-binding.md) (03),
+[client receipts](03a-client-receipts.md) (03),
+[scoped send admission](04b-scoped-send-admission.md) (04),
+[publisher recovery](04a-publisher-recovery.md) (04),
+[release contract](06a-release-contract.md) (06),
+[scoped read handoff](06b-scoped-read-handoff.md) (06),
+[governed published read](06c-governed-published-read.md) (06),
+[core release gates](08a-core-release-gates.md) (08),
+[I/O cost](08b-io-cost.md) (08),
+[cloud profiles](09-cloud-profiles.md) (01),
+[BI marketplace](09a-bi-marketplace.md) (02),
+[downstream handoff](10-downstream-handoff.md) (00).
+
 ## Delivery order and dependencies
 
 ### Contracts for independent work

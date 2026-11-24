@@ -1,7 +1,16 @@
 # 15 — Staged Writes (Delta + WAL Durability), Background Compaction, and Caching
 
-*(2026-11-20. SPEC-ONLY by direction: design and cross-review now,
-implementation deferred. Motivation: M2's per-transaction COW commit
+*(2026-11-20. Status update 2026-11-23: the staged-delta capture layer,
+its WAL-durable intent/receipt ledger and the one-shot native dispatch
+are IMPLEMENTED (extensions 1.4→1.19; see [PROGRESS.md](PROGRESS.md) M2
+track and the per-slice status in
+[modules/04a](modules/04a-publisher-recovery.md) /
+[modules/04b](modules/04b-scoped-send-admission.md)). The background
+compaction/publish thread and the read caching tier below remain
+design-only (M4/M5). The §7.0 status table is the 2026-11-20 snapshot,
+kept for design context.)*
+
+*(Motivation: M2's per-transaction COW commit
 forces every UPDATE/DELETE to rewrite base files synchronously and every
 commit to make remote PUTs — correct, but it caps write throughput,
 manufactures small files, and pins commit latency to the cloud RTT.
