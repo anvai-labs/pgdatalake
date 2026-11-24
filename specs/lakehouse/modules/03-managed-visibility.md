@@ -254,9 +254,11 @@ snapshot and cut. **Reconciled 2026-11-23:** bound COUNT keeps its
 ordinary aggregate — the executor's bound scan preserves all three, so
 COUNT returns the resolved scan's multiplicity per held snapshot
 (drill: 1/2/3 with one observation GET each). The metadata-only fast
-path (Parquet-metadata task-row sum for the published part plus ledger
-`row_count` sum for the overlay part — disjoint by construction, with
-an EXPLAIN-visible fast-path marker) is the next band. Add distinct
+path landed (#96): lakehouse.managed_count_cut(regclass) sums the
+plan's Parquet-metadata task rows plus the cut's overlay ledger
+`row_count` (disjoint by construction), visible in EXPLAIN (VERBOSE),
+and declines delete-bearing plans, non-staged write mode and parallel
+planning. Add distinct
 telemetry for the compatibility refusal,
 origin timeout and oversized proof so operators can distinguish a safe
 refusal from a slow authorized read.
@@ -419,15 +421,16 @@ statement its own transaction, the true RC shape):
   with its proven overlay — external rows are unprovable and stay
   excluded until a qualified publication proves them. The pin is stable
   across statements; the per-statement freshness is in the re-install.
-- **rc3 — latch-style stall, no lost or double-counted rows.** A cursor
+- **rc3 — portal-suspended statement, no lost or double-counted rows.** A cursor
   over a self-join suspends the statement after the cuts install; the
   head moves; the resumed statement keeps its installed cuts (zero
   re-resolutions) and the join multiset equals the resolved view's
   multiset squared (M[v]² pairs per value v — the overlay's
   duplicate-valued rows are distinct rows and pair accordingly). Each
-  scan descriptor deterministically resolves its own identical cut
-  under the statement snapshot (two observation GETs for a self-join);
-  a shared per-statement cut cache is a follow-up optimization band.
+  scan descriptor re-observes and its pure selector resolves a
+  compatible cut — identical observations yield identical cuts
+  (two observation GETs for a self-join); a shared per-statement
+  cut cache is a follow-up optimization band.
 - The RR held-transaction counterpart is the drill's held-snapshot trio
   plus the rescan-retained-cut case (same fixture); the two campaigns
   together cover both isolation postures of the release candidate.

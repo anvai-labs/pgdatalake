@@ -317,6 +317,9 @@ def exercise(db, namespace, writer, reader, owner, worker):
                             rc1_state = json.loads(
                                 rc_r("SELECT lakehouse.managed_read_cut_evidence()")[0])
                             assert rc1 == 3, (rc1, rc1_state)
+                            assert rc1_state == {"pin": int(parent), "proved": False,
+                                                 "overlay": [int(first_id),
+                                                             int(late_id)]}, rc1_state
                             assert len(reads) - rc1_reads == 1, reads[rc1_reads:]
 
                             # rc2: an external publication between
@@ -334,7 +337,7 @@ def exercise(db, namespace, writer, reader, owner, worker):
                             assert rc2_state == rc1_state, (rc1_state, rc2_state)
                             assert len(reads) - rc1_reads == 2, reads[rc1_reads:]
 
-                            # rc3: latch-style stall — a cursor over a
+                            # rc3: portal-suspended statement — a cursor over a
                             # self-join suspends the statement after the
                             # cut installs; the head moves (another
                             # external publication); the resumed statement
@@ -373,9 +376,9 @@ def exercise(db, namespace, writer, reader, owner, worker):
                             rc_r("COMMIT")
                             print(json.dumps({"case": "rc-statement-campaign",
                                               "rc1_count": rc1, "rc2_count": rc2,
-                                              "rc2_stable_fallback": True,
+                                              "rc2_state": rc2_state,
                                               "rc3_pairs": len(ids),
-                                              "rc3_catalog_resolutions": 0}),
+                                              "rc3_gets": len(reads) - rc3_reads}),
                                   flush=True)
 
                         # Release the held snapshots (their AccessShare
