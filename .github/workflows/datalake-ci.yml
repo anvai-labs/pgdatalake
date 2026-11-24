@@ -212,6 +212,8 @@ jobs:
             --capture-adapter "$PWD/src/test/lakehouse/fixtures/managed-capture-binding-adapter.sql" \
             --admitted-transport --native-lookup
           python3 src/test/lakehouse/fixtures/publication-discovery-check.py
+          python3 src/test/lakehouse/fixtures/managed-cut-sql-check.py \
+            --worker "$rust_target/release/examples/bound_publication_fixture"
           python3 src/test/lakehouse/fixtures/publication-ledger-load-check.py
           python3 src/test/lakehouse/fixtures/native-managed-lookup-check.py --restart-fixture "$PGHOST/data"
           python3 src/test/lakehouse/fixtures/native-managed-send-hold-check.py --restart-fixture "$PGHOST/data"
