@@ -111,6 +111,17 @@ managed_count_wanted(Query *parse, Oid *relid_out)
 	if (!managed_lakehouse_rel(rte->relid))
 		return false;
 
+	/*
+	 * A capture-bound relation keeps its ordinary aggregate: the executor's
+	 * bound scan admits and installs the compatible-pin cut, so COUNT(*) gets
+	 * the same multiplicity as the resolved scan with the same admission,
+	 * privileges and snapshot. The count rewrite (ledger-sum shortcut) cannot
+	 * preserve any of those (spec 03, "Bound COUNT continues to decline until
+	 * it can preserve the same privileges, snapshot and cut").
+	 */
+	if (lakehouse_rel_is_capture_bound(rte->relid))
+		return false;
+
 	if (relid_out != NULL)
 		*relid_out = rte->relid;
 	return true;

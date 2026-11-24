@@ -198,6 +198,27 @@ def exercise(db, namespace, writer, reader, owner, worker):
                             assert len(reads) - scan_reads == 3, reads[scan_reads:]
                             assert reads[scan_reads:] == [(route, "Bearer fixture-read")] * 3, reads
                             assert len(posts) == 1
+
+                            # Managed COUNT red case: bound COUNT must
+                            # produce the same multiplicity as the
+                            # resolved scan under each held snapshot —
+                            # base rows plus overlay members, same
+                            # installed cut, same admission. (Red while
+                            # bound COUNT declines with 0A000.)
+                            count_reads = len(reads)
+                            for scanner, want, pin, overlay in (
+                                    (before_r, 1, parent, []),
+                                    (between_r, 2, parent, [first_id]),
+                                    (fresh_r, 3, child, [])):
+                                got_n = int(scanner("SELECT count(*) FROM events")[0])
+                                assert got_n == want, (got_n, want)
+                                state = json.loads(
+                                    scanner("SELECT lakehouse.managed_read_cut_evidence()")[0])
+                                assert state["pin"] == int(pin), state
+                            print(json.dumps({"case": "managed-count-cut",
+                                              "counts": [1, 2, 3],
+                                              "reader_catalog_gets":
+                                                  len(reads) - count_reads}), flush=True)
                             print(json.dumps({"case": "managed-cut-sql-drill", "parent": parent,
                                               "child": child, "first_id": first_id,
                                               "late_id": late_id, "catalog_posts": len(posts),

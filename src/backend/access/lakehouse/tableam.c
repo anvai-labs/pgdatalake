@@ -187,6 +187,19 @@ lookup_capture_binding(Oid relid, pg_uuid_t *binding_id)
 	return required;
 }
 
+/*
+ * Planner-hook predicate: a capture-bound relation must keep its ordinary
+ * aggregate — the count rewrite cannot preserve the managed scan's
+ * admission, snapshot and cut, and the executor's bound scan now serves
+ * exactly that multiplicity. Runs SPI inside the planner the same way
+ * scan_begin does.
+ */
+bool
+lakehouse_rel_is_capture_bound(Oid relid)
+{
+	return lookup_capture_binding(relid, NULL);
+}
+
 void
 lakehouse_check_capture_read(Oid relid)
 {
