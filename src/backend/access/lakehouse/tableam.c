@@ -2832,8 +2832,8 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 		PG_TRY();
 		{
 			bool		recheck_null = false;
-			Oid			argtypes[4];
-			Datum		args[4];
+			Oid			argtypes[6];
+			Datum		args[6];
 			int			ret;
 
 			SetUserIdAndSecContext(owner, sec_context | SECURITY_LOCAL_USERID_CHANGE |
@@ -2847,29 +2847,41 @@ install_managed_cut(LakehouseTableScanDesc scan, TupleDesc tupdesc)
 			 * keep a mid-window revocation invisible no matter which snapshot
 			 * the caller pushes.  Query the grant row directly under the
 			 * registered fresh snapshot instead: revocation, expiry, a
-			 * swapped mapping and a same-OID credential-option change
-			 * (canonical jsonb fingerprint) all refuse here. Binding
-			 * rotation, lineage and shape drift are covered by the
-			 * statement-scope preflight's dual scope probes.
+			 * swapped mapping, a narrowed prefix/region and a same-OID
+			 * credential-option change (canonical jsonb fingerprint) all
+			 * refuse here.  Binding rotation, lineage and shape drift are
+			 * covered by the statement-scope preflight's dual scope probes.
 			 */
+			if (scan->admission.mapping_fingerprint == NULL ||
+				scan->admission.catalog_prefix == NULL ||
+				scan->admission.s3_region == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("managed read admission record is incomplete")));
 			argtypes[0] = UUIDOID;
 			argtypes[1] = OIDOID;
 			argtypes[2] = OIDOID;
 			argtypes[3] = TEXTOID;
+			argtypes[4] = TEXTOID;
+			argtypes[5] = TEXTOID;
 			args[0] = UUIDPGetDatum(&scan->admission.binding);
 			args[1] = ObjectIdGetDatum(reader);
 			args[2] = ObjectIdGetDatum(scan->admission.mapping);
 			args[3] = CStringGetTextDatum(scan->admission.mapping_fingerprint);
+			args[4] = CStringGetTextDatum(scan->admission.catalog_prefix);
+			args[5] = CStringGetTextDatum(scan->admission.s3_region);
 			{
 				SPIPlanPtr	plan = SPI_prepare(
 											   "SELECT NOT g.revoked AND g.expires_at > clock_timestamp()"
 											   " AND g.mapping_id = $3"
+											   " AND g.catalog_prefix = $5"
+											   " AND g.s3_region = $6"
 											   " AND md5(coalesce(to_jsonb(m.umoptions)::text, 'null')) = $4"
 											   " FROM lakehouse.managed_read_grants g"
 											   " JOIN pg_user_mapping m ON m.oid = g.mapping_id"
 											   "  AND m.umuser = g.reader_role"
 											   " WHERE g.binding_id = $1 AND g.reader_role = $2",
-											   4, argtypes);
+											   6, argtypes);
 
 				if (plan == NULL)
 					elog(ERROR, "could not prepare the managed read recheck");
