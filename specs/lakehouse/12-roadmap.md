@@ -24,7 +24,7 @@ define the seam tests that must pass before production wiring.
       crate, `cbindgen` header generation, meson feature `-Ddatalake=auto`
 - [x] CI: build PG with feature on (ubuntu, cargo toolchain pinned), S3-compatible fixture (SeaweedFS, see doc 10) +
       Lakekeeper docker-compose fixture
-- **Gate**: `meson setup build -Ddatalake=enabled && ninja && meson test --suite
+- **Gate**: `meson setup build -Ddatalake=enabled -Dcassert=true && ninja && meson test --suite
   regress` green on CI (meson-only tree: autoconf `make check` cannot coexist
   with meson in the same checkout, and the upstream `parallel_schedule` suite
   runs unchanged under `meson test`); `SELECT lakehouse.version()`

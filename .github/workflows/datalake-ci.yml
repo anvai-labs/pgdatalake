@@ -136,7 +136,15 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             bison flex libreadline-dev zlib1g-dev libxml2-dev \
             libicu-dev libssl-dev libzstd-dev liblz4-dev libnuma-dev \
-            pkg-config python3-pip
+            pkg-config python3-pip ccache
+
+      - name: ccache cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ github.sha }}
+          restore-keys: |
+            ccache-
 
       - name: Install meson + ninja
         run: pip3 install --user meson ninja
@@ -153,8 +161,14 @@ jobs:
       - name: Bring up docker fixtures (SeaweedFS S3, Lakekeeper, Azurite, fake-gcs)
         run: make lakehouse-up
 
-      - name: meson setup (-Ddatalake=enabled)
-        run: meson setup build -Ddatalake=enabled
+      - name: meson setup (-Ddatalake=enabled, -Dcassert=true)
+        # meson.build already defaults to buildtype=debugoptimized, so this
+        # line documents the existing default. The real change: -Dcassert=true
+        # compiles C Assert() in — CI has never run assertion-enabled, while
+        # the fixtures enforce Python assertions; catch C-side contract
+        # breaches in CI instead of locally. ccache absorbs rebuild cost on
+        # cache hits.
+        run: CC="ccache gcc" meson setup build -Ddatalake=enabled -Dcassert=true
 
       - name: ninja
         run: ninja -C build

@@ -15,7 +15,7 @@ make lakehouse-up || { echo "FAIL: lakehouse-up"; exit 1; }
 
 # 2. build (meson-only tree, conda-gcc workaround; install: meson test runs
 #    the INSTALLED binaries — the stale-tmp_install gotcha)
-CC=/usr/bin/gcc ~/.local/bin/meson setup build -Ddatalake=enabled > /tmp/cr1-setup.log 2>&1 || { echo "FAIL: meson setup"; tail -5 /tmp/cr1-setup.log; exit 1; }
+CC=/usr/bin/gcc ~/.local/bin/meson setup build -Ddatalake=enabled -Dcassert=true > /tmp/cr1-setup.log 2>&1 || { echo "FAIL: meson setup"; tail -5 /tmp/cr1-setup.log; exit 1; }
 CC=/usr/bin/gcc ninja -C build > /tmp/cr1-ninja.log 2>&1 || { echo "FAIL: ninja"; tail -5 /tmp/cr1-ninja.log; exit 1; }
 CC=/usr/bin/gcc meson install --destdir build/tmp_install > /dev/null 2>&1
 echo "PASS: meson setup + ninja + install"
