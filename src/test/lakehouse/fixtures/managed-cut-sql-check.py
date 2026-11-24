@@ -301,6 +301,86 @@ def exercise(db, namespace, writer, reader, owner, worker):
                                   flush=True)
                             fresh_r("COMMIT")
 
+                        # --- RC statement-isolation campaign (Read
+                        # Committed: a fresh compatible cut per statement,
+                        # repeated accesses within one statement share it,
+                        # no lost or double-counted rows). The RC reader
+                        # session runs WITHOUT an explicit transaction.
+                        # Re-grant first: the mid-window case revoked.
+                        install_reader_grant(db, binding, reader, prefix)
+                        with login(db, reader) as rc_r:
+                            # rc1: fresh fallback cut (head is past the
+                            # accepted child from the rescan case) — count
+                            # is the resolved scan's multiplicity.
+                            rc1_reads = len(reads)
+                            rc1 = int(rc_r("SELECT count(*) FROM events")[0])
+                            rc1_state = json.loads(
+                                rc_r("SELECT lakehouse.managed_read_cut_evidence()")[0])
+                            assert rc1 == 3, (rc1, rc1_state)
+                            assert rc1_state == {"pin": int(parent), "proved": False,
+                                                 "overlay": [int(first_id),
+                                                             int(late_id)]}, rc1_state
+                            assert len(reads) - rc1_reads == 1, reads[rc1_reads:]
+
+                            # rc2: an external publication between
+                            # statements → the next statement re-installs
+                            # FRESH (RC per-statement semantics, one more
+                            # observation GET) and lands on the same
+                            # conservative fallback: the trino row is
+                            # unprovable, so the retained parent and its
+                            # proven overlay are stable across statements.
+                            trino(f"INSERT INTO {relation} VALUES (40)")
+                            rc2 = int(rc_r("SELECT count(*) FROM events")[0])
+                            rc2_state = json.loads(
+                                rc_r("SELECT lakehouse.managed_read_cut_evidence()")[0])
+                            assert rc2 == 3, (rc2, rc2_state)
+                            assert rc2_state == rc1_state, (rc1_state, rc2_state)
+                            assert len(reads) - rc1_reads == 2, reads[rc1_reads:]
+
+                            # rc3: portal-suspended statement — a cursor over a
+                            # self-join suspends the statement after the
+                            # cut installs; the head moves (another
+                            # external publication); the resumed statement
+                            # keeps its cut (zero re-resolutions) and the
+                            # join neither loses nor double-counts rows:
+                            # every id pairs with itself exactly once per
+                            # side.
+                            rc3_reads = len(reads)
+                            rc_r("BEGIN")
+                            rc_r("DECLARE rcj CURSOR FOR "
+                                 "SELECT e1.id FROM events e1, events e2 "
+                                 "WHERE e1.id = e2.id ORDER BY e1.id")
+                            got = rc_r("FETCH 1 IN rcj")
+                            assert len(got) == 1, got
+                            trino(f"INSERT INTO {relation} VALUES (50)")
+                            rest = rc_r("FETCH ALL IN rcj")
+                            ids = sorted(int(v) for v in got + rest)
+                            # no lost or double-counted rows: the self-join
+                            # multiset must equal the resolved view's
+                            # multiset squared (M[v]^2 pairs per value v)
+                            view = sorted(int(v) for v in
+                                          rc_r("SELECT id FROM events "
+                                               "ORDER BY id"))
+                            from collections import Counter
+                            m = Counter(view)
+                            want = sorted(v for v, n in m.items()
+                                          for _ in range(n * n))
+                            assert ids == want, (ids, want, view)
+                            # 2 observation GETs (one per scan descriptor,
+                            # each deterministically resolving the same
+                            # cut under the statement snapshot) + 1 for
+                            # the verification read above; a shared
+                            # per-statement cut cache is a follow-up band
+                            assert len(reads) - rc3_reads == 3, reads[rc3_reads:]
+                            rc_r("CLOSE rcj")
+                            rc_r("COMMIT")
+                            print(json.dumps({"case": "rc-statement-campaign",
+                                              "rc1_count": rc1, "rc2_count": rc2,
+                                              "rc2_state": rc2_state,
+                                              "rc3_pairs": len(ids),
+                                              "rc3_gets": len(reads) - rc3_reads}),
+                                  flush=True)
+
                         # Release the held snapshots (their AccessShare
                         # locks would block the rotation's exclusive lock).
                         before_r("COMMIT")
