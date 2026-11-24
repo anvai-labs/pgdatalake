@@ -250,7 +250,14 @@ selection. EndScan and the executor's error path release both. Portals
 continue using their installed cut across fetches. Object retention
 must protect the selected pin for the supported portal lifetime. Bound
 COUNT continues to decline until it can preserve the same privileges,
-snapshot and cut. Add distinct telemetry for the compatibility refusal,
+snapshot and cut. **Reconciled 2026-11-23:** bound COUNT keeps its
+ordinary aggregate — the executor's bound scan preserves all three, so
+COUNT returns the resolved scan's multiplicity per held snapshot
+(drill: 1/2/3 with one observation GET each). The metadata-only fast
+path (Parquet-metadata task-row sum for the published part plus ledger
+`row_count` sum for the overlay part — disjoint by construction, with
+an EXPLAIN-visible fast-path marker) is the next band. Add distinct
+telemetry for the compatibility refusal,
 origin timeout and oversized proof so operators can distinguish a safe
 refusal from a slow authorized read.
 
