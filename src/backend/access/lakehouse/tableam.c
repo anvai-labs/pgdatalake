@@ -1698,8 +1698,9 @@ prune_scan_registry_above(SubTransactionId subid)
 /*
  * One row of lakehouse.admit_managed_read: the operator-approved route,
  * table incarnation and enrollment anchor for the checked role. Strings
- * are copied into the scan context; the fresh-proof frame re-reads a
- * second copy and compares it field by field.
+ * are copied into the scan context; the fresh-proof frame rechecks the
+ * operator's grant directly under an explicit fresh snapshot (the
+ * function's VOLATILE body cannot honor a pushed snapshot).
  */
 typedef struct ManagedReadAdmission
 {
