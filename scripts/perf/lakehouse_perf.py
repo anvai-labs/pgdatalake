@@ -349,13 +349,15 @@ def run_write_suite(conn, args):
         input=code, check=True, text=True, capture_output=True)
 
     cur = conn.cursor()
-    cur.execute("SELECT to_regclass('smoke_server') IS NULL OR "
-                "NOT EXISTS (SELECT 1 FROM pg_foreign_server "
+    cur.execute("SELECT NOT EXISTS (SELECT 1 FROM pg_foreign_server "
                 "WHERE srvname = 'smoke_server')")
     if cur.fetchone()[0]:
         raise SystemExit("the write suite needs a 'smoke_server' foreign "
-                         "server in the target database (see the tpcds "
-                         "setup in scripts/perf/tpcds/ddl.sql preamble)")
+                         "server in the target database — create it once "
+                         "as in scripts/perf/tpcds/ddl.sql's parent setup "
+                         "(CREATE FOREIGN DATA WRAPPER/HANDLER + SERVER + "
+                         "USER MAPPING), or run the scan suite which "
+                         "creates it via SCAN_DDL")
     cur.execute("SET statement_timeout = %s", [args.timeout * 1000])
     cur.execute("DROP TABLE IF EXISTS perf_write CASCADE")
     cur.execute("DROP TABLE IF EXISTS perf_cow CASCADE")
@@ -462,6 +464,8 @@ def main():
                          "(use a dedicated schema for scale variants)")
     ap.add_argument("--expected-store-sales", type=int, default=28_800_991,
                     help="verify count for the fixture's store_sales table")
+    ap.add_argument("--ddl", default=str(DEFAULT_DDL),
+                    help="tpcds foreign-table DDL for first-use attach")
     ap.add_argument("--tpch-ddl", default=str(DEFAULT_TPCH_DDL))
     ap.add_argument("--tpch-queries", default=str(DEFAULT_TPCH_QUERIES))
     ap.add_argument("--write-rows", type=int, default=1_000_000,

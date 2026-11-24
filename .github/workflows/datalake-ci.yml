@@ -21,6 +21,7 @@ on:
     branches: ['**']
     paths:
       - 'src/backend/access/lakehouse/**'
+      - 'scripts/perf/**'
       - 'src/test/lakehouse/**'
       - 'src/test/regress/lakehouse/**'
       - 'scripts/*shared_sources.py'
