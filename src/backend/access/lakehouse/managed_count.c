@@ -141,8 +141,26 @@ managed_count_cut_func_oid(void)
 
 	if (fn_oid == InvalidOid)
 	{
-		fn_oid = DatumGetObjectId(DirectFunctionCall1(regprocedurein,
-													  CStringGetDatum("lakehouse.managed_count_cut(regclass)")));
+		/*
+		 * Extensions below 1.20 have no cut COUNT function: regprocedurein
+		 * would raise 42883 at planning time for every bound count(*).
+		 * Swallow that and keep ordinary planning — the bound gate still
+		 * produces the pre-1.20 refusal at execution.
+		 */
+		MemoryContext ccxt = CurrentMemoryContext;
+
+		PG_TRY();
+		{
+			fn_oid = DatumGetObjectId(DirectFunctionCall1(regprocedurein,
+														  CStringGetDatum("lakehouse.managed_count_cut(regclass)")));
+		}
+		PG_CATCH();
+		{
+			MemoryContextSwitchTo(ccxt);
+			FlushErrorState();
+			fn_oid = InvalidOid;
+		}
+		PG_END_TRY();
 	}
 	return fn_oid;
 }
