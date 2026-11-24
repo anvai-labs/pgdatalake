@@ -79,14 +79,17 @@ correctness comes from the commit assertion, never from the inspection alone:
 - **Mixed transactions.** A transaction may stage INSERTs and tombstone
   published rows together; one overwrite at commit contains survivors plus
   the staged rows, each row exactly once (T3 pins zero duplication). Rows
-  inserted in the same transaction remain unaddressable for mutation —
-  "cannot modify a row inserted in this transaction", `55000` — because they
-  have no published identity to tombstone yet. The same applies **after
-  commit** under staged append: rows sitting in committed-unpublished
-  ledger segments have no published base to rewrite, so a direct
-  UPDATE/DELETE refuses with `55000` ("cannot resolve row identity")
-  until the publisher drains — the "delete a pending insert" journey of
-  §4, committed-transaction flavor (T9 pins it).
+  inserted in the same transaction remain unaddressable for mutation with
+  SQLSTATE `55000` — the direct COW profile reports "cannot modify a row
+  inserted in this transaction"; on staged-append tables the same
+  unaddressability surfaces as "cannot resolve row identity" — because
+  they have no published identity to tombstone yet. The same applies
+  **after commit** under staged append: rows sitting in
+  committed-unpublished ledger segments have no published base to
+  rewrite, so a direct UPDATE/DELETE refuses with `55000` ("cannot
+  resolve row identity") until the publisher drains — the "delete a
+  pending insert" journey of §4, committed-transaction flavor (T9 pins
+  it).
 - **Error-code table** (pinned; fixtures assert SQLSTATE exactly):
 
 | Outcome | SQLSTATE | Meaning |

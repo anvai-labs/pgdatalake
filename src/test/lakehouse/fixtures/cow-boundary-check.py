@@ -13,8 +13,8 @@ T3  mixed transaction: staged INSERTs + tombstoned published row commit
 T5  zero-row DELETE/UPDATE: no new snapshot, rows unchanged
 T6  FDW write-refusal control: INSERT/UPDATE/DELETE on an external
     foreign table → core 0A000, remote snapshot unchanged
-T7  savepoint rollback of a COW mutation: row restored, zero catalog
-    POSTs (snapshot unchanged), rows unchanged
+T7  savepoint rollback of a COW mutation: row restored, snapshot
+    unchanged, rows unchanged
 T8  delete-bearing source snapshot: 0A000 "Iceberg deletes" refusal
 """
 

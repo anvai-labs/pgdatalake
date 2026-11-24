@@ -4036,7 +4036,9 @@ lakehouse_tuple_fetch_row_version(Relation rel, ItemPointer tid,
 				 errmsg("lakehouse: %s cannot resolve row identity for row-version fetch",
 						RelationGetRelationName(rel)),
 				 errdetail("The tid was not produced by a live managed scan of this relation "
-						   "in this transaction.")));
+						   "in this transaction; rows inserted in the same transaction, or "
+						   "committed but not yet published under staged append, are not "
+						   "addressable for mutation.")));
 	check_cow_scan(scan->session);
 	if (ItemPointerGetOffsetNumber(tid) == 0)
 		ereport(ERROR,
