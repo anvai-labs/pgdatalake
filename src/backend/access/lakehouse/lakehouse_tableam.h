@@ -127,6 +127,7 @@ extern Oid	lakehouse_am_oid(void);
 extern void install_lakehouse_count_exec(void);
 extern void lakehouse_check_capture_read(Oid relid);
 extern bool lakehouse_rel_is_capture_bound(Oid relid);
+extern bool lakehouse_managed_cut_count(Oid relid, int64 *count_out);
 extern LakehouseWriteEntry *lakehouse_find_write_entry(Oid relid);
 extern LakehouseWriteEntry *get_write_entry(Relation rel);
 extern char *lakehouse_build_schema_json(TupleDesc tupdesc);

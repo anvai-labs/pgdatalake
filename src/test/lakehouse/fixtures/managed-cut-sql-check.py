@@ -68,7 +68,7 @@ def exercise(db, namespace, writer, reader, owner, worker):
                                            root.rstrip("/"), binding, incarnation)
         sql(db, f"""
             CREATE EXTENSION lakehouse;
-            ALTER EXTENSION lakehouse UPDATE TO '1.19';
+            ALTER EXTENSION lakehouse UPDATE TO '1.20';
             CREATE SERVER cut_catalog FOREIGN DATA WRAPPER lakehouse_fdw OPTIONS
                 (endpoint '{endpoint}', warehouse 'smoke',
                  s3_endpoint 'http://127.0.0.1:9000');
@@ -212,6 +212,11 @@ def exercise(db, namespace, writer, reader, owner, worker):
                                     (fresh_r, 3, child, [])):
                                 got_n = int(scanner("SELECT count(*) FROM events")[0])
                                 assert got_n == want, (got_n, want)
+                                if scanner is fresh_r:
+                                    plan = "\n".join(
+                                        scanner("EXPLAIN (COSTS OFF, VERBOSE) "
+                                                "SELECT count(*) FROM events"))
+                                    assert "managed_count_cut" in plan, plan
                                 state = json.loads(
                                     scanner("SELECT lakehouse.managed_read_cut_evidence()")[0])
                                 assert state["pin"] == int(pin), state

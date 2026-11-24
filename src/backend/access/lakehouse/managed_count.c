@@ -86,7 +86,7 @@ managed_lakehouse_rel(Oid relid)
  * security quals. On match, returns the base rel's OID.
  */
 static bool
-managed_count_wanted(Query *parse, Oid *relid_out)
+managed_count_wanted(Query *parse, Oid *relid_out, bool *bound_out)
 {
 	RangeTblEntry *rte;
 
@@ -112,15 +112,17 @@ managed_count_wanted(Query *parse, Oid *relid_out)
 		return false;
 
 	/*
-	 * A capture-bound relation keeps its ordinary aggregate: the executor's
-	 * bound scan admits and installs the compatible-pin cut, so COUNT(*) gets
-	 * the same multiplicity as the resolved scan with the same admission,
-	 * privileges and snapshot. The count rewrite (ledger-sum shortcut) cannot
-	 * preserve any of those (spec 03, "Bound COUNT continues to decline until
-	 * it can preserve the same privileges, snapshot and cut").
+	 * Capture-bound relations take the metadata-only cut fast path
+	 * (lakehouse.managed_count_cut): the installed cut's two parts are
+	 * disjoint by construction - published base rows from Parquet metadata
+	 * plus overlay ledger row_count - so the sum is exact without dedup (spec
+	 * 03). Planning inside a parallel worker cannot take the latest snapshot,
+	 * so there the rewrite is skipped and the executor's bound gate refuses
+	 * parallel scans with the ordinary 0A000.
 	 */
-	if (lakehouse_rel_is_capture_bound(rte->relid))
+	if (IsInParallelMode())
 		return false;
+	*bound_out = lakehouse_rel_is_capture_bound(rte->relid);
 
 	if (relid_out != NULL)
 		*relid_out = rte->relid;
@@ -132,6 +134,20 @@ managed_count_wanted(Query *parse, Oid *relid_out)
  * extension's schema (the extension installs into the `lakehouse` schema,
  * RULES §4).
  */
+static Oid
+managed_count_cut_func_oid(void)
+{
+	static Oid	fn_oid = InvalidOid;
+
+	if (fn_oid == InvalidOid)
+	{
+		fn_oid = DatumGetObjectId(DirectFunctionCall1(regprocedurein,
+													  CStringGetDatum("lakehouse.managed_count_cut(regclass)")));
+	}
+	return fn_oid;
+}
+
+
 static Oid
 managed_count_func_oid(void)
 {
@@ -160,9 +176,10 @@ managed_count_func_oid(void)
  * and RLS semantics are re-established inside managed_count() itself.
  */
 static void
-rewrite_to_managed_count(Query *parse, Oid relid)
+rewrite_to_managed_count(Query *parse, Oid relid, bool bound)
 {
-	Oid			fn_oid = managed_count_func_oid();
+	Oid			fn_oid = bound ? managed_count_cut_func_oid()
+		: managed_count_func_oid();
 	FuncExpr   *fn;
 	TargetEntry *te = linitial_node(TargetEntry, parse->targetList);
 
@@ -170,7 +187,8 @@ rewrite_to_managed_count(Query *parse, Oid relid)
 		return;					/* extension not upgraded: normal planning */
 
 	fn = makeFuncExpr(fn_oid, INT8OID,
-					  list_make1(makeConst(OIDOID, -1, InvalidOid,
+					  list_make1(makeConst(bound ? REGCLASSOID : OIDOID,
+										   -1, InvalidOid,
 										   sizeof(Oid),
 										   ObjectIdGetDatum(relid),
 										   false, true)),
@@ -199,13 +217,16 @@ lakehouse_count_exec_planner(Query *parse, const char *query_string,
 							 ExplainState *es)
 {
 	Oid			relid = InvalidOid;
+	bool		bound = false;
+
 
 	elog(DEBUG1, "lakehouse count_exec: hook entered");
-	if (!count_exec_in_fallback && managed_count_wanted(parse, &relid))
+	if (!count_exec_in_fallback && managed_count_wanted(parse, &relid,
+														&bound))
 	{
-		elog(DEBUG1, "lakehouse count_exec: rewriting count(*) relid %u",
-			 (unsigned) relid);
-		rewrite_to_managed_count(parse, relid);
+		elog(DEBUG1, "lakehouse count_exec: rewriting count(*) relid %u%s",
+			 (unsigned) relid, bound ? " (cut fast path)" : "");
+		rewrite_to_managed_count(parse, relid, bound);
 	}
 
 	if (prev_planner_hook != NULL)
@@ -228,6 +249,37 @@ install_lakehouse_count_exec(void)
  * SECURITY INVOKER: the caller's permissions and RLS apply.
  */
 static void count_exec_run_ordinary(Oid relid, int64 *result);
+
+PG_FUNCTION_INFO_V1(lakehouse_managed_count_cut);
+
+/*
+ * Metadata-only COUNT for capture-bound tables (spec 03, "managed
+ * COUNT"): the planner rewrite routes bound count(*) here. Computes the
+ * installed cut's two disjoint parts — the published base from Parquet
+ * metadata (no data-file reads) plus the overlay ledger row_count —
+ * with the same admission, privileges and snapshot as the resolved
+ * scan. Unadmitted/unsupported shapes refuse exactly as the scan does.
+ */
+Datum
+lakehouse_managed_count_cut(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	AclResult	aclresult;
+	int64		result = 0;
+
+	aclresult = pg_class_aclcheck(relid, GetUserId(), ACL_SELECT);
+	if (aclresult != ACLCHECK_OK)
+		aclcheck_error(aclresult, OBJECT_TABLE, get_rel_name(relid));
+
+	LockRelationOid(relid, AccessShareLock);
+	if (!lakehouse_managed_cut_count(relid, &result))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("bound managed capture does not support table scans")));
+
+	PG_RETURN_INT64(result);
+}
+
 
 PG_FUNCTION_INFO_V1(lakehouse_managed_count);
 
