@@ -201,7 +201,7 @@ every tagged release.
 1. **Cold-room smoke test** — from a FRESH clone, no warm caches:
    - `git clone` the repo, check out the release/branch ref
    - `make lakehouse-up` (SeaweedFS S3 + Lakekeeper + Azurite + fake-gcs fixtures)
-   - `meson setup build -Ddatalake=enabled && ninja`
+   - `meson setup build -Ddatalake=enabled && ninja -Dcassert=true`
    - upstream regress suite via `meson test --suite setup && meson test
      --suite regress` (must stay 100% green — a fork that breaks upstream
      behavior fails the smoke test even if iceberg tests pass).
