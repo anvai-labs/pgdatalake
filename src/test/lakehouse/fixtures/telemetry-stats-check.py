@@ -159,7 +159,8 @@ def main():
         finally:
             sql("postgres", f"DROP DATABASE {name} WITH (FORCE)")
     finally:
-        trino(f"DROP TABLE IF EXISTS {archive}; DROP SCHEMA iceberg.{ns}")
+        trino(f"DROP TABLE IF EXISTS {archive}; DROP TABLE IF EXISTS {table}; "
+              f"DROP SCHEMA iceberg.{ns}")
 
 
 if __name__ == "__main__":
