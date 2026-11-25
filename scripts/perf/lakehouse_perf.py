@@ -441,6 +441,10 @@ def main():
     ap.add_argument("--suite", choices=["tpcds", "tpch", "scan", "write"],
                     default="tpcds")
     ap.add_argument("--dsn", default="postgres://postgres@localhost:52021/postgres")
+    ap.add_argument("--profile-id", default=None,
+                    help="hardware profile id (spec 19 §6.4): required when "
+                         "writing receipt files; receipts without it are not "
+                         "comparable across hosts")
     ap.add_argument("--timeout", type=int, default=1200,
                     help="per-run statement timeout (s)")
     ap.add_argument("--no-warmup", dest="warmup", action="store_false",
@@ -494,6 +498,9 @@ def main():
             ap.error("samples and timeout must be positive")
         if Path(args.oracle).resolve() == Path(args.receipt).resolve():
             ap.error("receipt must be separate from the oracle")
+        if not args.profile_id:
+            ap.error("--profile-id is required for receipts (spec 19 §6.4: "
+                     "receipts without a hardware profile are not comparable)")
         from pinned_receipt import run_pinned
 
         args.workload = "shipped_tpcds_canaries" if Path(args.queries).resolve() == DEFAULT_QUERIES \

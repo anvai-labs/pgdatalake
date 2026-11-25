@@ -4698,6 +4698,7 @@ _PG_init(void)
 		 */
 		install_lakehouse_count_exec();
 		install_lakehouse_telemetry();
+		install_lakehouse_scan_stats();
 		RegisterXactCallback(lakehouse_xact_callback, NULL);
 		RegisterSubXactCallback(lakehouse_subxact_callback, NULL);
 		xact_callbacks_registered = true;
