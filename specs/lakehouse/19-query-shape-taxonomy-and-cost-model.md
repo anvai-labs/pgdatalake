@@ -181,18 +181,18 @@ Closed-form cost functions per variant, coefficients fitted by regression on the
 ### 6.3 L2 — ONNX-compiled variant selector in the hot path
 The decision runs in `lakehouse_count_exec_planner` between matcher pass and standard_planner — ONCE per statement at plan time, never per row. **Hot-path contract (binding for every layer built on this spec)**: capture is lock-free in-memory only (no locks, no I/O, no table access at capture time); the flush runs off the execution path at commit (a background-drain lane via the publisher-worker pattern is the v2 upgrade that removes even that); the ONLY hot-path logic is the compiled-model decision, and its throughput is a measured, budgeted property — cheap enough to be non-prohibitive, structured enough to stay learnable.
 
-**Capacity ladder** — model capacity is a measured dial, not a guess. Each level ships only with (a) a measured p99 decision latency via the embedded evaluator on the reference box and (b) an accuracy receipt (wrong-variant rate on the labeled sweep vs L1). Bigger weights must BUY accuracy: a level with no wrong-variant improvement over the incumbent is rejected regardless of latency.
+**Capacity ladder** — model capacity is a measured dial, not a guess. Each level ships only with (a) a measured p99 decision latency via the embedded evaluator on EVERY active profile per §6.4 rule 3 and (b) an accuracy receipt (wrong-variant rate on the labeled sweep vs L1). Bigger weights must BUY accuracy: a level with no wrong-variant improvement over the incumbent is rejected regardless of latency.
 
-| Level | Features k | Ensemble | Relative weights | p99 budget | Ships when |
+| Level | Features k | Ensemble | Relative weights (trees × depth, summed over ensemble members; anchored to the B0 TREE variant) | p99 budget | Ships when |
 |---|---|---|---|---|---|
 | B0 | 16 | linear classifier or 1 shallow tree | 1× | ≤ 25 µs | L1 residuals justify L2 |
 | B1 | 32 (2×) | GBT, 2× depth, 2× trees | ~4× | ≤ 50 µs | beats B0 on the sweep |
 | B2 | 32 | GBT, 4× depth, 4× trees, 3-model ensemble | ~16× | ≤ 100 µs | beats B1 materially (≥ 1/3 of remaining wrong-variants) |
 | B3 | 64 (per-statement histograms of historical fingerprint timings) | largest ensemble the evaluator holds | ~64× | ≤ 250 µs | opt-in `lakehouse.decision_profile = xl` for measurement, never default |
 
-- **Model classes**: tree ensembles / linear classifiers only — the preferred runtime is the embedded evaluator for the restricted ONNX subset (TreeEnsemble/LinearClassifier ops); a full `ort` C API build with a statically linked onnxruntime core is the fallback ONLY if a future model needs ops outside the subset. **All features pre-planning-available at the hook's insertion point** (the raw parse tree, before any planning): parse-tree-derived properties (sublink/aggregate/operator classes from the matcher's shape walk), §4b table_stats cardinalities, filterability-tier histograms, param-class counts, manifest/file counts, storage-op counters, historical fingerprint timings from query_stats. Planner row estimates do NOT exist at this point and are not features (family E's complaint about weak pre-planning cardinality is acknowledged — the model compensates with table_stats + selectivity defaults). Matcher DECLINE paths are never features; the doctrine "the model never enables a declined rewrite" is unaffected.
+- **Model classes**: tree ensembles / linear classifiers only — the preferred runtime is the embedded evaluator for the restricted ONNX subset (TreeEnsemble/LinearClassifier ops); a full `ort` C API build with a statically linked onnxruntime core is the fallback ONLY if a future model needs ops outside the subset. **All features pre-planning-available at the hook's insertion point** (the raw parse tree, before any planning): parse-tree-derived properties (sublink/aggregate/operator classes from the matcher's shape walk), §4b table_stats cardinalities, filterability-tier histograms, param-class counts, manifest/file counts, **historical per-fingerprint storage-op counter aggregates from query_stats/query_stats_scans (§4a) — with a zero-history sentinel for first-sighting fingerprints — historical fingerprint timings from query_stats**. Planner row estimates do NOT exist at this point and are not features (family E's complaint about weak pre-planning cardinality is acknowledged — the model compensates with table_stats + selectivity defaults). Matcher DECLINE paths are never features; the doctrine "the model never enables a declined rewrite" is unaffected.
 - **Capacity receipts are re-run on every model swap**: a content-hashed artifact ships with its ladder row (level, measured p99, sweep accuracy); the telemetry dataset records which hash decided each run. A new model must beat the incumbent on the pinned sweep at its level's budget before rollout — capacity never ships on faith.
-- **Hot-path discipline**: model bytes + tensors loaded once per backend at first decision (lazy, like the AM oid cache); inference is one `Run` call or a tree-walk over a pre-flattened array; allocation-free after warmup; a model load failure or version mismatch falls back to L1 permanently for that backend (one WARNING, no per-query cost). **Runtime output faults are inputs to the same fallback**: a non-finite (NaN/Inf) score, a class index outside the registry-entry range, or an argmax tie (broken deterministically by lowest index) sends THAT statement to L1 and increments a telemetry counter — a TreeEnsemble fed an unexpected input can emit exactly this garbage. Each ladder level's p99 budget is a hard ceiling measured in §7; a level that misses its ceiling ships at the next lower level.
+- **Hot-path discipline**: model bytes AND the feature sources are cached per backend — the model artifact plus a lazily-loaded feature snapshot (§4b stats + historical aggregates, read once at the first decision, refreshed off-path via the same background-drain lane as §4a) — so the decision itself reads only memory (heap reads at plan time cannot meet B0's budget); inference is one `Run` call or a tree-walk over a pre-flattened array; allocation-free after warmup; a model load failure or version mismatch falls back to L1 permanently for that backend (one WARNING, no per-query cost). **Runtime output faults are inputs to the same fallback**: a non-finite (NaN/Inf) score, a class index outside the registry-entry range, or an argmax tie (broken deterministically by lowest index) sends THAT statement to L1 and increments a telemetry counter — a TreeEnsemble fed an unexpected input can emit exactly this garbage. Each ladder level's p99 budget is a hard ceiling measured in §7; a level that misses its ceiling ships at the next lower level. **The default-path ceiling is B2's ≤100 µs p99** (B0's 25 µs and B1's 50 µs are the earlier rungs; B3 is opt-in xl and never default) — this supersedes the single-model 50 µs figure of earlier revisions.
 - **Versioning**: the model artifact carries a content hash; the telemetry dataset records which hash decided each run, closing the retraining loop. Model swaps are data-only changes (no recompile), gated by the same receipt discipline: a new model must beat the incumbent on the pinned sweep before rollout.
 - **Fail-safe doctrine**: L2 may only select among registry entries the matcher has already proven equivalent for the statement at hand. Decline paths, volatile guards, and the foreign-CTE gate are not model inputs — they remain deterministic code. Semantics never depend on model output.
 
@@ -220,8 +220,8 @@ compare, SF100+ to trust).
    dataset snapshot ids — the perf driver gains `--profile-id` and refuses to
    write receipts without it.
 2. Cross-profile comparison is only valid for the SAME snapshot ids and engine
-   commit; the pinned-receipt machinery (spec [02](02-sql-surface.md) §receipts)
-   enforces the dataset/engine pins.
+   commit; the pinned-receipt machinery (RULES §10 + [10-testing](10-testing.md)
+   "Milestone TDD and smoke receipts") enforces the dataset/engine pins.
 3. Ladder levels (§6.3) must meet their p99 budget on the SLOWEST profile in
    the active matrix — shipping on the fast box alone is not compliance.
    Per-profile budget notes ride in the receipt (a B2 decision at 80µs on
@@ -230,8 +230,10 @@ compare, SF100+ to trust).
    profile: family signatures (storage-bound vs CPU-bound) are expected to
    differ across profiles, and that difference is itself training data for
    the cost model — the model learns per-profile behavior from per-profile
-   telemetry (profile id is a categorical feature; §6.3 k-budget accommodates
-   it by replacing a scalar feature slot at B1+).
+   telemetry (profile id enters as an ordinal slot in the fixed 1×k tensor —
+   trees split on the index; a newly joined profile invalidates the incumbent
+   model and forces a retrain/re-receipt; the §6.3 k-budget accommodates the
+   slot by replacing a scalar feature slot at B1+).
 5. CI (GitHub runners) measures neither ladder latency nor QPS — CI pins
    correctness only. Performance receipts come exclusively from the named
    profiles, cold-cache protocol documented per run.
@@ -245,7 +247,7 @@ compare, SF100+ to trust).
 | Taxonomy | every timed query carries a family label; composite queries recorded; unknown-signature queries explicitly listed |
 | Registry | entry 2 (hashed subplan) merged with its equivalence table + fixture, red→green, q4/q6 receipts |
 | L1 | fitted coefficients published in the spec; leave-one-query-out validation on the sweep; wrong-variant rate < 10% |
-| L2 | ladder receipts published (every level: measured p99 within its budget + wrong-variant rate vs incumbent); model-vs-L1 agreement report; fault-injection fixture covers load failure AND runtime garbage (NaN/Inf, out-of-range class, argmax tie) each falling back to L1; **an equivalence-under-either-choice fixture runs the same statement under the selected and the non-selected proven-equivalent variant and asserts identical rows** (the north-star claim, tested) |
+| L2 | ladder receipts published (every level: measured p99 within its budget per §6.4 rules 1 and 3 + wrong-variant rate vs incumbent); model-vs-L1 agreement report; fault-injection fixture covers load failure AND runtime garbage (NaN/Inf, out-of-range class, argmax tie) each falling back to L1; **an equivalence-under-either-choice fixture runs the same statement under the selected and the non-selected proven-equivalent variant and asserts identical rows** (the north-star claim, tested) |
 
 ## 8. Non-goals
 
