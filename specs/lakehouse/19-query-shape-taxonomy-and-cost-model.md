@@ -6,14 +6,14 @@
 
 ## 1. Where this stands
 
-At the pullup slice ([PROGRESS](PROGRESS.md) track "Correlated-agg pullup", landed in #104): q1 closed by the planner-hook rewrite (category A below); the matcher declines fail-safe everywhere else. q4/q6 timeouts are not category A and remain undiagnosed. Scans are M1 (projection pushdown only); row transport is tuple-per-row; receipts come from `scripts/perf/lakehouse_perf.py` (medians only, no per-phase resource attribution).
+At the pullup slice ([PROGRESS](PROGRESS.md) "Cost and expansion" track + the spec-19 row, landed in #104): q1 closed by the planner-hook rewrite (category A below); the matcher declines fail-safe everywhere else. q4/q6 timeouts are not category A and remain undiagnosed. Scans are M1 (projection pushdown only); row transport is tuple-per-row; receipts come from `scripts/perf/lakehouse_perf.py` (medians only, no per-phase resource attribution).
 
 ## 2. The taxonomy
 
 | # | Shape family | Known members | Bottleneck signature (telemetry) | Remedy lever |
 |---|---|---|---|---|
 | A | Correlated-agg SubPlan over a foreign-table CTE | q1 (fixed) | subplan evaluations ≈ outer rows × ctr rows; per-eval time ≈ CTE scan slice | planner pullup (landed): grouped subquery + INNER join, O(N+M) |
-| B | Correlated EXPR SubPlans the pullup declines (volatile, OR-embedded, multi-level correlation, havingQual) | q4, q6 (suspected, unconfirmed) | same rescan signature on declined shapes | executor-side hashed/memoized EXPR SubPlans keyed on the correlation params (upstream hashes only `IN` sublinks; **correlated** EXPR subplans re-execute per row — uncorrelated ones already run once via InitPlan) |
+| B | Correlated EXPR SubPlans the pullup declines (volatile, OR-embedded, multi-level correlation, havingQual) | q4, q6 (suspected, unconfirmed) | same rescan signature on declined shapes | executor-side hashed/memoized EXPR SubPlans keyed on the correlation params — **volatile-bearing shapes stay declined with no remedy (memoization is semantics-changing there)**; non-volatile correlated EXPR subplans re-execute per row (uncorrelated ones already run once via InitPlan) |
 | C | Row-transport-bound | q2, q7; TPC-H q2/q7 canaries | remote scan fast, executor + client slow; high row count ÷ scan time | typed batch/chunk transport or deeper pushdown |
 | D | Overfetch | q9 (128 s), q5 | files examined = total files regardless of quals; no range-GET reduction | snapshot-stats pruning (per-file min/max), predicate pushdown past M1 |
 | E | Cardinality misestimate on foreign tables | latent everywhere | planner estimated rows vs actual rows divergence; bad join order in EXPLAIN | stats ingestion (composed per-file value_counts + sampling — Iceberg has no global NDV; see §4b), ANALYZE-grade |
@@ -25,8 +25,8 @@ Assignment rule: a query enters exactly one family by its dominant telemetry sig
 ```mermaid
 flowchart TD
     T[Telemetry capture<br/>L0] --> F[Query fingerprint<br/>L0]
-    F --> X[Taxonomy classifier<br/>L1 deterministic]
-    X --> R[Remedy registry<br/>L1: pullup, hashed-subplan, transport, prune]
+    F --> X[Taxonomy classifier<br/>deterministic rules]
+    X --> R[Remedy registry<br/>pullup landed; entries added per slice]
     T --> C[Cost dataset<br/>fingerprint -> features -> outcome]
     C --> P[L1 parametric cost model<br/>regression fit, closed form]
     P --> M[L2 compiled variant selector<br/>ONNX in the hot path]
@@ -179,10 +179,10 @@ Matcher categories decide; no model. Every current behavior stays in this lane u
 Closed-form cost functions per variant, coefficients fitted by regression on the telemetry dataset: e.g. `cost_pullup ≈ a·M_group + b·N_probe + c·scan`, `cost_subplan ≈ N·(d·M + e)`; choose the cheaper. Inspectable, printable in EXPLAIN, and the reference implementation for L2.
 
 ### 6.3 L2 — ONNX-compiled variant selector in the hot path
-The decision runs in `lakehouse_count_exec_planner` between matcher pass and standard_planner; budget ≤ 50 µs p99 (planner time is already multi-ms for these queries; the budget is a floor requirement, not headroom).
+The decision runs in `lakehouse_count_exec_planner` between matcher pass and standard_planner; budget ≤ 50 µs p99 (planner time is already multi-ms for these queries; the budget is a hard ceiling, measured in §7).
 
 - **Model**: gradient-boosted trees (or a linear classifier) trained offline on the L1 dataset, exported to ONNX — tree/linear model classes only, because the preferred runtime is the embedded evaluator for the restricted ONNX subset (TreeEnsemble/LinearClassifier ops); a full `ort` C API build with statically linked onnxruntime core is the fallback ONLY if a future model needs ops outside the subset. Fixed input tensor 1×k, k ≤ 16, **all features pre-planning-available at the hook's insertion point** (the raw parse tree, before any planning): parse-tree-derived properties (sublink/aggregate/operator classes from the matcher's shape walk), table cardinalities from §4b table_stats, param-class counts, historical fingerprint timings from query_stats. Planner row estimates do NOT exist at this point and are not features (family E's complaint about weak pre-planning cardinality is acknowledged — the model compensates with table_stats + selectivity defaults). Matcher DECLINE paths are never features; the doctrine "the model never enables a declined rewrite" is unaffected.
-- **Hot-path discipline**: model bytes + tensors loaded once per backend at first decision (lazy, like the AM oid cache); inference is one `Run` call or a tree-walk over a pre-flattened array; allocation-free after warmup; a model load failure or version mismatch falls back to L1 permanently for that backend (one WARNING, no per-query cost). **Runtime output faults are inputs to the same fallback**: a non-finite (NaN/Inf) score, a class index outside the registry-entry range, or an argmax tie (broken deterministically by lowest index) sends THAT statement to L1 and increments a telemetry counter — a TreeEnsemble fed an unexpected input can emit exactly this garbage. The ≤50 µs p99 budget is a hard ceiling requirement (measured, §7), not headroom.
+- **Hot-path discipline**: model bytes + tensors loaded once per backend at first decision (lazy, like the AM oid cache); inference is one `Run` call or a tree-walk over a pre-flattened array; allocation-free after warmup; a model load failure or version mismatch falls back to L1 permanently for that backend (one WARNING, no per-query cost). **Runtime output faults are inputs to the same fallback**: a non-finite (NaN/Inf) score, a class index outside the registry-entry range, or an argmax tie (broken deterministically by lowest index) sends THAT statement to L1 and increments a telemetry counter — a TreeEnsemble fed an unexpected input can emit exactly this garbage. The ≤50 µs p99 budget is a hard ceiling requirement (measured, §7).
 - **Versioning**: the model artifact carries a content hash; the telemetry dataset records which hash decided each run, closing the retraining loop. Model swaps are data-only changes (no recompile), gated by the same receipt discipline: a new model must beat the incumbent on the pinned sweep before rollout.
 - **Fail-safe doctrine**: L2 may only select among registry entries the matcher has already proven equivalent for the statement at hand. Decline paths, volatile guards, and the foreign-CTE gate are not model inputs — they remain deterministic code. Semantics never depend on model output.
 
