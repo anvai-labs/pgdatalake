@@ -10,13 +10,27 @@
  * requests beyond the scan itself.
  *
  * The failure contract is identical to telemetry.c: collection at
- * executor teardown, flush at XACT_EVENT_PRE_COMMIT, every failure
- * swallowed — statistics never break a user query.
+ * executor teardown wrapped in PG_TRY (palloc/pstrdup/relcache can
+ * ereport; core does not wrap FDW End hooks), flush at
+ * XACT_EVENT_PRE_COMMIT, every failure swallowed — statistics never
+ * break a user query. The buffer is capped with drop-oldest (a
+ * many-scan transaction must not grow session memory unboundedly or
+ * stall PRE_COMMIT with thousands of inserts).
  *
- * v1 scope: table-level stats only (rows, file counts before/after
- * pruning, scan tasks, total bytes, delete presence). Column-level
- * stats (value_counts composition, filterability tiers) need new core
- * FFI exports and are the follow-up slice (spec 19 §4b).
+ * v1 scope and caveats: table-level stats only (rows, file counts
+ * before/after pruning, scan tasks, total bytes, delete presence) —
+ * column-level stats (value_counts composition, filterability tiers)
+ * need new core FFI exports and are the follow-up slice (spec 19
+ * §4b). No retention or disable switch yet (telemetry has both) —
+ * operator-facing knobs are the follow-up. Statements that error
+ * before EndForeignScan lose their record (same caveat class as
+ * telemetry). One row per EXECUTOR (the spec's "first scan per
+ * snapshot" phrasing is reconciled to per-executor semantics here).
+ * The flush inserts rows individually (parameterized — endpoint and
+ * namespace.table are user-controlled FDW options and are bound, never
+ * interpolated): rows are independently valid, so a mid-batch failure
+ * commits rows 1..k-1 rather than dropping the batch; the cap bounds
+ * the worst-case commit cost. Atomic batching is the follow-up.
  *---------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -36,10 +50,17 @@
 #include "utils/timestamp.h"
 
 void		install_lakehouse_scan_stats(void);
+void		lakehouse_scan_stats_record(Oid relid, const char *endpoint,
+										const char *ns_table,
+										int64 snapshot_id, int64 row_count,
+										int files_total, int files_pruned,
+										int scan_tasks, int64 total_bytes,
+										bool has_deletes);
 
 /*
  * owner of lakehouse.table_stats, resolved at record time (inside a
- * transaction) and cached for the commit-callback flush
+ * transaction) and cached for the commit-callback flush. v1: not
+ * invalidated on DROP/re-CREATE within a session.
  */
 static Oid	stats_owner = InvalidOid;
 
@@ -58,6 +79,12 @@ typedef struct ScanStatRecord
 	bool		has_deletes;
 	TimestampTz captured_at;
 } ScanStatRecord;
+
+/*
+ * bounded like telemetry: a many-scan transaction must not grow session
+ * memory unboundedly or stall PRE_COMMIT with thousands of inserts
+ */
+#define SCAN_STATS_BUFFER_MAX 1000
 
 static List *scan_stats_buffer = NIL;
 static bool in_scan_stats_flush = false;
@@ -93,49 +120,78 @@ lakehouse_scan_stats_record(Oid relid, const char *endpoint,
 							int files_pruned, int scan_tasks,
 							int64 total_bytes, bool has_deletes)
 {
-	ScanStatRecord *rec;
-	MemoryContext oldcxt;
+	MemoryContext ccxt = CurrentMemoryContext;
 
 	/*
-	 * resolve + cache the stats-table owner while in a real transaction
-	 * (relcache asserts transaction state)
+	 * statistics never break a user query: palloc/pstrdup/relcache can
+	 * ereport (OOM), and core does not wrap FDW End hooks
 	 */
-	if (!OidIsValid(stats_owner))
+	PG_TRY();
 	{
-		Oid			table_relid = get_relname_relid("table_stats",
-													get_namespace_oid("lakehouse",
-																	  true));
+		ScanStatRecord *rec;
+		MemoryContext oldcxt;
 
-		if (OidIsValid(table_relid))
+		/*
+		 * resolve + cache the stats-table owner while in a real transaction
+		 * (relcache asserts transaction state)
+		 */
+		if (!OidIsValid(stats_owner))
 		{
-			Relation	rel = RelationIdGetRelation(table_relid);
+			Oid			table_relid = get_relname_relid("table_stats",
+														get_namespace_oid("lakehouse",
+																		  true));
 
-			if (RelationIsValid(rel))
+			if (OidIsValid(table_relid))
 			{
-				stats_owner = rel->rd_rel->relowner;
-				RelationClose(rel);
+				Relation	rel = RelationIdGetRelation(table_relid);
+
+				if (RelationIsValid(rel))
+				{
+					stats_owner = rel->rd_rel->relowner;
+					RelationClose(rel);
+				}
 			}
 		}
-	}
-	if (!OidIsValid(stats_owner) || in_scan_stats_flush)
-		return;
+		if (!OidIsValid(stats_owner) || in_scan_stats_flush)
+			return;
 
-	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
-	rec = (ScanStatRecord *) palloc(sizeof(ScanStatRecord));
-	rec->dbid = MyDatabaseId;
-	rec->relid = relid;
-	rec->endpoint = pstrdup(endpoint);
-	rec->ns_table = pstrdup(ns_table);
-	rec->snapshot_id = snapshot_id;
-	rec->row_count = row_count;
-	rec->files_total = files_total;
-	rec->files_pruned = files_pruned;
-	rec->scan_tasks = scan_tasks;
-	rec->total_bytes = total_bytes;
-	rec->has_deletes = has_deletes;
-	rec->captured_at = GetCurrentTimestamp();
-	scan_stats_buffer = lappend(scan_stats_buffer, rec);
-	MemoryContextSwitchTo(oldcxt);
+		/*
+		 * allocate + link under TopMemoryContext: the ambient context here is
+		 * the executor's query context, deleted before the PRE_COMMIT flush
+		 * reads the buffer
+		 */
+		oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+		rec = (ScanStatRecord *) palloc(sizeof(ScanStatRecord));
+		rec->dbid = MyDatabaseId;
+		rec->relid = relid;
+		rec->endpoint = pstrdup(endpoint ? endpoint : "");
+		rec->ns_table = pstrdup(ns_table ? ns_table : "");
+		rec->snapshot_id = snapshot_id;
+		rec->row_count = row_count;
+		rec->files_total = files_total;
+		rec->files_pruned = files_pruned;
+		rec->scan_tasks = scan_tasks;
+		rec->total_bytes = total_bytes;
+		rec->has_deletes = has_deletes;
+		rec->captured_at = GetCurrentTimestamp();
+		if (list_length(scan_stats_buffer) >= SCAN_STATS_BUFFER_MAX)
+		{
+			ScanStatRecord *oldest = lfirst(list_head(scan_stats_buffer));
+
+			pfree(oldest->endpoint);
+			pfree(oldest->ns_table);
+			pfree(oldest);
+			scan_stats_buffer = list_delete_first(scan_stats_buffer);
+		}
+		scan_stats_buffer = lappend(scan_stats_buffer, rec);
+		MemoryContextSwitchTo(ccxt);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(ccxt);
+		FlushErrorState();
+	}
+	PG_END_TRY();
 }
 
 /* flush buffered rows as the table owner; failures cost the buffer */
@@ -160,52 +216,54 @@ scan_stats_flush(void)
 
 	PG_TRY();
 	{
+		const char *stmt = "INSERT INTO lakehouse.table_stats "
+			"(dbid, relid, endpoint, ns_table, snapshot_id, "
+			"row_count, files_total, files_pruned, scan_tasks, "
+			"total_bytes, has_deletes, captured_at) "
+			"VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)";
+		Oid			argtypes[12] = {OIDOID, OIDOID, TEXTOID, TEXTOID,
+			INT8OID, INT8OID, INT4OID, INT4OID, INT4OID, INT8OID,
+		BOOLOID, TIMESTAMPTZOID};
+		Datum		vals[12];
+		char		nulls[13] = {' ', ' ', ' ', ' ', ' ', ' ', ' ',
+		' ', ' ', ' ', ' ', ' '};
+
 		in_scan_stats_flush = true;
 
 		if (SPI_connect() != SPI_OK_CONNECT)
 			elog(ERROR, "scan stats flush: SPI_connect failed");
 		connected = true;
+		/* commit callbacks run without an active snapshot */
 		PushActiveSnapshot(GetTransactionSnapshot());
 		snap_pushed = true;
 
 		/*
-		 * parameterized: endpoint/ns_table are user-controlled FDW options
-		 * and must never be string-interpolated
+		 * parameterized per-row inserts: endpoint and namespace.table are
+		 * user-controlled FDW options and are bound, never interpolated. Rows
+		 * are independently valid, so a mid-batch failure commits rows 1..k-1
+		 * rather than dropping the batch; the buffer cap bounds the
+		 * worst-case commit cost. Atomic batching is the follow-up.
 		 */
+		foreach(lc, scan_stats_buffer)
 		{
-			const char *stmt = "INSERT INTO lakehouse.table_stats "
-				"(dbid, relid, endpoint, ns_table, snapshot_id, "
-				"row_count, files_total, files_pruned, scan_tasks, "
-				"total_bytes, has_deletes, captured_at) "
-				"VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)";
-			Oid			argtypes[12] = {OIDOID, OIDOID, TEXTOID, TEXTOID,
-				INT8OID, INT8OID, INT4OID, INT4OID, INT4OID, INT8OID,
-			BOOLOID, TIMESTAMPTZOID};
-			Datum		vals[12];
-			char		nulls[13] = {' ', ' ', ' ', ' ', ' ', ' ', ' ',
-			' ', ' ', ' ', ' ', ' '};
+			ScanStatRecord *rec = lfirst(lc);
 
-			foreach(lc, scan_stats_buffer)
-			{
-				ScanStatRecord *rec = lfirst(lc);
+			vals[0] = ObjectIdGetDatum(rec->dbid);
+			vals[1] = ObjectIdGetDatum(rec->relid);
+			vals[2] = CStringGetTextDatum(rec->endpoint);
+			vals[3] = CStringGetTextDatum(rec->ns_table);
+			vals[4] = Int64GetDatum(rec->snapshot_id);
+			vals[5] = Int64GetDatum(rec->row_count);
+			vals[6] = Int32GetDatum(rec->files_total);
+			vals[7] = Int32GetDatum(rec->files_pruned);
+			vals[8] = Int32GetDatum(rec->scan_tasks);
+			vals[9] = Int64GetDatum(rec->total_bytes);
+			vals[10] = BoolGetDatum(rec->has_deletes);
+			vals[11] = TimestampTzGetDatum(rec->captured_at);
 
-				vals[0] = ObjectIdGetDatum(rec->dbid);
-				vals[1] = ObjectIdGetDatum(rec->relid);
-				vals[2] = CStringGetTextDatum(rec->endpoint);
-				vals[3] = CStringGetTextDatum(rec->ns_table);
-				vals[4] = Int64GetDatum(rec->snapshot_id);
-				vals[5] = Int64GetDatum(rec->row_count);
-				vals[6] = Int32GetDatum(rec->files_total);
-				vals[7] = Int32GetDatum(rec->files_pruned);
-				vals[8] = Int32GetDatum(rec->scan_tasks);
-				vals[9] = Int64GetDatum(rec->total_bytes);
-				vals[10] = BoolGetDatum(rec->has_deletes);
-				vals[11] = TimestampTzGetDatum(rec->captured_at);
-
-				if (SPI_execute_with_args(stmt, 12, argtypes, vals,
-										  nulls, false, 0) != SPI_OK_INSERT)
-					elog(ERROR, "scan stats flush: insert failed");
-			}
+			if (SPI_execute_with_args(stmt, 12, argtypes, vals,
+									  nulls, false, 0) != SPI_OK_INSERT)
+				elog(ERROR, "scan stats flush: insert failed");
 		}
 
 		SPI_finish();

@@ -672,7 +672,8 @@ lakehouse_EndForeignScan(ForeignScanState *node)
 	 * session frees (all values come from the already-parsed manifests — no
 	 * origin requests). Failures swallowed inside.
 	 */
-	if (state->session != NULL && !state->parallel && !state->count_exec)
+	if (state->session != NULL && !state->parallel && !state->count_exec &&
+		(node->ss.ps.state->es_top_eflags & EXEC_FLAG_EXPLAIN_ONLY) == 0)
 	{
 		uint64		snap = (uint64) pg_datalake_scan_snapshot_id(state->session);
 		uint64		before = pg_datalake_scan_files_before_pruning(state->session);
@@ -682,8 +683,18 @@ lakehouse_EndForeignScan(ForeignScanState *node)
 
 		for (uint64 i = 0; i < state->task_count; i++)
 		{
-			rows += (uint64) pg_datalake_scan_task_rows(state->session, i);
-			bytes += (uint64) pg_datalake_scan_task_size(state->session, i);
+			/*
+			 * negative manifest values are real (the count path guards them
+			 * identically): clamp to 0 so a corrupt record_count cannot wrap
+			 * the sum into garbage stats
+			 */
+			int64		task_rows = pg_datalake_scan_task_rows(state->session, i);
+			int64		task_size = pg_datalake_scan_task_size(state->session, i);
+
+			if (task_rows > 0)
+				rows += (uint64) task_rows;
+			if (task_size > 0)
+				bytes += (uint64) task_size;
 		}
 		if (snap != 0 && node->ss.ss_currentRelation != NULL)
 		{

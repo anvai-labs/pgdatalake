@@ -67,9 +67,19 @@ def main():
                 assert ep == CATALOG, r
                 assert ns_t == f"{ns}.events", r
 
-            # INTERNAL: PUBLIC revoked (owner sees the row; a fresh
-            # non-superuser role would get 42501 — covered by the
-            # telemetry fixture's role checks for the same posture)
+            # INTERNAL: PUBLIC revoked — an unprivileged role gets 42501
+            reader = "scanst_r_" + uuid4().hex[:8]
+            sql(name, f"CREATE ROLE {reader} LOGIN")
+            sql(name, f"SET ROLE {reader}; "
+                      "SELECT 1 FROM lakehouse.table_stats LIMIT 1",
+                error="42501")
+            sql(name, "RESET ROLE")
+
+            # m2: plain EXPLAIN (EXPLAIN_ONLY) must not add a row
+            b4 = int(sql(name, "SELECT count(*) FROM lakehouse.table_stats"))
+            sql(name, "EXPLAIN (COSTS OFF) SELECT count(*) FROM events")
+            a4 = int(sql(name, "SELECT count(*) FROM lakehouse.table_stats"))
+            assert a4 == b4, f"EXPLAIN-only recorded: {a4} != {b4}"
 
             # a heap-only statement adds NO scan-stats rows
             before = int(sql(name, "SELECT count(*) FROM lakehouse.table_stats"))
