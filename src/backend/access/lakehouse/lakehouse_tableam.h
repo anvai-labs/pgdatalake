@@ -126,6 +126,13 @@ lakehouse_commit_errcode(LakehouseWriteEntry *entry)
 extern Oid	lakehouse_am_oid(void);
 extern void install_lakehouse_count_exec(void);
 extern void install_lakehouse_telemetry(void);
+extern void install_lakehouse_scan_stats(void);
+extern void lakehouse_scan_stats_record(Oid relid, const char *endpoint,
+										const char *ns_table,
+										int64 snapshot_id, int64 row_count,
+										int files_total, int files_pruned,
+										int scan_tasks, int64 total_bytes,
+										bool has_deletes);
 extern void lakehouse_telemetry_guc_init(void);
 extern void lakehouse_check_capture_read(Oid relid);
 extern bool lakehouse_rel_is_capture_bound(Oid relid);

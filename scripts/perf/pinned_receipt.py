@@ -178,6 +178,7 @@ def write_receipt(connect, args, query_names, database_error, output):
         "cache_state": "after_warmup" if args.warmup else "uncontrolled_no_warmup",
         "workload": args.workload,
         "fixture_schema": args.fixture_schema, "timeout_seconds": args.timeout,
+        "profile_id": getattr(args, "profile_id", None),
         "requested_samples_per_query": args.samples,
         "queries": {name: {"status": "NOT RUN", "samples": []} for name in query_names},
     }

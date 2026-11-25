@@ -36,6 +36,7 @@
 #include "port/atomics.h"
 
 #include "lakehouse_fdw.h"
+#include "lakehouse_tableam.h"
 #include "batch_fill.h"
 #include "pg_datalake_core.h"
 
@@ -662,6 +663,41 @@ lakehouse_EndForeignScan(ForeignScanState *node)
 
 	if (state == NULL)
 		return;
+
+	/*
+	 * spec 19 §4b (L0 physical stats): record the completed scan BEFORE the
+	 * session frees (all values come from the already-parsed manifests — no
+	 * origin requests). Failures swallowed inside.
+	 */
+	if (state->session != NULL && !state->parallel && !state->count_exec)
+	{
+		uint64		snap = (uint64) pg_datalake_scan_snapshot_id(state->session);
+		uint64		before = pg_datalake_scan_files_before_pruning(state->session);
+		uint64		after = pg_datalake_scan_files_after_pruning(state->session);
+		uint64		rows = 0;
+		uint64		bytes = 0;
+
+		for (uint64 i = 0; i < state->task_count; i++)
+		{
+			rows += (uint64) pg_datalake_scan_task_rows(state->session, i);
+			bytes += (uint64) pg_datalake_scan_task_size(state->session, i);
+		}
+		if (snap != 0 && node->ss.ss_currentRelation != NULL)
+		{
+			char		ns_table[1024];
+
+			snprintf(ns_table, sizeof(ns_table), "%s.%s",
+					 state->opts.namespace, state->opts.table);
+			lakehouse_scan_stats_record(RelationGetRelid(node->ss.ss_currentRelation),
+										state->opts.endpoint, ns_table,
+										(int64) snap, (int64) rows,
+										(int) before, (int) (before - after),
+										(int) state->task_count,
+										(int64) bytes,
+										pg_datalake_scan_has_deletes(state->session));
+		}
+	}
+
 	if (state->rows != NULL)
 	{
 		pg_datalake_rows_close(state->rows);
