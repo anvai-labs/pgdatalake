@@ -36,7 +36,10 @@
 #include "port/atomics.h"
 
 #include "lakehouse_fdw.h"
+
+#ifndef LAKEHOUSE_STOCK_FDW
 #include "lakehouse_tableam.h"
+#endif
 #include "batch_fill.h"
 #include "pg_datalake_core.h"
 
