@@ -667,10 +667,13 @@ lakehouse_EndForeignScan(ForeignScanState *node)
 	if (state == NULL)
 		return;
 
+#ifndef LAKEHOUSE_STOCK_FDW
+
 	/*
 	 * spec 19 §4b (L0 physical stats): record the completed scan BEFORE the
 	 * session frees (all values come from the already-parsed manifests — no
-	 * origin requests). Failures swallowed inside.
+	 * origin requests). Failures swallowed inside. Managed-only: the stock
+	 * FDW has no internal stats tables.
 	 */
 	if (state->session != NULL && !state->parallel && !state->count_exec &&
 		(node->ss.ps.state->es_top_eflags & EXEC_FLAG_EXPLAIN_ONLY) == 0)
@@ -711,6 +714,7 @@ lakehouse_EndForeignScan(ForeignScanState *node)
 										pg_datalake_scan_has_deletes(state->session));
 		}
 	}
+#endif
 
 	if (state->rows != NULL)
 	{
