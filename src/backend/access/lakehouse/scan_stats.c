@@ -40,6 +40,7 @@
 #include "catalog/pg_class.h"
 #include "executor/spi.h"
 #include "fmgr.h"
+#include "pg_datalake_core.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -56,6 +57,10 @@ void		lakehouse_scan_stats_record(Oid relid, const char *endpoint,
 										int files_total, int files_pruned,
 										int scan_tasks, int64 total_bytes,
 										bool has_deletes);
+void		lakehouse_column_stats_record(Oid relid, const char *ns_table,
+										  int64 snapshot_id, int64 rows,
+										  ScanSession * session, Relation rel);
+
 
 /*
  * owner of lakehouse.table_stats, resolved at record time (inside a
@@ -89,6 +94,31 @@ typedef struct ScanStatRecord
 static List *scan_stats_buffer = NIL;
 static bool in_scan_stats_flush = false;
 
+/*
+ * composed per-column rows (spec 19 §4b): value_count is the explicit
+ * UPPER bound (value_counts summed across files — values repeat across
+ * files); the tier derives per the fixed §4b rules. Partition columns
+ * (T0) are not derivable yet — no spec FFI — recorded as their
+ * datatype tier with the partition refinement as follow-up.
+ */
+typedef struct ColumnStatRecord
+{
+	Oid			dbid;
+	Oid			relid;
+	char	   *ns_table;
+	int64		snapshot_id;
+	char	   *field_name;
+	int64		field_id;
+	char		datatype_class[16]; /* numeric|string|boolean|temporal|other */
+	int64		null_count;
+	int64		value_count_upper;
+	bool		has_bounds;
+	char		tier[3];		/* T1..T4 (T0 deferred) */
+	TimestampTz captured_at;
+} ColumnStatRecord;
+
+static List *column_stats_buffer = NIL;
+
 static void scan_stats_flush(void);
 static void scan_stats_xact_callback(XactEvent event, void *arg);
 
@@ -107,6 +137,17 @@ scan_stats_drop_buffer(void)
 	}
 	list_free(scan_stats_buffer);
 	scan_stats_buffer = NIL;
+
+	foreach(lc, column_stats_buffer)
+	{
+		ColumnStatRecord *crec = lfirst(lc);
+
+		pfree(crec->ns_table);
+		pfree(crec->field_name);
+		pfree(crec);
+	}
+	list_free(column_stats_buffer);
+	column_stats_buffer = NIL;
 }
 
 /*
@@ -194,6 +235,132 @@ lakehouse_scan_stats_record(Oid relid, const char *endpoint,
 	PG_END_TRY();
 }
 
+/*
+ * datatype class and filterability tier per the fixed §4b rules
+ * (T2: composed NDV <= 100 AND NDV/rows <= 0.05; T1: >100 with bounds;
+ * T3: boolean/temporal; T4: no bounds / unclassifiable)
+ */
+static void
+classify_column(Oid typid, bool has_bounds, int64 values, int64 rows,
+				char *class_out, char *tier_out)
+{
+	const char *class = "other";
+	const char *tier = "T4";
+
+	switch (typid)
+	{
+		case BOOLOID:
+			class = "boolean";
+			tier = has_bounds ? "T3" : "T4";
+			break;
+		case DATEOID:
+		case TIMESTAMPOID:
+		case TIMESTAMPTZOID:
+			class = "temporal";
+			tier = has_bounds ? "T3" : "T4";
+			break;
+		case INT2OID:
+		case INT4OID:
+		case INT8OID:
+		case FLOAT4OID:
+		case FLOAT8OID:
+		case NUMERICOID:
+			class = "numeric";
+			break;
+		case VARCHAROID:
+		case TEXTOID:
+		case BPCHAROID:
+			class = "string";
+			break;
+		default:
+			class = "other";
+			tier = "T4";
+			break;
+	}
+	if ((strcmp(class, "numeric") == 0 || strcmp(class, "string") == 0))
+	{
+		if (values > 0 && values <= 100 && rows > 0 &&
+			values * 100 <= 5 * rows)
+			tier = "T2";		/* enum-like: dictionary/value-set prune */
+		else if (values > 100 && has_bounds)
+			tier = "T1";		/* row-group prune */
+		else if (!has_bounds)
+			tier = "T4";
+		else
+			tier = "T1";
+	}
+	strcpy(class_out, class);
+	strcpy(tier_out, tier);
+}
+
+/* called from lakehouse_EndForeignScan; every failure swallowed */
+void
+lakehouse_column_stats_record(Oid relid, const char *ns_table,
+							  int64 snapshot_id, int64 rows,
+							  ScanSession * session, Relation rel)
+{
+	MemoryContext ccxt = CurrentMemoryContext;
+
+	PG_TRY();
+	{
+		MemoryContext oldcxt;
+		TupleDesc	tupdesc;
+		uint64		field_count;
+
+		if (session == NULL || rel == NULL || !OidIsValid(stats_owner) ||
+			in_scan_stats_flush)
+			return;
+		if (!OidIsValid(stats_owner) || rows < 0)
+			return;
+
+		tupdesc = RelationGetDescr(rel);
+		field_count = pg_datalake_scan_field_count(session);
+
+		oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+		for (uint64 idx = 0; idx < field_count; idx++)
+		{
+			const char *name = pg_datalake_scan_field_name(session, idx);
+			int64		nulls = 0;
+			int64		values = 0;
+			bool		has_bounds = false;
+			ColumnStatRecord *crec;
+			AttrNumber	attno = (AttrNumber) (idx + 1);
+			Form_pg_attribute attr;
+
+			if (name == NULL || !pg_datalake_scan_column_stats(session, idx,
+															   &nulls,
+															   &values,
+															   &has_bounds))
+				break;
+			if (attno > tupdesc->natts)
+				break;
+			attr = TupleDescAttr(tupdesc, idx);
+
+			crec = (ColumnStatRecord *) palloc(sizeof(ColumnStatRecord));
+			crec->dbid = MyDatabaseId;
+			crec->relid = relid;
+			crec->ns_table = pstrdup(ns_table);
+			crec->snapshot_id = snapshot_id;
+			crec->field_name = pstrdup(name);
+			crec->field_id = pg_datalake_scan_field_id(session, idx);
+			classify_column(attr->atttypid, has_bounds, values, rows,
+							crec->datatype_class, crec->tier);
+			crec->null_count = nulls;
+			crec->value_count_upper = values;
+			crec->has_bounds = has_bounds;
+			crec->captured_at = GetCurrentTimestamp();
+			column_stats_buffer = lappend(column_stats_buffer, crec);
+		}
+		MemoryContextSwitchTo(ccxt);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(ccxt);
+		FlushErrorState();
+	}
+	PG_END_TRY();
+}
+
 /* flush buffered rows as the table owner; failures cost the buffer */
 static void
 scan_stats_flush(void)
@@ -205,8 +372,8 @@ scan_stats_flush(void)
 	bool		snap_pushed = false;
 	MemoryContext oldcxt;
 
-	if (scan_stats_buffer == NIL || in_scan_stats_flush ||
-		!OidIsValid(stats_owner))
+	if ((scan_stats_buffer == NIL && column_stats_buffer == NIL) ||
+		in_scan_stats_flush || !OidIsValid(stats_owner))
 		return;
 
 	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
@@ -264,6 +431,43 @@ scan_stats_flush(void)
 			if (SPI_execute_with_args(stmt, 12, argtypes, vals,
 									  nulls, false, 0) != SPI_OK_INSERT)
 				elog(ERROR, "scan stats flush: insert failed");
+		}
+
+		/* composed per-column rows (parameterized; tier precomputed) */
+		{
+			const char *cstmt = "INSERT INTO lakehouse.column_stats "
+				"(dbid, relid, ns_table, snapshot_id, field_name, "
+				"field_id, datatype_class, null_count, value_count_upper, "
+				"has_bounds, tier, captured_at) "
+				"VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)";
+			Oid			cargtypes[12] = {OIDOID, OIDOID, TEXTOID, INT8OID,
+				TEXTOID, INT8OID, TEXTOID, INT8OID, INT8OID, BOOLOID,
+			TEXTOID, TIMESTAMPTZOID};
+			Datum		cvals[12];
+			char		cnulls[13] = {' ', ' ', ' ', ' ', ' ', ' ', ' ',
+			' ', ' ', ' ', ' ', ' '};
+
+			foreach(lc, column_stats_buffer)
+			{
+				ColumnStatRecord *crec = lfirst(lc);
+
+				cvals[0] = ObjectIdGetDatum(crec->dbid);
+				cvals[1] = ObjectIdGetDatum(crec->relid);
+				cvals[2] = CStringGetTextDatum(crec->ns_table);
+				cvals[3] = Int64GetDatum(crec->snapshot_id);
+				cvals[4] = CStringGetTextDatum(crec->field_name);
+				cvals[5] = Int64GetDatum(crec->field_id);
+				cvals[6] = CStringGetTextDatum(crec->datatype_class);
+				cvals[7] = Int64GetDatum(crec->null_count);
+				cvals[8] = Int64GetDatum(crec->value_count_upper);
+				cvals[9] = BoolGetDatum(crec->has_bounds);
+				cvals[10] = CStringGetTextDatum(crec->tier);
+				cvals[11] = TimestampTzGetDatum(crec->captured_at);
+
+				if (SPI_execute_with_args(cstmt, 12, cargtypes, cvals,
+										  cnulls, false, 0) != SPI_OK_INSERT)
+					elog(ERROR, "scan stats flush: column insert failed");
+			}
 		}
 
 		SPI_finish();

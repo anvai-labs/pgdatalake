@@ -34,7 +34,7 @@ def main():
         try:
             sql(name, f"""
                 CREATE EXTENSION lakehouse;
-                ALTER EXTENSION lakehouse UPDATE TO '1.23';
+                ALTER EXTENSION lakehouse UPDATE TO '1.24';
                 CREATE FOREIGN DATA WRAPPER lh HANDLER lakehouse.lakehouse_fdw_handler;
                 CREATE SERVER s FOREIGN DATA WRAPPER lh OPTIONS
                     (endpoint '{CATALOG}', warehouse 'smoke', s3_endpoint '{S3}');
@@ -74,6 +74,31 @@ def main():
                       "SELECT 1 FROM lakehouse.table_stats LIMIT 1",
                 error="42501")
             sql(name, "RESET ROLE")
+
+            # column_stats: one row per schema field with composed
+            # manifest stats + derived tier. value_count_upper is
+            # conservative (trino writes non-null counts, not NDV), so
+            # tiers land at T1 for these bounded columns; the T2
+            # enum-like refinement needs Parquet footer distinct_count
+            # (follow-up).
+            sql(name, "SELECT sum(amt), sum(id) FROM events")
+            r = sql(name, f"""
+                SELECT field_name, datatype_class, null_count,
+                       value_count_upper, has_bounds, tier
+                FROM lakehouse.column_stats
+                WHERE ns_table = '{ns}.events'
+                ORDER BY field_name, captured_at
+            """).strip()
+            clines = [x.split("|") for x in r.split("\n") if x]
+            assert len(clines) >= 3, f"expected >=3 column rows: {r}"
+            for fname, dclass, nulls, vupper, bounds, tier in clines:
+                assert dclass in ("numeric", "string", "boolean",
+                                  "temporal", "other"), r
+                assert tier in ("T1", "T2", "T3", "T4"), r
+                assert int(nulls) >= 0 and int(vupper) >= 0, r
+            by_name = {x[0]: x for x in clines}
+            assert by_name["id"][1] == "numeric", r
+            assert by_name["amt"][1] == "numeric", r
 
             # m2: plain EXPLAIN (EXPLAIN_ONLY) must not add a row
             b4 = int(sql(name, "SELECT count(*) FROM lakehouse.table_stats"))
