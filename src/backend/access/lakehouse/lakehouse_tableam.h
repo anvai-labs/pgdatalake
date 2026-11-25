@@ -133,6 +133,11 @@ extern void lakehouse_scan_stats_record(Oid relid, const char *endpoint,
 										int files_total, int files_pruned,
 										int scan_tasks, int64 total_bytes,
 										bool has_deletes);
+struct ScanSession;
+extern void lakehouse_column_stats_record(Oid relid, const char *ns_table,
+										  int64 snapshot_id, int64 rows,
+										  struct ScanSession *session,
+										  Relation rel);
 extern void lakehouse_telemetry_guc_init(void);
 extern void lakehouse_check_capture_read(Oid relid);
 extern bool lakehouse_rel_is_capture_bound(Oid relid);

@@ -712,6 +712,10 @@ lakehouse_EndForeignScan(ForeignScanState *node)
 										(int) state->task_count,
 										(int64) bytes,
 										pg_datalake_scan_has_deletes(state->session));
+			lakehouse_column_stats_record(RelationGetRelid(node->ss.ss_currentRelation),
+										  ns_table, (int64) snap,
+										  (int64) rows, state->session,
+										  node->ss.ss_currentRelation);
 		}
 	}
 #endif

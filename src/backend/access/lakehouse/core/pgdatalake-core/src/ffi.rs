@@ -48,9 +48,32 @@ fn version_cstr() -> &'static CStr {
 /// An open planned scan; opaque handle owned by the C side, freed with
 /// `pg_datalake_scan_free`. File-path `CStrings` are precomputed so accessors
 /// return stable pointers for the session's lifetime.
+/// Composed per-column manifest statistics (spec 19 §4b): `value_counts`
+/// summed across planned files (an explicit UPPER bound — values repeat
+/// across files), null counts summed, bound presence, and metric
+/// coverage (every planned file reported `value_counts` for the field).
+#[derive(Clone, Copy, Default)]
+pub struct ColumnStat {
+    pub nulls: i64,
+    pub values: i64,
+    pub has_bounds: bool,
+    pub covered: bool,
+}
+
+/// Sum helper: entries or default (`clippy::items_after_statements`).
+fn column_stat_slot(
+    map: &mut std::collections::BTreeMap<i64, ColumnStat>,
+    id: i64,
+) -> &mut ColumnStat {
+    map.entry(id).or_default()
+}
+
 pub struct ScanSession {
     plan: ScanPlan,
     file_paths: Vec<CString>,
+    field_ids: Vec<i64>,
+    field_names: Vec<CString>,
+    column_stats: std::collections::BTreeMap<i64, ColumnStat>,
     s3: S3Options,
     deletes: crate::parquet::LoadedDeletes,
     read_root: Option<S3ReadRoot>,
@@ -59,16 +82,41 @@ pub struct ScanSession {
 impl ScanSession {
     fn from_plan(
         plan: ScanPlan,
+        schema: &crate::catalog::metadata::Schema,
         s3: S3Options,
         deletes: crate::parquet::LoadedDeletes,
         read_root: Option<S3ReadRoot>,
     ) -> Self {
+        let mut column_stats: std::collections::BTreeMap<i64, ColumnStat> =
+            std::collections::BTreeMap::new();
+        for t in &plan.tasks {
+            let df = &t.entry.data_file;
+            for (id, vc) in &df.value_counts {
+                let slot = column_stat_slot(&mut column_stats, *id);
+                slot.values = slot.values.saturating_add(*vc);
+                slot.covered = true;
+            }
+            for (id, nc) in &df.null_value_counts {
+                let slot = column_stat_slot(&mut column_stats, *id);
+                slot.nulls = slot.nulls.saturating_add(*nc);
+            }
+            for (id, _) in df.lower_bounds.iter().chain(df.upper_bounds.iter()) {
+                column_stat_slot(&mut column_stats, *id).has_bounds = true;
+            }
+        }
         Self {
             file_paths: plan
                 .tasks
                 .iter()
                 .map(|t| CString::new(t.entry.data_file.file_path.as_str()).unwrap_or_default())
                 .collect(),
+            field_ids: schema.fields.iter().map(|f| f.id).collect(),
+            field_names: schema
+                .fields
+                .iter()
+                .map(|f| CString::new(f.name.as_str()).unwrap_or_default())
+                .collect(),
+            column_stats,
             plan,
             s3,
             deletes,
@@ -84,7 +132,7 @@ impl ScanSession {
     ) -> Result<Self, ReadError> {
         let deletes =
             crate::scan::load_row_deletes_with_root(&plan, Some(&s3), schema, read_root.as_ref())?;
-        Ok(Self::from_plan(plan, s3, deletes, read_root))
+        Ok(Self::from_plan(plan, schema, s3, deletes, read_root))
     }
 
     fn s3_options(&self) -> S3Options {
@@ -351,6 +399,91 @@ pub unsafe extern "C" fn pg_datalake_scan_task_file(
         Some(c) => c.as_ptr(),
         None => std::ptr::null(),
     }
+}
+
+/// Number of schema fields in the scanned table (spec 19 §4b).
+///
+/// # Safety
+/// `session` must be NULL or a live handle from `pg_datalake_scan_new`.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_scan_field_count(session: *mut ScanSession) -> u64 {
+    match unsafe { session.as_ref() } {
+        Some(s) => s.field_ids.len() as u64,
+        None => 0,
+    }
+}
+
+/// The field id at schema position `idx` (0 when out of range).
+///
+/// # Safety
+/// `session` must be NULL or a live handle from `pg_datalake_scan_new`.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_scan_field_id(session: *mut ScanSession, idx: u64) -> i64 {
+    match unsafe { session.as_ref() } {
+        Some(s) => s.field_ids.get(idx as usize).copied().unwrap_or(0),
+        None => 0,
+    }
+}
+
+/// The field name at schema position `idx` (NULL when out of range).
+/// The pointer borrows from the session.
+///
+/// # Safety
+/// `session` must be NULL or a live handle from `pg_datalake_scan_new`;
+/// the returned pointer must not outlive the session.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_scan_field_name(
+    session: *mut ScanSession,
+    idx: u64,
+) -> *const c_char {
+    let Some(s) = (unsafe { session.as_ref() }) else {
+        return std::ptr::null();
+    };
+    match s.field_names.get(idx as usize) {
+        Some(c) => c.as_ptr(),
+        None => std::ptr::null(),
+    }
+}
+
+/// Composed per-column manifest statistics (spec 19 §4b): null count,
+/// `value_counts` summed across files (an explicit UPPER bound — values
+/// repeat across files), and bound presence; `out_covered` is true only
+/// when EVERY planned file reported `value_counts` for the field (the
+/// metric is optional per Iceberg). Writes zeros/false when the writer
+/// supplied no metrics. Returns false when out of range.
+///
+/// # Safety
+/// `session` must be NULL or a live handle from `pg_datalake_scan_new`;
+/// the out pointers must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_scan_column_stats(
+    session: *mut ScanSession,
+    idx: u64,
+    out_nulls: *mut i64,
+    out_values: *mut i64,
+    out_has_bounds: *mut bool,
+    out_covered: *mut bool,
+) -> bool {
+    let Some(s) = (unsafe { session.as_ref() }) else {
+        return false;
+    };
+    let Some(id) = s.field_ids.get(idx as usize) else {
+        return false;
+    };
+    let stat = s.column_stats.get(id).copied().unwrap_or_default();
+    if !out_nulls.is_null() {
+        unsafe { *out_nulls = stat.nulls };
+    }
+    if !out_values.is_null() {
+        unsafe { *out_values = stat.values };
+    }
+    if !out_has_bounds.is_null() {
+        unsafe { *out_has_bounds = stat.has_bounds };
+    }
+    if !out_covered.is_null() {
+        unsafe { *out_covered = stat.covered };
+    }
+    true
 }
 
 /// The scan's pinned Iceberg snapshot id — the basis of the parallel

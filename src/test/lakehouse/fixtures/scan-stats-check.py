@@ -25,23 +25,32 @@ def main():
     ns = "scanst_" + uuid4().hex[:12]
     name = "scanst_" + uuid4().hex[:8]
     table = f"iceberg.{ns}.events"
+    table100 = f"iceberg.{ns}.events100"
     trino(f"CREATE SCHEMA iceberg.{ns}")
-    trino(f"CREATE TABLE {table} (id bigint, amt double) WITH (format_version = 2)")
-    trino(f"INSERT INTO {table} VALUES (1, 10.0), (2, 20.0), (3, 30.0), (4, 40.0)")
+    trino(f"CREATE TABLE {table} (id bigint, grp varchar, amt double) WITH (format_version = 2)")
+    trino(f"INSERT INTO {table} VALUES (1, 'a', 10.0), (2, 'b', 20.0), "
+          "(3, 'a', 30.0), (4, 'b', 40.0)")
+    # 100-row table: exercises T2 (2 distinct grp = 2% of rows) and the
+    # T4 fall-through (id: 100 distinct, not >100, ratio fails)
+    trino(f"CREATE TABLE {table100} (id bigint, grp varchar) WITH (format_version = 2)")
+    trino(f"INSERT INTO {table100} SELECT x, 'g' || CAST(x % 2 AS varchar) "
+          "FROM UNNEST(sequence(1, 100)) u(x)")
     try:
         sql("postgres", f"CREATE DATABASE {name} TEMPLATE template0 "
                         f"ENCODING 'UTF8' LOCALE 'C'")
         try:
             sql(name, f"""
                 CREATE EXTENSION lakehouse;
-                ALTER EXTENSION lakehouse UPDATE TO '1.23';
+                ALTER EXTENSION lakehouse UPDATE TO '1.24';
                 CREATE FOREIGN DATA WRAPPER lh HANDLER lakehouse.lakehouse_fdw_handler;
                 CREATE SERVER s FOREIGN DATA WRAPPER lh OPTIONS
                     (endpoint '{CATALOG}', warehouse 'smoke', s3_endpoint '{S3}');
                 CREATE USER MAPPING FOR CURRENT_USER SERVER s OPTIONS
                     (s3_access_key 'lakehouse-test', s3_secret_key 'lakehouse-test-password');
-                CREATE FOREIGN TABLE events (id bigint, amt double precision) SERVER s
+                CREATE FOREIGN TABLE events (id bigint, grp varchar, amt double precision) SERVER s
                     OPTIONS (table '{ns}.events');
+                CREATE FOREIGN TABLE events100 (id bigint, grp varchar) SERVER s
+                    OPTIONS (table '{ns}.events100');
             """)
 
             # two scans of the same snapshot: the count(*) takes the
@@ -73,7 +82,63 @@ def main():
             sql(name, f"SET ROLE {reader}; "
                       "SELECT 1 FROM lakehouse.table_stats LIMIT 1",
                 error="42501")
+            sql(name, f"SET ROLE {reader}; "
+                      "SELECT 1 FROM lakehouse.column_stats LIMIT 1",
+                error="42501")
             sql(name, "RESET ROLE")
+
+            sql(name, "SELECT sum(amt), sum(id) FROM events")
+            # column_stats: one row per schema field with composed
+            # manifest stats + derived tier (needs a DATA scan —
+            # count(*) opts out via the count-exec path). value_count_upper is
+            # conservative (trino writes non-null counts, not NDV), so
+            # tiers land at T1 for these bounded columns; the T2
+            # enum-like refinement needs Parquet footer distinct_count
+            # (follow-up).
+            r = sql(name, f"""
+                SELECT field_name, datatype_class, null_count,
+                       value_count_upper, has_bounds, metrics_covered, tier
+                FROM lakehouse.column_stats
+                WHERE ns_table = '{ns}.events'
+                ORDER BY field_name, captured_at
+            """).strip()
+            clines = [x.split("|") for x in r.split("\n") if x]
+            assert len(clines) >= 3, f"expected >=3 column rows: {r}"
+            for fname, dclass, nulls, vupper, bounds, covered, tier in clines:
+                assert dclass in ("numeric", "string", "boolean",
+                                  "temporal", "other",
+                                  "metrics-incomplete"), r
+                assert tier in ("T1", "T2", "T3", "T4"), r
+                assert int(nulls) >= 0 and int(vupper) >= 0, r
+                assert covered == "t", r
+            by_name = {x[0]: x for x in clines}
+            assert set(by_name) == {"id", "grp", "amt"}, r
+            assert by_name["id"][1] == "numeric", r
+            assert by_name["grp"][1] == "string", r
+            assert by_name["amt"][1] == "numeric", r
+            # spec-literal tiers on a 4-row table: values <= 100 but the
+            # 5% ratio fails and nothing is >100 -> T4 for all three
+            assert all(x[6] == "T4" for x in clines), r
+
+            # 100-row table: spec-literal tiers. TRUE NDV for grp is 2
+            # (enum-like -> T2), but trino's value_counts record NON-NULL
+            # counts (100), which fail both the T2 gate (100% of rows)
+            # and the T1 gate (not >100) -> the conservative T4. T2 on
+            # trino-written tables needs Parquet footer distinct_count
+            # (documented follow-up).
+            sql(name, "SELECT count(*) FROM events100")
+            sql(name, "SELECT sum(id) FROM events100")
+            r = sql(name, f"""
+                SELECT field_name, tier FROM lakehouse.column_stats
+                WHERE ns_table = '{ns}.events100'
+                ORDER BY field_name, captured_at
+            """).strip()
+            c100 = [x.split("|") for x in r.split("\n") if x]
+            last = {}
+            for fname, tier in c100:
+                last[fname] = tier
+            assert last.get("grp") == "T4", r
+            assert last.get("id") == "T4", r
 
             # m2: plain EXPLAIN (EXPLAIN_ONLY) must not add a row
             b4 = int(sql(name, "SELECT count(*) FROM lakehouse.table_stats"))
@@ -93,7 +158,8 @@ def main():
         finally:
             sql("postgres", f"DROP DATABASE {name} WITH (FORCE)")
     finally:
-        trino(f"DROP TABLE IF EXISTS {table}; DROP SCHEMA iceberg.{ns}")
+        trino(f"DROP TABLE IF EXISTS {table}; "
+              f"DROP TABLE IF EXISTS {table100}; DROP SCHEMA iceberg.{ns}")
 
 
 if __name__ == "__main__":
