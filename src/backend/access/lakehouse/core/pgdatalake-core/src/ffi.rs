@@ -94,7 +94,6 @@ impl ScanSession {
             for (id, vc) in &df.value_counts {
                 let slot = column_stat_slot(&mut column_stats, *id);
                 slot.values = slot.values.saturating_add(*vc);
-                slot.covered = true;
             }
             for (id, nc) in &df.null_value_counts {
                 let slot = column_stat_slot(&mut column_stats, *id);
@@ -103,6 +102,16 @@ impl ScanSession {
             for (id, _) in df.lower_bounds.iter().chain(df.upper_bounds.iter()) {
                 column_stat_slot(&mut column_stats, *id).has_bounds = true;
             }
+        }
+        // coverage = EVERY planned file reported value_counts for the
+        // field (the metric is optional per Iceberg; a sum over partial
+        // coverage is neither an upper bound nor a null floor)
+        for f in &schema.fields {
+            let covered = plan
+                .tasks
+                .iter()
+                .all(|t| t.entry.data_file.value_counts.contains_key(&f.id));
+            column_stat_slot(&mut column_stats, f.id).covered = covered;
         }
         Self {
             file_paths: plan

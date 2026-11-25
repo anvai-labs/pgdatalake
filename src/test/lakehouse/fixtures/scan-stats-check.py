@@ -92,7 +92,7 @@ def main():
             # manifest stats + derived tier (needs a DATA scan —
             # count(*) opts out via the count-exec path). value_count_upper is
             # conservative (trino writes non-null counts, not NDV), so
-            # tiers land at T1 for these bounded columns; the T2
+            # tiers land at T4 for these bounded columns (spec-literal); the T2
             # enum-like refinement needs Parquet footer distinct_count
             # (follow-up).
             r = sql(name, f"""
