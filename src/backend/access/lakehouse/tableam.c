@@ -4661,6 +4661,9 @@ _PG_init(void)
 								   NULL, NULL, NULL);
 	}							/* end preload-only GUC block */
 
+	/* spec 19 §4 (L0): telemetry GUCs — same "lakehouse." prefix */
+	lakehouse_telemetry_guc_init();
+
 	MarkGUCPrefixReserved("lakehouse");
 
 	/*
@@ -4694,6 +4697,7 @@ _PG_init(void)
 		 * an ordinary-aggregate fallback.
 		 */
 		install_lakehouse_count_exec();
+		install_lakehouse_telemetry();
 		RegisterXactCallback(lakehouse_xact_callback, NULL);
 		RegisterSubXactCallback(lakehouse_subxact_callback, NULL);
 		xact_callbacks_registered = true;
