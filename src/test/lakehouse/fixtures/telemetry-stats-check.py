@@ -66,6 +66,44 @@ def main():
             """).strip()
             assert int(r) >= 1, f"no captured foreign-scan row: {r}"
 
+            # B1: multi-statement TRANSACTION — every non-final
+            # statement's record must survive to the commit flush with
+            # valid values (the pre-fix bug read freed portal memory)
+            sql(name, """
+                BEGIN;
+                SELECT count(*) FROM events;
+                SELECT count(*) FROM events;
+                SELECT count(*) FROM events;
+                COMMIT;
+            """)
+            r = sql(name, """
+                SELECT count(*) FROM lakehouse.query_stats
+                WHERE foreign_scans >= 1 AND total_ms IS NOT NULL
+                  AND total_ms >= 0 AND captured_at IS NOT NULL
+            """).strip()
+            assert int(r) >= 4, f"multi-statement tx capture lost rows: {r}"
+
+            # B2: a statement that errors MID-EXECUTION must not poison
+            # capture for later statements in the session
+            sql(name, "SELECT 1.0 / (id - 3) FROM events;",
+                error="22012")
+            sql(name, "SELECT count(*) FROM events")
+            r = sql(name, """
+                SELECT count(*) FROM lakehouse.query_stats
+                WHERE foreign_scans >= 1
+            """).strip()
+            assert int(r) >= 5, f"capture died after a run error: {r}"
+
+            # negative case: a heap-only statement must not ADD a row
+            # (count(*) over foreign tables legitimately shows
+            # foreign_scans=0 — the FDW count elision plans have no
+            # ForeignScan node)
+            r = sql(name, "SELECT count(*) FROM lakehouse.query_stats").strip()
+            before = int(r)
+            sql(name, "SELECT count(*) FROM pg_class")
+            r = sql(name, "SELECT count(*) FROM lakehouse.query_stats").strip()
+            assert int(r) == before, f"heap-only statement captured: {r}"
+
             # INTERNAL: PUBLIC revoked — an unprivileged role can neither
             # read the table nor call the admin functions
             sql(name, f"CREATE ROLE {reader} LOGIN")
@@ -138,12 +176,31 @@ def main():
             sql(name, "SELECT lakehouse.grant_operator_telemetry("
                       "'operator-endpoint')")
             r = sql(name, "SELECT granted, endpoint IS NOT NULL, "
-                          "granted_by IS NOT NULL FROM lakehouse.telemetry_consent").strip()
-            assert r == "t|t|t", r
+                          "granted_by = session_user "
+                          "FROM lakehouse.telemetry_consent").strip()
+            assert r == "t|t|t", r  # granted_by records the INVOKING admin
+            # a share with nothing pending reports no change and stamps
+            # nothing
             r = sql(name, "SELECT shared, snapshot_id, state FROM "
                           "lakehouse.share_query_stats_with_operator()").strip()
             shared, sh_snap, sh_state = [x.strip() for x in r.split("|")]
-            assert sh_state == "no change", r  # drained already
+            assert sh_state == "no change", r
+            r = sql(name, "SELECT shared_at IS NOT NULL FROM "
+                          "lakehouse.telemetry_consent").strip()
+            assert r == "f", r
+
+            # a share WITH data: capture one more statement, share
+            # (two-phase: stages on this call), then the second share
+            # publishes + stamps the ledger
+            sql(name, "SELECT count(*) FROM events")
+            r = sql(name, "SELECT shared, snapshot_id, state FROM "
+                          "lakehouse.share_query_stats_with_operator()").strip()
+            shared, sh_snap, sh_state = [x.strip() for x in r.split("|")]
+            assert sh_state == "staged" and int(shared) >= 1, r
+            r = sql(name, "SELECT shared, snapshot_id, state FROM "
+                          "lakehouse.share_query_stats_with_operator()").strip()
+            shared, sh_snap, sh_state = [x.strip() for x in r.split("|")]
+            assert sh_state == "published" and sh_snap != "", r
             r = sql(name, "SELECT shared_at IS NOT NULL FROM "
                           "lakehouse.telemetry_consent").strip()
             assert r == "t", r

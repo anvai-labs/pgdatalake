@@ -34,6 +34,8 @@ CREATE TABLE lakehouse.telemetry_consent (
     id              boolean PRIMARY KEY DEFAULT true CHECK (id),
     granted         boolean NOT NULL DEFAULT false,
     endpoint        text,
+    CONSTRAINT telemetry_consent_endpoint CHECK (
+        (NOT granted) OR (endpoint IS NOT NULL)),
     consent_version text NOT NULL DEFAULT 'v1',
     granted_by      name,
     granted_at      timestamptz,
@@ -52,7 +54,7 @@ SET search_path = pg_catalog, lakehouse
 AS $$
     UPDATE lakehouse.telemetry_consent
     SET granted = true, endpoint = grant_operator_telemetry.endpoint,
-        granted_by = "current_user"()::text::name, granted_at = now()
+        granted_by = session_user::text::name, granted_at = now()
     WHERE id;
 $$;
 
@@ -102,8 +104,11 @@ BEGIN
     ), ins AS (
         INSERT INTO lakehouse.query_stats_archive
             (captured_at, dbid, userid, queryid, rows, total_ms, foreign_scans)
-        SELECT captured_at, dbid::bigint, userid::bigint, queryid, rows,
-               total_ms, foreign_scans
+        -- naive archive column: normalize to UTC wall-clock (AT TIME
+        -- ZONE on a timestamptz yields the UTC reading regardless of
+        -- the session zone)
+        SELECT captured_at AT TIME ZONE 'UTC', dbid::bigint,
+               userid::bigint, queryid, rows, total_ms, foreign_scans
         FROM moved
         RETURNING 1
     )
@@ -145,7 +150,10 @@ BEGIN
     shared := r.archived;
     snapshot_id := r.snapshot_id;
     state := r.state;
-    UPDATE lakehouse.telemetry_consent SET shared_at = now() WHERE id;
+    -- stamp the ledger only when rows actually moved to the archive
+    IF r.archived > 0 THEN
+        UPDATE lakehouse.telemetry_consent SET shared_at = now() WHERE id;
+    END IF;
 END;
 $$;
 
