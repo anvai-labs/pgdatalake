@@ -196,6 +196,47 @@ The decision runs in `lakehouse_count_exec_planner` between matcher pass and sta
 - **Versioning**: the model artifact carries a content hash; the telemetry dataset records which hash decided each run, closing the retraining loop. Model swaps are data-only changes (no recompile), gated by the same receipt discipline: a new model must beat the incumbent on the pinned sweep before rollout.
 - **Fail-safe doctrine**: L2 may only select among registry entries the matcher has already proven equivalent for the statement at hand. Decline paths, volatile guards, and the foreign-CTE gate are not model inputs — they remain deterministic code. Semantics never depend on model output.
 
+### 6.4 Measurement matrix (multi-hardware, multi-scale)
+
+Ladder receipts and QPS baselines are only correct when accumulated ACROSS
+hardware profiles and scale factors on pinned engine versions and identical
+dataset snapshots. A single-box number is an anecdote, not a receipt.
+
+**Host profiles** (extend as hardware joins; profile ids are stable):
+
+| id | host | CPU | RAM | storage | character |
+|---|---|---|---|---|---|
+| wsl2-dev | WSL2 workstation (current dev box) | laptop-class, few cores | 16-32Gi | NVMe-class | fast-storage, CPU-bound at scale |
+| dataserver3 | singh.local server | 32c Xeon E5-2630L v3 @1.8GHz | 30Gi | 4x419G rotational RAID | many-cores, storage-latency-bound — the honest profile for object-store-heavy workloads |
+
+**Scale factors**: TPC-H/TPC-DS SF=1 and SF=10 minimum on every profile; SF=100
+on dataserver3 when disk headroom allows (SF1 exists to debug shapes, SF10 to
+compare, SF100+ to trust).
+
+**Comparability rules**:
+
+1. Every receipt JSON records the profile id, CPU model, core count, RAM,
+   storage class (ROTA flag), kernel, engine commit, build type and the exact
+   dataset snapshot ids — the perf driver gains `--profile-id` and refuses to
+   write receipts without it.
+2. Cross-profile comparison is only valid for the SAME snapshot ids and engine
+   commit; the pinned-receipt machinery (spec [02](02-sql-surface.md) §receipts)
+   enforces the dataset/engine pins.
+3. Ladder levels (§6.3) must meet their p99 budget on the SLOWEST profile in
+   the active matrix — shipping on the fast box alone is not compliance.
+   Per-profile budget notes ride in the receipt (a B2 decision at 80µs on
+   NVMe and 180µs on dataserver3 is one receipt, not two).
+4. The physical collector and the labeled sweep (§4c item 4) run on EVERY
+   profile: family signatures (storage-bound vs CPU-bound) are expected to
+   differ across profiles, and that difference is itself training data for
+   the cost model — the model learns per-profile behavior from per-profile
+   telemetry (profile id is a categorical feature; §6.3 k-budget accommodates
+   it by replacing a scalar feature slot at B1+).
+5. CI (GitHub runners) measures neither ladder latency nor QPS — CI pins
+   correctness only. Performance receipts come exclusively from the named
+   profiles, cold-cache protocol documented per run.
+
+
 ## 7. Exit criteria per layer
 
 | Layer | Exit receipt |
