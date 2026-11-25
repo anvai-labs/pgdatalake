@@ -113,6 +113,7 @@ typedef struct ColumnStatRecord
 	int64		null_count;
 	int64		value_count_upper;
 	bool		has_bounds;
+	bool		metrics_covered;	/* every planned file reported metrics */
 	char		tier[3];		/* T1..T4 (T0 deferred) */
 	TimestampTz captured_at;
 } ColumnStatRecord;
@@ -225,6 +226,21 @@ lakehouse_scan_stats_record(Oid relid, const char *endpoint,
 			scan_stats_buffer = list_delete_first(scan_stats_buffer);
 		}
 		scan_stats_buffer = lappend(scan_stats_buffer, rec);
+
+		/*
+		 * column rows multiply by #fields: same cap bounds the insert count
+		 * the PRE_COMMIT flush will perform
+		 */
+		while (list_length(column_stats_buffer) >= SCAN_STATS_BUFFER_MAX)
+		{
+			ColumnStatRecord *coldest =
+				lfirst(list_head(column_stats_buffer));
+
+			pfree(coldest->ns_table);
+			pfree(coldest->field_name);
+			pfree(coldest);
+			column_stats_buffer = list_delete_first(column_stats_buffer);
+		}
 		MemoryContextSwitchTo(ccxt);
 	}
 	PG_CATCH();
@@ -277,17 +293,19 @@ classify_column(Oid typid, bool has_bounds, int64 values, int64 rows,
 			tier = "T4";
 			break;
 	}
-	if ((strcmp(class, "numeric") == 0 || strcmp(class, "string") == 0))
+	if (strcmp(class, "numeric") == 0 || strcmp(class, "string") == 0)
 	{
-		if (values > 0 && values <= 100 && rows > 0 &&
-			values * 100 <= 5 * rows)
+		/*
+		 * spec 19 §4b, literal: T2 iff composed NDV bound <= 100 AND <= 5%
+		 * of rows (an all-null column qualifies: 0 values IS the empty
+		 * value-set prune); T1 iff > 100 with bounds; else T4.
+		 */
+		if (values <= 100 && rows > 0 && values * 100 <= 5 * rows)
 			tier = "T2";		/* enum-like: dictionary/value-set prune */
 		else if (values > 100 && has_bounds)
 			tier = "T1";		/* row-group prune */
-		else if (!has_bounds)
-			tier = "T4";
 		else
-			tier = "T1";
+			tier = "T4";
 	}
 	strcpy(class_out, class);
 	strcpy(tier_out, tier);
@@ -307,14 +325,15 @@ lakehouse_column_stats_record(Oid relid, const char *ns_table,
 		TupleDesc	tupdesc;
 		uint64		field_count;
 
-		if (session == NULL || rel == NULL || !OidIsValid(stats_owner) ||
-			in_scan_stats_flush)
-			return;
-		if (!OidIsValid(stats_owner) || rows < 0)
+		if (session == NULL || rel == NULL || rows < 0 ||
+			!OidIsValid(stats_owner) || in_scan_stats_flush)
 			return;
 
 		tupdesc = RelationGetDescr(rel);
 		field_count = pg_datalake_scan_field_count(session);
+		elog(DEBUG1, "col-stats trace: fields=%llu rows=%lld owner=%u",
+			 (unsigned long long) field_count, (long long) rows,
+			 stats_owner);
 
 		oldcxt = MemoryContextSwitchTo(TopMemoryContext);
 		for (uint64 idx = 0; idx < field_count; idx++)
@@ -323,18 +342,43 @@ lakehouse_column_stats_record(Oid relid, const char *ns_table,
 			int64		nulls = 0;
 			int64		values = 0;
 			bool		has_bounds = false;
+			bool		metrics_covered = false;
 			ColumnStatRecord *crec;
-			AttrNumber	attno = (AttrNumber) (idx + 1);
-			Form_pg_attribute attr;
+			Form_pg_attribute attr = NULL;
 
 			if (name == NULL || !pg_datalake_scan_column_stats(session, idx,
 															   &nulls,
 															   &values,
-															   &has_bounds))
+															   &has_bounds,
+															   &metrics_covered))
+			{
+				elog(DEBUG1, "col-stats trace: FFI false at idx %llu",
+					 (unsigned long long) idx);
 				break;
-			if (attno > tupdesc->natts)
-				break;
-			attr = TupleDescAttr(tupdesc, idx);
+			}
+			elog(DEBUG1, "col-stats trace: idx=%llu name=%s nulls=%lld vals=%lld cov=%d bounds=%d",
+				 (unsigned long long) idx, name, (long long) nulls,
+				 (long long) values, (int) metrics_covered, (int) has_bounds);
+
+			/*
+			 * resolve the attribute BY NAME: the Iceberg schema order need
+			 * not match the foreign table's column order/subset (the reader
+			 * resolves parquet columns by name too), and a positional pair
+			 * mislabels datatype_class/tier while name/id/stats stay right.
+			 * Unmatched fields (dropped/ renamed attrs) record class 'other',
+			 * tier T4.
+			 */
+			for (int i = 0; i < tupdesc->natts; i++)
+			{
+				Form_pg_attribute a = TupleDescAttr(tupdesc, i);
+
+				if (!a->attisdropped &&
+					namestrcmp(&(a->attname), name) == 0)
+				{
+					attr = a;
+					break;
+				}
+			}
 
 			crec = (ColumnStatRecord *) palloc(sizeof(ColumnStatRecord));
 			crec->dbid = MyDatabaseId;
@@ -343,11 +387,28 @@ lakehouse_column_stats_record(Oid relid, const char *ns_table,
 			crec->snapshot_id = snapshot_id;
 			crec->field_name = pstrdup(name);
 			crec->field_id = pg_datalake_scan_field_id(session, idx);
-			classify_column(attr->atttypid, has_bounds, values, rows,
-							crec->datatype_class, crec->tier);
+
+			/*
+			 * M4/coverage: value_counts are OPTIONAL per file — a sum over
+			 * partial coverage is neither an upper bound nor a null floor, so
+			 * a not-fully-covered field is recorded class 'other', tier T4
+			 * (metrics incomplete) regardless of datatype.
+			 */
+			if (attr != NULL && metrics_covered)
+				classify_column(attr->atttypid, has_bounds, values, rows,
+								crec->datatype_class, crec->tier);
+			else
+			{
+				strcpy(crec->datatype_class,
+					   attr == NULL ? "other" : attr->attisdropped ? "other" :
+					   "metrics-incomplete");
+				strcpy(crec->tier, "T4");
+			}
+
 			crec->null_count = nulls;
 			crec->value_count_upper = values;
 			crec->has_bounds = has_bounds;
+			crec->metrics_covered = metrics_covered;
 			crec->captured_at = GetCurrentTimestamp();
 			column_stats_buffer = lappend(column_stats_buffer, crec);
 		}
@@ -433,19 +494,24 @@ scan_stats_flush(void)
 				elog(ERROR, "scan stats flush: insert failed");
 		}
 
-		/* composed per-column rows (parameterized; tier precomputed) */
+		/*
+		 * composed per-column rows: parameterized, 13 params in exact column
+		 * order (dbid, relid, ns_table, snapshot_id, field_name, field_id,
+		 * datatype_class, null_count, value_count_upper, has_bounds,
+		 * metrics_covered, tier, captured_at)
+		 */
 		{
 			const char *cstmt = "INSERT INTO lakehouse.column_stats "
 				"(dbid, relid, ns_table, snapshot_id, field_name, "
 				"field_id, datatype_class, null_count, value_count_upper, "
-				"has_bounds, tier, captured_at) "
-				"VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)";
-			Oid			cargtypes[12] = {OIDOID, OIDOID, TEXTOID, INT8OID,
+				"has_bounds, metrics_covered, tier, captured_at) "
+				"VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)";
+			Oid			cargtypes[13] = {OIDOID, OIDOID, TEXTOID, INT8OID,
 				TEXTOID, INT8OID, TEXTOID, INT8OID, INT8OID, BOOLOID,
-			TEXTOID, TIMESTAMPTZOID};
-			Datum		cvals[12];
-			char		cnulls[13] = {' ', ' ', ' ', ' ', ' ', ' ', ' ',
-			' ', ' ', ' ', ' ', ' '};
+			BOOLOID, TEXTOID, TIMESTAMPTZOID};
+			Datum		cvals[13];
+			char		cnulls[14] = {' ', ' ', ' ', ' ', ' ', ' ', ' ',
+			' ', ' ', ' ', ' ', ' ', ' '};
 
 			foreach(lc, column_stats_buffer)
 			{
@@ -461,10 +527,11 @@ scan_stats_flush(void)
 				cvals[7] = Int64GetDatum(crec->null_count);
 				cvals[8] = Int64GetDatum(crec->value_count_upper);
 				cvals[9] = BoolGetDatum(crec->has_bounds);
-				cvals[10] = CStringGetTextDatum(crec->tier);
-				cvals[11] = TimestampTzGetDatum(crec->captured_at);
+				cvals[10] = BoolGetDatum(crec->metrics_covered);
+				cvals[11] = CStringGetTextDatum(crec->tier);
+				cvals[12] = TimestampTzGetDatum(crec->captured_at);
 
-				if (SPI_execute_with_args(cstmt, 12, cargtypes, cvals,
+				if (SPI_execute_with_args(cstmt, 13, cargtypes, cvals,
 										  cnulls, false, 0) != SPI_OK_INSERT)
 					elog(ERROR, "scan stats flush: column insert failed");
 			}

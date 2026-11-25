@@ -23,8 +23,13 @@ CREATE TABLE lakehouse.column_stats (
     null_count         bigint NOT NULL,
     value_count_upper  bigint NOT NULL,
     has_bounds         boolean NOT NULL,
+    metrics_covered    boolean NOT NULL,
     tier               text NOT NULL
 );
+
+-- NOTE: composition is over the PLANNED (post-pruning) file subset, so
+-- tier is scan-dependent — the same (snapshot, field) can legitimately
+-- record different tiers from a pruned vs a full scan.
 CREATE INDEX lakehouse_column_stats_rel_idx
     ON lakehouse.column_stats (relid, snapshot_id);
 REVOKE ALL ON lakehouse.column_stats FROM PUBLIC;

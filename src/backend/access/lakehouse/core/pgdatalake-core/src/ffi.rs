@@ -46,16 +46,26 @@ fn version_cstr() -> &'static CStr {
 }
 
 /// An open planned scan; opaque handle owned by the C side, freed with
-/// `pg_datalake_scan_free`. File-path `CStrings` and the composed
-/// per-column manifest statistics (spec 19 §4b: `value_counts` summed
-/// across planned files — an explicit UPPER bound — null counts, bound
-/// presence) are precomputed so accessors return stable data for the
-/// session's lifetime.
+/// `pg_datalake_scan_free`. File-path `CStrings` are precomputed so accessors
+/// return stable pointers for the session's lifetime.
+/// Composed per-column manifest statistics (spec 19 §4b): `value_counts`
+/// summed across planned files (an explicit UPPER bound — values repeat
+/// across files), null counts summed, bound presence, and metric
+/// coverage (every planned file reported `value_counts` for the field).
 #[derive(Clone, Copy, Default)]
 pub struct ColumnStat {
     pub nulls: i64,
     pub values: i64,
     pub has_bounds: bool,
+    pub covered: bool,
+}
+
+/// Sum helper: entries or default (`clippy::items_after_statements`).
+fn column_stat_slot(
+    map: &mut std::collections::BTreeMap<i64, ColumnStat>,
+    id: i64,
+) -> &mut ColumnStat {
+    map.entry(id).or_default()
 }
 
 pub struct ScanSession {
@@ -67,14 +77,6 @@ pub struct ScanSession {
     s3: S3Options,
     deletes: crate::parquet::LoadedDeletes,
     read_root: Option<S3ReadRoot>,
-}
-
-/// Sum helper: entries or default (`clippy::items_after_statements`).
-fn column_stat_slot(
-    map: &mut std::collections::BTreeMap<i64, ColumnStat>,
-    id: i64,
-) -> &mut ColumnStat {
-    map.entry(id).or_default()
 }
 
 impl ScanSession {
@@ -90,10 +92,13 @@ impl ScanSession {
         for t in &plan.tasks {
             let df = &t.entry.data_file;
             for (id, vc) in &df.value_counts {
-                column_stat_slot(&mut column_stats, *id).values += *vc;
+                let slot = column_stat_slot(&mut column_stats, *id);
+                slot.values = slot.values.saturating_add(*vc);
+                slot.covered = true;
             }
             for (id, nc) in &df.null_value_counts {
-                column_stat_slot(&mut column_stats, *id).nulls += *nc;
+                let slot = column_stat_slot(&mut column_stats, *id);
+                slot.nulls = slot.nulls.saturating_add(*nc);
             }
             for (id, _) in df.lower_bounds.iter().chain(df.upper_bounds.iter()) {
                 column_stat_slot(&mut column_stats, *id).has_bounds = true;
@@ -396,12 +401,6 @@ pub unsafe extern "C" fn pg_datalake_scan_task_file(
     }
 }
 
-/// The scan's pinned Iceberg snapshot id — the basis of the parallel
-/// stable-task-mapping contract (13-review #7): workers plan THIS id,
-/// so concurrent commits can never make task index N mean different
-/// files on different processes.
-///
-/// # Safety
 /// Number of schema fields in the scanned table (spec 19 §4b).
 ///
 /// # Safety
@@ -447,9 +446,11 @@ pub unsafe extern "C" fn pg_datalake_scan_field_name(
 }
 
 /// Composed per-column manifest statistics (spec 19 §4b): null count,
-/// value-count upper bound (`value_counts` summed across files — values
-/// repeat across files), and bound presence. Writes zeros/false when
-/// the writer supplied no metrics. Returns false when out of range.
+/// `value_counts` summed across files (an explicit UPPER bound — values
+/// repeat across files), and bound presence; `out_covered` is true only
+/// when EVERY planned file reported `value_counts` for the field (the
+/// metric is optional per Iceberg). Writes zeros/false when the writer
+/// supplied no metrics. Returns false when out of range.
 ///
 /// # Safety
 /// `session` must be NULL or a live handle from `pg_datalake_scan_new`;
@@ -461,6 +462,7 @@ pub unsafe extern "C" fn pg_datalake_scan_column_stats(
     out_nulls: *mut i64,
     out_values: *mut i64,
     out_has_bounds: *mut bool,
+    out_covered: *mut bool,
 ) -> bool {
     let Some(s) = (unsafe { session.as_ref() }) else {
         return false;
@@ -478,12 +480,20 @@ pub unsafe extern "C" fn pg_datalake_scan_column_stats(
     if !out_has_bounds.is_null() {
         unsafe { *out_has_bounds = stat.has_bounds };
     }
+    if !out_covered.is_null() {
+        unsafe { *out_covered = stat.covered };
+    }
     true
 }
 
-#[no_mangle]
+/// The scan's pinned Iceberg snapshot id — the basis of the parallel
+/// stable-task-mapping contract (13-review #7): workers plan THIS id,
+/// so concurrent commits can never make task index N mean different
+/// files on different processes.
+///
 /// # Safety
 /// `session` must be NULL or a live handle from `pg_datalake_scan_new`.
+#[no_mangle]
 pub unsafe extern "C" fn pg_datalake_scan_snapshot_id(session: *mut ScanSession) -> i64 {
     match unsafe { session.as_ref() } {
         Some(s) => s.plan.snapshot_id,
