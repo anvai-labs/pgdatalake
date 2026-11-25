@@ -304,6 +304,8 @@ lakehouse_telemetry_exec_end(QueryDesc *queryDesc)
 		!in_telemetry_flush &&
 		queryDesc->planstate != NULL)
 	{
+		MemoryContext ccxt = CurrentMemoryContext;
+
 		PG_TRY();
 		{
 			count_foreign_scan_walker(queryDesc->planstate, &n_foreign);
@@ -311,7 +313,12 @@ lakehouse_telemetry_exec_end(QueryDesc *queryDesc)
 		}
 		PG_CATCH();
 		{
-			/* telemetry must never break the query */
+			/*
+			 * telemetry must never break the query; capture_end may have
+			 * switched to TopMemoryContext before erroring — restore the
+			 * caller's context
+			 */
+			MemoryContextSwitchTo(ccxt);
 			FlushErrorState();
 			n_foreign = 0;
 		}
@@ -405,7 +412,7 @@ telemetry_flush(void)
 			if (!first)
 				appendStringInfoChar(&buf, ',');
 			first = false;
-			appendStringInfo(&buf, "(%u,%u," INT64_FORMAT ",%s,%.3f,%d,'%s')",
+			appendStringInfo(&buf, "(%u,%u," UINT64_FORMAT ",%s,%.3f,%d,'%s')",
 							 rec->dbid, rec->userid, rec->queryid,
 							 rowsbuf, total_ms, rec->foreign_scans,
 							 timestamptz_to_str(rec->started_at));

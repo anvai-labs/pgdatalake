@@ -96,8 +96,9 @@ def main():
 
             # negative case: a heap-only statement must not ADD a row
             # (count(*) over foreign tables legitimately shows
-            # foreign_scans=0 — the FDW count elision plans have no
-            # ForeignScan node)
+            # foreign_scans=0 — the foreign-count path plans a core
+            # ForeignPath whose ForeignScan node the capture counts only
+            # when present; heap statements must never appear at all)
             r = sql(name, "SELECT count(*) FROM lakehouse.query_stats").strip()
             before = int(r)
             sql(name, "SELECT count(*) FROM pg_class")
