@@ -17,11 +17,12 @@
  * many-scan transaction must not grow session memory unboundedly or
  * stall PRE_COMMIT with thousands of inserts).
  *
- * v1 scope and caveats: table-level stats only (rows, file counts
- * before/after pruning, scan tasks, total bytes, delete presence) —
- * column-level stats (value_counts composition, filterability tiers)
- * need new core FFI exports and are the follow-up slice (spec 19
- * §4b). No retention or disable switch yet (telemetry has both) —
+ * v1 scope and caveats: table-level rows plus per-column composed
+ * stats (datatype class, nulls, value-count upper bound, bounds
+ * presence, metric coverage, filterability tier). Column-row SETS are
+ * written per executor and are not atomic as a set — a mid-batch
+ * flush failure leaves a snapshot's fields partially recorded.
+ * Retention/disable knobs are the follow-up. No retention or disable switch yet (telemetry has both) —
  * operator-facing knobs are the follow-up. Statements that error
  * before EndForeignScan lose their record (same caveat class as
  * telemetry). One row per EXECUTOR (the spec's "first scan per
@@ -109,7 +110,7 @@ typedef struct ColumnStatRecord
 	int64		snapshot_id;
 	char	   *field_name;
 	int64		field_id;
-	char		datatype_class[16]; /* numeric|string|boolean|temporal|other */
+	char		datatype_class[24]; /* numeric|string|boolean|temporal|other|metrics-incomplete */
 	int64		null_count;
 	int64		value_count_upper;
 	bool		has_bounds;
