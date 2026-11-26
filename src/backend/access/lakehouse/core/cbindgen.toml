@@ -73,6 +73,7 @@ include = [
     "pg_datalake_rows_col_null",
     "pg_datalake_rows_col_text",
     "pg_datalake_rows_close",
+    "pg_datalake_rows_row_groups_pruned",
     "pg_datalake_scan_files_before_pruning",
     "pg_datalake_scan_files_after_pruning",
 ]

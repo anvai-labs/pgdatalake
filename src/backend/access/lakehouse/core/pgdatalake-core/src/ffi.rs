@@ -70,6 +70,7 @@ fn column_stat_slot(
 
 pub struct ScanSession {
     plan: ScanPlan,
+    predicate: Option<crate::scan::ScanPredicate>,
     file_paths: Vec<CString>,
     field_ids: Vec<i64>,
     field_names: Vec<CString>,
@@ -82,6 +83,7 @@ pub struct ScanSession {
 impl ScanSession {
     fn from_plan(
         plan: ScanPlan,
+        predicate: Option<&crate::scan::ScanPredicate>,
         schema: &crate::catalog::metadata::Schema,
         s3: S3Options,
         deletes: crate::parquet::LoadedDeletes,
@@ -114,6 +116,7 @@ impl ScanSession {
             column_stat_slot(&mut column_stats, f.id).covered = covered;
         }
         Self {
+            predicate: predicate.cloned(),
             file_paths: plan
                 .tasks
                 .iter()
@@ -135,13 +138,16 @@ impl ScanSession {
 
     fn from_read_plan(
         plan: ScanPlan,
+        predicate: Option<&crate::scan::ScanPredicate>,
         s3: S3Options,
         schema: &crate::catalog::metadata::Schema,
         read_root: Option<S3ReadRoot>,
     ) -> Result<Self, ReadError> {
         let deletes =
             crate::scan::load_row_deletes_with_root(&plan, Some(&s3), schema, read_root.as_ref())?;
-        Ok(Self::from_plan(plan, schema, s3, deletes, read_root))
+        Ok(Self::from_plan(
+            plan, predicate, schema, s3, deletes, read_root,
+        ))
     }
 
     fn s3_options(&self) -> S3Options {
@@ -308,7 +314,7 @@ pub unsafe extern "C" fn pg_datalake_scan_new_bound(
                 client.scan_table(&ns_levels, &table, predicate.as_ref(), selector.as_ref())?;
             (plan, s3, schema, None)
         };
-        ScanSession::from_read_plan(plan, s3, &schema, read_root)
+        ScanSession::from_read_plan(plan, predicate.as_ref(), s3, &schema, read_root)
     });
     let session = result.unwrap_or_else(|panic| {
         let msg = if let Some(s) = panic.downcast_ref::<&str>() {
@@ -697,9 +703,14 @@ pub unsafe extern "C" fn pg_datalake_rows_open(
         // ALWAYS through open_with_deletes: the old empty-projection
         // open_all branch silently dropped position deletes from
         // count(*)-style scans (13-review blocker #5)
-        let rows =
-            crate::parquet::ParquetRows::open_with_deletes(&io, &key, &projection, row_deletes)
-                .map_err(|e| e.to_string())?;
+        let rows = crate::parquet::ParquetRows::open_with_deletes(
+            &io,
+            &key,
+            &projection,
+            row_deletes,
+            s.predicate.as_ref(),
+        )
+        .map_err(|e| e.to_string())?;
         let column_names = rows
             .column_names()
             .iter()
@@ -1012,6 +1023,19 @@ pub unsafe extern "C" fn pg_datalake_scan_files_before_pruning(session: *mut Sca
 pub unsafe extern "C" fn pg_datalake_scan_files_after_pruning(session: *mut ScanSession) -> u64 {
     match unsafe { session.as_ref() } {
         Some(s) => s.plan.files_after_pruning as u64,
+        None => 0,
+    }
+}
+
+/// Row groups skipped by exact min/max stats at `rows_open` (2a, spec 15
+/// §6.3a / doc 06 §1 step 5). 0 when no pruning ran.
+///
+/// # Safety
+/// `rows` must be NULL or a pointer returned by `pg_datalake_rows_open`.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_rows_row_groups_pruned(rows: *mut RowsHandle) -> u64 {
+    match rows.as_ref() {
+        Some(h) => h.rows.row_groups_pruned as u64,
         None => 0,
     }
 }
