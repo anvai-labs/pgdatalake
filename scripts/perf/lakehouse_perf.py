@@ -48,7 +48,11 @@ DEFAULT_TPCH_DDL = REPO / "scripts" / "perf" / "tpch" / "ddl.sql"
 DEFAULT_TPCH_QUERIES = REPO / "scripts" / "perf" / "tpch" / "queries"
 
 # q1/q2/q3 = the recorded §5.1 comparison set
+# Full sweep set (q1-q10, DNF-and-continue) vs the pinned qualification
+# canaries (q1-q3; run_pinned oracle validation is strict on set equality,
+# so growing the pinned set would silently invalidate recorded oracles).
 TPCDS_QUERIES = [f"query{i}" for i in range(1, 11)]
+TPCDS_PINNED_CANARIES = ["query1", "query2", "query3"]
 
 # TPC-H SF=1 (duckdb dbgen): the full 22-branch lineitem fact
 TPCH_QUERIES = [f"query{i}" for i in range(1, 11)]
@@ -235,7 +239,13 @@ def run_scan_suite(conn, args):
     }
     rows = []
     for name, sql in queries.items():
-        runs, med = measure(cur, sql, args.timeout, warmup=args.warmup)
+        try:
+            runs, med = measure(cur, sql, args.timeout, warmup=args.warmup)
+        except QueryTimeout as e:
+            print(f"{name}: TIMEOUT ({e})", flush=True)
+            rows.append((name, None))
+            conn.rollback()
+            continue
         print(f"{name}: runs={['%.2f' % r for r in runs]} median={med:.2f}s")
         rows.append((name, med))
     return rows
@@ -314,7 +324,13 @@ def run_tpch_suite(conn, args):
             sql = (Path(args.tpch_queries) / f"{q}.sql").read_text()
         except FileNotFoundError:
             raise SystemExit(f"missing query file: {args.tpch_queries}/{q}.sql")
-        runs, med = measure(cur, sql, args.timeout, warmup=args.warmup)
+        try:
+            runs, med = measure(cur, sql, args.timeout, warmup=args.warmup)
+        except QueryTimeout as e:
+            print(f"{q}: TIMEOUT ({e})", flush=True)
+            rows.append((q, None))
+            conn.rollback()
+            continue
         print(f"{q}: runs={['%.1f' % r for r in runs]} median={med:.1f}s")
         rows.append((q, med))
     return rows
@@ -520,7 +536,8 @@ def main():
         args.workload = "shipped_tpcds_canaries" if Path(args.queries).resolve() == DEFAULT_QUERIES \
             else "custom_exploratory"
         try:
-            passed = run_pinned(lambda: connect(args.dsn), args, TPCDS_QUERIES, psycopg2.Error)
+            passed = run_pinned(lambda: connect(args.dsn), args,
+                                TPCDS_PINNED_CANARIES, psycopg2.Error)
         except FileExistsError:
             ap.error("receipt path already exists; choose a new file")
         print(f"{'PASS' if passed else 'FAIL'}: {args.receipt}")

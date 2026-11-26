@@ -78,9 +78,16 @@ def main():
             rows = plan_rows(name, query, "metadata")
             assert len(rows) == 1 and 4000 <= rows[0] <= 6000, rows
 
-            # session cache: a repeat plan is served from the cache and
-            # must report the same estimate
-            assert plan_rows(name, query, "metadata") == rows
+            # session cache: TWO EXPLAINs in ONE sql() call share one
+            # backend, so the second plan is served from planner_rows_cache
+            # (sql() opens a fresh psql per call — separate calls would
+            # prove data stability, not cache behavior)
+            both = sql(name, "SET lakehouse.plan_rows_mode = 'metadata'; "
+                             "EXPLAIN " + query + "; EXPLAIN " + query)
+            m = re.findall(r"rows=(\d+)", both)
+            assert len(m) == 2 and m[0] == m[1], (m, both)
+            rows = [int(m[0])]
+            assert 4000 <= rows[0] <= 6000, rows
 
             # quals ride ON TOP of the metadata tuples: 5000 tuples with
             # no pg_statistic NDV applies core's DEFAULT_NUM_DISTINCT(200)

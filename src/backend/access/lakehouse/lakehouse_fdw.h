@@ -94,7 +94,6 @@ extern bool lakehouse_trivial_count_shape(Query *parse);
 extern void ExtractOptions(Oid foreigntableid, Oid checkAsUser, LakehouseOptions *opts);
 
 /* fdw_plan.c */
-extern void lakehouse_fdw_plan_guc_init(void);
 extern void lakehouse_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 										Oid foreigntableid);
 extern void lakehouse_GetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,

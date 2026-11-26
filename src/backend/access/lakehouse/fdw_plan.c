@@ -343,10 +343,18 @@ planner_metadata_rows(Oid foreigntableid, int64 *rows_out)
 	PG_CATCH();
 	{
 		/*
-		 * restore the caller's context BEFORE touching the error state:
-		 * CopyErrorData/FlushErrorState allocate in CurrentMemoryContext
-		 * (pgindent-safe error path, telemetry.c precedent)
+		 * decline only statement-level errors: OOM/admin-shutdown FATALs must
+		 * propagate, not be swallowed into a planning fallback (telemetry.c
+		 * precedent). Restore the caller's context BEFORE touching the error
+		 * state: CopyErrorData/FlushErrorState allocate in
+		 * CurrentMemoryContext.
 		 */
+		ErrorData  *err = CopyErrorData();
+		bool		fatal = (err->elevel >= FATAL);
+
+		FreeErrorData(err);
+		if (fatal)
+			PG_RE_THROW();
 		MemoryContextSwitchTo(oldcxt);
 		if (session != NULL)
 			pg_datalake_scan_free(session);
@@ -402,10 +410,10 @@ lakehouse_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 
 	/*
 	 * mode = default, or metadata declined (fetch failed / clamped): leave
-	 * core's estimate untouched (rel->rows already = 1000)
+	 * core's estimate untouched — rel->rows is already core's rows=1000
+	 * default, and baserel->tuples < 0 here (the tuples >= 0 branch returned
+	 * above), so there is nothing further to compute.
 	 */
-	if (baserel->tuples >= 0)
-		set_baserel_size_estimates(root, baserel);
 }
 
 void
