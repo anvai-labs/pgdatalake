@@ -222,6 +222,7 @@ jobs:
           python3 src/test/lakehouse/fixtures/publish-table-check.py
           python3 src/test/lakehouse/fixtures/cte-barrier-check.py
           python3 src/test/lakehouse/fixtures/agg-pullup-check.py
+          python3 src/test/lakehouse/fixtures/relsize-check.py
           python3 src/test/lakehouse/fixtures/telemetry-stats-check.py
           python3 src/test/lakehouse/fixtures/scan-stats-check.py
           python3 src/test/lakehouse/fixtures/publication-ledger-load-check.py

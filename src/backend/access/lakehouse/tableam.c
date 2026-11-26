@@ -2475,7 +2475,7 @@ managed_read_status_error(enum PgDatalakeReadStatus status, const char *errbuf,
 }
 
 static char *
-managed_cred_string(const PgDatalakeCredentialBytes * bytes)
+managed_cred_string(const PgDatalakeCredentialBytes *bytes)
 {
 	char	   *value;
 
@@ -3740,7 +3740,7 @@ stage_slot(LakehouseWriteEntry *entry, TupleTableSlot *slot, TupleDesc tupdesc)
 
 /* The raw COW rewrite and UPDATE's row-version fetch both need a delete-free base. */
 static void
-check_cow_scan(ScanSession * session)
+check_cow_scan(ScanSession *session)
 {
 	if (pg_datalake_scan_has_deletes(session))
 		ereport(ERROR,
@@ -4663,6 +4663,9 @@ _PG_init(void)
 
 	/* spec 19 §4 (L0): telemetry GUCs — same "lakehouse." prefix */
 	lakehouse_telemetry_guc_init();
+
+	/* spec 19 §6.5 (family E): planner relsize GUCs */
+	lakehouse_fdw_plan_guc_init();
 
 	MarkGUCPrefixReserved("lakehouse");
 

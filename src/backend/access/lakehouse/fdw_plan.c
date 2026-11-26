@@ -39,6 +39,9 @@
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/hsearch.h"
+#include "utils/guc.h"
+#include "utils/memutils.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/cost.h"
 #include "utils/json.h"
@@ -164,6 +167,159 @@ lakehouse_GetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 	add_path(output_rel, &path->path);
 }
 
+/*
+ * Planner-visible relsize from Iceberg metadata (spec 19 §6.5, family E).
+ *
+ * Un-ANALYZEd foreign tables plan as rows=1000 (core's bogus default,
+ * costsize.c set_foreign_size_estimates). Against multi-million-row
+ * Iceberg tables that collapses the whole cost model: TPC-DS q4's
+ * six-way CTE self-join planned as Nested Loop chains because every
+ * input looked trivially small. The parquet record_count sums are exact
+ * and already paid for at execution — expose them at planning time.
+ *
+ * Session-lifetime cache (TopMemoryContext, key: relid): repeat planning
+ * (prepared statements, EXPLAIN loops) reuses the first fetch; a failed
+ * fetch is cached as rows = -1 so a wedged endpoint costs one attempt
+ * per rel per session. The cached rows go stale when the table is
+ * rewritten during the session — estimates, not correctness (the
+ * executor re-proves visibility), same staleness class as
+ * telemetry's stats_owner.
+ */
+#define PLAN_ROWS_DEFAULT 0
+#define PLAN_ROWS_METADATA 1
+
+static int	lakehouse_plan_rows_mode = PLAN_ROWS_METADATA;
+static double lakehouse_plan_rows_scale = 1.0;
+static double lakehouse_plan_rows_max = 1e12;
+
+typedef struct PlannerRowsEntry
+{
+	Oid			relid;			/* hash key (must be first) */
+	int64		rows;			/* -1 = cached fetch failure */
+	int64		snapshot_id;
+} PlannerRowsEntry;
+
+static HTAB *planner_rows_cache = NULL;
+
+static bool planner_metadata_rows(Oid foreigntableid, int64 *rows_out);
+
+void		lakehouse_fdw_plan_guc_init(void);
+
+void
+lakehouse_fdw_plan_guc_init(void)
+{
+	static const struct config_enum_entry plan_rows_modes[] = {
+		{"default", PLAN_ROWS_DEFAULT, false},
+		{"metadata", PLAN_ROWS_METADATA, false},
+		{NULL, 0, false}
+	};
+
+	DefineCustomEnumVariable("lakehouse.plan_rows_mode",
+							 "Foreign-table row estimates: \"metadata\" sums parquet record_counts at plan time, \"default\" keeps core's rows=1000.",
+							 NULL,
+							 &lakehouse_plan_rows_mode,
+							 PLAN_ROWS_METADATA,
+							 plan_rows_modes,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+	DefineCustomRealVariable("lakehouse.plan_rows_scale",
+							 "Multiplier applied to metadata-derived row estimates (per-profile L1 calibration, spec 19 §6.5).",
+							 NULL,
+							 &lakehouse_plan_rows_scale,
+							 1.0, 0.0001, 1e6,
+							 PGC_SUSET, 0,
+							 NULL, NULL, NULL);
+	DefineCustomRealVariable("lakehouse.plan_rows_max",
+							 "Sanity clamp on metadata-derived row estimates.",
+							 NULL,
+							 &lakehouse_plan_rows_max,
+							 1e12, 1, 1e15,
+							 PGC_SUSET, 0,
+							 NULL, NULL, NULL);
+}
+
+/*
+ * Exact row count for a foreign table from Iceberg metadata, cached per
+ * session. Fail-safe: any error (endpoint down, bad credentials, user
+ * mapping without secrets) is swallowed and returns false — planning
+ * falls back to core's default rather than failing the query. The
+ * user mapping is resolved against the invoker (GetUserId()); view
+ * indirection keeps planning local, matching GetForeignRelSize's
+ * permission precedent.
+ */
+static bool
+planner_metadata_rows(Oid foreigntableid, int64 *rows_out)
+{
+	PlannerRowsEntry *ent;
+	bool		found;
+	LakehouseOptions opts;
+	ScanSession *session = NULL;
+	int64		rows = 0;
+	MemoryContext oldcxt;
+
+	if (planner_rows_cache == NULL)
+	{
+		HASHCTL		ctl;
+
+		oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+		MemSet(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(PlannerRowsEntry);
+		planner_rows_cache = hash_create("lakehouse planner rows cache",
+										 64, &ctl,
+										 HASH_ELEM | HASH_BLOBS);
+		MemoryContextSwitchTo(oldcxt);
+	}
+
+	ent = (PlannerRowsEntry *) hash_search(planner_rows_cache,
+										   &foreigntableid,
+										   HASH_ENTER, &found);
+	if (found)
+	{
+		*rows_out = ent->rows;
+		return ent->rows >= 0;
+	}
+
+	/* seed the cache with the failure value: success overwrites below */
+	ent->rows = -1;
+	ent->snapshot_id = 0;
+
+	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+
+	PG_TRY();
+	{
+		ExtractOptions(foreigntableid, InvalidOid, &opts);
+		session = lakehouse_OpenSession(&opts, NULL);
+		for (uint64 i = 0; i < pg_datalake_scan_task_count(session); i++)
+			rows += pg_datalake_scan_task_rows(session, i);
+		ent->rows = rows;
+		ent->snapshot_id = pg_datalake_scan_snapshot_id(session);
+		pg_datalake_scan_free(session);
+		session = NULL;
+		elog(DEBUG1, "lakehouse planner relsize: relid %u rows " INT64_FORMAT
+			 " snapshot " INT64_FORMAT,
+			 foreigntableid, rows, ent->snapshot_id);
+	}
+	PG_CATCH();
+	{
+		/*
+		 * restore the caller's context BEFORE touching the error state:
+		 * CopyErrorData/FlushErrorState allocate in CurrentMemoryContext
+		 * (pgindent-safe error path, telemetry.c precedent)
+		 */
+		MemoryContextSwitchTo(oldcxt);
+		if (session != NULL)
+			pg_datalake_scan_free(session);
+		FlushErrorState();
+		return false;
+	}
+	PG_END_TRY();
+
+	MemoryContextSwitchTo(oldcxt);
+	*rows_out = ent->rows;
+	return true;
+}
+
 void
 lakehouse_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 							Oid foreigntableid)
@@ -171,7 +327,41 @@ lakehouse_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 	/*
 	 * ExecutorStart checks relation permissions before opening the scan. Keep
 	 * planning local, including plans for views. Use catalog statistics when
-	 * available and otherwise retain core's foreign-table estimate.
+	 * available; otherwise derive the estimate from Iceberg table metadata
+	 * (parquet record_count sums) — exact, fail-safe, cached per session.
+	 */
+	if (baserel->tuples >= 0)
+	{
+		set_baserel_size_estimates(root, baserel);
+		return;
+	}
+
+	if (lakehouse_plan_rows_mode == PLAN_ROWS_METADATA)
+	{
+		int64		rows;
+
+		if (planner_metadata_rows(foreigntableid, &rows) &&
+			rows >= 0 && (double) rows <= lakehouse_plan_rows_max)
+		{
+			double		scaled = (double) rows * lakehouse_plan_rows_scale;
+
+			/*
+			 * tuples drives set_baserel_size_estimates (quals selectivity
+			 * applies on top); pages feeds the foreign-scan cost in
+			 * GetForeignPaths (~100 rows per page-equivalent)
+			 */
+			baserel->tuples = scaled;
+			baserel->pages = Max(1, (int) Min(scaled / 100.0,
+											  (double) INT_MAX));
+			set_baserel_size_estimates(root, baserel);
+			return;
+		}
+		/* fall through: fail-safe keeps core's rows=1000 default */
+	}
+
+	/*
+	 * mode = default, or metadata declined (fetch failed / clamped): leave
+	 * core's estimate untouched (rel->rows already = 1000)
 	 */
 	if (baserel->tuples >= 0)
 		set_baserel_size_estimates(root, baserel);

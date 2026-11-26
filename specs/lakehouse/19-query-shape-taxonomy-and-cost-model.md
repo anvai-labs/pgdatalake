@@ -238,6 +238,47 @@ compare, SF100+ to trust).
    correctness only. Performance receipts come exclusively from the named
    profiles, cold-cache protocol documented per run.
 
+### 6.5 L1 seam — planner-visible foreign-table cardinality (landed 2026-11-26)
+
+The q4 profile (2026-11-26, both hardware profiles) exposed family E at its
+root: every un-ANALYZEd foreign table planned as core's rows=1000 default
+(costsize.c set_foreign_size_estimates), so the six-way `year_total` CTE
+self-join planned as Nested Loop chains over multi-million-row inputs. The
+relsize slice grounds the cost model in Iceberg metadata:
+
+- `lakehouse.plan_rows_mode = metadata` (default): when a foreign table has
+  no catalog statistics (reltuples < 0), GetForeignRelSize sums the
+  snapshot's parquet record_counts through a metadata-only scan session and
+  caches it per backend (key: relid; failed fetches cached so a dead
+  endpoint costs one attempt per session). `lakehouse.plan_rows_mode =
+  default` retains the core default as escape hatch.
+- `lakehouse.plan_rows_scale` (PGC_SUSET, default 1.0): per-profile
+  multiplier on metadata rows — the operator-facing L1 calibration knob.
+  Tuning loop: run the labeled sweep with `--profile-id`, fold
+  lakehouse.query_stats (per-query ms) against table_stats cardinalities via
+  scripts/perf/telemetry_report.py, adjust scale in postgresql.conf, repeat.
+  The model influences planning inputs ONLY; rewrite admission stays with
+  the L0 matcher (§6.1 doctrine unchanged).
+- Known residual (family E, next slice): join/column selectivity still uses
+  core defaults (DEFAULT_NUM_DISTINCT 200) without pg_statistic — q4's
+  outer CTE join stays Nested Loop until the ANALYZE/NDV slice populates
+  real per-column NDV from §4b column_stats. Fixture pins the current
+  estimate (5000-row table with one qual plans 5000/200 = 25 rows).
+- Fail-fast boundary (pre-existing contract, lakehouse.h): EXPLAIN runs
+  ExecutorStart(EXPLAIN_ONLY), and BeginForeignScan opens its session
+  unconditionally — an unreachable endpoint fails the statement at plan
+  time regardless of plan_rows_mode. The relsize fail-safe (decline to
+  core default) applies to metadata-fetch failures that occur BEFORE that
+  boundary (clamped rows, dead endpoint on a rel reached only through the
+  metadata path); the fixture pins both behaviors.
+
+Canonical data law (2026-11-26): ONE Iceberg dataset copy lives in the
+dataserver3 Garage bucket `warehouse`; compute servers target it over the
+network (WSL2 profile = remote-S3 latency class, ds3 profile = local class).
+Garage keys are imported (GK-format IDs, 64-hex secrets) so both stores
+accept identical credentials; the compose fixture stack (CI-fast tier)
+remains SeaweedFS until the compose-swap slice lands.
+
 
 ## 7. Exit criteria per layer
 
