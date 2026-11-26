@@ -212,9 +212,9 @@ jobs:
           export SCOPED_PGHOST="$RUNNER_TEMP/scoped-smoke" PGHOST="$SCOPED_PGHOST" PGPORT=52594
           mkdir -m 700 "$SCOPED_PGHOST"
           initdb -D "$SCOPED_PGHOST/data" -A trust -U "$PGUSER" --no-locale
-          # socket in /tmp (the runner default) so the fixture's psql finds
-          # it regardless of PGHOST propagation
-          pg_ctl -D "$SCOPED_PGHOST/data" -l "$SCOPED_PGHOST/server.log" -o "-k /tmp -p $PGPORT -c listen_addresses='' -c shared_preload_libraries=lakehouse -c lakehouse.publisher_enabled=off" -w start
+          # PGHOST and -k MUST agree: libpq treats a leading-slash PGHOST
+          # as the socket directory, and the fixture's psql inherits it
+          pg_ctl -D "$SCOPED_PGHOST/data" -l "$SCOPED_PGHOST/server.log" -o "-k $SCOPED_PGHOST -p $PGPORT -c listen_addresses='' -c shared_preload_libraries=lakehouse -c lakehouse.publisher_enabled=off" -w start
           python3 src/test/lakehouse/fixtures/scoped-read-check.py
           pg_ctl -D "$SCOPED_PGHOST/data" -m fast -w stop
           export PGHOST="$RUNNER_TEMP/cow-smoke" PGPORT=52592

@@ -30,7 +30,6 @@
 #include "optimizer/tlist.h"
 #include "parser/parse_collate.h"
 #include "parser/parsetree.h"
-#include "parser/parse_relation.h"
 #include "nodes/nodeFuncs.h"
 #include "access/sysattr.h"
 #include "access/table.h"
@@ -354,6 +353,20 @@ planner_metadata_rows(Oid foreigntableid, Oid checkAsUser, int64 *rows_out)
 		}
 		PG_CATCH();
 		{
+			/*
+			 * same FATAL policy as the sibling catch below: OOM/admin
+			 * shutdown propagate (they must not become a planning fallback);
+			 * statement-level errors decline the sizing
+			 */
+			ErrorData  *err;
+			bool		fatal;
+
+			MemoryContextSwitchTo(oldcxt);
+			err = CopyErrorData();
+			fatal = (err->elevel >= FATAL);
+			FreeErrorData(err);
+			if (fatal)
+				PG_RE_THROW();
 			FlushErrorState();
 		}
 		PG_END_TRY();
@@ -428,19 +441,14 @@ lakehouse_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 		!parse_is_trivial_count(root->parse))
 	{
 		/*
-		 * the principal the executor will scan under (view owner if set):
-		 * checkAsUser lives on the RTE's RTEPermissionInfo (parse-time)
+		 * the principal the executor will scan under: baserel->userid is
+		 * core-maintained for every shape (build_simple_rel, including
+		 * inheritance children via the parent) and is exactly what
+		 * create_plan copies into ForeignScan.checkAsUser (postgres_fdw
+		 * precedent: "should match what ExecCheckPermissions() does")
 		 */
-		RangeTblEntry *rte = (root->simple_rte_array != NULL &&
-							  baserel->relid > 0 &&
-							  baserel->relid < (Index) root->simple_rel_array_size)
-			? root->simple_rte_array[baserel->relid] : NULL;
-		RTEPermissionInfo *perminfo = (rte != NULL && rte->perminfoindex > 0)
-			? list_nth(root->parse->rteperminfos, rte->perminfoindex - 1)
-			: NULL;
-		Oid			checkAsUser = (perminfo != NULL &&
-								   OidIsValid(perminfo->checkAsUser))
-			? perminfo->checkAsUser : GetUserId();
+		Oid			checkAsUser = OidIsValid(baserel->userid)
+			? baserel->userid : GetUserId();
 		int64		rows;
 
 		if (planner_metadata_rows(foreigntableid, checkAsUser, &rows) &&
