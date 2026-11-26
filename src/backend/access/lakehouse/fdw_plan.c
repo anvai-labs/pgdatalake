@@ -326,25 +326,31 @@ planner_metadata_rows(Oid foreigntableid, int64 *rows_out)
 
 	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
 
+	/*
+	 * Options + the read-binding gate run OUTSIDE the TRY block: returning
+	 * from inside a PG_TRY body skips the macro's unwind bookkeeping, and a
+	 * later longjmp past this frame then trips glibc's __longjmp_chk
+	 * ("longjmp causes uninitialized stack frame", CI scoped-read crash).
+	 * ExtractOptions only ereports on misplaced catalog options — rejected
+	 * at DDL time, so a raise here means catalog corruption and may
+	 * propagate.
+	 */
+	ExtractOptions(foreigntableid, InvalidOid, &opts);
+
+	/*
+	 * read-binding servers (scoped reads, spec 12 authority model) keep the
+	 * exact single-session request choreography their fixtures script per
+	 * request (scope proofs are about precise request sequences, not planner
+	 * economics) — never size them at plan time.
+	 */
+	if (opts.read_binding.expected_table_uuid != NULL ||
+		opts.read_binding.storage_root != NULL ||
+		opts.read_binding.catalog_prefix != NULL ||
+		opts.read_binding.s3_region != NULL)
+		return false;
+
 	PG_TRY();
 	{
-		ExtractOptions(foreigntableid, InvalidOid, &opts);
-
-		/*
-		 * read-binding servers (scoped reads, spec 12 authority model) keep
-		 * the exact single-session request choreography their fixtures script
-		 * per request (scope proofs are about precise request sequences, not
-		 * planner economics) — never size them at plan time.
-		 */
-		if (opts.read_binding.expected_table_uuid != NULL ||
-			opts.read_binding.storage_root != NULL ||
-			opts.read_binding.catalog_prefix != NULL ||
-			opts.read_binding.s3_region != NULL)
-		{
-			MemoryContextSwitchTo(oldcxt);
-			return false;
-		}
-
 		session = lakehouse_OpenSession(&opts, NULL);
 		for (uint64 i = 0; i < pg_datalake_scan_task_count(session); i++)
 			rows += pg_datalake_scan_task_rows(session, i);
