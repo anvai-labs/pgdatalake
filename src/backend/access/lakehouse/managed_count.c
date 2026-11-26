@@ -487,52 +487,74 @@ match_agg_sublink_shape(SubLink *sl, Query *parse, AggPullupContext *ctx)
 
 	rtr = linitial_node(RangeTblRef, sq->jointree->fromlist);
 	rte = rt_fetch(rtr->rtindex, sq->rtable);
-	if (rte == NULL || rte->rtekind != RTE_CTE)
+	if (rte == NULL)
 		return decl(__LINE__);
 
 	/*
-	 * the CTE must resolve to THIS query's list (one level up from the
-	 * subselect): a name-shadowing inner WITH would bind differently, and its
-	 * copied RTE could not be re-homed (M2/13-review)
+	 * v2: the subselect source is either a CTE of this query (q1 family) or a
+	 * bare FOREIGN TABLE (the q6 family: item is a foreign table, not a CTE).
+	 * Local heap sources keep stock planning. An inner WITH in the subselect
+	 * declines (name-shadowing ambiguity, M2/13-review).
 	 */
-	if (rte->ctelevelsup != 1 || sq->cteList != NIL)
-		return decl(__LINE__);
-
-	/* the referenced CTE must be one of this query's CTEs */
-	foreach(lc, parse->cteList)
+	if (rte->rtekind == RTE_CTE)
 	{
-		cte = lfirst_node(CommonTableExpr, lc);
+		/*
+		 * the CTE must resolve to THIS query's list (one level up from the
+		 * subselect): a name-shadowing inner WITH would bind differently, and
+		 * its copied RTE could not be re-homed (M2/13-review)
+		 */
+		if (rte->ctelevelsup != 1 || sq->cteList != NIL)
+			return decl(__LINE__);
 
-		if (strcmp(cte->ctename, rte->ctename) == 0)
+		/* the referenced CTE must be one of this query's CTEs */
+		foreach(lc, parse->cteList)
 		{
-			ctx->cte_name = cte->ctename;
-			break;
+			cte = lfirst_node(CommonTableExpr, lc);
+
+			if (strcmp(cte->ctename, rte->ctename) == 0)
+			{
+				ctx->cte_name = cte->ctename;
+				break;
+			}
 		}
+		if (ctx->cte_name == NULL)
+			return decl(__LINE__);
+
+		/*
+		 * the CTE body must scan a foreign table: the per-row rescans are
+		 * catastrophic there; local CTEs keep stock planning
+		 */
+		if (!foreign_rte_walker((Node *) cte->ctequery, NULL))
+			return decl(__LINE__);
+
+		/* locate the outer CTE alias among the outer rtable entries */
+		for (int i = 1; i <= list_length(parse->rtable); i++)
+		{
+			RangeTblEntry *r = rt_fetch(i, parse->rtable);
+
+			if (r != NULL && r->rtekind == RTE_CTE &&
+				strcmp(r->ctename, rte->ctename) == 0)
+			{
+				ctx->outer_rtindex = i;
+				found_outer_rte = true;
+				break;
+			}
+		}
+		if (!found_outer_rte)
+			return decl(__LINE__);
 	}
-	if (ctx->cte_name == NULL)
-		return decl(__LINE__);
-
-	/*
-	 * the CTE body must scan a foreign table: the per-row rescans are
-	 * catastrophic there; local CTEs keep stock planning
-	 */
-	if (!foreign_rte_walker((Node *) cte->ctequery, NULL))
-		return decl(__LINE__);
-
-	/* locate the outer CTE alias among the outer rtable entries */
-	for (int i = 1; i <= list_length(parse->rtable); i++)
+	else if (rte->rtekind == RTE_RELATION &&
+			 rte->relkind == RELKIND_FOREIGN_TABLE)
 	{
-		RangeTblEntry *r = rt_fetch(i, parse->rtable);
-
-		if (r != NULL && r->rtekind == RTE_CTE &&
-			strcmp(r->ctename, rte->ctename) == 0)
-		{
-			ctx->outer_rtindex = i;
-			found_outer_rte = true;
-			break;
-		}
+		/*
+		 * bare foreign table (q6 family): the outer reference is whichever
+		 * rtable entry the correlation equalities point at, derived from the
+		 * WHERE conjuncts below. No same-table requirement: the equivalence
+		 * holds for any outer table joined on the correlation keys (the
+		 * aggregate reads the inner table only).
+		 */
 	}
-	if (!found_outer_rte)
+	else
 		return decl(__LINE__);
 	ctx->inner_rtindex = rtr->rtindex;
 
@@ -564,7 +586,96 @@ match_agg_sublink_shape(SubLink *sl, Query *parse, AggPullupContext *ctx)
 		ctx->agg_collid = exprCollation(te_expr);
 	}
 
-	/* WHERE: conjuncts of correlated equalities only (>= 1) */
+	/*
+	 * WHERE: conjuncts of correlated equalities only (>= 1). For the
+	 * bare-foreign-table path the outer alias is not known yet — derive it
+	 * from the level-1 Vars in the conjuncts first: all outer references must
+	 * name ONE rtable entry, whose RTE must itself be a foreign table (the
+	 * correlation keys join the outer rows to the inner aggregate; the
+	 * subselect reads the inner table only).
+	 */
+	if (sq->jointree->quals == NULL)
+		return decl(__LINE__);
+	where = (Node *) sq->jointree->quals;
+	if (ctx->outer_rtindex == 0)
+	{
+		int			outer_varno = -1;
+		ListCell   *varcell;
+
+		elog(DEBUG1, "agg-pullup: foreign-path pre-pass, quals top=%d",
+			 IsA(where, OpExpr) ? T_OpExpr :
+			 IsA(where, BoolExpr) ? T_BoolExpr : -1);
+
+		if (IsA(where, OpExpr))
+		{
+			foreach(varcell, ((OpExpr *) where)->args)
+			{
+				Node	   *arg = lfirst(varcell);
+
+				while (arg != NULL && IsA(arg, RelabelType))
+					arg = (Node *) ((RelabelType *) arg)->arg;
+				if (arg != NULL && IsA(arg, Var) &&
+					((Var *) arg)->varlevelsup == 1)
+				{
+					int			v = ((Var *) arg)->varno;
+
+					if (outer_varno == -1)
+						outer_varno = v;
+					else if (outer_varno != v)
+						return decl(__LINE__);
+				}
+			}
+		}
+		else if (IsA(where, BoolExpr) &&
+				 ((BoolExpr *) where)->boolop == AND_EXPR)
+		{
+			foreach(varcell, ((BoolExpr *) where)->args)
+			{
+				Node	   *conj = lfirst(varcell);
+
+				if (!IsA(conj, OpExpr))
+					continue;
+				foreach(varcell, ((OpExpr *) conj)->args)
+				{
+					Node	   *arg = lfirst(varcell);
+
+					while (arg != NULL && IsA(arg, RelabelType))
+						arg = (Node *) ((RelabelType *) arg)->arg;
+					if (arg != NULL && IsA(arg, Var) &&
+						((Var *) arg)->varlevelsup == 1)
+					{
+						int			v = ((Var *) arg)->varno;
+
+						if (outer_varno == -1)
+							outer_varno = v;
+						else if (outer_varno != v)
+							return decl(__LINE__);
+					}
+				}
+			}
+		}
+		elog(DEBUG1, "agg-pullup: foreign-path outer_varno=%d natts-check next",
+			 outer_varno);
+		if (outer_varno <= 0)
+			return decl(__LINE__);
+		{
+			/*
+			 * the outer Vars live in the OUTER query's rtable (level-1 from
+			 * the subselect's perspective), not in sq->rtable
+			 */
+			RangeTblEntry *r = rt_fetch(outer_varno, parse->rtable);
+
+			if (r == NULL || r->rtekind != RTE_RELATION ||
+				r->relkind != RELKIND_FOREIGN_TABLE)
+			{
+				elog(DEBUG1, "agg-pullup: foreign-path outer RTE %d not foreign (kind=%d rel=%c)",
+					 outer_varno, r ? (int) r->rtekind : -1,
+					 r ? r->relkind : '?');
+				return decl(__LINE__);
+			}
+		}
+		ctx->outer_rtindex = outer_varno;
+	}
 	if (sq->jointree->quals == NULL)
 		return decl(__LINE__);
 	where = (Node *) sq->jointree->quals;
@@ -689,7 +800,7 @@ pullup_cte_agg_sublinks(Query *parse)
 	int			i;
 
 	memset(&ctx, 0, sizeof(ctx));
-	if (parse->cteList == NIL || parse->jointree == NULL ||
+	if (parse->jointree == NULL ||
 		parse->jointree->quals == NULL || parse->jointree->fromlist == NIL ||
 		IsInParallelMode())
 		return;
@@ -801,6 +912,20 @@ pullup_cte_agg_sublinks(Query *parse)
 	gq->hasAggs = true;
 	rte = rt_fetch(ctx.inner_rtindex, ((Query *) sl->subselect)->rtable);
 	nrte = copyObject(rte);
+
+	/*
+	 * PG16+: an RTE with relid MUST carry a perminfoindex into the new
+	 * subquery's perminfo list — copy the subselect's entry and point at it
+	 * (gq's rtable has exactly one entry, so index 1).
+	 */
+	if (rte->perminfoindex != 0)
+	{
+		RTEPermissionInfo *pinfo = list_nth(((Query *) sl->subselect)->rteperminfos,
+											rte->perminfoindex - 1);
+
+		gq->rteperminfos = lappend(gq->rteperminfos, copyObject(pinfo));
+		nrte->perminfoindex = list_length(gq->rteperminfos);
+	}
 
 	/*
 	 * keep the copied CTE RTE's alias/eref (colnames match the CTE output
