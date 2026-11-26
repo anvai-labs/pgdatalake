@@ -206,7 +206,17 @@ jobs:
           sh src/test/lakehouse/fixtures/cow-delete-guard.sh
           python3 src/test/lakehouse/fixtures/catalog-reply-loss-check.py
           COUNT_FORK_SMOKE=1 python3 src/test/lakehouse/fixtures/fdw-count-check.py
+          # dedicated server + log: the shared cow-smoke postmaster's log
+          # gets redirected by restart fixtures, losing crash evidence —
+          # scoped-read's own window stays here (uploaded in testlogs)
+          export SCOPED_PGHOST="$RUNNER_TEMP/scoped-smoke" PGPORT=52594
+          mkdir -m 700 "$SCOPED_PGHOST"
+          initdb -D "$SCOPED_PGHOST/data" -A trust -U "$PGUSER" --no-locale
+          pg_ctl -D "$SCOPED_PGHOST/data" -l "$SCOPED_PGHOST/server.log" -o "-k $SCOPED_PGHOST -p $PGPORT -c listen_addresses='' -c shared_preload_libraries=lakehouse -c lakehouse.publisher_enabled=off" -w start
           python3 src/test/lakehouse/fixtures/scoped-read-check.py
+          pg_ctl -D "$SCOPED_PGHOST/data" -m fast -w stop
+          unset PGPORT
+          export PGPORT=52592
           rust_target="$PWD/build/src/backend/access/lakehouse/rust-target"
           (
             cd src/backend/access/lakehouse/core
@@ -306,5 +316,6 @@ jobs:
             build/testrun/
             ${{ runner.temp }}/cow-smoke/server.log
             ${{ runner.temp }}/stock-fdw-smoke/server.log
+            ${{ runner.temp }}/scoped-smoke/server.log
           if-no-files-found: ignore
           retention-days: 7
