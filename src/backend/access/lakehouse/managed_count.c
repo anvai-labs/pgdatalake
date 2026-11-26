@@ -32,6 +32,7 @@
 #include "executor/spi.h"
 #include "storage/lmgr.h"
 #include "fmgr.h"
+#include "utils/guc.h"
 #include "utils/typcache.h"
 #include "miscadmin.h"
 #include "nodes/parsenodes.h"
@@ -66,6 +67,28 @@ static planner_hook_type prev_planner_hook = NULL;
  * PERMANENTLY fails (published segments) that is an infinite loop.
  */
 static bool count_exec_in_fallback = false;
+
+/*
+ * operator gate for the correlated-aggregate pullup rewrite (spec 19 §5
+ * remedy registry): ON by default; OFF restores the per-row SubPlan for
+ * the q1/q6 shapes so A/B receipts (pullup x relsize, §6.5) can attribute
+ * wins and an operator has an escape hatch if a shape misbehaves. This is
+ * an OPERATOR gate only — it never participates in admission decisions
+ * (the L2 doctrine: estimates and models never enable or disable rewrites).
+ */
+bool		lakehouse_agg_pullup_enabled = true;
+
+void
+lakehouse_agg_pullup_guc_init(void)
+{
+	DefineCustomBoolVariable("lakehouse.agg_pullup",
+							 "Enable the correlated-aggregate pullup rewrite (q1/q6 shapes).",
+							 NULL,
+							 &lakehouse_agg_pullup_enabled,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+}
 
 static Oid	lh_am_oid_cache = InvalidOid;
 
@@ -1183,7 +1206,8 @@ lakehouse_count_exec_planner(Query *parse, const char *query_string,
 		rewrite_to_managed_count(parse, relid, bound);
 	}
 
-	pullup_cte_agg_sublinks(parse);
+	if (lakehouse_agg_pullup_enabled)
+		pullup_cte_agg_sublinks(parse);
 
 	if (prev_planner_hook != NULL)
 		return prev_planner_hook(parse, query_string, cursorOptions,
