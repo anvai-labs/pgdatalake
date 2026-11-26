@@ -209,7 +209,8 @@ jobs:
           # dedicated server + log: the shared cow-smoke postmaster's log
           # gets redirected by restart fixtures, losing crash evidence —
           # scoped-read's own window stays here (uploaded in testlogs)
-          export SCOPED_PGHOST="$RUNNER_TEMP/scoped-smoke" PGHOST="$SCOPED_PGHOST" PGPORT=52594
+          export SCOPED_PGHOST="$RUNNER_TEMP/scoped-smoke"
+          export PGHOST="$SCOPED_PGHOST" PGPORT=52594
           mkdir -m 700 "$SCOPED_PGHOST"
           initdb -D "$SCOPED_PGHOST/data" -A trust -U "$PGUSER" --no-locale
           # PGHOST and -k MUST agree: libpq treats a leading-slash PGHOST
