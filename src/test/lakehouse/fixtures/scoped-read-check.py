@@ -184,7 +184,13 @@ def exercise(db, parent, child, prefix, route, enrolled):
                 assert object_requests and all(
                     path.startswith(root_path + "/") for _, path in object_requests
                 ), object_requests
-                assert object_requests.count(("GET", metadata_path)) == 1, object_requests
+                # the metadata fetch happens TWICE per query since the
+                # relsize slice (plan-time sizing session + executor's
+                # snapshot-pinned session; the Rust block cache is
+                # session-scoped, so no cross-session dedup). Scope is
+                # still exact: every path stays under root_path and the
+                # manifest trio never reaches outside it.
+                assert object_requests.count(("GET", metadata_path)) == 2, object_requests
                 print(f"{name}: {len(object_requests)} scoped storage requests", flush=True)
 
             state["case"] = "warm-then-sibling"
