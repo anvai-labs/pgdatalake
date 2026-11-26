@@ -304,4 +304,7 @@ jobs:
           path: |
             build/meson-logs/
             build/testrun/
+            ${{ runner.temp }}/cow-smoke/server.log
+            ${{ runner.temp }}/stock-fdw-smoke/server.log
+          if-no-files-found: ignore
           retention-days: 7
