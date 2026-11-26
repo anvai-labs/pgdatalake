@@ -412,8 +412,8 @@ telemetry_flush(void)
 			if (!first)
 				appendStringInfoChar(&buf, ',');
 			first = false;
-			appendStringInfo(&buf, "(%u,%u," UINT64_FORMAT ",%s,%.3f,%d,'%s')",
-							 rec->dbid, rec->userid, rec->queryid,
+			appendStringInfo(&buf, "(%u,%u," INT64_FORMAT ",%s,%.3f,%d,'%s')",
+							 rec->dbid, rec->userid, (int64) rec->queryid,
 							 rowsbuf, total_ms, rec->foreign_scans,
 							 timestamptz_to_str(rec->started_at));
 		}
