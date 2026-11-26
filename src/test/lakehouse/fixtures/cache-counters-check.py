@@ -21,24 +21,22 @@ S3_AK = os.getenv("LH_S3_ACCESS_KEY", "lakehouse-test")
 S3_SK = os.getenv("LH_S3_SECRET_KEY", "lakehouse-test-password")
 
 
-def scan_with_counters(name, query):
-    """Run scan + counter reads in ONE psql invocation: the block cache is
-    per-backend, so separate sql() calls (fresh backend each) would all
-    read zeros and prove nothing."""
-    out = sql(name, "SELECT hits, misses, fetched_bytes, used_bytes, entries "
-                    "FROM lakehouse.cache_stats(); "
-                    f"{query}; "
-                    "SELECT hits, misses, fetched_bytes, used_bytes, entries "
-                    "FROM lakehouse.cache_stats()")
+def warm_rescan_proof(name, query):
+    """Two scans + three counter reads in ONE psql invocation: the block
+    cache is per-backend, so separate sql() calls (fresh backend each)
+    would all read zeros. Returns (before, after_scan1, after_scan2)."""
+    reads = ("SELECT hits, misses, fetched_bytes, used_bytes, entries "
+             "FROM lakehouse.cache_stats()")
+    out = sql(name, f"{reads}; {query}; {reads}; {query}; {reads}")
     lines = [ln for ln in out.split("\n") if "|" in ln]
-    assert len(lines) == 2, out
+    assert len(lines) == 3, out
 
     def parse(ln):
         h, m, f, u, e = [int(x) for x in ln.split("|")]
         return {"hits": h, "misses": m, "fetched": f, "used": u,
                 "entries": e}
 
-    return parse(lines[0]), parse(lines[1])
+    return parse(lines[0]), parse(lines[1]), parse(lines[2])
 
 
 def main():
@@ -68,22 +66,17 @@ def main():
                     OPTIONS (table '{ns}.events');
             """)
 
-            # first scan in a fresh backend: cold — fills the cache
-            # (footers + data ranges), so misses grow and fetched_bytes
-            # accumulates
-            s0, s1 = scan_with_counters(name, "SELECT sum(id) FROM events")
-            assert s1["fetched"] > s0["fetched"], (s0, s1)
+            # one backend: cold scan fills the cache (misses grow,
+            # fetched_bytes accumulates), the warm re-scan adds ZERO
+            # fetched bytes and serves from hits (§6.2 no-invalidation
+            # law: immutable entries stay valid — the WORM proof)
+            a, b, c = warm_rescan_proof(name, "SELECT sum(id) FROM events")
+            assert b["fetched"] > a["fetched"], (a, b)
+            assert c["fetched"] == b["fetched"], (b, c)
+            assert c["hits"] > b["hits"], (b, c)
 
-            # second scan in a SECOND fresh backend still misses once
-            # (per-backend cache), but within that backend the warm
-            # re-scan must add ZERO fetched bytes while hits grow
-            # (§6.2 no-invalidation law: immutable entries stay valid)
-            s2, s3 = scan_with_counters(name, "SELECT sum(id) FROM events")
-            assert s3["fetched"] == s2["fetched"], (s2, s3)
-            assert s3["hits"] > s2["hits"], (s2, s3)
-
-            print(f'{{"case": "cache-counters", "hits": {s3["hits"]}, '
-                  f'"misses": {s3["misses"]}, "fetched": {s3["fetched"]}}}',
+            print(f'{{"case": "cache-counters", "hits": {c["hits"]}, '
+                  f'"misses": {c["misses"]}, "fetched": {c["fetched"]}}}',
                   flush=True)
         finally:
             sql("postgres", f"DROP DATABASE {name} WITH (FORCE)")
