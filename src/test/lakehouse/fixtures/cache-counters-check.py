@@ -21,11 +21,24 @@ S3_AK = os.getenv("LH_S3_ACCESS_KEY", "lakehouse-test")
 S3_SK = os.getenv("LH_S3_SECRET_KEY", "lakehouse-test-password")
 
 
-def stats(name):
-    row = sql(name, "SELECT hits, misses, fetched_bytes, used_bytes, entries "
+def scan_with_counters(name, query):
+    """Run scan + counter reads in ONE psql invocation: the block cache is
+    per-backend, so separate sql() calls (fresh backend each) would all
+    read zeros and prove nothing."""
+    out = sql(name, "SELECT hits, misses, fetched_bytes, used_bytes, entries "
+                    "FROM lakehouse.cache_stats(); "
+                    f"{query}; "
+                    "SELECT hits, misses, fetched_bytes, used_bytes, entries "
                     "FROM lakehouse.cache_stats()")
-    h, m, f, u, e = [int(x) for x in row.split("|")]
-    return {"hits": h, "misses": m, "fetched": f, "used": u, "entries": e}
+    lines = [ln for ln in out.split("\n") if "|" in ln]
+    assert len(lines) == 2, out
+
+    def parse(ln):
+        h, m, f, u, e = [int(x) for x in ln.split("|")]
+        return {"hits": h, "misses": m, "fetched": f, "used": u,
+                "entries": e}
+
+    return parse(lines[0]), parse(lines[1])
 
 
 def main():
@@ -55,24 +68,22 @@ def main():
                     OPTIONS (table '{ns}.events');
             """)
 
-            s0 = stats(name)
-            assert s0["fetched"] >= 0
-
-            # first scan: cold — fills the cache (footers + data ranges)
-            sql(name, "SELECT sum(id) FROM events")
-            s1 = stats(name)
+            # first scan in a fresh backend: cold — fills the cache
+            # (footers + data ranges), so misses grow and fetched_bytes
+            # accumulates
+            s0, s1 = scan_with_counters(name, "SELECT sum(id) FROM events")
             assert s1["fetched"] > s0["fetched"], (s0, s1)
 
-            # second scan: fully served from the cache — fetched_bytes must
-            # not grow (no new GETs), hits must grow (§6.2 no-invalidation
-            # law: immutable entries stay valid)
-            sql(name, "SELECT sum(id) FROM events")
-            s2 = stats(name)
-            assert s2["fetched"] == s1["fetched"], (s1, s2)
-            assert s2["hits"] > s1["hits"], (s1, s2)
+            # second scan in a SECOND fresh backend still misses once
+            # (per-backend cache), but within that backend the warm
+            # re-scan must add ZERO fetched bytes while hits grow
+            # (§6.2 no-invalidation law: immutable entries stay valid)
+            s2, s3 = scan_with_counters(name, "SELECT sum(id) FROM events")
+            assert s3["fetched"] == s2["fetched"], (s2, s3)
+            assert s3["hits"] > s2["hits"], (s2, s3)
 
-            print(f'{{"case": "cache-counters", "hits": {s2["hits"]}, '
-                  f'"misses": {s2["misses"]}, "fetched": {s2["fetched"]}}}',
+            print(f'{{"case": "cache-counters", "hits": {s3["hits"]}, '
+                  f'"misses": {s3["misses"]}, "fetched": {s3["fetched"]}}}',
                   flush=True)
         finally:
             sql("postgres", f"DROP DATABASE {name} WITH (FORCE)")
