@@ -34,7 +34,7 @@ def main():
     trino(f"CREATE TABLE {item_table} (i_item_sk bigint, i_current_price double, i_category varchar) "
           "WITH (format_version = 2)")
     trino(f"INSERT INTO {item_table} "
-          "SELECT x, 'cat' || CAST(x % 2 AS varchar), 10.0 "
+          "SELECT x, CAST(10.0 AS double), 'cat' || CAST(x % 2 AS varchar) "
           "FROM UNNEST(sequence(1, 100)) u(x)")
     try:
         sql("postgres", f"CREATE DATABASE {name} TEMPLATE template0 "
