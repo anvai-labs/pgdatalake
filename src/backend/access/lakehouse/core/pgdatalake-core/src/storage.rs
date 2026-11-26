@@ -174,9 +174,14 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
-// A new network handle must get bytes from the store before serving a cache
-// hit. The same credentials can have different permissions after reopening.
-static NEXT_REMOTE_CACHE_SCOPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// Remote cache identity is STABLE per location (endpoint|bucket): byte
+// ranges of immutable paths are valid forever (spec 15 §6.2), so the
+// block cache must be reusable across handles — the measurement gate
+// (lakehouse.cache_stats + cache-counters-check) showed per-handle
+// scopes reduce cross-query hit ratio to ZERO (2026-11-26: 0 hits after
+// a warm re-scan). Auth freshness is unaffected: only GETs authorize,
+// through the opening handle's client as before; cached bytes need no
+// GET and carry no credential state.
 
 /// An open handle to one object-store location.
 ///
@@ -292,16 +297,14 @@ impl StorageIo {
         // bucket), or relative to the prefix for Local (which is why the
         // local store is opened rooted). No re-prefixing happens here.
         //
-        let scope_id = match loc {
-            Location::Local { root } => format!("local:{root}"),
-            Location::S3 { .. } | Location::Http { .. } => {
-                use std::sync::atomic::Ordering::Relaxed;
-
-                let scope = NEXT_REMOTE_CACHE_SCOPE
-                    .try_update(Relaxed, Relaxed, |id| id.checked_add(1))
-                    .map_err(|_| StorageError::Config("remote cache scope exhausted".into()))?;
-                format!("remote:{scope}")
-            }
+        let scope_id = match (loc, s3) {
+            (Location::Local { root }, _) => format!("local:{root}"),
+            (Location::S3 { bucket, .. }, Some(opts)) => format!(
+                "remote:{}|{bucket}",
+                opts.endpoint.as_deref().unwrap_or("aws"),
+            ),
+            (Location::Http { url }, _) => format!("remote:{url}"),
+            (Location::S3 { bucket, .. }, None) => format!("remote:aws|{bucket}"),
         };
         Ok(Self {
             scope_id: scope_id.into(),
