@@ -465,6 +465,11 @@ match_agg_sublink_shape(SubLink *sl, Query *parse, AggPullupContext *ctx)
 
 	/* a declined earlier candidate must not leave stale match state */
 	ctx->cte_name = NULL;
+	ctx->outer_rtindex = 0;
+	ctx->inner_rtindex = 0;
+	ctx->agg_type = InvalidOid;
+	ctx->agg_typmod = -1;
+	ctx->agg_collid = InvalidOid;
 	ctx->corr_inner_attnos = NIL;
 	ctx->corr_outer_attnos = NIL;
 	ctx->corr_types = NIL;
@@ -480,11 +485,14 @@ match_agg_sublink_shape(SubLink *sl, Query *parse, AggPullupContext *ctx)
 		sq->windowClause != NIL || sq->limitOffset != NULL ||
 		sq->limitCount != NULL || sq->setOperations != NULL ||
 		sq->distinctClause != NIL || sq->hasTargetSRFs ||
+		sq->hasModifyingCTE ||
 		sq->jointree == NULL ||
 		list_length(sq->jointree->fromlist) != 1 ||
 		!sq->hasAggs)
 		return decl(__LINE__);
 
+	if (!IsA(linitial(sq->jointree->fromlist), RangeTblRef))
+		return decl(__LINE__);
 	rtr = linitial_node(RangeTblRef, sq->jointree->fromlist);
 	rte = rt_fetch(rtr->rtindex, sq->rtable);
 	if (rte == NULL)
@@ -805,21 +813,66 @@ pullup_cte_agg_sublinks(Query *parse)
 		IsInParallelMode())
 		return;
 
-	/* find the first OpExpr carrying a matching correlated-agg SubLink */
+	/*
+	 * find the first OpExpr carrying a matching correlated-agg SubLink. The
+	 * SubLink may sit one level deep inside a scalar expression over it (the
+	 * real q6 shape: i.price > 1.2 * (sublink) — OpExpr(>) with an
+	 * OpExpr(*) arg), so descend into non-SubLink args of the top OpExpr as
+	 * well. The candidate stays the TOP OpExpr (the strict outer comparison
+	 * is checked on it).
+	 */
 	if (IsA(parse->jointree->quals, OpExpr))
 	{
 		OpExpr	   *op = (OpExpr *) parse->jointree->quals;
 		ListCell   *a;
+		bool		found = false;
 
 		foreach(a, op->args)
 		{
-			if (IsA(lfirst(a), SubLink) &&
-				match_agg_sublink_shape((SubLink *) lfirst(a), parse, &ctx))
+			if (IsA(lfirst(a), SubLink))
 			{
-				candidate = op;
-				sl = lfirst_node(SubLink, a);
-				break;
+				found = true;
+				if (match_agg_sublink_shape((SubLink *) lfirst(a), parse,
+											&ctx))
+				{
+					candidate = op;
+					sl = lfirst_node(SubLink, a);
+					break;
+				}
 			}
+			else if (IsA(lfirst(a), OpExpr))
+			{
+				OpExpr	   *inner = (OpExpr *) lfirst(a);
+				ListCell   *a2;
+
+				foreach(a2, inner->args)
+				{
+					if (IsA(lfirst(a2), SubLink))
+					{
+						found = true;
+						if (match_agg_sublink_shape((SubLink *) lfirst(a2),
+													parse, &ctx))
+						{
+							candidate = op;
+							sl = lfirst_node(SubLink, a2);
+							break;
+						}
+					}
+				}
+				if (sl != NULL)
+					break;
+			}
+		}
+		if (found && sl == NULL)
+		{
+			/*
+			 * the quals contain correlated-agg candidate SubLinks but no
+			 * shape matched — say so (B1/verification: silent declines hid
+			 * exactly this class in the v2 review)
+			 */
+			elog(DEBUG1, "agg-pullup: quals contain candidate SubLinks but "
+				 "no shape matched");
+			return;
 		}
 	}
 
@@ -832,30 +885,66 @@ pullup_cte_agg_sublinks(Query *parse)
 			 ((BoolExpr *) parse->jointree->quals)->boolop == AND_EXPR)
 	{
 		ListCell   *a;
+		bool		found = false;
 
 		foreach(a, ((BoolExpr *) parse->jointree->quals)->args)
 		{
 			Node	   *arg = lfirst(a);
+			ListCell   *a2;
+			bool		arg_found = false;
 
 			if (!IsA(arg, OpExpr))
 				continue;
 			{
-				ListCell   *a2;
+				ListCell   *a3;
 
-				foreach(a2, ((OpExpr *) arg)->args)
+				foreach(a3, ((OpExpr *) arg)->args)
 				{
-					if (IsA(lfirst(a2), SubLink) &&
-						match_agg_sublink_shape((SubLink *) lfirst(a2),
-												parse, &ctx))
+					if (IsA(lfirst(a3), SubLink))
 					{
-						candidate = (OpExpr *) arg;
-						sl = lfirst_node(SubLink, a2);
-						break;
+						found = true;
+						if (match_agg_sublink_shape((SubLink *) lfirst(a3),
+													parse, &ctx))
+						{
+							candidate = (OpExpr *) arg;
+							sl = lfirst_node(SubLink, a3);
+							arg_found = true;
+							break;
+						}
+					}
+					else if (IsA(lfirst(a3), OpExpr))
+					{
+						OpExpr	   *inner = (OpExpr *) lfirst(a3);
+						ListCell   *a4;
+
+						foreach(a4, inner->args)
+						{
+							if (IsA(lfirst(a4), SubLink))
+							{
+								found = true;
+								if (match_agg_sublink_shape(
+															(SubLink *) lfirst(a4), parse, &ctx))
+								{
+									candidate = (OpExpr *) arg;
+									sl = lfirst_node(SubLink, a4);
+									arg_found = true;
+									break;
+								}
+							}
+						}
+						if (sl != NULL)
+							break;
 					}
 				}
 			}
-			if (candidate != NULL)
+			if (arg_found)
 				break;
+		}
+		if (found && sl == NULL)
+		{
+			elog(DEBUG1, "agg-pullup: quals contain candidate SubLinks but "
+				 "no shape matched");
+			return;
 		}
 	}
 	if (candidate == NULL)
