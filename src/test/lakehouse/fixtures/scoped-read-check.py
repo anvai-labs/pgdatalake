@@ -174,7 +174,13 @@ def exercise(db, parent, child, prefix, route, enrolled):
                 object_requests.clear()
                 actual = sql(db, f"SELECT id FROM {name} ORDER BY id")
                 assert actual == expected, (name, actual)
-                assert catalog_requests == [("GET", route)], catalog_requests
+                # TWO loads of the SAME route per query since the relsize
+                # slice (spec 19 §6.5): one at plan time (planner-visible
+                # relsize metadata session, cached per relid per backend)
+                # and one at execution (snapshot-pinned session). The scope
+                # invariant is unchanged: only this route is touched, never
+                # a namespace LIST or any other endpoint.
+                assert catalog_requests == [("GET", route)] * 2, catalog_requests
                 assert object_requests and all(
                     path.startswith(root_path + "/") for _, path in object_requests
                 ), object_requests
@@ -213,7 +219,10 @@ def exercise(db, parent, child, prefix, route, enrolled):
                 catalog_requests.clear()
                 object_requests.clear()
                 sql(db, "SELECT id FROM child_rows", error=sqlstate)
-                assert catalog_requests == [("GET", route)], (case, catalog_requests)
+                # plan-time sizing load + executor load (see above); the
+                # crafted reply is served to both, so the failing sqlstate
+                # still comes from the executor's session
+                assert catalog_requests == [("GET", route)] * 2, (case, catalog_requests)
                 expected = [("GET", metadata_path)] if expect_metadata else []
                 assert object_requests == expected, (case, object_requests)
                 if case.startswith("oversized-"):
