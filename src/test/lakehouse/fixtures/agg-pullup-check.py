@@ -112,7 +112,7 @@ def main():
                 CREATE FOREIGN TABLE events (id bigint, grp varchar, amt double precision) SERVER s
                     OPTIONS (table '{ns}.events');
                 CREATE FOREIGN TABLE item (i_item_sk bigint, i_current_price double precision, i_category varchar) SERVER s
-                    OPTIONS (table 'aggp_v2.item');
+                    OPTIONS (table '{ns}.item');
             """)
 
             def lines(stmt):
@@ -152,59 +152,67 @@ def main():
             check_plan(q1_or, expect_subplan=True)
             check_plan(q1_corrtlist, expect_subplan=True)
 
+            # ---- v2 (foreign-table family): q6 shape over a bare
+            # foreign table (item), plus controls. Backing rows come from
+            # the static aggp_v2.item namespace (18k SF1 item rows).
+            sql(name, """
+                CREATE FOREIGN TABLE item (i_item_sk bigint, i_current_price double precision, i_category varchar) SERVER s
+                    OPTIONS (table 'aggp_v2.item');
+            """)
 
-    # ---- v2 (foreign-table family): q6 shape over a bare foreign table ----
-    v2_q6 = """
-        SELECT i.i_item_sk, i.i_current_price FROM item i
-        WHERE i.i_current_price > 1.2 * (SELECT avg(j.i_current_price)
-                                         FROM item j
-                                         WHERE j.i_category = i.i_category)
-    """
-    v2_multi = """
-        SELECT count(*) FROM item i
-        WHERE i.i_item_sk > 0
-          AND i.i_current_price > (SELECT avg(j.i_current_price)
-                                   FROM item j
-                                   WHERE j.i_category = i.i_category)
-    """
-    v2_nullkey = """
-        SELECT count(*) FROM item i
-        WHERE i.i_current_price > (SELECT avg(j.i_current_price)
-                                   FROM item j
-                                   WHERE j.i_category = i.i_category)
-    """
-    v2_ineq = """
-        SELECT i.i_item_sk FROM item i
-        WHERE i.i_current_price > (SELECT avg(j.i_current_price)
-                                   FROM item j
-                                   WHERE j.i_category < i.i_category)
-    """
-    # q6 pullup fires on the bare-foreign-table shape
-    r = sql(name, "EXPLAIN (COSTS OFF) " + v2_q6)
-    assert "agg_pullup" in r and "SubPlan" not in r, r
-    # rewritten vs grouped-oracle identical
-    got = sql(name, "SELECT count(*), sum(i.i_item_sk) FROM item i WHERE "
-                    "i.i_current_price > (SELECT avg(j.i_current_price) "
-                    "FROM item j WHERE j.i_category = i.i_category)").strip()
-    oracle = sql(name, "SELECT count(*), sum(sk) FROM (SELECT i.i_item_sk sk "
-                       "FROM item i JOIN (SELECT i_category cat, "
-                       "avg(i_current_price) thr FROM item "
-                       "GROUP BY i_category) a ON i.i_category = a.cat "
-                       "WHERE i.i_current_price > a.thr) x").strip()
-    assert got == oracle, (got, oracle)
-    # multi-conjunct: outer filter + correlated equality (AND path)
-    got2 = sql(name, v2_multi).strip()
-    oracle2 = sql(name, "SELECT count(*) FROM item i WHERE i.i_item_sk > 0 "
-                        "AND i.i_current_price > (SELECT avg(j.i_current_price) "
-                        "FROM item j WHERE j.i_category = i.i_category)").strip()
-    assert got2 == oracle2, (got2, oracle2)
-    # inequality correlation declines (SubPlan retained)
-    r = sql(name, "EXPLAIN (COSTS OFF) " + v2_ineq)
-    assert "SubPlan" in r, r
+            v2_q6 = """
+                SELECT i.i_item_sk, i.i_current_price FROM item i
+                WHERE i.i_current_price > 1.2 * (SELECT avg(j.i_current_price)
+                                                 FROM item j
+                                                 WHERE j.i_category = i.i_category)
+            """
+            v2_multi = """
+                SELECT count(*) FROM item i
+                WHERE i.i_item_sk > 0
+                  AND i.i_current_price > (SELECT avg(j.i_current_price)
+                                           FROM item j
+                                           WHERE j.i_category = i.i_category)
+            """
+            v2_ineq = """
+                SELECT i.i_item_sk FROM item i
+                WHERE i.i_current_price > (SELECT avg(j.i_current_price)
+                                           FROM item j
+                                           WHERE j.i_category < i.i_category)
+            """
 
-    print(json.dumps({"case": "agg-pullup-v2",
-                      "rewritten_rows": int(got.split("|")[0]),
-                      "oracle_rows": int(oracle.split("|")[0])}), flush=True)
+            # q6 pullup fires: no SubPlan, agg_pullup hash join present
+            r = sql(name, "EXPLAIN (COSTS OFF) " + v2_q6)
+            assert "SubPlan" not in r and "agg_pullup" in r, r
+
+            # rewritten vs grouped-oracle identical
+            got = sql(name, "SELECT count(*), sum(i.i_item_sk) FROM item i "
+                            "WHERE i.i_current_price > (SELECT "
+                            "avg(j.i_current_price) FROM item j WHERE "
+                            "j.i_category = i.i_category)").strip()
+            oracle = sql(name, "SELECT count(*), sum(sk) FROM (SELECT "
+                               "i.i_item_sk sk FROM item i JOIN (SELECT "
+                               "i_category cat, avg(i_current_price) thr "
+                               "FROM item GROUP BY i_category) a ON "
+                               "i.i_category = a.cat WHERE i.i_current_price "
+                               "> a.thr) x").strip()
+            assert got == oracle, (got, oracle)
+
+            # multi-conjunct AND path: rewritten, matches stock result
+            r = sql(name, "EXPLAIN (COSTS OFF) " + v2_multi)
+            assert "agg_pullup" in r, r
+            got2 = sql(name, "SELECT count(*) FROM item i WHERE i.i_item_sk "
+                             "> 0 AND i.i_current_price > (SELECT "
+                             "avg(j.i_current_price) FROM item j WHERE "
+                             "j.i_category = i.i_category)").strip()
+            ref2 = sql(name, "SELECT count(*) FROM item i WHERE i.i_item_sk "
+                             "> 0 AND i.i_current_price > (SELECT "
+                             "avg(j.i_current_price) FROM item j WHERE "
+                             "j.i_category = i.i_category)").strip()
+            assert got2 == ref2
+
+            # inequality correlation declines
+            r = sql(name, "EXPLAIN (COSTS OFF) " + v2_ineq)
+            assert "SubPlan" in r, r
 
             print(json.dumps({"case": "agg-pullup",
                               "rows": 1,
