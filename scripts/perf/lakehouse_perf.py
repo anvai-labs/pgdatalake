@@ -48,7 +48,7 @@ DEFAULT_TPCH_DDL = REPO / "scripts" / "perf" / "tpch" / "ddl.sql"
 DEFAULT_TPCH_QUERIES = REPO / "scripts" / "perf" / "tpch" / "queries"
 
 # q1/q2/q3 = the recorded §5.1 comparison set
-TPCDS_QUERIES = ["query1", "query2", "query3"]
+TPCDS_QUERIES = [f"query{i}" for i in range(1, 11)]
 
 # TPC-H SF=1 (duckdb dbgen): the full 22-branch lineitem fact
 TPCH_QUERIES = [f"query{i}" for i in range(1, 11)]
@@ -114,17 +114,23 @@ def connect(dsn: str, autocommit: bool = True):
     return conn
 
 
+class QueryTimeout(Exception):
+    """statement_timeout fired; the sweep records a DNF and moves on."""
+
+
 def timed(cur, sql: str, timeout_s: int) -> float:
     cur.execute(f"SET statement_timeout = {timeout_s * 1000}")
     t0 = time.perf_counter()
     try:
         cur.execute(sql)  # single-statement files; psycopg2 has no nextset on pgwire
     except psycopg2.errors.QueryCanceled:
-        raise SystemExit(f"TIMEOUT after {timeout_s}s: {sql[:60]}...")
+        raise QueryTimeout(f"TIMEOUT after {timeout_s}s: {sql[:60]}...")
     return time.perf_counter() - t0
 
 
 def measure(cur, sql: str, timeout_s: int, warmup: bool = True):
+    """4 timed runs (warmup + 3); on a timeout, remaining runs are
+    skipped and (None, None) marks the query DNF in the receipt."""
     if warmup:
         timed(cur, sql, timeout_s)
     runs = [timed(cur, sql, timeout_s) for _ in range(3)]
@@ -267,8 +273,16 @@ def run_tpcds_suite(conn, args):
     rows = []
     for q in TPCDS_QUERIES:
         sql = (Path(args.queries) / f"{q}.sql").read_text()
-        runs, med = measure(cur, sql, args.timeout, warmup=args.warmup)
-        print(f"{q}: runs={['%.1f' % r for r in runs]} median={med:.1f}s")
+        try:
+            runs, med = measure(cur, sql, args.timeout, warmup=args.warmup)
+        except QueryTimeout as e:
+            # a timeout kills only this query's runs (planning included —
+            # statement_timeout covers the planner too); the sweep continues
+            print(f"{q}: TIMEOUT ({e})", flush=True)
+            rows.append((q, None))
+            conn.rollback()
+            continue
+        print(f"{q}: runs={['%.1f' % r for r in runs]} median={med:.1f}s", flush=True)
         rows.append((q, med))
     return rows
 
@@ -529,7 +543,7 @@ def main():
     print("\n| query | median (s) |")
     print("|---|---|")
     for name, med in rows:
-        print(f"| {name} | {med:.2f} |")
+        print(f"| {name} | {'DNF' if med is None else f'{med:.2f}'} |")
 
 
 if __name__ == "__main__":
