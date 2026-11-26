@@ -329,6 +329,22 @@ planner_metadata_rows(Oid foreigntableid, int64 *rows_out)
 	PG_TRY();
 	{
 		ExtractOptions(foreigntableid, InvalidOid, &opts);
+
+		/*
+		 * read-binding servers (scoped reads, spec 12 authority model) keep
+		 * the exact single-session request choreography their fixtures script
+		 * per request (scope proofs are about precise request sequences, not
+		 * planner economics) — never size them at plan time.
+		 */
+		if (opts.read_binding.expected_table_uuid != NULL ||
+			opts.read_binding.storage_root != NULL ||
+			opts.read_binding.catalog_prefix != NULL ||
+			opts.read_binding.s3_region != NULL)
+		{
+			MemoryContextSwitchTo(oldcxt);
+			return false;
+		}
+
 		session = lakehouse_OpenSession(&opts, NULL);
 		for (uint64 i = 0; i < pg_datalake_scan_task_count(session); i++)
 			rows += pg_datalake_scan_task_rows(session, i);

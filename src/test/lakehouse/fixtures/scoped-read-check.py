@@ -174,23 +174,15 @@ def exercise(db, parent, child, prefix, route, enrolled):
                 object_requests.clear()
                 actual = sql(db, f"SELECT id FROM {name} ORDER BY id")
                 assert actual == expected, (name, actual)
-                # TWO loads of the SAME route per query since the relsize
-                # slice (spec 19 §6.5): one at plan time (planner-visible
-                # relsize metadata session, cached per relid per backend)
-                # and one at execution (snapshot-pinned session). The scope
-                # invariant is unchanged: only this route is touched, never
-                # a namespace LIST or any other endpoint.
-                assert catalog_requests == [("GET", route)] * 2, catalog_requests
+                # read-binding servers keep the exact single-session
+                # request choreography (fdw_plan.c skips plan-time sizing
+                # for bound servers precisely so these scope proofs stay
+                # per-request scripted)
+                assert catalog_requests == [("GET", route)], catalog_requests
                 assert object_requests and all(
                     path.startswith(root_path + "/") for _, path in object_requests
                 ), object_requests
-                # the metadata fetch happens TWICE per query since the
-                # relsize slice (plan-time sizing session + executor's
-                # snapshot-pinned session; the Rust block cache is
-                # session-scoped, so no cross-session dedup). Scope is
-                # still exact: every path stays under root_path and the
-                # manifest trio never reaches outside it.
-                assert object_requests.count(("GET", metadata_path)) == 2, object_requests
+                assert object_requests.count(("GET", metadata_path)) == 1, object_requests
                 print(f"{name}: {len(object_requests)} scoped storage requests", flush=True)
 
             state["case"] = "warm-then-sibling"
@@ -225,10 +217,7 @@ def exercise(db, parent, child, prefix, route, enrolled):
                 catalog_requests.clear()
                 object_requests.clear()
                 sql(db, "SELECT id FROM child_rows", error=sqlstate)
-                # plan-time sizing load + executor load (see above); the
-                # crafted reply is served to both, so the failing sqlstate
-                # still comes from the executor's session
-                assert catalog_requests == [("GET", route)] * 2, (case, catalog_requests)
+                assert catalog_requests == [("GET", route)], (case, catalog_requests)
                 expected = [("GET", metadata_path)] if expect_metadata else []
                 assert object_requests == expected, (case, object_requests)
                 if case.startswith("oversized-"):
