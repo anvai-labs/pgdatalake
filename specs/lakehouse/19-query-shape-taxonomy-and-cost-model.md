@@ -259,11 +259,15 @@ relsize slice grounds the cost model in Iceberg metadata:
   scripts/perf/telemetry_report.py, adjust scale in postgresql.conf, repeat.
   The model influences planning inputs ONLY; rewrite admission stays with
   the L0 matcher (§6.1 doctrine unchanged).
-- Known residual (family E, next slice): join/column selectivity still uses
-  core defaults (DEFAULT_NUM_DISTINCT 200) without pg_statistic — q4's
-  outer CTE join stays Nested Loop until the ANALYZE/NDV slice populates
-  real per-column NDV from §4b column_stats. Fixture pins the current
-  estimate (5000-row table with one qual plans 5000/200 = 25 rows).
+- ANALYZE tier (landed 2026-11-26, this slice): the FDW now provides
+  AnalyzeForeignTable + AcquireSampleRows (metadata relsize + reservoir
+  sampling, PG20 hook signature), so explicit ANALYZE AND auto-analyze
+  populate real per-column NDV/MCV/histograms into pg_statistic. Fixture:
+  5000 rows / 7 distinct grp values plans the qual at ~1/7 (713 rows vs
+  the 25 default-NDV estimate pinned pre-ANALYZE). Stats tiering per
+  profile: metadata bounds compose NDV for integer-like columns (§4b
+  filterability tiers) as the zero-IO approximation; explicit ANALYZE
+  samples for exact stats — the composed tier lands as its own slice.
 - Fail-fast boundary (pre-existing contract, lakehouse.h): EXPLAIN runs
   ExecutorStart(EXPLAIN_ONLY), and BeginForeignScan opens its session
   unconditionally — an unreachable endpoint fails the statement at plan

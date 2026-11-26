@@ -46,6 +46,7 @@ lakehouse_sources += files(
   'managed_count.c',
   'telemetry.c',
   'scan_stats.c',
+  'fdw_analyze.c',
 )
 
 if host_system == 'windows'

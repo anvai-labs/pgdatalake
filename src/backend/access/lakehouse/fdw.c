@@ -258,6 +258,12 @@ lakehouse_fdw_handler(PG_FUNCTION_ARGS)
 	routine->ShutdownForeignScan = lakehouse_ShutdownForeignScan;
 
 	/*
+	 * ANALYZE support (spec 19 §6.5): metadata relsize + reservoir row
+	 * sampling so pg_statistic carries real NDV (family E residual).
+	 */
+	routine->AnalyzeForeignTable = lakehouse_AnalyzeForeignTable;
+
+	/*
 	 * Our reader is process-local (no shared connections), so every
 	 * foreign-table scan is parallel safe (slice 17, doc 06 §3). Without
 	 * this hook the planner disables parallel paths for foreign tables
@@ -400,19 +406,19 @@ lakehouse_OpenSession(LakehouseOptions *opts, const char *rte_selector)
 
 	errbuf[0] = '\0';
 	session = pg_datalake_scan_new_bound(opts->endpoint,
-								   opts->warehouse,
-								   opts->token ? opts->token : "",
-								   opts->namespace,
-								   opts->table,
-								   opts->s3_endpoint,
-								   opts->s3_access_key,
-								   opts->s3_secret_key,
-								   opts->predicate_json ? opts->predicate_json : "",
-								   sel_json,
-								   binding,
-								   &status,
-								   errbuf,
-								   sizeof(errbuf));
+										 opts->warehouse,
+										 opts->token ? opts->token : "",
+										 opts->namespace,
+										 opts->table,
+										 opts->s3_endpoint,
+										 opts->s3_access_key,
+										 opts->s3_secret_key,
+										 opts->predicate_json ? opts->predicate_json : "",
+										 sel_json,
+										 binding,
+										 &status,
+										 errbuf,
+										 sizeof(errbuf));
 	if (session == NULL)
 	{
 		if (binding != NULL)

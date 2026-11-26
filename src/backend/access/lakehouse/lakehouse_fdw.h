@@ -113,6 +113,16 @@ extern ForeignScan *lakehouse_GetForeignPlan(PlannerInfo *root,
 											 Plan *outer_plan);
 
 /* fdw_exec.c */
+/* fdw_analyze.c */
+extern bool lakehouse_AnalyzeForeignTable(Relation rel,
+										  AcquireSampleRowsFunc *func,
+										  BlockNumber *totalpages);
+extern int	lakehouse_AcquireSampleRows(Relation rel, int elevel,
+										HeapTuple *rows, int targrows,
+										double *totalrows,
+										double *totaldeadrows);
+
+/* fdw_exec.c */
 extern void lakehouse_BeginForeignScan(ForeignScanState *node, int eflags);
 extern TupleTableSlot *lakehouse_IterateForeignScan(ForeignScanState *node);
 extern void lakehouse_ReScanForeignScan(ForeignScanState *node);

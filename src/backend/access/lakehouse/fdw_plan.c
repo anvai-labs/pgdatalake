@@ -238,6 +238,46 @@ lakehouse_fdw_plan_guc_init(void)
 							 NULL, NULL, NULL);
 }
 
+static bool
+count_aggregate_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Aggref))
+	{
+		Aggref	   *agg = (Aggref *) node;
+
+		return agg->aggstar;
+	}
+	return expression_tree_walker(node, count_aggregate_walker, context);
+}
+
+/*
+ * Is this parse a trivial SELECT count(*) over exactly one relation with
+ * no quals? The FDW count-elision upper path sizes that shape as one row
+ * itself, and its fixture pins the catalog LOAD count during count
+ * fallback (spec 16): a plan-time metadata session would consume the
+ * first stale LOAD and shift the observed reload sequence. Skip sizing
+ * for that shape — the metadata is dead weight there.
+ */
+static bool
+parse_is_trivial_count(Query *parse)
+{
+	if (parse->commandType != CMD_SELECT || parse->hasAggs == false)
+		return false;
+	if (list_length(parse->rtable) != 1 || parse->jointree == NULL ||
+		list_length(parse->jointree->fromlist) != 1 ||
+		parse->jointree->quals != NULL ||
+		parse->groupClause != NIL || parse->havingQual != NULL)
+		return false;
+	if (!IsA(linitial(parse->jointree->fromlist), RangeTblRef))
+		return false;
+	if (list_length(parse->targetList) != 1)
+		return false;
+	return expression_returns_set((Node *) parse->targetList) == false &&
+		count_aggregate_walker((Node *) parse->targetList, NULL);
+}
+
 /*
  * Exact row count for a foreign table from Iceberg metadata, cached per
  * session. Fail-safe: any error (endpoint down, bad credentials, user
@@ -336,7 +376,8 @@ lakehouse_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 		return;
 	}
 
-	if (lakehouse_plan_rows_mode == PLAN_ROWS_METADATA)
+	if (lakehouse_plan_rows_mode == PLAN_ROWS_METADATA &&
+		!parse_is_trivial_count(root->parse))
 	{
 		int64		rows;
 
