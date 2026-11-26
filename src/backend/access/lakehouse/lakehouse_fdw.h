@@ -111,7 +111,6 @@ extern ForeignScan *lakehouse_GetForeignPlan(PlannerInfo *root,
 											 List *scan_clauses,
 											 Plan *outer_plan);
 
-/* fdw_exec.c */
 /* fdw_analyze.c */
 extern bool lakehouse_AnalyzeForeignTable(Relation rel,
 										  AcquireSampleRowsFunc *func,

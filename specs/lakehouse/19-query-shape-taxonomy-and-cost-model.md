@@ -260,12 +260,18 @@ relsize slice grounds the cost model in Iceberg metadata:
   The model influences planning inputs ONLY; rewrite admission stays with
   the L0 matcher (§6.1 doctrine unchanged).
 - ANALYZE tier (landed 2026-11-26, this slice): the FDW now provides
-  AnalyzeForeignTable + AcquireSampleRows (metadata relsize + reservoir
-  sampling, PG20 hook signature), so explicit ANALYZE AND auto-analyze
-  populate real per-column NDV/MCV/histograms into pg_statistic. Fixture:
-  5000 rows / 7 distinct grp values plans the qual at ~1/7 (713 rows vs
-  the 25 default-NDV estimate pinned pre-ANALYZE). Stats tiering per
-  profile: metadata bounds compose NDV for integer-like columns (§4b
+  AnalyzeForeignTable + AcquireSampleRows (PG20 hook signature):
+  metadata relsize, then reservoir sampling (Algorithm R) over whole
+  parquet tasks in randomized task order, streaming until 4x targrows
+  rows are seen so the replacement branch keeps the sample unbiased
+  across the cut. Task-level IO failures ereport ERROR (ANALYZE is
+  explicit maintenance — fail-fast, never a silent partial sample).
+  Explicit ANALYZE AND auto-analyze populate real per-column
+  NDV/MCV/histograms into pg_statistic. Fixtures: 5000 rows / 7 distinct
+  grp values plans the qual at ~1/7 (~713 rows vs the 25 default-NDV
+  estimate pinned pre-ANALYZE); a 5-task/150k-row table exercises
+  multi-task advance + the reservoir branch. Stats tiering per profile:
+  metadata bounds compose NDV for integer-like columns (§4b
   filterability tiers) as the zero-IO approximation; explicit ANALYZE
   samples for exact stats — the composed tier lands as its own slice.
 - Fail-fast boundary (pre-existing contract, lakehouse.h): EXPLAIN runs

@@ -343,19 +343,22 @@ planner_metadata_rows(Oid foreigntableid, int64 *rows_out)
 	PG_CATCH();
 	{
 		/*
-		 * decline only statement-level errors: OOM/admin-shutdown FATALs must
-		 * propagate, not be swallowed into a planning fallback (telemetry.c
-		 * precedent). Restore the caller's context BEFORE touching the error
-		 * state: CopyErrorData/FlushErrorState allocate in
-		 * CurrentMemoryContext.
+		 * Restore the caller's context BEFORE CopyErrorData: at PG_CATCH
+		 * entry CurrentMemoryContext is ErrorContext, and CopyErrorData
+		 * allocates there (cassert asserts allocations never happen in
+		 * ErrorContext — 2026-11-26 CI crash). FATAL-class failures (OOM,
+		 * admin shutdown) then propagate instead of being swallowed into a
+		 * planning fallback; statement-level errors are declined.
 		 */
-		ErrorData  *err = CopyErrorData();
-		bool		fatal = (err->elevel >= FATAL);
-
-		FreeErrorData(err);
-		if (fatal)
-			PG_RE_THROW();
 		MemoryContextSwitchTo(oldcxt);
+		{
+			ErrorData  *err = CopyErrorData();
+			bool		fatal = (err->elevel >= FATAL);
+
+			FreeErrorData(err);
+			if (fatal)
+				PG_RE_THROW();
+		}
 		if (session != NULL)
 			pg_datalake_scan_free(session);
 		FlushErrorState();

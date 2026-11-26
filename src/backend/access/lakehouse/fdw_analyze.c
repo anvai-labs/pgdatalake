@@ -105,10 +105,8 @@ lakehouse_AnalyzeForeignTable(Relation rel, AcquireSampleRowsFunc *func,
 	LakehouseOptions opts;
 	ScanSession *session;
 	int64		rows = 0;
-	char		errbuf[1024];
 
 	ExtractOptions(relid, GetUserId(), &opts);
-	errbuf[0] = '\0';
 	session = lakehouse_OpenSession(&opts, NULL);
 	for (uint64 i = 0; i < pg_datalake_scan_task_count(session); i++)
 		rows += pg_datalake_scan_task_rows(session, i);
@@ -132,8 +130,8 @@ lakehouse_AcquireSampleRows(Relation rel, int elevel,
 	TupleDesc	tupdesc = RelationGetDescr(rel);
 	Oid			relid = RelationGetRelid(rel);
 	LakehouseOptions opts;
-	ScanSession *session = NULL;
-	RowsHandle *rh = NULL;
+	ScanSession *volatile session = NULL;
+	RowsHandle *volatile rh = NULL;
 	FmgrInfo   *in_funcs;
 	Oid		   *typioparams;
 	int		   *slot_index;
@@ -143,86 +141,105 @@ lakehouse_AcquireSampleRows(Relation rel, int elevel,
 	char	   *projection_json;
 	char		errbuf[1024];
 	uint64		ntasks;
-	uint64	   *task_rows;
 	int64		total_rows = 0;
-	int			streamed = 0;
+	uint64		streamed = 0;
 	int			nrows = 0;
 	PgDatalakeRowBatch batch;
 	bool		batch_valid = false;
 	uint32		batch_cursor = 0;
-	int			task_order_pos = 0;
-	int		   *task_order;
+	uint64		task_pos = 0;
+	uint64	   *task_order;
 	uint64		stop_at;
 
-	/* analytic plan: session + task metadata first (fail-fast) */
-	ExtractOptions(relid, GetUserId(), &opts);
-	errbuf[0] = '\0';
-	session = lakehouse_OpenSession(&opts, NULL);
-
-	ntasks = pg_datalake_scan_task_count(session);
-	task_rows = (uint64 *) palloc(sizeof(uint64) * Max(1, (int) ntasks));
-	for (uint64 i = 0; i < ntasks; i++)
-	{
-		task_rows[i] = (uint64) pg_datalake_scan_task_rows(session, i);
-		total_rows += (int64) task_rows[i];
-	}
-
-	/* randomized task order: whole-task reads without file-order bias */
-	task_order = (int *) palloc(sizeof(int) * Max(1, (int) ntasks));
-	for (uint64 i = 0; i < ntasks; i++)
-		task_order[i] = (int) i;
-	for (uint64 i = ntasks; i > 1; i--)
-	{
-		uint64		j = (uint64) (random() % (long) i);
-		int			tmp = task_order[i - 1];
-
-		task_order[i - 1] = task_order[j];
-		task_order[j] = tmp;
-	}
-
-	analyze_setup_column_map(rel, &in_funcs, &typioparams, &slot_index,
-							 &maps, &projection_json);
-	row_values = (Datum *) palloc(tupdesc->natts * sizeof(Datum));
-	row_nulls = (bool *) palloc(tupdesc->natts * sizeof(bool));
-
-	/* keep streaming until 4x the target is seen (whole tasks at a time) */
-	stop_at = (uint64) targrows * ANALYZE_ROWS_FACTOR;
+	/*
+	 * The acquire hook receives core's elevel (DEBUG2 for plain ANALYZE) but
+	 * task-level IO failures must longjmp, not return: at elevel < ERROR
+	 * ereport() returns and the caller would dereference NULL handles
+	 * (executor precedent: hardcoded ERROR so "a caught panic is never
+	 * mistaken for EOF", fdw_exec.c 13-review #8). ANALYZE is explicit
+	 * maintenance — fail fast.
+	 */
+	(void) elevel;
 
 	PG_TRY();
 	{
-		while (nrows < targrows &&
-			   (task_order_pos < (int) ntasks) &&
-			   ((uint64) streamed < stop_at || nrows == 0))
-		{
-			int			cur = task_order[task_order_pos];
+		ExtractOptions(relid, GetUserId(), &opts);
+		errbuf[0] = '\0';
+		session = lakehouse_OpenSession(&opts, NULL);
 
-			if (!batch_valid)
+		ntasks = pg_datalake_scan_task_count(session);
+		for (uint64 i = 0; i < ntasks; i++)
+			total_rows += pg_datalake_scan_task_rows(session, i);
+
+		/* randomized task order: whole-task reads without file-order bias */
+		task_order = (uint64 *) palloc(sizeof(uint64) * ntasks);
+		for (uint64 i = 0; i < ntasks; i++)
+			task_order[i] = i;
+		for (uint64 i = ntasks; i > 1; i--)
+		{
+			uint64		j = (uint64) (random() % (long) i);
+			uint64		tmp = task_order[i - 1];
+
+			task_order[i - 1] = task_order[j];
+			task_order[j] = tmp;
+		}
+
+		analyze_setup_column_map(rel, &in_funcs, &typioparams, &slot_index,
+								 &maps, &projection_json);
+		row_values = (Datum *) palloc(tupdesc->natts * sizeof(Datum));
+		row_nulls = (bool *) palloc(tupdesc->natts * sizeof(bool));
+
+		/*
+		 * Stream rows in randomized task order until 4x the target is seen
+		 * (or the table is exhausted), filling first and then replacing via
+		 * reservoir (Algorithm R) — the replacement branch keeps the sample
+		 * unbiased regardless of where the 4x stop cut the stream.
+		 */
+		stop_at = (uint64) targrows * ANALYZE_ROWS_FACTOR;
+
+		while (task_pos < ntasks &&
+			   (nrows == 0 || streamed < stop_at))
+		{
+			if (rh == NULL)
+			{
+				errbuf[0] = '\0';
+				rh = pg_datalake_rows_open(session, task_order[task_pos],
+										   projection_json,
+										   errbuf, sizeof(errbuf));
+				if (rh == NULL)
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_EXCEPTION),
+							 errmsg("lakehouse: ANALYZE could not open task %llu: %s",
+									(unsigned long long) task_order[task_pos],
+									errbuf[0] != '\0' ? errbuf : "unknown error")));
+				batch_valid = false;
+				batch_cursor = 0;
+			}
+
+			/*
+			 * Executor-shaped advance (fdw_exec.c IterateForeignScan):
+			 * batch_next on the LIVE handle serves the next arrow batch; EOF
+			 * closes the task and moves on. A caught failure is never
+			 * mistaken for EOF.
+			 */
+			if (!batch_valid || batch_cursor >= batch.live_count)
 			{
 				int			nst;
 
 				errbuf[0] = '\0';
-				rh = pg_datalake_rows_open(session, (uint64) cur,
-										   projection_json,
-										   errbuf, sizeof(errbuf));
-				if (rh == NULL)
-					ereport(elevel,
-							(errcode(ERRCODE_DATA_EXCEPTION),
-							 errmsg("lakehouse: ANALYZE could not open task %d: %s",
-									cur,
-									errbuf[0] != '\0' ? errbuf : "unknown error")));
 				nst = pg_datalake_rows_batch_next(rh, &batch,
 												  errbuf, sizeof(errbuf));
 				if (nst == 2)
-					ereport(elevel,
+					ereport(ERROR,
 							(errcode(ERRCODE_DATA_EXCEPTION),
-							 errmsg("lakehouse: ANALYZE row read failed in task %d: %s",
-									cur,
+							 errmsg("lakehouse: ANALYZE row read failed in task %llu: %s",
+									(unsigned long long) task_order[task_pos],
 									errbuf[0] != '\0' ? errbuf : "unknown error")));
 				if (nst == 1)
 				{
 					pg_datalake_rows_close(rh);
 					rh = NULL;
-					task_order_pos++;
+					task_pos++;
 					continue;
 				}
 				batch_valid = true;
@@ -284,10 +301,10 @@ lakehouse_AcquireSampleRows(Relation rel, int elevel,
 																	sizeof(cell_err));
 
 							if (text == NULL)
-								ereport(elevel,
+								ereport(ERROR,
 										(errcode(ERRCODE_DATA_EXCEPTION),
-										 errmsg("lakehouse: ANALYZE row read failed in task %d: %s",
-												cur,
+										 errmsg("lakehouse: ANALYZE row read failed in task %llu: %s",
+												(unsigned long long) task_order[task_pos],
 												cell_err[0] != '\0' ? cell_err : "unknown error")));
 							row_values[i] =
 								InputFunctionCall(&in_funcs[i],
@@ -314,17 +331,12 @@ lakehouse_AcquireSampleRows(Relation rel, int elevel,
 					long		j = random() % (long) streamed;
 
 					if (j < targrows)
+					{
 						heap_freetuple(rows[j]);
-					rows[j] = heap_form_tuple(tupdesc, row_values,
-											  row_nulls);
+						rows[j] = heap_form_tuple(tupdesc, row_values,
+												  row_nulls);
+					}
 				}
-			}
-
-			if (batch_cursor >= batch.live_count)
-			{
-				pg_datalake_rows_close(rh);
-				rh = NULL;
-				batch_valid = false;
 			}
 		}
 	}
@@ -336,10 +348,6 @@ lakehouse_AcquireSampleRows(Relation rel, int elevel,
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-
-	if (rh != NULL)
-		pg_datalake_rows_close(rh);
-	pg_datalake_scan_free(session);
 
 	ereport(DEBUG1,
 			(errmsg("lakehouse ANALYZE \"%s\": sampled %d of %lld rows",

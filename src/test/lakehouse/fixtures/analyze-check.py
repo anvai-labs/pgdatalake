@@ -35,11 +35,25 @@ def main():
     ns = "ana_" + uuid4().hex[:12]
     name = "ana_" + uuid4().hex[:8]
     table = f"iceberg.{ns}.events"
+    big = f"iceberg.{ns}.events_big"
     trino(f"CREATE SCHEMA iceberg.{ns}")
     trino(f"CREATE TABLE {table} (id bigint, grp varchar) "
           "WITH (format_version = 2)")
     trino(f"INSERT INTO {table} "
           "SELECT x, CAST(x % 7 AS varchar) FROM UNNEST(sequence(1, 5000)) u(x)")
+    # multi-task, reservoir-exercising table: 15 INSERTs = 15 data files =
+    # 15 scan tasks; 150k total rows > 4x default targrows (120k) so the
+    # reservoir replacement branch runs across task boundaries. (The
+    # single-batch 5000-row table exits the sampler before batch
+    # exhaustion and cannot catch advance bugs — it pins selectivity
+    # only.) Trino caps sequence() at 10k entries, hence 10k per INSERT.
+    trino(f"CREATE TABLE {big} (id bigint, grp varchar) "
+          "WITH (format_version = 2)")
+    for part in range(15):
+        lo = part * 10000 + 1
+        trino(f"INSERT INTO {big} "
+              f"SELECT x + {part * 10000}, CAST(x % 7 AS varchar) FROM "
+              f"UNNEST(sequence(1, 10000)) u(x)")
     try:
         sql("postgres", f"CREATE DATABASE {name} TEMPLATE template0 "
                         f"ENCODING 'UTF8' LOCALE 'C'")
@@ -85,12 +99,25 @@ def main():
             sql(name, "ANALYZE dead_events",
                 error="08000: lakehouse")
 
-            print(f'{{"case": "analyze", "ndv_selectivity_rows": {r[0]}}}',
+            # multi-task + reservoir: ANALYZE over 5 tasks / 150k rows;
+            # selectivity must still reflect the real 7-distinct NDV
+            sql(name, "CREATE FOREIGN TABLE events_big (id bigint, "
+                      "grp varchar) SERVER s "
+                      f"OPTIONS (table '{ns}.events_big');")
+            sql(name, "ANALYZE events_big")
+            r2 = plan_rows(name, "SELECT id FROM events_big "
+                                 "WHERE grp = '2'")
+            # the plan may report the estimate at more than one node
+            assert r2 and all(17000 <= x <= 26000 for x in r2), r2
+
+            print(f'{{"case": "analyze", "ndv_selectivity_rows": {r[0]}, '
+                  f'"reservoir_rows": {r2[0]}}}',
                   flush=True)
         finally:
             sql("postgres", f"DROP DATABASE {name} WITH (FORCE)")
     finally:
-        trino(f"DROP TABLE IF EXISTS {table}; DROP SCHEMA iceberg.{ns}")
+        trino(f"DROP TABLE IF EXISTS {big}; DROP TABLE IF EXISTS {table}; "
+              f"DROP SCHEMA iceberg.{ns}")
 
 
 if __name__ == "__main__":
