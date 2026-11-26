@@ -30,6 +30,7 @@
 #include "optimizer/tlist.h"
 #include "parser/parse_collate.h"
 #include "parser/parsetree.h"
+#include "parser/parse_relation.h"
 #include "nodes/nodeFuncs.h"
 #include "access/sysattr.h"
 #include "access/table.h"
@@ -201,7 +202,8 @@ typedef struct PlannerRowsEntry
 
 static HTAB *planner_rows_cache = NULL;
 
-static bool planner_metadata_rows(Oid foreigntableid, int64 *rows_out);
+static bool planner_metadata_rows(Oid foreigntableid, Oid checkAsUser,
+								  int64 *rows_out);
 
 void		lakehouse_fdw_plan_guc_init(void);
 
@@ -281,17 +283,20 @@ parse_is_trivial_count(Query *parse)
 /*
  * Exact row count for a foreign table from Iceberg metadata, cached per
  * session. Fail-safe: any error (endpoint down, bad credentials, user
- * mapping without secrets) is swallowed and returns false — planning
- * falls back to core's default rather than failing the query. The
- * user mapping is resolved against the invoker (GetUserId()); view
- * indirection keeps planning local, matching GetForeignRelSize's
- * permission precedent.
+ * mapping missing or without secrets) is swallowed and returns false —
+ * planning falls back to core's default rather than failing the query.
+ * The user mapping is resolved for the principal the executor WILL use
+ * (rte->checkAsUser: the view owner under view indirection, else the
+ * invoker) so planning never raises a mapping error a fixture or user
+ * expects at execution time; sizing just declines and core's default
+ * estimate stands.
  */
 static bool
-planner_metadata_rows(Oid foreigntableid, int64 *rows_out)
+planner_metadata_rows(Oid foreigntableid, Oid checkAsUser, int64 *rows_out)
 {
 	PlannerRowsEntry *ent;
 	bool		found;
+	bool		bound = false;
 	LakehouseOptions opts;
 	ScanSession *session = NULL;
 	int64		rows = 0;
@@ -327,27 +332,37 @@ planner_metadata_rows(Oid foreigntableid, int64 *rows_out)
 	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
 
 	/*
-	 * Options + the read-binding gate run OUTSIDE the TRY block: returning
-	 * from inside a PG_TRY body skips the macro's unwind bookkeeping, and a
-	 * later longjmp past this frame then trips glibc's __longjmp_chk
-	 * ("longjmp causes uninitialized stack frame", CI scoped-read crash).
-	 * ExtractOptions only ereports on misplaced catalog options — rejected
-	 * at DDL time, so a raise here means catalog corruption and may
-	 * propagate.
+	 * Resolve options + the read-binding gate in their own TRY that declines
+	 * on ANY error: a missing user mapping must surface at EXECUTION time
+	 * (check_view_mappings choreographs mapping create/drop around executor
+	 * resolution), never at plan time. The gate decision is a plain flag —
+	 * never a return from inside a PG_TRY body (that skips unwind
+	 * bookkeeping; glibc __longjmp_chk then aborts a later longjmp past this
+	 * frame — 2026-11-26 CI crash).
 	 */
-	ExtractOptions(foreigntableid, InvalidOid, &opts);
+	{
+		bool		resolved = false;
 
-	/*
-	 * read-binding servers (scoped reads, spec 12 authority model) keep the
-	 * exact single-session request choreography their fixtures script per
-	 * request (scope proofs are about precise request sequences, not planner
-	 * economics) — never size them at plan time.
-	 */
-	if (opts.read_binding.expected_table_uuid != NULL ||
-		opts.read_binding.storage_root != NULL ||
-		opts.read_binding.catalog_prefix != NULL ||
-		opts.read_binding.s3_region != NULL)
-		return false;
+		PG_TRY();
+		{
+			ExtractOptions(foreigntableid, checkAsUser, &opts);
+			bound = (opts.read_binding.expected_table_uuid != NULL ||
+					 opts.read_binding.storage_root != NULL ||
+					 opts.read_binding.catalog_prefix != NULL ||
+					 opts.read_binding.s3_region != NULL);
+			resolved = true;
+		}
+		PG_CATCH();
+		{
+			FlushErrorState();
+		}
+		PG_END_TRY();
+		if (!resolved || bound)
+		{
+			MemoryContextSwitchTo(oldcxt);
+			return false;
+		}
+	}
 
 	PG_TRY();
 	{
@@ -412,9 +427,23 @@ lakehouse_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 	if (lakehouse_plan_rows_mode == PLAN_ROWS_METADATA &&
 		!parse_is_trivial_count(root->parse))
 	{
+		/*
+		 * the principal the executor will scan under (view owner if set):
+		 * checkAsUser lives on the RTE's RTEPermissionInfo (parse-time)
+		 */
+		RangeTblEntry *rte = (root->simple_rte_array != NULL &&
+							  baserel->relid > 0 &&
+							  baserel->relid < (Index) root->simple_rel_array_size)
+			? root->simple_rte_array[baserel->relid] : NULL;
+		RTEPermissionInfo *perminfo = (rte != NULL && rte->perminfoindex > 0)
+			? list_nth(root->parse->rteperminfos, rte->perminfoindex - 1)
+			: NULL;
+		Oid			checkAsUser = (perminfo != NULL &&
+								   OidIsValid(perminfo->checkAsUser))
+			? perminfo->checkAsUser : GetUserId();
 		int64		rows;
 
-		if (planner_metadata_rows(foreigntableid, &rows) &&
+		if (planner_metadata_rows(foreigntableid, checkAsUser, &rows) &&
 			rows >= 0 && (double) rows <= lakehouse_plan_rows_max)
 		{
 			double		scaled = (double) rows * lakehouse_plan_rows_scale;
