@@ -1619,6 +1619,37 @@ pub unsafe extern "C" fn pg_datalake_core_cache_init(max_bytes: i64) {
     crate::cache::global_init(max_bytes.max(0) as u64);
 }
 
+/// Diagnostic counters for the per-backend immutable-path block cache
+/// (spec 15 §6.3a measurement gate; keying law §6.2). Zeros when the
+/// cache is uninitialized ("no cache yet"), never NULL-fails.
+#[repr(C)]
+pub struct PgDatalakeCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub fetched_bytes: u64,
+    pub entries: u64,
+    pub used_bytes: u64,
+}
+
+/// C signature: `void pg_datalake_core_cache_stats(PgDatalakeCacheStats *out)`
+///
+/// # Safety
+/// `out` may be NULL (no-op); otherwise a valid writable pointer.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_core_cache_stats(out: *mut PgDatalakeCacheStats) {
+    if out.is_null() {
+        return;
+    }
+    let (hits, misses, fetched, entries, used) = crate::cache::global().stats();
+    *out = PgDatalakeCacheStats {
+        hits,
+        misses,
+        fetched_bytes: fetched,
+        entries: entries as u64,
+        used_bytes: used,
+    };
+}
+
 /// Set the rollover threshold (P1, spec 15 §7.2): when the buffered
 /// rows' estimated bytes reach this size, `push()` rolls a file — one
 /// transaction then emits MANY size-bounded files in ONE snapshot

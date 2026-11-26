@@ -46,6 +46,7 @@ typedef struct LakehouseExecState
 	bool		parallel;		/* running as a parallel worker (slice 17) */
 	ScanSession *session;
 	RowsHandle *rows;
+	PgDatalakeCacheStats cache_at_begin;	/* block-cache counters at Begin */
 	uint64		current_task;
 	uint64		task_count;
 	char	   *projection_csv; /* visible attribute names, comma-joined */

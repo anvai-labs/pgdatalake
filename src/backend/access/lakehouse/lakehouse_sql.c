@@ -41,6 +41,41 @@ pg_lakehouse_version(PG_FUNCTION_ARGS)
 }
 
 /*
+ * lakehouse.cache_stats(): the per-backend immutable-path block cache's
+ * diagnostic counters (spec 15 §6.3a measurement gate — the R6 result
+ * cache is gated on these measurements; §6.2 keying law means entries
+ * are valid forever, so the only interesting questions are hit ratio,
+ * fetch volume, and capacity pressure). Returns one row of BIGINTs.
+ */
+PG_FUNCTION_INFO_V1(pg_lakehouse_cache_stats);
+
+Datum
+pg_lakehouse_cache_stats(PG_FUNCTION_ARGS)
+{
+	PgDatalakeCacheStats stats;
+	TupleDesc	tupdesc;
+	Datum		values[5];
+	bool		nulls[5] = {false, false, false, false, false};
+	HeapTuple	tuple;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("return type of lakehouse.cache_stats() is not composite")));
+
+	pg_datalake_core_cache_stats(&stats);
+
+	values[0] = Int64GetDatum((int64) stats.hits);
+	values[1] = Int64GetDatum((int64) stats.misses);
+	values[2] = Int64GetDatum((int64) stats.fetched_bytes);
+	values[3] = Int64GetDatum((int64) stats.used_bytes);
+	values[4] = Int64GetDatum((int64) stats.entries);
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+/*
  * lakehouse.scan_files(endpoint text, warehouse text, token text,
  *                      namespace text, table_name text,
  *                      s3_endpoint text, s3_access_key text,

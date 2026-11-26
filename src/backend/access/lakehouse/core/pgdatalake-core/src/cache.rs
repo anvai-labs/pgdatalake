@@ -173,6 +173,21 @@ impl BlockCache {
     /// laziness metric: a ranged parquet reader must fetch strictly less
     /// than the whole file for partial scans, and cache hits must add
     /// nothing. Test/diagnostics only.
+    /// Full diagnostic snapshot (spec 15 §6.3a measurement gate): hit and
+    /// miss counts, cumulative miss-fill bytes, live entry count, used
+    /// bytes. Diagnostics only — never a policy input and never a store
+    /// (§6.3a: the block cache IS the reader's stats surface).
+    pub fn stats(&self) -> (u64, u64, u64, usize, u64) {
+        let inner = self.inner.lock().unwrap();
+        (
+            inner.hits,
+            inner.misses,
+            inner.fetched,
+            inner.map.len(),
+            inner.used,
+        )
+    }
+
     pub fn fetched_bytes(&self) -> u64 {
         let inner = self.inner.lock().unwrap();
         inner.fetched
