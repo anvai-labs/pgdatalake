@@ -155,11 +155,6 @@ def main():
             # ---- v2 (foreign-table family): q6 shape over a bare
             # foreign table (item), plus controls. Backing rows come from
             # the static aggp_v2.item namespace (18k SF1 item rows).
-            sql(name, """
-                CREATE FOREIGN TABLE item (i_item_sk bigint, i_current_price double precision, i_category varchar) SERVER s
-                    OPTIONS (table 'aggp_v2.item');
-            """)
-
             v2_q6 = """
                 SELECT i.i_item_sk, i.i_current_price FROM item i
                 WHERE i.i_current_price > 1.2 * (SELECT avg(j.i_current_price)
