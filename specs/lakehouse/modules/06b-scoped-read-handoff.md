@@ -48,6 +48,14 @@ The same fixture remaps each role in turn to the other root’s valid S3 key. Ea
 
 The catalog recorder tests the mapped token and allowed route and uses live Lakekeeper responses. The fixture exercises provider prefix policy, SQL mapping rotation and revocation in a disposable, self-hosted profile. Service-issued grant generations and authenticated Lakekeeper, hosted login and cloud IAM qualification remain release gates. [Scoped read fixture](../../../src/test/lakehouse/fixtures/scoped-read-check.py)
 
+The 2026-11-27 stock PostgreSQL 19 release run used Lakekeeper, SeaweedFS and
+Trino 484. Trino independently matched the parent, child and sibling row
+multisets. HTTP 401, 403, 404, 500 and 503 recorder responses each stopped after
+one catalog request and zero object requests. Prepared reads exercised
+credential rotation and revocation. The running fixture's failed S3 key probe
+was isolated by starting Trino from the tracked catalog settings while
+retaining the same Lakekeeper and SeaweedFS services.
+
 ## Observation and decision
 
 The fixture encodes a provider observation as JSON. A positive observation has integer `version: 1`, `status: "pin"`, `binding_id`, positive integer `generation`, `mapping_role`, canonical lowercase `table_uuid`, `ref` and `snapshot_id` as a canonical signed 64-bit decimal **string**. Binding ID scopes the full enrolled authority, storage roots and credential identity, which need not appear in the observation. Scope it to the installation that issued it. Config, authority or trust-domain changes require re-enrollment. The examples use symbolic role identities. A deployed adapter must also distinguish a dropped/recreated role or mapping by changing the generation. A negative observation carries just version and status. V1 is an offline interoperation format. The online adapter and SQL diagnostics still require implementation.
