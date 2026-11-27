@@ -31,6 +31,7 @@
 #include "parser/parse_func.h"
 #include "executor/spi.h"
 #include "storage/lmgr.h"
+#include "utils/memutils.h"
 #include "fmgr.h"
 #include "utils/guc.h"
 #include "utils/typcache.h"
@@ -54,6 +55,12 @@
 
 #include "lakehouse.h"
 #include "lakehouse_tableam.h"
+
+/* cte_stats_hook.c (spec 19 §6.5 family C/E) */
+extern void lakehouse_cte_stats_hook_begin(List *entries,
+										   MemoryContext plan_ctx);
+extern void lakehouse_cte_stats_hook_end(void);
+extern List *collect_cte_ndv_entries(Query *parse);
 #include "lakehouse_fdw.h"
 
 extern Oid	lakehouse_am_oid(void);
@@ -1209,10 +1216,48 @@ lakehouse_count_exec_planner(Query *parse, const char *query_string,
 	if (lakehouse_agg_pullup_enabled)
 		pullup_cte_agg_sublinks(parse);
 
-	if (prev_planner_hook != NULL)
-		return prev_planner_hook(parse, query_string, cursorOptions,
-								 boundParams, es);
-	return standard_planner(parse, query_string, cursorOptions, boundParams, es);
+	extern bool lakehouse_cte_stats_hook;
+
+	if (!lakehouse_cte_stats_hook)
+	{
+		if (prev_planner_hook != NULL)
+			return prev_planner_hook(parse, query_string, cursorOptions,
+									 boundParams, es);
+		return standard_planner(parse, query_string, cursorOptions,
+								boundParams, es);
+	}
+
+	/*
+	 * family-C/E planning input (spec 19 §6.5): synthesize statistics for
+	 * multiply-referenced CTE discriminator columns so the 6-way self-join
+	 * shapes cost Hash Joins, not Nested Loop chains (q4 DNF root cause —
+	 * CTE-output columns carry no pg_statistic). The collector walks the
+	 * parse's own equality literals; entries live in a dedicated context that
+	 * dies with this planning cycle.
+	 */
+	{
+		MemoryContext entries_ctx = AllocSetContextCreate(CurrentMemoryContext,
+														  "lakehouse cte ndv entries",
+														  ALLOCSET_SMALL_SIZES);
+		MemoryContext old_ctx = MemoryContextSwitchTo(entries_ctx);
+		List	   *entries = collect_cte_ndv_entries(parse);
+
+		MemoryContextSwitchTo(old_ctx);
+		lakehouse_cte_stats_hook_begin(entries, entries_ctx);
+
+		{
+			PlannedStmt *result;
+
+			if (prev_planner_hook != NULL)
+				result = prev_planner_hook(parse, query_string,
+										   cursorOptions, boundParams, es);
+			else
+				result = standard_planner(parse, query_string,
+										  cursorOptions, boundParams, es);
+			lakehouse_cte_stats_hook_end();
+			return result;
+		}
+	}
 }
 
 void

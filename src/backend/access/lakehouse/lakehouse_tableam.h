@@ -139,6 +139,10 @@ extern void lakehouse_column_stats_record(Oid relid, const char *ns_table,
 										  struct ScanSession *session,
 										  Relation rel);
 extern void lakehouse_telemetry_guc_init(void);
+extern void lakehouse_cte_stats_hook_init(void);
+extern void lakehouse_cte_stats_hook_begin(List *entries,
+										   MemoryContext plan_ctx);
+extern void lakehouse_cte_stats_hook_end(void);
 extern void lakehouse_fdw_plan_guc_init(void);
 extern void lakehouse_agg_pullup_guc_init(void);
 extern void lakehouse_check_capture_read(Oid relid);
