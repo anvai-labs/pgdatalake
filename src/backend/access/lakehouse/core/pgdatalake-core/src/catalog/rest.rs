@@ -697,6 +697,37 @@ mod tests {
     }
 
     #[test]
+    fn scoped_load_distinguishes_missing_table_from_unavailable_publication() {
+        for status in [404, 500] {
+            let fixture = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}", fixture.server_addr().to_ip().unwrap());
+            let worker = std::thread::spawn(move || {
+                let request = fixture
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(request.url(), "/v1/namespaces/ns/tables/events");
+                let response = tiny_http::Response::from_string(
+                    r#"{"metadata-location":"s3://warehouse/events/metadata/md.json"}"#,
+                )
+                .with_status_code(status);
+                request.respond(response).unwrap();
+            });
+
+            let catalog =
+                RestCatalog::new_scoped(&endpoint, Box::new(StaticToken("test".into()))).unwrap();
+            let error = catalog
+                .load_scoped_metadata_location(&["ns"], "events", None, 256, Duration::from_secs(2))
+                .unwrap_err();
+            worker.join().unwrap();
+            match (status, error) {
+                (404, RestError::NotFound(_)) | (500, RestError::Http(_)) => {}
+                (status, other) => panic!("unexpected error for {status}: {other}"),
+            }
+        }
+    }
+
+    #[test]
     fn scoped_metadata_pointer_caps_declared_and_streamed_responses() {
         use std::io::Cursor;
 
