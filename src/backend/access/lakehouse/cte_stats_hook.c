@@ -273,6 +273,14 @@ cte_qual_walker(Node *node, void *context)
 			Var		   *var = NULL;
 			Const	   *cst = NULL;
 
+			/*
+			 * strip RelabelType: text quals arrive as (Var::text = 'literal')
+			 */
+			while (a != NULL && IsA(a, RelabelType))
+				a = (Node *) ((RelabelType *) a)->arg;
+			while (b != NULL && IsA(b, RelabelType))
+				b = (Node *) ((RelabelType *) b)->arg;
+
 			if (IsA(a, Var) && IsA(b, Const))
 			{
 				var = (Var *) a;
