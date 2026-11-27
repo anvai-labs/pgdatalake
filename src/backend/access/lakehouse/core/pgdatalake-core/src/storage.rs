@@ -174,14 +174,8 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
-// Remote cache identity is STABLE per location (endpoint|bucket): byte
-// ranges of immutable paths are valid forever (spec 15 §6.2), so the
-// block cache must be reusable across handles — the measurement gate
-// (lakehouse.cache_stats + cache-counters-check) showed per-handle
-// scopes reduce cross-query hit ratio to ZERO (2026-11-26: 0 hits after
-// a warm re-scan). Auth freshness is unaffected: only GETs authorize,
-// through the opening handle's client as before; cached bytes need no
-// GET and carry no credential state.
+// A newly opened network client must re-establish access with the provider.
+static NEXT_REMOTE_CACHE_SCOPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// An open handle to one object-store location.
 ///
@@ -297,25 +291,15 @@ impl StorageIo {
         // bucket), or relative to the prefix for Local (which is why the
         // local store is opened rooted). No re-prefixing happens here.
         //
-        // Components are '|'-escaped (backslash first) so the separator
-        // is unambiguous — round-5 review M1: endpoint "aws|x" + bucket
-        // "y" must not collide with endpoint "aws" + bucket "x|y" (a
-        // collision would serve wrong-location bytes from the cache).
-        // The None-s3 sentinel "aws" is degenerate-but-documented: an
-        // endpoint literally equal to "aws" is not a valid object-store
-        // endpoint (scheme required).
-        let esc =
-            |component: &str| -> String { component.replace('\\', "\\\\").replace('|', "\\|") };
-        let scope_id = match (loc, s3) {
-            (Location::Local { root }, _) => format!("local:{}", esc(root)),
-            (Location::S3 { bucket, .. }, Some(opts)) => format!(
-                "remote:{}|{}",
-                esc(opts.endpoint.as_deref().unwrap_or("aws")),
-                esc(bucket),
-            ),
-            (Location::Http { url }, _) => format!("remote:{}", esc(url)),
-            (Location::S3 { bucket, .. }, None) => {
-                format!("remote:aws|{}", esc(bucket))
+        let scope_id = match loc {
+            Location::Local { root } => format!("local:{root}"),
+            Location::S3 { .. } | Location::Http { .. } => {
+                use std::sync::atomic::Ordering::Relaxed;
+
+                let scope = NEXT_REMOTE_CACHE_SCOPE
+                    .try_update(Relaxed, Relaxed, |value| value.checked_add(1))
+                    .map_err(|_| StorageError::Config("remote cache scope exhausted".into()))?;
+                format!("remote:{scope}")
             }
         };
         Ok(Self {

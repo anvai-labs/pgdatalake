@@ -39,7 +39,6 @@
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
-#include "utils/hsearch.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
 #include "optimizer/optimizer.h"
@@ -168,43 +167,23 @@ lakehouse_GetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 }
 
 /*
- * Planner-visible relsize from Iceberg metadata (spec 19 §6.5, family E).
- *
- * Un-ANALYZEd foreign tables plan as rows=1000 (core's bogus default,
- * costsize.c set_foreign_size_estimates). Against multi-million-row
- * Iceberg tables that collapses the whole cost model: TPC-DS q4's
- * six-way CTE self-join planned as Nested Loop chains because every
- * input looked trivially small. The parquet record_count sums are exact
- * and already paid for at execution — expose them at planning time.
- *
- * Session-lifetime cache (TopMemoryContext, key: relid): repeat planning
- * (prepared statements, EXPLAIN loops) reuses the first fetch; a failed
- * fetch is cached as rows = -1 so a wedged endpoint costs one attempt
- * per rel per session. The cached rows go stale when the table is
- * rewritten during the session — estimates, not correctness (the
- * executor re-proves visibility), same staleness class as
- * telemetry's stats_owner.
+ * Local catalog statistics are the serving default. Operators can opt into a
+ * remote estimate for isolated profiling of an unbound foreign table.
  */
 #define PLAN_ROWS_DEFAULT 0
 #define PLAN_ROWS_METADATA 1
 
-static int	lakehouse_plan_rows_mode = PLAN_ROWS_METADATA;
-bool		lakehouse_cache_enabled = true;
+static int	lakehouse_plan_rows_mode = PLAN_ROWS_DEFAULT;
+static bool lakehouse_cache_enabled = true;
 bool		lakehouse_rowgroup_pruning = true;
 static double lakehouse_plan_rows_scale = 1.0;
 static double lakehouse_plan_rows_max = 1e12;
 
-typedef struct PlannerRowsEntry
+static void
+assign_cache_enabled(bool enabled, void *extra)
 {
-	Oid			relid;			/* hash key (must be first) */
-	int64		rows;			/* -1 = cached fetch failure */
-	int64		snapshot_id;
-} PlannerRowsEntry;
-
-static HTAB *planner_rows_cache = NULL;
-
-static bool planner_metadata_rows(Oid foreigntableid, Oid checkAsUser,
-								  int64 *rows_out);
+	pg_datalake_core_cache_set_enabled(enabled);
+}
 
 void		lakehouse_fdw_plan_guc_init(void);
 
@@ -218,12 +197,12 @@ lakehouse_fdw_plan_guc_init(void)
 	};
 
 	DefineCustomEnumVariable("lakehouse.plan_rows_mode",
-							 "Foreign-table row estimates: \"metadata\" sums parquet record_counts at plan time, \"default\" keeps core's rows=1000.",
+							 "Foreign-table row estimates: \"default\" uses local statistics, \"metadata\" enables operator remote estimates.",
 							 NULL,
 							 &lakehouse_plan_rows_mode,
-							 PLAN_ROWS_METADATA,
+							 PLAN_ROWS_DEFAULT,
 							 plan_rows_modes,
-							 PGC_USERSET, 0,
+							 PGC_SUSET, 0,
 							 NULL, NULL, NULL);
 	DefineCustomRealVariable("lakehouse.plan_rows_scale",
 							 "Multiplier applied to metadata-derived row estimates (per-profile L1 calibration, spec 19 §6.5).",
@@ -238,7 +217,7 @@ lakehouse_fdw_plan_guc_init(void)
 							 &lakehouse_cache_enabled,
 							 true,
 							 PGC_USERSET, 0,
-							 NULL, NULL, NULL);
+							 NULL, assign_cache_enabled, NULL);
 	DefineCustomBoolVariable("lakehouse.rowgroup_pruning",
 							 "Predicate-based pruning (file bounds/partitions AND row-group stats) when a translated predicate exists; rows are always re-checked locally. Off = no plan-time pruning at all.",
 							 NULL,
@@ -296,179 +275,98 @@ parse_is_trivial_count(Query *parse)
 }
 
 /*
- * Exact row count for a foreign table from Iceberg metadata, cached per
- * session. Fail-safe: any error (endpoint down, bad credentials, user
- * mapping missing or without secrets) is swallowed and returns false —
- * planning falls back to core's default rather than failing the query.
- * The user mapping is resolved for the principal the executor WILL use
- * (rte->checkAsUser: the view owner under view indirection, else the
- * invoker) so planning never raises a mapping error a fixture or user
- * expects at execution time; sizing just declines and core's default
- * estimate stands.
+ * Collect an operator's estimate without retaining credential options or a
+ * relation-only cache across plans. Provider unavailability and a missing
+ * mapping can fall back to the local estimate.
  */
 static bool
-planner_metadata_rows(Oid foreigntableid, Oid checkAsUser, int64 *rows_out)
+planner_metadata_rows(Oid foreigntableid, const char *selector, int64 *rows_out)
 {
-	PlannerRowsEntry *ent;
-	bool		found;
-	bool		bound = false;
 	LakehouseOptions opts;
-	ScanSession *session = NULL;
-	int64		rows = 0;
+	ScanSession *volatile session = NULL;
+	MemoryContext context;
 	MemoryContext oldcxt;
+	volatile bool available = false;
+	int64		rows = 0;
 
-	if (planner_rows_cache == NULL)
-	{
-		HASHCTL		ctl;
-
-		oldcxt = MemoryContextSwitchTo(TopMemoryContext);
-		MemSet(&ctl, 0, sizeof(ctl));
-		ctl.keysize = sizeof(Oid);
-		ctl.entrysize = sizeof(PlannerRowsEntry);
-		planner_rows_cache = hash_create("lakehouse planner rows cache",
-										 64, &ctl,
-										 HASH_ELEM | HASH_BLOBS);
-		MemoryContextSwitchTo(oldcxt);
-	}
-
-	ent = (PlannerRowsEntry *) hash_search(planner_rows_cache,
-										   &foreigntableid,
-										   HASH_ENTER, &found);
-	if (found)
-	{
-		*rows_out = ent->rows;
-		return ent->rows >= 0;
-	}
-
-	/* seed the cache with the failure value: success overwrites below */
-	ent->rows = -1;
-	ent->snapshot_id = 0;
-
-	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
-
-	/*
-	 * Resolve options + the read-binding gate in their own TRY that declines
-	 * on ANY error: a missing user mapping must surface at EXECUTION time
-	 * (check_view_mappings choreographs mapping create/drop around executor
-	 * resolution), never at plan time. The gate decision is a plain flag —
-	 * never a return from inside a PG_TRY body (that skips unwind
-	 * bookkeeping; glibc __longjmp_chk then aborts a later longjmp past this
-	 * frame — 2026-11-26 CI crash).
-	 */
-	{
-		bool		resolved = false;
-
-		PG_TRY();
-		{
-			ExtractOptions(foreigntableid, checkAsUser, &opts);
-			bound = (opts.read_binding.expected_table_uuid != NULL ||
-					 opts.read_binding.storage_root != NULL ||
-					 opts.read_binding.catalog_prefix != NULL ||
-					 opts.read_binding.s3_region != NULL);
-			resolved = true;
-		}
-		PG_CATCH();
-		{
-			/*
-			 * same FATAL policy as the sibling catch below: OOM/admin
-			 * shutdown propagate (they must not become a planning fallback);
-			 * statement-level errors decline the sizing
-			 */
-			ErrorData  *err;
-			bool		fatal;
-
-			MemoryContextSwitchTo(oldcxt);
-			err = CopyErrorData();
-			fatal = (err->elevel >= FATAL);
-			FreeErrorData(err);
-			if (fatal)
-				PG_RE_THROW();
-			FlushErrorState();
-		}
-		PG_END_TRY();
-		if (!resolved || bound)
-		{
-			MemoryContextSwitchTo(oldcxt);
-			return false;
-		}
-	}
-
+	context = AllocSetContextCreate(CurrentMemoryContext,
+									"lakehouse planning options",
+									ALLOCSET_SMALL_SIZES);
+	oldcxt = MemoryContextSwitchTo(context);
 	PG_TRY();
 	{
-		session = lakehouse_OpenSession(&opts, NULL);
-		for (uint64 i = 0; i < pg_datalake_scan_task_count(session); i++)
-			rows += pg_datalake_scan_task_rows(session, i);
-		ent->rows = rows;
-		ent->snapshot_id = pg_datalake_scan_snapshot_id(session);
-		pg_datalake_scan_free(session);
-		session = NULL;
-		elog(DEBUG1, "lakehouse planner relsize: relid %u rows " INT64_FORMAT
-			 " snapshot " INT64_FORMAT,
-			 foreigntableid, rows, ent->snapshot_id);
+		ExtractOptions(foreigntableid, GetUserId(), &opts);
+		if (opts.read_binding.expected_table_uuid == NULL &&
+			opts.read_binding.storage_root == NULL &&
+			opts.read_binding.catalog_prefix == NULL &&
+			opts.read_binding.s3_region == NULL)
+		{
+			uint64		tasks;
+
+			CHECK_FOR_INTERRUPTS();
+			session = lakehouse_OpenSession(&opts, selector);
+			CHECK_FOR_INTERRUPTS();
+			tasks = pg_datalake_scan_task_count(session);
+			available = true;
+			for (uint64 i = 0; i < tasks; i++)
+			{
+				int64		task_rows = pg_datalake_scan_task_rows(session, i);
+
+				CHECK_FOR_INTERRUPTS();
+				if (task_rows < 0 || task_rows > PG_INT64_MAX - rows)
+				{
+					available = false;
+					break;
+				}
+				rows += task_rows;
+			}
+			pg_datalake_scan_free(session);
+			session = NULL;
+		}
 	}
 	PG_CATCH();
 	{
-		/*
-		 * Restore the caller's context BEFORE CopyErrorData: at PG_CATCH
-		 * entry CurrentMemoryContext is ErrorContext, and CopyErrorData
-		 * allocates there (cassert asserts allocations never happen in
-		 * ErrorContext — 2026-11-26 CI crash). FATAL-class failures (OOM,
-		 * admin shutdown) then propagate instead of being swallowed into a
-		 * planning fallback; statement-level errors are declined.
-		 */
-		MemoryContextSwitchTo(oldcxt);
-		{
-			ErrorData  *err = CopyErrorData();
-			bool		fatal = (err->elevel >= FATAL);
+		int			sqlstate = geterrcode();
 
-			FreeErrorData(err);
-			if (fatal)
-				PG_RE_THROW();
-		}
+		MemoryContextSwitchTo(oldcxt);
 		if (session != NULL)
 			pg_datalake_scan_free(session);
+		if (sqlstate != ERRCODE_CONNECTION_EXCEPTION &&
+			sqlstate != ERRCODE_UNDEFINED_OBJECT)
+			PG_RE_THROW();
 		FlushErrorState();
-		return false;
+		available = false;
 	}
 	PG_END_TRY();
 
 	MemoryContextSwitchTo(oldcxt);
-	*rows_out = ent->rows;
-	return true;
+	MemoryContextDelete(context);
+	if (available)
+		*rows_out = rows;
+	return available;
 }
 
 void
 lakehouse_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 							Oid foreigntableid)
 {
-	/*
-	 * ExecutorStart checks relation permissions before opening the scan. Keep
-	 * planning local, including plans for views. Use catalog statistics when
-	 * available; otherwise derive the estimate from Iceberg table metadata
-	 * (parquet record_count sums) — exact, fail-safe, cached per session.
-	 */
+	/* Serving plans use the PostgreSQL catalog without origin I/O. */
 	if (baserel->tuples >= 0)
 	{
 		set_baserel_size_estimates(root, baserel);
 		return;
 	}
 
-	if (lakehouse_plan_rows_mode == PLAN_ROWS_METADATA &&
+	if (lakehouse_plan_rows_mode == PLAN_ROWS_METADATA && superuser() &&
+		baserel->reloptkind == RELOPT_BASEREL &&
+		(!OidIsValid(baserel->userid) || baserel->userid == GetUserId()) &&
 		!parse_is_trivial_count(root->parse))
 	{
-		/*
-		 * the principal the executor will scan under: baserel->userid is
-		 * core-maintained for every shape (build_simple_rel, including
-		 * inheritance children via the parent) and is exactly what
-		 * create_plan copies into ForeignScan.checkAsUser (postgres_fdw
-		 * precedent: "should match what ExecCheckPermissions() does")
-		 */
-		Oid			checkAsUser = OidIsValid(baserel->userid)
-			? baserel->userid : GetUserId();
 		int64		rows;
 
-		if (planner_metadata_rows(foreigntableid, checkAsUser, &rows) &&
-			rows >= 0 && (double) rows <= lakehouse_plan_rows_max)
+		if (planner_metadata_rows(foreigntableid,
+								  query_snapshot_selector(root, baserel), &rows) &&
+			(double) rows <= lakehouse_plan_rows_max)
 		{
 			double		scaled = (double) rows * lakehouse_plan_rows_scale;
 

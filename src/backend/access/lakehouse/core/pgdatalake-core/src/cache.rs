@@ -1,8 +1,6 @@
 //! Bounded byte cache for immutable Iceberg objects (spec 15 §6.2).
-//! Remote cache identity is the LOCATION (endpoint|bucket) — entries are
-//! immutable bytes valid across handle reopenings (§6.2 amendment
-//! 2026-11-26; SQL-layer authorization gates every query). Entries are
-//! evicted by capacity.
+//! Network entries belong to one open storage handle and its clones. A
+//! new handle establishes access with the provider. Eviction is capacity-based.
 
 use crate::storage::{StorageError, StorageIo};
 use std::collections::HashMap;
@@ -15,8 +13,8 @@ struct Entry {
 }
 
 /// Thread-safe LRU for object bytes and ranges. Keys include the storage
-/// location scope, caller namespace, object key and range. Entries
-/// larger than the capacity pass through uncached.
+/// scope, caller namespace, object key and range. Oversized and empty
+/// entries pass through uncached.
 pub struct BlockCache {
     inner: Mutex<CacheInner>,
     max_bytes: u64,
@@ -128,7 +126,7 @@ impl BlockCache {
             let mut inner = self.inner.lock().unwrap();
             inner.fetched += bytes.len() as u64;
         }
-        self.fill(sk, bytes.clone());
+        self.fill(sk, &bytes);
         Ok(bytes)
     }
 
@@ -160,21 +158,22 @@ impl BlockCache {
             let mut inner = self.inner.lock().unwrap();
             inner.fetched += bytes.len() as u64;
         }
-        self.fill(sk, bytes.clone());
+        self.fill(sk, &bytes);
         Ok(bytes)
     }
 
-    /// Cache-fill with capacity-only LRU eviction (immutable-path law:
-    /// this is the ONLY way entries leave the cache). Oversized entries
-    /// pass through uncached.
-    fn fill(&self, sk: CacheKey, bytes: Vec<u8>) {
-        let mut inner = self.inner.lock().unwrap();
+    /// Fill an absent entry, evicting by capacity.
+    fn fill(&self, sk: CacheKey, bytes: &[u8]) {
         let cost = bytes.len() as u64;
-        let max = self.max_bytes;
-        if cost > max {
+        if cost == 0 || cost > self.max_bytes {
             return;
         }
-        while inner.used + cost > max {
+        let mut inner = self.inner.lock().unwrap();
+        // Another miss can fill this key while the store request is in flight.
+        if inner.map.contains_key(&sk) {
+            return;
+        }
+        while cost > self.max_bytes - inner.used {
             let victim = inner
                 .map
                 .iter()
@@ -183,14 +182,19 @@ impl BlockCache {
             let Some(victim) = victim else {
                 break;
             };
-            if let Some(e) = inner.map.remove(&victim) {
-                let after = inner.used.saturating_sub(e.bytes.len() as u64);
-                inner.used = after;
+            if let Some(entry) = inner.map.remove(&victim) {
+                inner.used -= entry.bytes.len() as u64;
             }
         }
         inner.tick += 1;
         let tick = inner.tick;
-        inner.map.insert(sk, Entry { bytes, tick });
+        inner.map.insert(
+            sk,
+            Entry {
+                bytes: bytes.to_vec(),
+                tick,
+            },
+        );
         inner.used += cost;
     }
 
@@ -337,14 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_cache_is_location_scoped_and_credential_free() {
-        // 2026-11-26 law (spec 15 §6.2 amendment): cache identity is the
-        // LOCATION (endpoint|bucket), not the handle. Cached immutable
-        // bytes are credential-free — SQL-layer authorization gates every
-        // query before storage is touched, so a reopened handle serves
-        // warm bytes WITHOUT consulting the store, even if the store
-        // would 403 a fresh GET. A different bucket is a different scope
-        // and never shares entries.
+    fn reopened_remote_cache_requires_storage_authorization() {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_string();
         let location = crate::storage::Location::S3 {
@@ -359,8 +356,6 @@ mod tests {
             path_style: true,
         };
         let responder = std::thread::spawn(move || {
-            // The store sees EXACTLY the first handle's two reads (whole
-            // object + range); the reopened handle must produce none.
             for is_range in [false, true] {
                 let request = server
                     .recv_timeout(std::time::Duration::from_secs(4))
@@ -391,10 +386,19 @@ mod tests {
                 }
                 request.respond(response).unwrap();
             }
-            // (Zero warm-read consults is proven by the counters
-            // assertion below: 4 hits over 2 misses — no store request
-            // can hide behind a hit.) The responder just ends here;
-            // keep-alive connection noise must not fail the test.
+            for is_range in [false, true] {
+                let request = server
+                    .recv_timeout(std::time::Duration::from_secs(4))
+                    .unwrap()
+                    .expect("fresh handles must consult the store");
+                assert_eq!(request.method(), &tiny_http::Method::Get);
+                assert!(request.url().ends_with("/table/manifest.avro"));
+                assert_eq!(
+                    request.headers().iter().any(|h| h.field.equiv("Range")),
+                    is_range
+                );
+                request.respond(tiny_http::Response::empty(403)).unwrap();
+            }
         });
         let cache = BlockCache::new(1024);
         let authorized = StorageIo::open(&location, Some(&options)).unwrap();
@@ -409,33 +413,37 @@ mod tests {
             b"row"
         );
 
-        // A REOPENED handle (fresh auth, same location) serves the same
-        // warm bytes with zero store consults — cross-query reuse is the
-        // point of the 2026-11-26 change.
+        // The provider revoked access without changing the configured credentials.
         let reopened = StorageIo::open(&location, Some(&options)).unwrap();
-        assert_eq!(cache.get_bytes(&reopened, "", key).unwrap(), b"rows");
-        assert_eq!(cache.get_range(&reopened, "", key, 0, 3).unwrap(), b"row");
-
-        responder.join().unwrap();
-        // 4 hits (2 warm reads per handle) over 2 cold misses
-        assert_eq!(cache.counters(), (4, 2));
-        assert_eq!(cache.fetched_bytes(), 7);
-
-        // A different bucket is a different scope: it must NOT see the
-        // warm bytes (a collision would return b"rows" from cache); it
-        // goes to the store instead, which the joined responder no longer
-        // serves — the read fails loudly, proving both isolation and
-        // cold-miss behavior.
-        let other = crate::storage::Location::S3 {
-            bucket: "other".into(),
-            key: "table".into(),
-        };
-        let other_io = StorageIo::open(&other, Some(&options)).unwrap();
         assert!(matches!(
-            cache.get_bytes(&other_io, "", key),
+            cache.get_bytes(&reopened, "", key),
             Err(StorageError::Http(_))
         ));
-        assert_eq!(cache.counters(), (4, 3));
+        assert!(matches!(
+            cache.get_range(&reopened, "", key, 0, 3),
+            Err(StorageError::Http(_))
+        ));
+        responder.join().unwrap();
+        assert_eq!(cache.counters(), (2, 4));
+        assert_eq!(cache.fetched_bytes(), 7);
+    }
+
+    #[test]
+    fn duplicate_fill_preserves_capacity_accounting() {
+        let (_dir, io) = fixture();
+        let cache = BlockCache::new(8);
+        let first = BlockCache::scoped_key(&io, "", "first", None);
+        let second = BlockCache::scoped_key(&io, "", "second", None);
+
+        // Two misses can finish reading the same key before either fill.
+        cache.fill(first.clone(), b"rows");
+        cache.fill(first.clone(), b"rows");
+        cache.fill(second, b"more");
+
+        let state = cache.inner.lock().unwrap();
+        assert_eq!(state.used, 8);
+        assert_eq!(state.map.len(), 2);
+        assert!(state.map.contains_key(&first));
     }
 
     /// Capacity law: inserting past the cap evicts LRU entries; the cap

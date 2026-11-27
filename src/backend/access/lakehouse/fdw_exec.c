@@ -43,9 +43,6 @@
 #include "batch_fill.h"
 #include "pg_datalake_core.h"
 
-extern bool lakehouse_cache_enabled;
-extern bool lakehouse_rowgroup_pruning;
-
 void
 lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 {
@@ -83,6 +80,10 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 			return;
 		}
 	}
+
+	/* Explain-only initialization must not resolve a scan or mapping. */
+	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+		return;
 
 	tupdesc = RelationGetDescr(rel);
 
@@ -162,13 +163,7 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 	}
 	pg_datalake_core_cache_stats(&state->cache_at_begin);
 
-	/*
-	 * per-statement measurement gates (spec 15 §6.3a): the cache gate
-	 * mirrors the session GUC into the Rust core (pass-through reads,
-	 * counters untouched); the pruning gate drops the predicate so row-group
-	 * pruning cannot fire for this scan
-	 */
-	pg_datalake_core_cache_set_enabled(lakehouse_cache_enabled);
+	/* Retain local quals when the measurement profile disables pruning. */
 	if (!lakehouse_rowgroup_pruning)
 		state->predicate_json = NULL;
 
@@ -198,7 +193,7 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
  * snapshot. The reader applies the same delete semantics as a normal scan.
  */
 static int64
-lakehouse_count_pinned_rows(ScanSession *session, uint64 tasks)
+lakehouse_count_pinned_rows(ScanSession * session, uint64 tasks)
 {
 	RowsHandle *volatile rows = NULL;
 	int64		count = 0;
@@ -421,7 +416,7 @@ lakehouse_IterateForeignScan(ForeignScanState *node)
 						continue;
 					}
 					{
-						const PgDatalakeBatchColumn *col =
+						const		PgDatalakeBatchColumn *col =
 							&state->batch.cols[pcol];
 
 						if (col->nulls[r])

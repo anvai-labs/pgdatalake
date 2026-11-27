@@ -1,5 +1,7 @@
 # PostgreSQL Lakehouse (`pgdatalake`) — Fork Design Specs
 
+The [foundation audit and delivery schedule](20-foundation-audit.md) records the current implementation, release evidence and dependencies.
+
 This directory contains the design specifications for making this PostgreSQL fork
 (`anvai-labs/pgdatalake`, tracking `postgres/postgres` master) a **native lakehouse**:
 query and manage open table-format tables (external tables that already live in a

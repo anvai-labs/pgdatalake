@@ -1,6 +1,13 @@
 # Anvai Lake core product and publication contract
 
-**Product evidence at merged core `f5b86d9a2f8c0f0e3ad2894562359bfb44ba36b5` (PR #69).** Anvai Lake has two public database packages. The first pilot attaches an existing published Iceberg table to upstream PostgreSQL 19.0 with a read-only FDW. The fork adds native SQL syntax and a managed TableAM. The scoped fixture recovers an accepted append after a lost reply. **Reconciled 2026-11-23:** the native worker dispatch and the compatible managed read joined that proof — ordinary bound TableAM SQL serves the compatible-pin cut with held-snapshot overlay evidence (#93, lost-reply drill). [Stock build and smoke](../../src/backend/access/lakehouse/stock/README.md) · [Core release gates](modules/08a-core-release-gates.md)
+Anvai Lake has two public database packages. The stock PG19.0 pilot
+attaches existing published Iceberg tables through a read-only FDW.
+The fork adds native SQL syntax and a managed TableAM. The managed
+fixture proves one-shot publication recovery after a lost reply,
+compatible-pin bound reads and eligible COUNT on the same cut.
+Provider retention, checked-role admission and hosted qualification
+remain open. [Stock build and smoke](../../src/backend/access/lakehouse/stock/README.md) ·
+[Current evidence and release gates](20-foundation-audit.md)
 
 ## Two packages, one shared reader
 

@@ -1,10 +1,7 @@
-"""Block-cache counters: the spec 15 §6.3a measurement gate.
+"""Measure both scans in one backend across two independently opened handles.
 
-lakehouse.cache_stats() exposes hits/misses/fetched_bytes/used_bytes/
-entries from the per-backend immutable-path block cache (§6.2 keying:
-entries valid forever, so a fully-warm re-scan must add ZERO fetched
-bytes — the WORM immutability proof). The R6 result-cache layer (§6.4)
-is gated on these measurements.
+Each statement must read through its current storage authority. Cache hits
+within a handle remain covered by the Rust loopback and range tests.
 """
 
 import importlib
@@ -21,14 +18,16 @@ S3_AK = os.getenv("LH_S3_ACCESS_KEY", "lakehouse-test")
 S3_SK = os.getenv("LH_S3_SECRET_KEY", "lakehouse-test-password")
 
 
-def warm_rescan_proof(name, query):
+def statement_cache_receipts(name, query):
     """Two scans + three counter reads in ONE psql invocation: the block
     cache is per-backend, so separate sql() calls (fresh backend each)
     would all read zeros. Returns (before, after_scan1, after_scan2)."""
     reads = ("SELECT hits, misses, fetched_bytes, used_bytes, entries "
              "FROM lakehouse.cache_stats()")
     out = sql(name, f"{reads}; {query}; {reads}; {query}; {reads}")
-    lines = [ln for ln in out.split("\n") if "|" in ln]
+    results = out.splitlines()
+    assert [line for line in results if "|" not in line] == ["2001000", "2001000"], out
+    lines = [line for line in results if "|" in line]
     assert len(lines) == 3, out
 
     def parse(ln):
@@ -66,14 +65,17 @@ def main():
                     OPTIONS (table '{ns}.events');
             """)
 
-            # one backend: cold scan fills the cache (misses grow,
-            # fetched_bytes accumulates), the warm re-scan adds ZERO
-            # fetched bytes and serves from hits (§6.2 no-invalidation
-            # law: immutable entries stay valid — the WORM proof)
-            a, b, c = warm_rescan_proof(name, "SELECT sum(id) FROM events")
+            a, b, c = statement_cache_receipts(name, "SELECT sum(id) FROM events")
             assert b["fetched"] > a["fetched"], (a, b)
-            assert c["fetched"] == b["fetched"], (b, c)
-            assert c["hits"] > b["hits"], (b, c)
+            assert c["fetched"] > b["fetched"], (b, c)
+            assert c["misses"] > b["misses"], (b, c)
+
+            counters = "SELECT hits, misses, fetched_bytes FROM lakehouse.cache_stats()"
+            # COUNT uses a separate first-demand scan path. The GUC must
+            # apply before this path runs even with no prior ordinary scan.
+            off = sql(name, "SET lakehouse.cache_enabled = off; "
+                            f"SELECT count(*) FROM events; {counters}")
+            assert off.splitlines() == ["2000", "0|0|0"], off
 
             print(f'{{"case": "cache-counters", "hits": {c["hits"]}, '
                   f'"misses": {c["misses"]}, "fetched": {c["fetched"]}}}',

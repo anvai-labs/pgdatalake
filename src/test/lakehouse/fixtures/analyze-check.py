@@ -4,7 +4,7 @@ The relsize slice grounded row counts in Iceberg metadata but left join
 and qual selectivity on core's DEFAULT_NUM_DISTINCT(200) fallback. With
 AnalyzeForeignTable/AcquireSampleRows, ANALYZE (explicit or auto-analyze)
 populates real per-column statistics: 5000 rows over 7 distinct grp values
-must plan grp = '1' at ~1/7 selectivity, not 5000/200.
+should plan grp = '1' at ~1/7 selectivity after ANALYZE.
 """
 
 import importlib
@@ -76,9 +76,9 @@ def main():
                     OPTIONS (table '{ns}.events');
             """)
 
-            # pre-ANALYZE: metadata tuples with default NDV -> 5000/200 = 25
+            # The core fallback before ANALYZE uses its local 1,000-row estimate.
             r = plan_rows(name, "SELECT id FROM events WHERE grp = '1'")
-            assert r == [25], r
+            assert r == [1000], r
 
             # explicit ANALYZE: sample -> real NDV (7 distinct over 5000)
             sql(name, "ANALYZE events")
