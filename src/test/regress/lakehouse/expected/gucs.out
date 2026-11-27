@@ -95,3 +95,44 @@ SHOW lakehouse.target_file_size;
 (1 row)
 
 RESET lakehouse.target_file_size;
+-- measurement gates (spec 15 §6.3a): server default on, session off/on
+SHOW lakehouse.cache_enabled;
+ lakehouse.cache_enabled 
+-------------------------
+ on
+(1 row)
+
+SET lakehouse.cache_enabled = off;
+SHOW lakehouse.cache_enabled;
+ lakehouse.cache_enabled 
+-------------------------
+ off
+(1 row)
+
+RESET lakehouse.cache_enabled;
+SHOW lakehouse.cache_enabled;
+ lakehouse.cache_enabled 
+-------------------------
+ on
+(1 row)
+
+SHOW lakehouse.rowgroup_pruning;
+ lakehouse.rowgroup_pruning 
+----------------------------
+ on
+(1 row)
+
+SET lakehouse.rowgroup_pruning = off;
+SHOW lakehouse.rowgroup_pruning;
+ lakehouse.rowgroup_pruning 
+----------------------------
+ off
+(1 row)
+
+RESET lakehouse.rowgroup_pruning;
+SHOW lakehouse.rowgroup_pruning;
+ lakehouse.rowgroup_pruning 
+----------------------------
+ on
+(1 row)
+

@@ -240,7 +240,7 @@ lakehouse_fdw_plan_guc_init(void)
 							 PGC_USERSET, 0,
 							 NULL, NULL, NULL);
 	DefineCustomBoolVariable("lakehouse.rowgroup_pruning",
-							 "Prune row groups by exact min/max statistics when a translated predicate exists (rows are always re-checked locally).",
+							 "Predicate-based pruning (file bounds/partitions AND row-group stats) when a translated predicate exists; rows are always re-checked locally. Off = no plan-time pruning at all.",
 							 NULL,
 							 &lakehouse_rowgroup_pruning,
 							 true,
