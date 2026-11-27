@@ -92,10 +92,18 @@ lakehouse_batch_map_column(Form_pg_attribute attr,
 		case 4:					/* TimestampUs (epoch micros) */
 			if ((attr->atttypid == TIMESTAMPOID ||
 				 attr->atttypid == TIMESTAMPTZOID) &&
-				(attr->atttypmod == -1 ||
-				 attr->atttypmod >= MAX_TIMESTAMP_PRECISION))
-				/* typmod IS the precision (0..6); 6/-1 need no rounding */
+				(attr->atttypmod == -1 || attr->atttypmod >= 0) &&
+				attr->atttypmod <= MAX_TIMESTAMP_PRECISION)
+			{
+				/*
+				 * typmod IS the precision (0..6); 6/-1 need no rounding.
+				 * Sub-6 precisions take the exact AdjustTimestampForTypmod
+				 * integer arithmetic (TimestampOffsets/Scales tables) —
+				 * byte-identical to timestamp_in's rounding (B2 widening).
+				 */
 				map->target = LAKE_FAST_TIMESTAMP;
+				map->typmod = attr->atttypmod;
+			}
 			break;
 
 		case 7:					/* Date32 (days since 1970-01-01) */
@@ -108,7 +116,12 @@ lakehouse_batch_map_column(Form_pg_attribute attr,
 				map->target = LAKE_FAST_TEXT;
 			else if (attr->atttypid == VARCHAROID)
 				map->target = LAKE_FAST_VARCHAR;	/* length checked per row */
-			/* bpchar (blank padding) / name (64-byte truncation) fallback */
+			else if (attr->atttypid == BPCHAROID &&
+					 attr->atttypmod >= 0)
+				/* typmod IS the char length + VARHDRSZ; padded per row */
+				map->target = LAKE_FAST_BPCHAR;
+			else if (attr->atttypid == NAMEOID)
+				map->target = LAKE_FAST_NAME;	/* truncated per row */
 			break;
 
 		case 6:					/* Bytes (raw span) */
@@ -147,6 +160,28 @@ lakehouse_batch_col_datum(const LakehouseBatchMap *map,
 			{
 				int64		v = ((const int64 *) col->values)[r];
 				int64		out;
+
+				/*
+				 * B2 widening: sub-6 typmod rounds exactly like
+				 * AdjustTimestampForTypmod (integer offsets/scales tables,
+				 * sign-split division) — byte-identical to timestamp_in.
+				 */
+				if (map->typmod >= 0 && map->typmod < 6)
+				{
+					static const int64 offsets[6] = {
+						500000, 50000, 5000, 500, 50, 5
+					};
+					static const int64 scales[6] = {
+						1000000, 100000, 10000, 1000, 100, 10
+					};
+
+					if (v >= 0)
+						v = ((v + offsets[map->typmod]) /
+							 scales[map->typmod]) * scales[map->typmod];
+					else
+						v = -(((-v + offsets[map->typmod]) /
+							   scales[map->typmod]) * scales[map->typmod]);
+				}
 
 				if (__builtin_sub_overflow(v,
 										   (int64) LAKE_PG_EPOCH_DAYS * USECS_PER_DAY,
@@ -202,6 +237,48 @@ lakehouse_batch_col_datum(const LakehouseBatchMap *map,
 				SET_VARSIZE(b, VARHDRSZ + sp->len);
 				memcpy(VARDATA(b), sp->ptr, sp->len);
 				return PointerGetDatum(b);
+			}
+
+		case LAKE_FAST_BPCHAR:
+			{
+				const BatchSpan *sp = &col->spans[r];
+				int32		maxlen = map->typmod - VARHDRSZ;
+				int32		chars = pg_mbstrlen_with_len((const char *) sp->ptr,
+														 (int) sp->len);
+				text	   *t;
+
+				/*
+				 * bpchar semantics: shorter values pad with spaces, longer
+				 * values error (same as varchar's length check).
+				 */
+				if (chars > maxlen)
+					ereport(ERROR,
+							(errcode(ERRCODE_STRING_DATA_RIGHT_TRUNCATION),
+							 errmsg("value too long for type character(%d)",
+									maxlen)));
+				t = (text *) palloc(VARHDRSZ + maxlen);
+				SET_VARSIZE(t, VARHDRSZ + maxlen);
+				memcpy(VARDATA(t), sp->ptr, sp->len);
+
+				/*
+				 * blank-pad by CHARACTER count: space is single-byte in all
+				 * server encodings (bpcharin pads the same way)
+				 */
+				memset(VARDATA(t) + sp->len, ' ', maxlen - chars);
+				return PointerGetDatum(t);
+			}
+
+		case LAKE_FAST_NAME:
+			{
+				const BatchSpan *sp = &col->spans[r];
+				Name		n = (Name) palloc0(NAMEDATALEN);
+
+				if (sp->len >= NAMEDATALEN)
+					ereport(ERROR,
+							(errcode(ERRCODE_NAME_TOO_LONG),
+							 errmsg("identifier too long")));
+				memcpy(NameStr(*n), sp->ptr, sp->len);
+				return NameGetDatum(n);
 			}
 
 		default:
