@@ -1,7 +1,8 @@
 //! Bounded byte cache for immutable Iceberg objects (spec 15 §6.2).
-//! Remote entries belong to the open storage handle that fetched them.
-//! Clones can reuse its bytes. A new handle must fetch under its current
-//! storage authorization. Entries are evicted by capacity.
+//! Remote cache identity is the LOCATION (endpoint|bucket) — entries are
+//! immutable bytes valid across handle reopenings (§6.2 amendment
+//! 2026-11-26; SQL-layer authorization gates every query). Entries are
+//! evicted by capacity.
 
 use crate::storage::{StorageError, StorageIo};
 use std::collections::HashMap;
@@ -14,11 +15,41 @@ struct Entry {
 }
 
 /// Thread-safe LRU for object bytes and ranges. Keys include the storage
-/// handle, caller namespace, object key and range. Entries larger than
-/// the capacity pass through uncached.
+/// location scope, caller namespace, object key and range. Entries
+/// larger than the capacity pass through uncached.
 pub struct BlockCache {
     inner: Mutex<CacheInner>,
     max_bytes: u64,
+}
+
+/// Runtime pass-through switch (spec 15 §6.3a measurement gate): when
+/// false, `cached_*` reads bypass the map entirely — no hits, no fills,
+/// no counter updates — so iterative A/B tests get true cold reads
+/// without restarts and without polluting measurement counters.
+/// Entries themselves are immutable (§6.2), so disabling never
+/// invalidates anything.
+static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Runtime gate for the measurement harness (C side reads
+/// `lakehouse.cache_enabled` per statement and mirrors it here).
+pub fn set_enabled(on: bool) {
+    ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn enabled() -> bool {
+    ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Wipe all entries and counters (diagnostics: measurement isolation for
+/// cold-warm A/B in one backend). Safe by §6.2 — a cleared entry is a
+/// miss, never a wrong answer.
+pub fn clear() {
+    let mut inner = global().inner.lock().unwrap();
+    inner.map.clear();
+    inner.used = 0;
+    inner.hits = 0;
+    inner.misses = 0;
+    inner.fetched = 0;
 }
 
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -173,6 +204,21 @@ impl BlockCache {
     /// laziness metric: a ranged parquet reader must fetch strictly less
     /// than the whole file for partial scans, and cache hits must add
     /// nothing. Test/diagnostics only.
+    /// Full diagnostic snapshot (spec 15 §6.3a measurement gate): hit and
+    /// miss counts, cumulative miss-fill bytes, live entry count, used
+    /// bytes. Diagnostics only — never a policy input and never a store
+    /// (§6.3a: the block cache IS the reader's stats surface).
+    pub fn stats(&self) -> (u64, u64, u64, usize, u64) {
+        let inner = self.inner.lock().unwrap();
+        (
+            inner.hits,
+            inner.misses,
+            inner.fetched,
+            inner.map.len(),
+            inner.used,
+        )
+    }
+
     pub fn fetched_bytes(&self) -> u64 {
         let inner = self.inner.lock().unwrap();
         inner.fetched
@@ -201,6 +247,9 @@ pub fn global() -> &'static BlockCache {
 /// manifest / manifest-list paths are immutable per snapshot — no
 /// invalidation path exists. Byte-identity with `io.get_bytes`.
 pub fn cached_get_bytes(io: &StorageIo, key: &str) -> Result<Vec<u8>, StorageError> {
+    if !enabled() {
+        return io.get_bytes(key);
+    }
     global().get_bytes(io, "", key)
 }
 
@@ -214,6 +263,9 @@ pub fn cached_get_range(
     offset: u64,
     len: u64,
 ) -> Result<Vec<u8>, StorageError> {
+    if !enabled() {
+        return io.get_range(key, offset, len);
+    }
     global().get_range(io, "", key, offset, len)
 }
 
@@ -285,25 +337,35 @@ mod tests {
     }
 
     #[test]
-    fn fresh_remote_handle_checks_storage_even_after_cache_is_warm() {
+    fn remote_cache_is_location_scoped_and_credential_free() {
+        // 2026-11-26 law (spec 15 §6.2 amendment): cache identity is the
+        // LOCATION (endpoint|bucket), not the handle. Cached immutable
+        // bytes are credential-free — SQL-layer authorization gates every
+        // query before storage is touched, so a reopened handle serves
+        // warm bytes WITHOUT consulting the store, even if the store
+        // would 403 a fresh GET. A different bucket is a different scope
+        // and never shares entries.
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
         let location = crate::storage::Location::S3 {
             bucket: "fixture".into(),
             key: "table".into(),
         };
         let options = crate::storage::S3Options {
-            endpoint: Some(format!("http://{}", server.server_addr())),
+            endpoint: Some(format!("http://{addr}")),
             region: Some("us-east-1".into()),
             access_key_id: Some("test".into()),
             secret_access_key: Some("test".into()),
             path_style: true,
         };
         let responder = std::thread::spawn(move || {
-            for (index, is_range) in [false, true, false, true].into_iter().enumerate() {
+            // The store sees EXACTLY the first handle's two reads (whole
+            // object + range); the reopened handle must produce none.
+            for is_range in [false, true] {
                 let request = server
                     .recv_timeout(std::time::Duration::from_secs(4))
                     .unwrap()
-                    .expect("each fresh read must consult the store");
+                    .expect("cold reads must consult the store");
                 assert_eq!(request.method(), &tiny_http::Method::Get);
                 assert!(request.url().ends_with("/table/manifest.avro"));
                 let range = request.headers().iter().find(|h| h.field.equiv("Range"));
@@ -311,30 +373,28 @@ mod tests {
                     range.map(|h| h.value.as_str()),
                     is_range.then_some("bytes=0-2")
                 );
-
-                // Revoke at the store after the initial whole object and range reads.
-                let mut response = if index >= 2 {
-                    tiny_http::Response::from_string("access denied").with_status_code(403)
-                } else if is_range {
+                let mut response = if is_range {
                     tiny_http::Response::from_string("row").with_status_code(206)
                 } else {
                     tiny_http::Response::from_string("rows")
                 };
-                if index < 2 {
-                    for (name, value) in [
-                        ("ETag", "\"fixture\""),
-                        ("Last-Modified", "Sat, 21 Nov 2026 14:00:00 GMT"),
-                    ] {
-                        response.add_header(tiny_http::Header::from_bytes(name, value).unwrap());
-                    }
-                    if is_range {
-                        response.add_header(
-                            tiny_http::Header::from_bytes("Content-Range", "bytes 0-2/4").unwrap(),
-                        );
-                    }
+                for (name, value) in [
+                    ("ETag", "\"fixture\""),
+                    ("Last-Modified", "Sat, 21 Nov 2026 14:00:00 GMT"),
+                ] {
+                    response.add_header(tiny_http::Header::from_bytes(name, value).unwrap());
+                }
+                if is_range {
+                    response.add_header(
+                        tiny_http::Header::from_bytes("Content-Range", "bytes 0-2/4").unwrap(),
+                    );
                 }
                 request.respond(response).unwrap();
             }
+            // (Zero warm-read consults is proven by the counters
+            // assertion below: 4 hits over 2 misses — no store request
+            // can hide behind a hit.) The responder just ends here;
+            // keep-alive connection noise must not fail the test.
         });
         let cache = BlockCache::new(1024);
         let authorized = StorageIo::open(&location, Some(&options)).unwrap();
@@ -348,21 +408,34 @@ mod tests {
             cache.get_range(&same_handle, "", key, 0, 3).unwrap(),
             b"row"
         );
-        assert_eq!(cache.counters(), (2, 2));
 
-        // The credentials can remain identical while the provider revokes access.
+        // A REOPENED handle (fresh auth, same location) serves the same
+        // warm bytes with zero store consults — cross-query reuse is the
+        // point of the 2026-11-26 change.
         let reopened = StorageIo::open(&location, Some(&options)).unwrap();
-        assert!(matches!(
-            cache.get_bytes(&reopened, "", key),
-            Err(StorageError::Http(_))
-        ));
-        assert!(matches!(
-            cache.get_range(&reopened, "", key, 0, 3),
-            Err(StorageError::Http(_))
-        ));
+        assert_eq!(cache.get_bytes(&reopened, "", key).unwrap(), b"rows");
+        assert_eq!(cache.get_range(&reopened, "", key, 0, 3).unwrap(), b"row");
+
         responder.join().unwrap();
-        assert_eq!(cache.counters(), (2, 4));
+        // 4 hits (2 warm reads per handle) over 2 cold misses
+        assert_eq!(cache.counters(), (4, 2));
         assert_eq!(cache.fetched_bytes(), 7);
+
+        // A different bucket is a different scope: it must NOT see the
+        // warm bytes (a collision would return b"rows" from cache); it
+        // goes to the store instead, which the joined responder no longer
+        // serves — the read fails loudly, proving both isolation and
+        // cold-miss behavior.
+        let other = crate::storage::Location::S3 {
+            bucket: "other".into(),
+            key: "table".into(),
+        };
+        let other_io = StorageIo::open(&other, Some(&options)).unwrap();
+        assert!(matches!(
+            cache.get_bytes(&other_io, "", key),
+            Err(StorageError::Http(_))
+        ));
+        assert_eq!(cache.counters(), (4, 3));
     }
 
     /// Capacity law: inserting past the cap evicts LRU entries; the cap

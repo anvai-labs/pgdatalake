@@ -2722,7 +2722,7 @@ mod eq_delete_binding_tests {
             .for_task(&plan.tasks[0].entry.data_file.file_path, 2, false)
             .unwrap();
         let mut rows =
-            crate::parquet::ParquetRows::open_with_deletes(&dio, &dkey, &["id"], rd).unwrap();
+            crate::parquet::ParquetRows::open_with_deletes(&dio, &dkey, &["id"], rd, None).unwrap();
         let mut ids = Vec::new();
         while rows.next() {
             if let CellValue::Int64(v) = rows.value(0) {
@@ -2809,7 +2809,7 @@ mod dv_fixture_tests {
 
         let (io, key) = open_for(&data_path, None).expect("open data file");
         let mut rows =
-            crate::parquet::ParquetRows::open_with_deletes(&io, &key, &["id"], row_deletes)
+            crate::parquet::ParquetRows::open_with_deletes(&io, &key, &["id"], row_deletes, None)
                 .expect("open rows");
         let mut ids = Vec::new();
         while rows.next() {
@@ -2971,7 +2971,7 @@ mod dv_trino_fixture_tests {
 
         let (io, key) = open_for(&data_path, None).expect("open data");
         let mut rows =
-            crate::parquet::ParquetRows::open_with_deletes(&io, &key, &["id"], row_deletes)
+            crate::parquet::ParquetRows::open_with_deletes(&io, &key, &["id"], row_deletes, None)
                 .expect("open rows");
         let mut ids = Vec::new();
         while rows.next() {

@@ -9,14 +9,19 @@ fail-safe declines keep the SubPlan.
 
 import importlib
 import json
+import os
 from uuid import uuid4
 
 from publication_fixture import sql
 
 trino = importlib.import_module("bound-publication-restart").trino
 
-CATALOG = "http://localhost:8181/catalog"
-S3 = "http://localhost:9000"
+# CI defaults (compose lakekeeper + seaweed); a profile can override —
+# the user mapping must carry credentials the S3 endpoint accepts.
+CATALOG = os.getenv("LH_CATALOG", "http://localhost:8181/catalog")
+S3 = os.getenv("LH_S3", "http://localhost:9000")
+S3_AK = os.getenv("LH_S3_ACCESS_KEY", "lakehouse-test")
+S3_SK = os.getenv("LH_S3_SECRET_KEY", "lakehouse-test-password")
 
 
 def main():
@@ -46,7 +51,7 @@ def main():
                 CREATE SERVER s FOREIGN DATA WRAPPER lh OPTIONS
                     (endpoint '{CATALOG}', warehouse 'smoke', s3_endpoint '{S3}');
                 CREATE USER MAPPING FOR CURRENT_USER SERVER s OPTIONS
-                    (s3_access_key 'lakehouse-test', s3_secret_key 'lakehouse-test-password');
+                    (s3_access_key '{S3_AK}', s3_secret_key '{S3_SK}');
                 CREATE FOREIGN TABLE events (id bigint, grp varchar, amt double precision) SERVER s
                     OPTIONS (table '{ns}.events');
                 CREATE FOREIGN TABLE item (i_item_sk bigint, i_current_price double precision, i_category varchar) SERVER s
@@ -120,6 +125,18 @@ def main():
                               WHERE c1.grp = c2.grp)
             """
             sql(name, q1_or)
+
+            # operator gate: lakehouse.agg_pullup=off restores the SubPlan
+            # for the rewriteable shape (escape hatch + A/B attribution,
+            # spec 19 §6.5); the SET must ride with the EXPLAIN — sql()
+            # opens a fresh session per call
+            off_plan = sql(name, "SET lakehouse.agg_pullup = off; "
+                                 "EXPLAIN (COSTS OFF) " + q1_shape)
+            assert "SubPlan" in off_plan, off_plan
+            on_plan = sql(name, "SET lakehouse.agg_pullup = on; "
+                                "EXPLAIN (COSTS OFF) " + q1_shape)
+            assert "SubPlan" not in on_plan and "agg_pullup" in on_plan, on_plan
+
             check_plan(q1_volatile, expect_subplan=True)
             check_plan(q1_ineq, expect_subplan=True)
             check_plan(q1_or, expect_subplan=True)

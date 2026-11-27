@@ -398,6 +398,28 @@ below requires its own authorization and version checks.
   size-capped (LRU), O_DIRECT-friendly contiguous extents; per-instance
   (never shared across catalogs/warehouses — a path is only unique
   within its warehouse; the cache namespace includes the warehouse id).
+
+**§6.2 amendment (2026-11-26, measurement-gated): cache identity is the
+LOCATION, not the handle.** The original handle-scoped keying
+(`remote:{handle-id}`) was reversed after the §6.3a measurement gate
+(`lakehouse.cache_stats` + cache-counters-check) measured cross-query
+hit ratio at literally ZERO — every SQL statement opens a fresh storage
+handle, so handle-scoped entries were unreachable by design and the
+block cache only ever served intra-query reuse. Remote cache identity
+is now `remote:{endpoint}|{bucket}` (components '|'-escaped so the
+separator is unambiguous; `http(s)` metadata locations key on
+`remote:{url}`; local unchanged: `local:{root}`).
+Soundness: cached immutable bytes carry no credential state and need no
+GET (§6.2's auth-freshness concern applies only to fresh GETs, which
+re-authorize through the opening handle's client exactly as before);
+SQL-layer authorization still gates every query at ExecutorStart before
+any storage access — the storage-credential revocation semantics now
+match PG's own shared_buffers behavior (a revoked role fails the SQL
+permission check, not the buffer read). Pinned by
+`remote_cache_is_location_scoped_and_credential_free` (same-location
+reopened handle = warm hits with zero store consults; different bucket =
+isolated scope, cold miss).
+
 - Security: cache files carry table DATA (RULES §6 class): directory
   perms 0700, lives in PGDATA or operator-specified secure path, never
   included in dumps; contents never logged.

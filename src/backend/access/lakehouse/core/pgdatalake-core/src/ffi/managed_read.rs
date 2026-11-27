@@ -95,7 +95,7 @@ impl ManagedReadObservation {
         }
 
         let bound = self.observed.plan_snapshot(pin, None)?;
-        ScanSession::from_read_plan(bound.plan, bound.s3, &bound.schema, Some(bound.root))
+        ScanSession::from_read_plan(bound.plan, None, bound.s3, &bound.schema, Some(bound.root))
     }
 }
 

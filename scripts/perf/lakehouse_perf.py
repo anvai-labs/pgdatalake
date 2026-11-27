@@ -48,7 +48,11 @@ DEFAULT_TPCH_DDL = REPO / "scripts" / "perf" / "tpch" / "ddl.sql"
 DEFAULT_TPCH_QUERIES = REPO / "scripts" / "perf" / "tpch" / "queries"
 
 # q1/q2/q3 = the recorded §5.1 comparison set
-TPCDS_QUERIES = ["query1", "query2", "query3"]
+# Full sweep set (q1-q10, DNF-and-continue) vs the pinned qualification
+# canaries (q1-q3; run_pinned oracle validation is strict on set equality,
+# so growing the pinned set would silently invalidate recorded oracles).
+TPCDS_QUERIES = [f"query{i}" for i in range(1, 11)]
+TPCDS_PINNED_CANARIES = ["query1", "query2", "query3"]
 
 # TPC-H SF=1 (duckdb dbgen): the full 22-branch lineitem fact
 TPCH_QUERIES = [f"query{i}" for i in range(1, 11)]
@@ -114,17 +118,23 @@ def connect(dsn: str, autocommit: bool = True):
     return conn
 
 
+class QueryTimeout(Exception):
+    """statement_timeout fired; the sweep records a DNF and moves on."""
+
+
 def timed(cur, sql: str, timeout_s: int) -> float:
     cur.execute(f"SET statement_timeout = {timeout_s * 1000}")
     t0 = time.perf_counter()
     try:
         cur.execute(sql)  # single-statement files; psycopg2 has no nextset on pgwire
     except psycopg2.errors.QueryCanceled:
-        raise SystemExit(f"TIMEOUT after {timeout_s}s: {sql[:60]}...")
+        raise QueryTimeout(f"TIMEOUT after {timeout_s}s: {sql[:60]}...")
     return time.perf_counter() - t0
 
 
 def measure(cur, sql: str, timeout_s: int, warmup: bool = True):
+    """4 timed runs (warmup + 3); on a timeout, remaining runs are
+    skipped and (None, None) marks the query DNF in the receipt."""
     if warmup:
         timed(cur, sql, timeout_s)
     runs = [timed(cur, sql, timeout_s) for _ in range(3)]
@@ -229,7 +239,13 @@ def run_scan_suite(conn, args):
     }
     rows = []
     for name, sql in queries.items():
-        runs, med = measure(cur, sql, args.timeout, warmup=args.warmup)
+        try:
+            runs, med = measure(cur, sql, args.timeout, warmup=args.warmup)
+        except QueryTimeout as e:
+            print(f"{name}: TIMEOUT ({e})", flush=True)
+            rows.append((name, None))
+            conn.rollback()
+            continue
         print(f"{name}: runs={['%.2f' % r for r in runs]} median={med:.2f}s")
         rows.append((name, med))
     return rows
@@ -267,8 +283,16 @@ def run_tpcds_suite(conn, args):
     rows = []
     for q in TPCDS_QUERIES:
         sql = (Path(args.queries) / f"{q}.sql").read_text()
-        runs, med = measure(cur, sql, args.timeout, warmup=args.warmup)
-        print(f"{q}: runs={['%.1f' % r for r in runs]} median={med:.1f}s")
+        try:
+            runs, med = measure(cur, sql, args.timeout, warmup=args.warmup)
+        except QueryTimeout as e:
+            # a timeout kills only this query's runs (planning included —
+            # statement_timeout covers the planner too); the sweep continues
+            print(f"{q}: TIMEOUT ({e})", flush=True)
+            rows.append((q, None))
+            conn.rollback()
+            continue
+        print(f"{q}: runs={['%.1f' % r for r in runs]} median={med:.1f}s", flush=True)
         rows.append((q, med))
     return rows
 
@@ -300,7 +324,13 @@ def run_tpch_suite(conn, args):
             sql = (Path(args.tpch_queries) / f"{q}.sql").read_text()
         except FileNotFoundError:
             raise SystemExit(f"missing query file: {args.tpch_queries}/{q}.sql")
-        runs, med = measure(cur, sql, args.timeout, warmup=args.warmup)
+        try:
+            runs, med = measure(cur, sql, args.timeout, warmup=args.warmup)
+        except QueryTimeout as e:
+            print(f"{q}: TIMEOUT ({e})", flush=True)
+            rows.append((q, None))
+            conn.rollback()
+            continue
         print(f"{q}: runs={['%.1f' % r for r in runs]} median={med:.1f}s")
         rows.append((q, med))
     return rows
@@ -506,7 +536,8 @@ def main():
         args.workload = "shipped_tpcds_canaries" if Path(args.queries).resolve() == DEFAULT_QUERIES \
             else "custom_exploratory"
         try:
-            passed = run_pinned(lambda: connect(args.dsn), args, TPCDS_QUERIES, psycopg2.Error)
+            passed = run_pinned(lambda: connect(args.dsn), args,
+                                TPCDS_PINNED_CANARIES, psycopg2.Error)
         except FileExistsError:
             ap.error("receipt path already exists; choose a new file")
         print(f"{'PASS' if passed else 'FAIL'}: {args.receipt}")
@@ -529,7 +560,7 @@ def main():
     print("\n| query | median (s) |")
     print("|---|---|")
     for name, med in rows:
-        print(f"| {name} | {med:.2f} |")
+        print(f"| {name} | {'DNF' if med is None else f'{med:.2f}'} |")
 
 
 if __name__ == "__main__":

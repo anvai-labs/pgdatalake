@@ -46,6 +46,7 @@ typedef struct LakehouseExecState
 	bool		parallel;		/* running as a parallel worker (slice 17) */
 	ScanSession *session;
 	RowsHandle *rows;
+	PgDatalakeCacheStats cache_at_begin;	/* block-cache counters at Begin */
 	uint64		current_task;
 	uint64		task_count;
 	char	   *projection_csv; /* visible attribute names, comma-joined */
@@ -110,6 +111,15 @@ extern ForeignScan *lakehouse_GetForeignPlan(PlannerInfo *root,
 											 List *tlist,
 											 List *scan_clauses,
 											 Plan *outer_plan);
+
+/* fdw_analyze.c */
+extern bool lakehouse_AnalyzeForeignTable(Relation rel,
+										  AcquireSampleRowsFunc *func,
+										  BlockNumber *totalpages);
+extern int	lakehouse_AcquireSampleRows(Relation rel, int elevel,
+										HeapTuple *rows, int targrows,
+										double *totalrows,
+										double *totaldeadrows);
 
 /* fdw_exec.c */
 extern void lakehouse_BeginForeignScan(ForeignScanState *node, int eflags);

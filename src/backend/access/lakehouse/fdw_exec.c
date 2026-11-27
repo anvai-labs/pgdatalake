@@ -43,6 +43,9 @@
 #include "batch_fill.h"
 #include "pg_datalake_core.h"
 
+extern bool lakehouse_cache_enabled;
+extern bool lakehouse_rowgroup_pruning;
+
 void
 lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 {
@@ -157,6 +160,18 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 			}
 		}
 	}
+	pg_datalake_core_cache_stats(&state->cache_at_begin);
+
+	/*
+	 * per-statement measurement gates (spec 15 §6.3a): the cache gate
+	 * mirrors the session GUC into the Rust core (pass-through reads,
+	 * counters untouched); the pruning gate drops the predicate so row-group
+	 * pruning cannot fire for this scan
+	 */
+	pg_datalake_core_cache_set_enabled(lakehouse_cache_enabled);
+	if (!lakehouse_rowgroup_pruning)
+		state->predicate_json = NULL;
+
 	state->opts = opts;
 	state->opts.endpoint = opts.endpoint ? pstrdup(opts.endpoint) : NULL;
 	state->opts.warehouse = opts.warehouse ? pstrdup(opts.warehouse) : NULL;
@@ -183,7 +198,7 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
  * snapshot. The reader applies the same delete semantics as a normal scan.
  */
 static int64
-lakehouse_count_pinned_rows(ScanSession * session, uint64 tasks)
+lakehouse_count_pinned_rows(ScanSession *session, uint64 tasks)
 {
 	RowsHandle *volatile rows = NULL;
 	int64		count = 0;
@@ -406,7 +421,7 @@ lakehouse_IterateForeignScan(ForeignScanState *node)
 						continue;
 					}
 					{
-						const		PgDatalakeBatchColumn *col =
+						const PgDatalakeBatchColumn *col =
 							&state->batch.cols[pcol];
 
 						if (col->nulls[r])
@@ -509,6 +524,22 @@ lakehouse_ExplainForeignScan(ForeignScanState *node, ExplainState *es)
 						   (int64) state->task_count, es);
 	ExplainPropertyInteger("Iceberg rows (parquet metadata)", NULL,
 						   (int64) rows, es);
+	{
+		/*
+		 * block-cache counters for THIS scan (delta vs Begin — the
+		 * session's metadata/manifest fetches plus any data reads the scan
+		 * made; spec 15 §6.3a measurement gate)
+		 */
+		PgDatalakeCacheStats now;
+
+		pg_datalake_core_cache_stats(&now);
+		ExplainPropertyInteger("Iceberg cache hits",
+							   NULL, (int64) (now.hits - state->cache_at_begin.hits), es);
+		ExplainPropertyInteger("Iceberg cache misses",
+							   NULL, (int64) (now.misses - state->cache_at_begin.misses), es);
+		ExplainPropertyInteger("Iceberg cache fetched bytes",
+							   NULL, (int64) (now.fetched_bytes - state->cache_at_begin.fetched_bytes), es);
+	}
 	ExplainPropertyText("Projection", state->projection_csv[0]
 						? state->projection_csv : "(all columns)", es);
 	ExplainPropertyText("Pushdown", "projection only; quals evaluated locally (M1)",

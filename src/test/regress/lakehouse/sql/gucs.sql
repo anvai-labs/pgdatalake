@@ -42,3 +42,15 @@ SET lakehouse.cache_max_bytes = '5GB';
 SET lakehouse.target_file_size = '4GB';
 SHOW lakehouse.target_file_size;
 RESET lakehouse.target_file_size;
+
+-- measurement gates (spec 15 §6.3a): server default on, session off/on
+SHOW lakehouse.cache_enabled;
+SET lakehouse.cache_enabled = off;
+SHOW lakehouse.cache_enabled;
+RESET lakehouse.cache_enabled;
+SHOW lakehouse.cache_enabled;
+SHOW lakehouse.rowgroup_pruning;
+SET lakehouse.rowgroup_pruning = off;
+SHOW lakehouse.rowgroup_pruning;
+RESET lakehouse.rowgroup_pruning;
+SHOW lakehouse.rowgroup_pruning;

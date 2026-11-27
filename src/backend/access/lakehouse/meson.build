@@ -46,6 +46,7 @@ lakehouse_sources += files(
   'managed_count.c',
   'telemetry.c',
   'scan_stats.c',
+  'fdw_analyze.c',
 )
 
 if host_system == 'windows'
@@ -80,7 +81,7 @@ install_data(
    'lakehouse--1.15--1.16.sql', 'lakehouse--1.16--1.17.sql',
    'lakehouse--1.17--1.18.sql', 'lakehouse--1.18--1.19.sql',
    'lakehouse--1.19--1.20.sql',
-   'lakehouse--1.20--1.21.sql', 'lakehouse--1.21--1.22.sql', 'lakehouse--1.22--1.23.sql', 'lakehouse--1.23--1.24.sql'],
+   'lakehouse--1.20--1.21.sql', 'lakehouse--1.21--1.22.sql', 'lakehouse--1.22--1.23.sql', 'lakehouse--1.23--1.24.sql', 'lakehouse--1.24--1.25.sql'],
   install_dir: dir_data_extension,
 )
 

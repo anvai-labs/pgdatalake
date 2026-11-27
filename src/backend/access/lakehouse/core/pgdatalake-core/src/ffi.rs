@@ -70,6 +70,7 @@ fn column_stat_slot(
 
 pub struct ScanSession {
     plan: ScanPlan,
+    predicate: Option<crate::scan::ScanPredicate>,
     file_paths: Vec<CString>,
     field_ids: Vec<i64>,
     field_names: Vec<CString>,
@@ -82,6 +83,7 @@ pub struct ScanSession {
 impl ScanSession {
     fn from_plan(
         plan: ScanPlan,
+        predicate: Option<&crate::scan::ScanPredicate>,
         schema: &crate::catalog::metadata::Schema,
         s3: S3Options,
         deletes: crate::parquet::LoadedDeletes,
@@ -114,6 +116,7 @@ impl ScanSession {
             column_stat_slot(&mut column_stats, f.id).covered = covered;
         }
         Self {
+            predicate: predicate.cloned(),
             file_paths: plan
                 .tasks
                 .iter()
@@ -135,13 +138,16 @@ impl ScanSession {
 
     fn from_read_plan(
         plan: ScanPlan,
+        predicate: Option<&crate::scan::ScanPredicate>,
         s3: S3Options,
         schema: &crate::catalog::metadata::Schema,
         read_root: Option<S3ReadRoot>,
     ) -> Result<Self, ReadError> {
         let deletes =
             crate::scan::load_row_deletes_with_root(&plan, Some(&s3), schema, read_root.as_ref())?;
-        Ok(Self::from_plan(plan, schema, s3, deletes, read_root))
+        Ok(Self::from_plan(
+            plan, predicate, schema, s3, deletes, read_root,
+        ))
     }
 
     fn s3_options(&self) -> S3Options {
@@ -308,7 +314,7 @@ pub unsafe extern "C" fn pg_datalake_scan_new_bound(
                 client.scan_table(&ns_levels, &table, predicate.as_ref(), selector.as_ref())?;
             (plan, s3, schema, None)
         };
-        ScanSession::from_read_plan(plan, s3, &schema, read_root)
+        ScanSession::from_read_plan(plan, predicate.as_ref(), s3, &schema, read_root)
     });
     let session = result.unwrap_or_else(|panic| {
         let msg = if let Some(s) = panic.downcast_ref::<&str>() {
@@ -697,9 +703,14 @@ pub unsafe extern "C" fn pg_datalake_rows_open(
         // ALWAYS through open_with_deletes: the old empty-projection
         // open_all branch silently dropped position deletes from
         // count(*)-style scans (13-review blocker #5)
-        let rows =
-            crate::parquet::ParquetRows::open_with_deletes(&io, &key, &projection, row_deletes)
-                .map_err(|e| e.to_string())?;
+        let rows = crate::parquet::ParquetRows::open_with_deletes(
+            &io,
+            &key,
+            &projection,
+            row_deletes,
+            s.predicate.as_ref(),
+        )
+        .map_err(|e| e.to_string())?;
         let column_names = rows
             .column_names()
             .iter()
@@ -1012,6 +1023,19 @@ pub unsafe extern "C" fn pg_datalake_scan_files_before_pruning(session: *mut Sca
 pub unsafe extern "C" fn pg_datalake_scan_files_after_pruning(session: *mut ScanSession) -> u64 {
     match unsafe { session.as_ref() } {
         Some(s) => s.plan.files_after_pruning as u64,
+        None => 0,
+    }
+}
+
+/// Row groups skipped by exact min/max stats at `rows_open` (2a, spec 15
+/// §6.3a / doc 06 §1 step 5). 0 when no pruning ran.
+///
+/// # Safety
+/// `rows` must be NULL or a pointer returned by `pg_datalake_rows_open`.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_rows_row_groups_pruned(rows: *mut RowsHandle) -> u64 {
+    match rows.as_ref() {
+        Some(h) => h.rows.row_groups_pruned as u64,
         None => 0,
     }
 }
@@ -1617,6 +1641,58 @@ pub unsafe extern "C" fn pg_datalake_write_last_snapshot_id(ws: *mut WriteSessio
 #[no_mangle]
 pub unsafe extern "C" fn pg_datalake_core_cache_init(max_bytes: i64) {
     crate::cache::global_init(max_bytes.max(0) as u64);
+}
+
+/// Diagnostic counters for the per-backend immutable-path block cache
+/// (spec 15 §6.3a measurement gate; keying law §6.2). Zeros when the
+/// cache is uninitialized ("no cache yet"), never NULL-fails.
+#[repr(C)]
+pub struct PgDatalakeCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub fetched_bytes: u64,
+    pub entries: u64,
+    pub used_bytes: u64,
+}
+
+/// C signature: `void pg_datalake_core_cache_stats(PgDatalakeCacheStats *out)`
+///
+/// # Safety
+/// `out` may be NULL (no-op); otherwise a valid writable pointer.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_core_cache_stats(out: *mut PgDatalakeCacheStats) {
+    if out.is_null() {
+        return;
+    }
+    let (hits, misses, fetched, entries, used) = crate::cache::global().stats();
+    *out = PgDatalakeCacheStats {
+        hits,
+        misses,
+        fetched_bytes: fetched,
+        entries: entries as u64,
+        used_bytes: used,
+    };
+}
+
+/// Runtime measurement gate (spec 15 §6.3a): false = pass-through reads
+/// (no cache fills, no counter updates). C mirrors
+/// `lakehouse.cache_enabled` here per statement.
+///
+/// # Safety
+/// No pointers; always safe.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_core_cache_set_enabled(on: bool) {
+    crate::cache::set_enabled(on);
+}
+
+/// Wipe entries + counters (measurement isolation for cold-warm A/B in
+/// one backend; a cleared entry is a miss, never a wrong answer — §6.2).
+///
+/// # Safety
+/// No pointers; always safe.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_core_cache_clear() {
+    crate::cache::clear();
 }
 
 /// Set the rollover threshold (P1, spec 15 §7.2): when the buffered

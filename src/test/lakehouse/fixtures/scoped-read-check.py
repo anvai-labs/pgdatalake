@@ -174,6 +174,10 @@ def exercise(db, parent, child, prefix, route, enrolled):
                 object_requests.clear()
                 actual = sql(db, f"SELECT id FROM {name} ORDER BY id")
                 assert actual == expected, (name, actual)
+                # read-binding servers keep the exact single-session
+                # request choreography (fdw_plan.c skips plan-time sizing
+                # for bound servers precisely so these scope proofs stay
+                # per-request scripted)
                 assert catalog_requests == [("GET", route)], catalog_requests
                 assert object_requests and all(
                     path.startswith(root_path + "/") for _, path in object_requests

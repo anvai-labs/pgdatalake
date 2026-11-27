@@ -3,3 +3,4 @@ fdw_plan.c
 fdw_exec.c
 batch_fill.c
 lakehouse_sql.c
+fdw_analyze.c

@@ -485,6 +485,174 @@ pub struct BatchView {
     pub cols: Vec<BatchColumnView>,
 }
 
+/// Three-valued row-group predicate truth over min/max statistics:
+/// `Match` (some row could satisfy the conjunct), `NoMatch` (provably
+/// empty), `Unknown` (stats missing, inexact, or type-incomparable —
+/// keep).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RgTruth {
+    Match,
+    NoMatch,
+    Unknown,
+}
+
+/// Typed comparison value for row-group statistics.
+#[derive(Debug)]
+enum RgVal {
+    I(i64),
+    F(f64),
+    S(Vec<u8>),
+    B(bool),
+}
+
+/// Could ANY value in [min, max] satisfy `op: value`?
+fn rg_interval_satisfies(op: &str, v: &RgVal, min: &RgVal, max: &RgVal) -> Option<bool> {
+    use std::cmp::Ordering;
+    // cross-kind compares widen Int to Float (exact for |i64| < 2^53,
+    // i.e. all SF-scale data — the intended widening; no From impl exists
+    // so the cast stays, clippy-allowed)
+    #[allow(clippy::cast_precision_loss)]
+    let ord = |a: &RgVal, b: &RgVal| -> Option<std::cmp::Ordering> {
+        match (a, b) {
+            (RgVal::I(x), RgVal::I(y)) => Some(x.cmp(y)),
+            (RgVal::I(x), RgVal::F(y)) => (*x as f64).partial_cmp(y),
+            (RgVal::F(x), RgVal::I(y)) => x.partial_cmp(&(*y as f64)),
+            (RgVal::F(x), RgVal::F(y)) => x.partial_cmp(y),
+            (RgVal::S(x), RgVal::S(y)) => Some(x.cmp(y)),
+            (RgVal::B(x), RgVal::B(y)) => Some(x.cmp(y)),
+            _ => None,
+        }
+    };
+    match op {
+        "eq" => {
+            // v inside [min, max]
+            Some(ord(min, v)? != Ordering::Greater && ord(v, max)? != Ordering::Greater)
+        }
+        "lt" => Some(ord(min, v)? == Ordering::Less),
+        "le" => Some(ord(min, v)? != Ordering::Greater),
+        "gt" => Some(ord(max, v)? == Ordering::Less),
+        "ge" => Some(ord(v, max)? != Ordering::Greater),
+        _ => None,
+    }
+}
+
+fn rg_json_val(v: &serde_json::Value) -> Option<RgVal> {
+    Some(match v {
+        serde_json::Value::Bool(b) => RgVal::B(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                RgVal::I(i)
+            } else {
+                RgVal::F(n.as_f64()?)
+            }
+        }
+        serde_json::Value::String(st) => RgVal::S(st.as_bytes().to_vec()),
+        _ => return None,
+    })
+}
+
+/// Leaf conjunct vs one row group's statistics (three-valued).
+fn rg_leaf_truth(
+    field: &str,
+    op: &str,
+    value: &serde_json::Value,
+    rg: &parquet::file::metadata::RowGroupMetaData,
+    names: &[&str],
+) -> RgTruth {
+    use parquet::file::statistics::Statistics;
+    let Some(idx) = names.iter().position(|n| *n == field) else {
+        return RgTruth::Unknown;
+    };
+    if idx >= rg.columns().len() {
+        return RgTruth::Unknown;
+    }
+    let Some(st) = rg.column(idx).statistics() else {
+        return RgTruth::Unknown;
+    };
+    let Some(v) = rg_json_val(value) else {
+        return RgTruth::Unknown;
+    };
+    // parquet 60: min/max are Option (absent stats = Unknown); pruning
+    // only on EXACT bounds (writer-emitted, not stale/truncated)
+    macro_rules! exact_bounds {
+        ($t:expr) => {
+            match (
+                $t.min_opt(),
+                $t.max_opt(),
+                $t.min_is_exact(),
+                $t.max_is_exact(),
+            ) {
+                (Some(a), Some(b), true, true) => (a, b),
+                _ => return RgTruth::Unknown,
+            }
+        };
+    }
+    let (min, max) = match st {
+        Statistics::Boolean(t) => {
+            let (a, b) = exact_bounds!(t);
+            (RgVal::B(*a), RgVal::B(*b))
+        }
+        Statistics::Int32(t) => {
+            let (a, b) = exact_bounds!(t);
+            (RgVal::I(i64::from(*a)), RgVal::I(i64::from(*b)))
+        }
+        Statistics::Int64(t) => {
+            let (a, b) = exact_bounds!(t);
+            (RgVal::I(*a), RgVal::I(*b))
+        }
+        Statistics::Float(t) => {
+            let (a, b) = exact_bounds!(t);
+            (RgVal::F(f64::from(*a)), RgVal::F(f64::from(*b)))
+        }
+        Statistics::Double(t) => {
+            let (a, b) = exact_bounds!(t);
+            (RgVal::F(*a), RgVal::F(*b))
+        }
+        Statistics::ByteArray(t) => {
+            let (a, b) = exact_bounds!(t);
+            (RgVal::S(a.data().to_vec()), RgVal::S(b.data().to_vec()))
+        }
+        Statistics::FixedLenByteArray(t) => {
+            let (a, b) = exact_bounds!(t);
+            (RgVal::S(a.data().to_vec()), RgVal::S(b.data().to_vec()))
+        }
+        Statistics::Int96(_) => return RgTruth::Unknown,
+    };
+    match rg_interval_satisfies(op, &v, &min, &max) {
+        Some(true) => RgTruth::Match,
+        Some(false) => RgTruth::NoMatch,
+        None => RgTruth::Unknown,
+    }
+}
+
+/// AND-tree over leaf truths; OR (when added to the vocabulary) composes
+/// by dual.
+fn rg_pred_truth(
+    pred: &crate::scan::ScanPredicate,
+    rg: &parquet::file::metadata::RowGroupMetaData,
+    names: &[&str],
+) -> RgTruth {
+    use crate::scan::ScanPredicate as P;
+    match pred {
+        P::And(v) => {
+            let mut t = RgTruth::Match;
+            for p in v {
+                match rg_pred_truth(p, rg, names) {
+                    RgTruth::NoMatch => return RgTruth::NoMatch,
+                    RgTruth::Unknown => t = RgTruth::Unknown,
+                    RgTruth::Match => {}
+                }
+            }
+            t
+        }
+        P::Eq { field, value } => rg_leaf_truth(field, "eq", value, rg, names),
+        P::Lt { field, value } => rg_leaf_truth(field, "lt", value, rg, names),
+        P::Le { field, value } => rg_leaf_truth(field, "le", value, rg, names),
+        P::Gt { field, value } => rg_leaf_truth(field, "gt", value, rg, names),
+        P::Ge { field, value } => rg_leaf_truth(field, "ge", value, rg, names),
+    }
+}
+
 /// Projected row iterator over one parquet object.
 pub struct ParquetRows {
     /// P0b3: the batch source is LAZY for the scan path — row groups
@@ -500,6 +668,10 @@ pub struct ParquetRows {
     /// width of the caller's projection (`column_indices` may exceed it —
     /// eq-delete internal columns ride beyond this mark)
     projection_len: usize,
+    /// 2a: row groups skipped by exact min/max stats at open (0 when the
+    /// predicate kept everything, stats were absent, or the schema is not
+    /// flat 1:1)
+    pub(crate) row_groups_pruned: usize,
     num_rows_in_current: usize,
     /// Absolute position of the current row within the FILE (position
     /// deletes are file-scoped, doc 07).
@@ -531,6 +703,7 @@ impl ParquetRows {
             key,
             projection,
             RowDeletes::default(),
+            None,
             crate::cache::global(),
         )
     }
@@ -543,8 +716,16 @@ impl ParquetRows {
         key: &str,
         projection: &[&str],
         deletes: RowDeletes,
+        predicate: Option<&crate::scan::ScanPredicate>,
     ) -> Result<Self, StorageError> {
-        Self::open_internal(io, key, projection, deletes, crate::cache::global())
+        Self::open_internal(
+            io,
+            key,
+            projection,
+            deletes,
+            predicate,
+            crate::cache::global(),
+        )
     }
 
     fn open_internal(
@@ -552,6 +733,7 @@ impl ParquetRows {
         key: &str,
         projection: &[&str],
         deletes: RowDeletes,
+        predicate: Option<&crate::scan::ScanPredicate>,
         cache: &'static BlockCache,
     ) -> Result<Self, StorageError> {
         // P0b (spec 15 §6.3a): ranged, cached, projection-pruned open.
@@ -626,6 +808,52 @@ impl ParquetRows {
         let _ = ranged.ahead.projected_chunks.set(chunks);
         let builder = builder.with_projection(proj_mask);
 
+        // 2a (spec 15 §6.3a / doc 06 §1 step 5): row-group stats pruning.
+        // A row group is SKIPPED only when some conjunct PROVES emptiness
+        // against EXACT min/max stats — everything else is kept, and PG
+        // re-checks every surviving row locally anyway (never-trust law).
+        // Flat 1:1 schemas only: stats are keyed by leaf column ordinal,
+        // which for our flat tables equals the arrow field index.
+        let mut row_groups_pruned = 0usize;
+        let builder = if let Some(pred) = predicate {
+            // Position deletes are FILE-ABSOLUTE row positions (slice 20):
+            // with_row_groups changes the reader's STREAM positions, so a
+            // tombstone could miss its row (deleted rows surface) or hit
+            // an innocent one (live rows vanish) — round-4 review B1,
+            // live-verified repro. Equality deletes are value-based and
+            // survive pruning. Conservative gate: prune only while no
+            // position deletes exist for the file.
+            let deletes_safe = deletes.positions.is_empty();
+            let md = builder.metadata();
+            let flat = deletes_safe
+                && md.num_row_groups() > 0
+                && arrow_schema.fields().len() == md.row_group(0).columns().len();
+            if flat {
+                let names: Vec<&str> = arrow_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().as_str())
+                    .collect();
+                let mut keep = Vec::new();
+                for rg_idx in 0..md.num_row_groups() {
+                    match rg_pred_truth(pred, md.row_group(rg_idx), &names) {
+                        RgTruth::NoMatch => {}
+                        _ => keep.push(rg_idx),
+                    }
+                }
+                row_groups_pruned = md.num_row_groups() - keep.len();
+                if row_groups_pruned > 0 {
+                    builder.with_row_groups(keep)
+                } else {
+                    builder
+                }
+            } else {
+                builder
+            }
+        } else {
+            builder
+        };
+
         // P0b3: the reader is stored LAZILY — row groups decode on demand
         // as the consumer walks rows (early termination skips the rest).
         let reader = builder
@@ -691,6 +919,7 @@ impl ParquetRows {
             batch_start_abs: 0,
             deletes,
             eq_col_indices,
+            row_groups_pruned,
         })
     }
 
@@ -720,6 +949,7 @@ impl ParquetRows {
             column_names: names,
             projection_len: indices.len(),
             column_indices: indices,
+            row_groups_pruned: 0,
             batch_start_abs: 0,
             deletes: RowDeletes::default(),
             eq_col_indices: Vec::new(),
@@ -1496,7 +1726,8 @@ mod tests {
         deletes.positions.insert(1); // id=2
         deletes.positions.insert(4); // id=5
 
-        let mut rows = ParquetRows::open_with_deletes(&io, "a.parquet", &["id"], deletes).unwrap();
+        let mut rows =
+            ParquetRows::open_with_deletes(&io, "a.parquet", &["id"], deletes, None).unwrap();
         let mut seen = Vec::new();
         while rows.next() {
             match rows.value(0) {
@@ -1548,7 +1779,7 @@ mod tests {
 
         // project name only: the eq column (id) is read internally
         let mut rows =
-            ParquetRows::open_with_deletes(&io, "data.parquet", &["name"], deletes).unwrap();
+            ParquetRows::open_with_deletes(&io, "data.parquet", &["name"], deletes, None).unwrap();
         let mut seen = Vec::new();
         while rows.next() {
             match rows.value(0) {
@@ -1648,6 +1879,191 @@ mod tests {
     /// cells decode to PostgreSQL-input-compatible TEXT — ISO dates,
     /// `HH:MM:SS.ffffff` times, `\x`-prefixed bytea hex (previously raw
     /// integers / bare hex that the type input functions reject).
+    /// Round-4 review B1 repro: row-group pruning must NOT run when the
+    /// file has position deletes (tombstones are FILE-ABSOLUTE; pruned
+    /// groups shift the reader's stream positions). Two directions:
+    /// a tombstone targeting a row in a KEPT group must still delete it,
+    /// and a tombstone targeting a row in what WOULD have been the pruned
+    /// group must not delete an innocent row. The conservative gate keeps
+    /// all row groups whenever positions exist.
+    #[test]
+    fn row_group_pruning_disabled_with_position_deletes() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int64, false),
+            ArrowField::new("grp", DataType::Utf8, false),
+        ]));
+        let file = std::fs::File::create(dir.path().join("rgd.parquet")).unwrap();
+        let mut w = ArrowWriter::try_new(
+            file,
+            schema.clone(),
+            Some(
+                WriterProperties::builder()
+                    .set_max_row_group_row_count(Some(50))
+                    .build(),
+            ),
+        )
+        .unwrap();
+        let ids: Vec<i64> = (1..=100).collect();
+        let grps: Vec<String> = ids.iter().map(|i| format!("g{}", (i - 1) / 50)).collect();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(ids.clone())),
+                Arc::new(StringArray::from(grps.clone())),
+            ],
+        )
+        .unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let io = StorageIo::open(
+            &crate::storage::Location::Local {
+                root: dir.path().to_str().unwrap().to_string(),
+            },
+            None,
+        )
+        .unwrap();
+        let ge60 = crate::scan::ScanPredicate::Ge {
+            field: "id".into(),
+            value: serde_json::json!(60),
+        };
+
+        // direction A: tombstone {55} targets id 56 in the KEPT region —
+        // with the gate, no pruning runs, the delete applies exactly, and
+        // id 56 does NOT leak
+        let mut rd = RowDeletes::default();
+        rd.positions.insert(55);
+        let mut rows =
+            ParquetRows::open_with_deletes(&io, "rgd.parquet", &["id"], rd, Some(&ge60)).unwrap();
+        assert_eq!(
+            rows.row_groups_pruned, 0,
+            "gate: no pruning with pos deletes"
+        );
+        let mut got = Vec::new();
+        while rows.next() {
+            match rows.value(0) {
+                CellValue::Int64(v) => got.push(v),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(got.len(), 99, "exactly id 56 is deleted");
+        assert!(!got.contains(&56));
+
+        // direction B: tombstone {5} targets id 6 in what WOULD have been
+        // the pruned group — the gate keeps the group, so id 6 survives
+        // pruning (the delete itself still applies: id 6 is absent)
+        let mut rd = RowDeletes::default();
+        rd.positions.insert(5);
+        let mut rows =
+            ParquetRows::open_with_deletes(&io, "rgd.parquet", &["id"], rd, Some(&ge60)).unwrap();
+        assert_eq!(rows.row_groups_pruned, 0);
+        let mut got = Vec::new();
+        while rows.next() {
+            match rows.value(0) {
+                CellValue::Int64(v) => got.push(v),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(got.len(), 99, "exactly id 6 is deleted");
+        assert!(!got.contains(&6));
+        assert!(got.contains(&56), "the would-be-pruned row survives");
+    }
+
+    /// 2a (spec 15 §6.3a / doc 06 §1 step 5): row-group stats pruning.
+    /// Two row groups (ids 1..=100, writer `max_row_group_size` = 50): a
+    /// predicate provably empty for group 1 (id >= 60) must skip it —
+    /// `rows_open` returns only group 2's ids and reports 1 pruned group.
+    /// A predicate every group could match reports 0.
+    #[test]
+    fn row_group_stats_pruning_skips_and_counts() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int64, false),
+            ArrowField::new("grp", DataType::Utf8, false),
+        ]));
+        let file = std::fs::File::create(dir.path().join("rg.parquet")).unwrap();
+        let mut w = ArrowWriter::try_new(
+            file,
+            schema.clone(),
+            Some(
+                WriterProperties::builder()
+                    .set_max_row_group_row_count(Some(50))
+                    .build(),
+            ),
+        )
+        .unwrap();
+        let ids: Vec<i64> = (1..=100).collect();
+        let grps: Vec<String> = ids.iter().map(|i| format!("g{}", (i - 1) / 50)).collect();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(ids.clone())),
+                Arc::new(StringArray::from(grps.clone())),
+            ],
+        )
+        .unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let io = StorageIo::open(
+            &crate::storage::Location::Local {
+                root: dir.path().to_str().unwrap().to_string(),
+            },
+            None,
+        )
+        .unwrap();
+        let ge60 = crate::scan::ScanPredicate::Ge {
+            field: "id".into(),
+            value: serde_json::json!(60),
+        };
+        let mut rows = ParquetRows::open_with_deletes(
+            &io,
+            "rg.parquet",
+            &["id"],
+            RowDeletes::default(),
+            Some(&ge60),
+        )
+        .unwrap();
+        assert_eq!(rows.row_groups_pruned, 1, "group 1 (ids 1..=50) pruned");
+
+        let mut got = Vec::new();
+        while rows.next() {
+            match rows.value(0) {
+                CellValue::Int64(v) => got.push(v),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(got, (51..=100).collect::<Vec<i64>>());
+
+        // a predicate every group could match keeps both groups
+        let le100 = crate::scan::ScanPredicate::Le {
+            field: "id".into(),
+            value: serde_json::json!(100),
+        };
+        let rows = ParquetRows::open_with_deletes(
+            &io,
+            "rg.parquet",
+            &["id"],
+            RowDeletes::default(),
+            Some(&le100),
+        )
+        .unwrap();
+        assert_eq!(rows.row_groups_pruned, 0);
+    }
+
     #[test]
     fn decodes_date_time_binary_to_input_compatible_text() {
         use arrow::array::{Date32Array, Time64MicrosecondArray};
@@ -1784,7 +2200,7 @@ mod pos_delete_applicability_tests {
                 false,
             )
             .unwrap();
-        let rows = ParquetRows::open_with_deletes(&io, &key, &[], rd).unwrap();
+        let rows = ParquetRows::open_with_deletes(&io, &key, &[], rd, None).unwrap();
         let mut seen = 0;
         let mut r = rows;
         while r.next() {
@@ -1843,9 +2259,15 @@ mod pos_delete_applicability_tests {
         // open + FULL read of the narrow projection: the fat column must
         // not ride along (whole-file open fetched {file_len} every time)
         let before = cache.fetched_bytes();
-        let mut rows =
-            ParquetRows::open_internal(&io, "fat.parquet", &["id"], RowDeletes::default(), cache)
-                .unwrap();
+        let mut rows = ParquetRows::open_internal(
+            &io,
+            "fat.parquet",
+            &["id"],
+            RowDeletes::default(),
+            None,
+            cache,
+        )
+        .unwrap();
         let mut count = 0;
         while rows.next() {
             count += 1;
@@ -1859,9 +2281,15 @@ mod pos_delete_applicability_tests {
 
         // second full open, same projection: pure cache hits
         let before2 = cache.fetched_bytes();
-        let mut rows =
-            ParquetRows::open_internal(&io, "fat.parquet", &["id"], RowDeletes::default(), cache)
-                .unwrap();
+        let mut rows = ParquetRows::open_internal(
+            &io,
+            "fat.parquet",
+            &["id"],
+            RowDeletes::default(),
+            None,
+            cache,
+        )
+        .unwrap();
         let mut count2 = 0;
         while rows.next() {
             count2 += 1;
@@ -1928,6 +2356,7 @@ mod pos_delete_applicability_tests {
             "eq.parquet",
             &["id", "name"],
             RowDeletes::default(),
+            None,
             cache,
         )
         .unwrap();
@@ -2098,9 +2527,15 @@ mod pos_delete_applicability_tests {
         }
         let fixture = RangeFixture::new(data);
         let cache = Box::leak(Box::new(BlockCache::new(128 << 10)));
-        let mut rows =
-            ParquetRows::open_internal(&fixture.io, "data", &["id"], RowDeletes::default(), cache)
-                .unwrap();
+        let mut rows = ParquetRows::open_internal(
+            &fixture.io,
+            "data",
+            &["id"],
+            RowDeletes::default(),
+            None,
+            cache,
+        )
+        .unwrap();
         let mut got = Vec::new();
         while rows.next() {
             got.push(rows.value(0));
