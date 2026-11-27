@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use crate::catalog::metadata::{FormatVersion, Schema, SnapshotSelector, TableMetadata};
-use crate::catalog::rest::{RestCatalog, StaticToken};
+use crate::catalog::rest::{RestCatalog, RestError, StaticToken};
 use crate::scan::{ScanPlan, ScanPredicate};
 use crate::storage::{fetch_metadata_bounded, Location, S3Options, StorageError, StorageIo};
 
@@ -19,6 +19,8 @@ pub enum PgDatalakeReadStatus {
     ReadPinUnavailable,
     ReadUnsupported,
     ReadUnavailable,
+    // Append new outcomes so the existing C status discriminants stay stable.
+    ReadCatalogNotFound,
 }
 
 #[derive(Debug)]
@@ -34,6 +36,17 @@ impl From<StorageError> for ReadError {
     fn from(error: StorageError) -> Self {
         let status = match error {
             StorageError::ReadDenied(_) => PgDatalakeReadStatus::ReadDenied,
+            _ => PgDatalakeReadStatus::ReadUnavailable,
+        };
+        Self(status, error.to_string())
+    }
+}
+
+impl From<RestError> for ReadError {
+    fn from(error: RestError) -> Self {
+        let status = match error {
+            RestError::NotFound(_) => PgDatalakeReadStatus::ReadCatalogNotFound,
+            RestError::Denied(_) => PgDatalakeReadStatus::ReadDenied,
             _ => PgDatalakeReadStatus::ReadUnavailable,
         };
         Self(status, error.to_string())
@@ -240,8 +253,7 @@ impl ReadBinding {
             catalog: RestCatalog::new_scoped(
                 &checked_endpoint(endpoint, false)?,
                 Box::new(StaticToken(token)),
-            )
-            .map_err(|e| ReadError(PgDatalakeReadStatus::ReadUnavailable, e.to_string()))?,
+            )?,
         })
     }
 
@@ -299,16 +311,13 @@ impl ReadBinding {
         // The operator provides the exact route. Fetching configuration could
         // accept delegated storage credentials or change the route or profile.
         let prefix = (!self.catalog_prefix.is_empty()).then_some(self.catalog_prefix.as_str());
-        let metadata_location = self
-            .catalog
-            .load_scoped_metadata_location(
-                namespace,
-                table,
-                prefix,
-                SCOPED_METADATA_BYTES,
-                SCOPED_METADATA_DEADLINE,
-            )
-            .map_err(|e| ReadError(PgDatalakeReadStatus::ReadUnavailable, e.to_string()))?;
+        let metadata_location = self.catalog.load_scoped_metadata_location(
+            namespace,
+            table,
+            prefix,
+            SCOPED_METADATA_BYTES,
+            SCOPED_METADATA_DEADLINE,
+        )?;
 
         let (io, key) = self.root.open(&metadata_location, &s3)?;
         let metadata =
@@ -335,6 +344,56 @@ impl ReadBinding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_refusals_preserve_their_outcomes_without_storage_access() {
+        for (code, expected) in [
+            (404, PgDatalakeReadStatus::ReadCatalogNotFound),
+            (503, PgDatalakeReadStatus::ReadUnavailable),
+            (401, PgDatalakeReadStatus::ReadDenied),
+            (403, PgDatalakeReadStatus::ReadDenied),
+        ] {
+            let fixture = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}", fixture.server_addr().to_ip().unwrap());
+            let worker = std::thread::spawn(move || {
+                let request = fixture
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(request.url(), "/v1/namespaces/ns/tables/events");
+                request.respond(tiny_http::Response::from_string(
+                    r#"{"metadata-location":"s3://warehouse/ns/events/metadata/current.json"}"#,
+                ).with_status_code(code)).unwrap();
+                assert!(fixture
+                    .recv_timeout(Duration::from_millis(100))
+                    .unwrap()
+                    .is_none());
+            });
+            let binding = ReadBinding::new(
+                "2a830328-da37-4b0b-a867-78912e62c620",
+                "s3://warehouse/ns/events".into(),
+                String::new(),
+                "us-east-1".into(),
+                &endpoint,
+                "fixture".into(),
+            )
+            .unwrap();
+            let Err(error) = binding.observe(
+                &["ns"],
+                "events",
+                crate::session::S3ClientOptions {
+                    endpoint: Some(endpoint),
+                    access_key_id: Some("fixture".into()),
+                    secret_access_key: Some("fixture".into()),
+                    ..Default::default()
+                },
+            ) else {
+                panic!("catalog HTTP {code} must refuse the read before S3");
+            };
+            worker.join().unwrap();
+            assert_eq!(error.0, expected, "catalog HTTP {code}");
+        }
+    }
 
     #[test]
     fn one_approved_observation_plans_its_exact_retained_pin() {

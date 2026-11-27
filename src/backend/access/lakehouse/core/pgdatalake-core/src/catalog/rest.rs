@@ -123,6 +123,8 @@ pub enum RestError {
     /// 404 from loadTable/dropTable etc. — distinct because the caller can
     /// react (doc 03 §5: remote table deleted under us → rel invalid).
     NotFound(String),
+    /// Explicit authentication or authorization refusal from a scoped load.
+    Denied(String),
     /// commitTable returned 409 `CommitFailedException` — a requirement we
     /// sent failed server-side (concurrent commit won). The ONLY retryable
     /// error class (doc 03 §5): `commit_with_retry` re-plans from a fresh
@@ -137,6 +139,7 @@ impl std::fmt::Display for RestError {
         match self {
             RestError::Http(m) => write!(f, "REST catalog HTTP error: {m}"),
             RestError::NotFound(m) => write!(f, "REST catalog object not found: {m}"),
+            RestError::Denied(m) => write!(f, "REST catalog access denied: {m}"),
             RestError::Conflict(m) => {
                 write!(f, "REST catalog commit conflict (stale base): {m}")
             }
@@ -319,6 +322,17 @@ impl RestCatalog {
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND {
             return Err(RestError::NotFound(format!(
+                "GET {} -> {status}",
+                redact_url(&url)
+            )));
+        }
+        if self.scoped
+            && matches!(
+                status,
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+            )
+        {
+            return Err(RestError::Denied(format!(
                 "GET {} -> {status}",
                 redact_url(&url)
             )));
