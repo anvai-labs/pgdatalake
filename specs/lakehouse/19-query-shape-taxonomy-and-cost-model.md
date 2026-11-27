@@ -42,6 +42,40 @@ Hard ordering rules:
 
 ## 4. Telemetry contract (L0)
 
+### 4a-gate. Telemetry policy layers and the pre-existing-wheels rule (2026-11-27)
+
+**Gate layers** — `lakehouse.telemetry` (and `_retention`) are PGC_SUSET:
+the fleet policy lives in postgresql.conf / ALTER SYSTEM (server level);
+admins scope it per database or per role with
+`ALTER DATABASE ... SET lakehouse.telemetry = off` /
+`ALTER ROLE ... SET ...` (opt-in per role); superusers may also flip it
+per session. Ordinary users cannot change it — telemetry policy is an
+admin decision, and the internal tables are REVOKE ALL FROM PUBLIC with
+owner-context inserts regardless (nothing user-visible changes). The
+consent-gated operator share (§4a) stays the only cross-account path.
+
+**Do not re-collect what core already collects.** Query identity
+(queryid), execution timing, row counts and buffer I/O per statement are
+ALREADY captured by `pg_stat_statements` (shared-memory, fingerprinted,
+gated by its own preload) — `lakehouse.query_stats` therefore stores
+`queryid` so lakehouse rows JOIN against pg_stat_statements instead of
+duplicating it; never add a column pg_stat_statements already carries
+unless the lakehouse-specific dimension (below) requires it.
+
+**What is genuinely lakehouse-new here** (the reason this telemetry
+exists): foreign-scan counts, Iceberg files examined/pruned, row-groups
+pruned, per-scan block-cache hits/misses/fetched bytes, snapshot/pin
+identity, and per-fingerprint storage-op signatures — none of which any
+core collector sees.
+
+**Future aggregation path (do not build twice)**: PostgreSQL 18+
+exposes the Custom Cumulative Statistics API
+(PGSTAT_KIND_EXPERIMENTAL ids; wiki registry) — in-memory shared-mem
+aggregation for extension counters. If lakehouse counters ever need
+hot-path shared-memory aggregation (vs today's commit-time flush into
+INTERNAL tables + Iceberg archive), implement them as a custom pgstat
+kind there rather than a new bespoke collector.
+
 New GUC-gated capture — `lakehouse.telemetry` (bool, default on) gates capture;
 `lakehouse.telemetry_retention` bounds the heap table:
 
