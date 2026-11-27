@@ -297,14 +297,26 @@ impl StorageIo {
         // bucket), or relative to the prefix for Local (which is why the
         // local store is opened rooted). No re-prefixing happens here.
         //
+        // Components are '|'-escaped (backslash first) so the separator
+        // is unambiguous — round-5 review M1: endpoint "aws|x" + bucket
+        // "y" must not collide with endpoint "aws" + bucket "x|y" (a
+        // collision would serve wrong-location bytes from the cache).
+        // The None-s3 sentinel "aws" is degenerate-but-documented: an
+        // endpoint literally equal to "aws" is not a valid object-store
+        // endpoint (scheme required).
+        let esc =
+            |component: &str| -> String { component.replace('\\', "\\\\").replace('|', "\\|") };
         let scope_id = match (loc, s3) {
-            (Location::Local { root }, _) => format!("local:{root}"),
+            (Location::Local { root }, _) => format!("local:{}", esc(root)),
             (Location::S3 { bucket, .. }, Some(opts)) => format!(
-                "remote:{}|{bucket}",
-                opts.endpoint.as_deref().unwrap_or("aws"),
+                "remote:{}|{}",
+                esc(opts.endpoint.as_deref().unwrap_or("aws")),
+                esc(bucket),
             ),
-            (Location::Http { url }, _) => format!("remote:{url}"),
-            (Location::S3 { bucket, .. }, None) => format!("remote:aws|{bucket}"),
+            (Location::Http { url }, _) => format!("remote:{}", esc(url)),
+            (Location::S3 { bucket, .. }, None) => {
+                format!("remote:aws|{}", esc(bucket))
+            }
         };
         Ok(Self {
             scope_id: scope_id.into(),
@@ -582,6 +594,20 @@ fn maybe_gunzip(bytes: Vec<u8>) -> Result<Vec<u8>, StorageError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cache_scope_encoding_is_injective() {
+        // round-5 M1: '|' in a component must not collapse distinct
+        // (endpoint, bucket) pairs onto one scope. Backslash-first
+        // escaping keeps the transform injective and reversible.
+        let esc = |c: &str| -> String { c.replace('\\', "\\\\").replace('|', "\\|") };
+        let a = format!("remote:{}|{}", esc("aws|x"), esc("y"));
+        let b = format!("remote:{}|{}", esc("aws"), esc("x|y"));
+        assert_ne!(a, b);
+        let round = esc("aws|x");
+        assert_eq!(round, "aws\\|x");
+        assert_eq!(round.replace("\\|", "|"), "aws|x");
+    }
+
     use super::*;
 
     /// 13-review #6: file:// object stores are refused unless explicitly
