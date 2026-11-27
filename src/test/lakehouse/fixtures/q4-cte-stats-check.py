@@ -88,8 +88,9 @@ def main():
             assert off_rows and all(r <= 5 for r in off_rows), \
                 (off_rows, plan_off)
 
-            # exact answer: 10 customers x ('s' x 2001) x ('c' x 2001)
-            assert res.strip().endswith("10"), res
+            # exact answer: 10 customers, 5 's' rows and 5 'c' rows each
+            # (yr unrestricted) -> 25 join pairs per customer = 250
+            assert res.strip() == "250", res
 
             print('{"case": "q4-cte-stats", "scan_rows": %d}' % scan_rows[0],
                   flush=True)
