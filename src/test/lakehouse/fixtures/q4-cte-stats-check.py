@@ -46,7 +46,7 @@ def main():
                 CREATE USER MAPPING FOR CURRENT_USER SERVER s OPTIONS
                     (s3_access_key '{S3_AK}', s3_secret_key '{S3_SK}');
                 CREATE FOREIGN TABLE pivot (cust bigint, sale_type varchar,
-                    yr bigint, total double) SERVER s
+                    yr bigint, total double precision) SERVER s
                     OPTIONS (table '{ns}.pivot');
             """)
 
