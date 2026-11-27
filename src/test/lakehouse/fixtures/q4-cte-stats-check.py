@@ -30,10 +30,10 @@ def main():
     trino(f"CREATE SCHEMA iceberg.{ns}")
     trino(f"CREATE TABLE {table} (cust bigint, sale_type varchar, "
           "yr bigint, total double) WITH (format_version = 2)")
-    trino(f"INSERT INTO {table} SELECT c, ch, y, c * 10 + y FROM "
-          "CROSS JOIN (VALUES 1998, 1999, 2000, 2001, 2002) t(y) "
-          "CROSS JOIN (VALUES 's', 'c', 'w') t2(ch), "
-          "(VALUES 1, 2, 3, 4, 5, 6, 7, 8, 9, 10) t3(c)")
+    trino(f"INSERT INTO {table} SELECT c, ch, y, c * 10 + y "
+          "FROM (VALUES 1, 2, 3, 4, 5, 6, 7, 8, 9, 10) t(c) "
+          "CROSS JOIN (VALUES 's', 'c', 'w') t2(ch) "
+          "CROSS JOIN (VALUES 1998, 1999, 2000, 2001, 2002) t3(y)")
     try:
         sql("postgres", f"CREATE DATABASE {name} TEMPLATE template0 "
                         f"ENCODING 'UTF8' LOCALE 'C'")
