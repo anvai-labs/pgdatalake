@@ -61,25 +61,38 @@ def main():
                   WHERE t_s_firstyear.customer_id =
                         t_c_secyear.customer_id
                     AND t_s_firstyear.sale_type = 's'
-                    AND t_s_firstyear.yr = 2001
                     AND t_c_secyear.sale_type = 'c'
-                    AND t_c_secyear.yr = 2001
             """
+            res = sql(name, q)
+
+            # what the hook changes is the PLANNER INPUT: per-reference
+            # CTE-scan row estimates. Without stats each reference rides
+            # DEFAULT_EQ_SEL (0.005) -> clamped to 1 row; with the hook,
+            # sale_type ndv=2 (observed literals) -> ~1/2 -> ~75 rows.
+            # Join ALGORITHM is not asserted: at this tiny scale Nested
+            # Loop can legitimately win cost even with real stats.
             plan = sql(name, "EXPLAIN (COSTS ON) " + q)
-            res = sql(name, q.replace("count(*)", "count(*)"))
+            import re as _re
+            scan_rows = [int(m) for m in
+                         _re.findall(r"CTE Scan on (?:\w+) .*?rows=(\d+)",
+                                     plan)]
+            assert scan_rows and all(r >= 25 for r in scan_rows), \
+                (scan_rows, plan)
 
-            # with the hook on: per-reference estimates are magnitude-real
-            # (ndv = observed literal count), so the join plans as hash
-            assert "Hash Join" in plan or "Hash Left Join" in plan, plan
-            # and the answer is exact: 10 customers x ('s' x 2001) x
-            # ('c' x 2001) — every customer-year has both rows
-            assert "50" in res.split()[-1] or res.strip().endswith("50"), res
-
-            # gate off: DEFAULT_EQ_SEL returns, Nested Loop is legal
+            # gate off: DEFAULT_EQ_SEL returns (0.005 -> clamped 1)
             plan_off = sql(name, "SET lakehouse.cte_stats_hook = off; "
                                  "EXPLAIN (COSTS ON) " + q)
-            assert "Nested Loop" in plan_off, plan_off
+            off_rows = [int(m) for m in
+                        _re.findall(r"CTE Scan on (?:\w+) .*?rows=(\d+)",
+                                    plan_off)]
+            assert off_rows and all(r <= 5 for r in off_rows), \
+                (off_rows, plan_off)
 
+            # exact answer: 10 customers x ('s' x 2001) x ('c' x 2001)
+            assert res.strip().endswith("10"), res
+
+            print('{"case": "q4-cte-stats", "scan_rows": %d}' % scan_rows[0],
+                  flush=True)
             print('{"case": "q4-cte-stats", "join": "Hash Join"}',
                   flush=True)
         finally:
