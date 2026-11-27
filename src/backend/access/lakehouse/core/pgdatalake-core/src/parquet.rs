@@ -485,6 +485,210 @@ pub struct BatchView {
     pub cols: Vec<BatchColumnView>,
 }
 
+/// One compiled row-level filter conjunct: compares the batch column at
+/// `col` (position within the masked batch) against `lit` with `op`,
+/// for rows of `kind`. Compiled conservatively at open: conjuncts we
+/// cannot evaluate (unknown field, incomparable literal or kind) are
+/// DROPPED — PG re-checks every row locally (never-trust law). NULL rows
+/// are KEPT (NULL fails every op at the SQL layer; the local re-check
+/// decides).
+#[derive(Debug, Clone)]
+enum RowFilter {
+    Eq {
+        kind: BatchKind,
+        col: usize,
+        val: RgVal,
+    },
+    Lt {
+        kind: BatchKind,
+        col: usize,
+        val: RgVal,
+    },
+    Le {
+        kind: BatchKind,
+        col: usize,
+        val: RgVal,
+    },
+    Gt {
+        kind: BatchKind,
+        col: usize,
+        val: RgVal,
+    },
+    Ge {
+        kind: BatchKind,
+        col: usize,
+        val: RgVal,
+    },
+}
+
+impl RowFilter {
+    fn col(&self) -> usize {
+        match self {
+            RowFilter::Eq { col, .. }
+            | RowFilter::Lt { col, .. }
+            | RowFilter::Le { col, .. }
+            | RowFilter::Gt { col, .. }
+            | RowFilter::Ge { col, .. } => *col,
+        }
+    }
+
+    fn val(&self) -> &RgVal {
+        match self {
+            RowFilter::Eq { val, .. }
+            | RowFilter::Lt { val, .. }
+            | RowFilter::Le { val, .. }
+            | RowFilter::Gt { val, .. }
+            | RowFilter::Ge { val, .. } => val,
+        }
+    }
+
+    fn kind(&self) -> BatchKind {
+        match self {
+            RowFilter::Eq { kind, .. }
+            | RowFilter::Lt { kind, .. }
+            | RowFilter::Le { kind, .. }
+            | RowFilter::Gt { kind, .. }
+            | RowFilter::Ge { kind, .. } => *kind,
+        }
+    }
+
+    /// Row check against a typed column view. Returns false (drop) only
+    /// when decidable on NUMERIC kinds; NULL, kind-mismatched views, and
+    /// Text/Bytes spans (the crate denies unsafe) keep the row — PG's
+    /// local re-check decides those.
+    fn row_keeps(&self, view: &BatchColumnView, row: usize) -> bool {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        if self.kind() != view.kind {
+            return true; // per-batch kind differs — undecidable here, keep
+        }
+        if row >= view.nulls.len() || view.nulls[row] != 0 {
+            return true; // NULL fails every op — decided by PG's re-check
+        }
+        let lit = self.val();
+        let ord = match (view.kind, lit) {
+            (BatchKind::Int64 | BatchKind::TimestampUs | BatchKind::Date32, RgVal::I(v)) => {
+                view.i64s.get(row).map(|x| x.cmp(v))
+            }
+            (BatchKind::Float64, RgVal::F(v)) => view.f64s.get(row).and_then(|x| x.partial_cmp(v)),
+            (BatchKind::Bool, RgVal::B(b)) => view
+                .bools
+                .get(row)
+                .map(|x| i8::from(*x != 0).cmp(&i8::from(*b))),
+            _ => None,
+        };
+        match self {
+            RowFilter::Eq { .. } => ord == Some(Equal),
+            RowFilter::Lt { .. } => ord == Some(Less),
+            RowFilter::Le { .. } => ord != Some(Greater),
+            RowFilter::Gt { .. } => ord == Some(Greater),
+            RowFilter::Ge { .. } => ord != Some(Less),
+        }
+    }
+}
+
+/// A compiled conjunction: row passes only when EVERY conjunct keeps it.
+#[derive(Debug, Clone, Default)]
+struct RowFilterSet {
+    conjuncts: Vec<RowFilter>,
+}
+
+impl RowFilterSet {
+    fn keeps(&self, views: &[BatchColumnView], row: usize) -> bool {
+        self.conjuncts
+            .iter()
+            .all(|c| c.row_keeps(&views[c.col()], row))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.conjuncts.is_empty()
+    }
+
+    /// Compile a `ScanPredicate` against the caller's projection: each leaf
+    /// resolves its field to a projected-column position; conjuncts on
+    /// non-projected fields or with unsupported literals are DROPPED (PG
+    /// re-checks every row locally — never-trust law).
+    fn compile(pred: &crate::scan::ScanPredicate, projection: &[&str]) -> RowFilterSet {
+        let mut out = RowFilterSet::default();
+        out.compile_into(pred, projection);
+        out
+    }
+
+    fn compile_into(&mut self, pred: &crate::scan::ScanPredicate, projection: &[&str]) {
+        use crate::scan::ScanPredicate as P;
+
+        match pred {
+            P::And(v) => {
+                for sub in v {
+                    self.compile_into(sub, projection);
+                }
+            }
+            P::Eq { field, value } => self.push_leaf(field, "eq", value, projection),
+            P::Lt { field, value } => self.push_leaf(field, "lt", value, projection),
+            P::Le { field, value } => self.push_leaf(field, "le", value, projection),
+            P::Gt { field, value } => self.push_leaf(field, "gt", value, projection),
+            P::Ge { field, value } => self.push_leaf(field, "ge", value, projection),
+        }
+    }
+
+    fn push_leaf(&mut self, field: &str, op: &str, value: &serde_json::Value, projection: &[&str]) {
+        // fields outside the caller's projection are re-checked by PG
+        let Some(col) = projection.iter().position(|n| **n == *field) else {
+            return;
+        };
+        let Some(val) = rg_json_val(value) else {
+            return;
+        };
+        // literal kind: numeric literals ride Int64 (dates/timestamps are
+        // pushed as epoch days/micros by TranslateQual) or Float64 for
+        // fractions; strings ride Text; bools ride Bool
+        let mk = |kind: BatchKind| match op {
+            "eq" => RowFilter::Eq {
+                kind,
+                col,
+                val: val.clone(),
+            },
+            "lt" => RowFilter::Lt {
+                kind,
+                col,
+                val: val.clone(),
+            },
+            "le" => RowFilter::Le {
+                kind,
+                col,
+                val: val.clone(),
+            },
+            "gt" => RowFilter::Gt {
+                kind,
+                col,
+                val: val.clone(),
+            },
+            _ => RowFilter::Ge {
+                kind,
+                col,
+                val: val.clone(),
+            },
+        };
+        match value {
+            serde_json::Value::Number(n) => {
+                if n.is_i64() {
+                    self.conjuncts.push(mk(BatchKind::Int64));
+                } else if let Some(f) = n.as_f64() {
+                    let fv: f64 = f;
+                    self.conjuncts.push(mk(BatchKind::Float64));
+                    let _ = fv;
+                }
+            }
+            serde_json::Value::String(_) => {
+                self.conjuncts.push(mk(BatchKind::Text));
+            }
+            serde_json::Value::Bool(_) => {
+                self.conjuncts.push(mk(BatchKind::Bool));
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Three-valued row-group predicate truth over min/max statistics:
 /// `Match` (some row could satisfy the conjunct), `NoMatch` (provably
 /// empty), `Unknown` (stats missing, inexact, or type-incomparable —
@@ -496,8 +700,8 @@ enum RgTruth {
     Unknown,
 }
 
-/// Typed comparison value for row-group statistics.
-#[derive(Debug)]
+/// Typed comparison value for row-group statistics and row filters.
+#[derive(Debug, Clone)]
 enum RgVal {
     I(i64),
     F(f64),
@@ -672,6 +876,8 @@ pub struct ParquetRows {
     /// predicate kept everything, stats were absent, or the schema is not
     /// flat 1:1)
     pub(crate) row_groups_pruned: usize,
+    /// 2b: compiled row-level filter (None = no filter / nothing dropped)
+    row_filter: Option<RowFilterSet>,
     num_rows_in_current: usize,
     /// Absolute position of the current row within the FILE (position
     /// deletes are file-scoped, doc 07).
@@ -885,6 +1091,13 @@ impl ParquetRows {
             })
             .collect();
 
+        // 2b (doc 06 §1 step 6): compile the row-level filter against the
+        // projection. Predicate fields outside the projection are dropped
+        // (PG re-checks every row); conservative by construction.
+        let row_filter = predicate
+            .map(|p| RowFilterSet::compile(p, projection))
+            .filter(|f| !f.is_empty());
+
         // eq columns resolve within the masked batch too (they may be
         // projected or internal-only)
         let mut eq_col_indices = Vec::with_capacity(deletes.equality.len());
@@ -920,6 +1133,7 @@ impl ParquetRows {
             deletes,
             eq_col_indices,
             row_groups_pruned,
+            row_filter,
         })
     }
 
@@ -950,6 +1164,7 @@ impl ParquetRows {
             projection_len: indices.len(),
             column_indices: indices,
             row_groups_pruned: 0,
+            row_filter: None,
             batch_start_abs: 0,
             deletes: RowDeletes::default(),
             eq_col_indices: Vec::new(),
@@ -1284,7 +1499,17 @@ impl ParquetRows {
             }
             return Ok(Some(BatchView {
                 rows: self.num_rows_in_current,
-                live_idx,
+                // 2b: row-level predicate filter applied AFTER deletes —
+                // dead rows never re-enter; dropped conjuncts keep rows
+                // (never-trust law: PG re-checks everything)
+                live_idx: match &self.row_filter {
+                    Some(rf) => {
+                        let mut li = live_idx;
+                        li.retain(|&r| rf.keeps(&cols, r as usize));
+                        li
+                    }
+                    None => live_idx,
+                },
                 start_abs: self.batch_start_abs,
                 cols,
             }));
