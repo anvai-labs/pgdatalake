@@ -1,7 +1,8 @@
 # 12 — Roadmap (M0 → M5)
 
-Each milestone ends with the named acceptance gate; no milestone overlaps
-another's gate. Rough sizing assumes 1–2 engineers + this agent.
+The [current milestone status and estimates](20-foundation-audit.md) reconcile this roadmap with the merged runtime and qualification receipts.
+
+Each milestone has its own acceptance gate. Work can proceed concurrently once its prerequisites hold. The current schedule states its staffing and access assumptions.
 
 Use the [milestone TDD and smoke protocol](10-testing.md#milestone-tdd-and-smoke-receipts)
 for each acceptance gate. The [progress tracker](PROGRESS.md) describes
@@ -82,9 +83,7 @@ define the seam tests that must pass before production wiring.
 ## M5 — The seamless layer (ongoing)
 - Deletion vectors as managed write mode (merge-on-read), bloom-filtered DV
   reads *(v3 conformance slices V1–V5: specs/lakehouse/14-v3-conformance.md
-  — V0 loud gates landed 2026-11-20; V1 DV-read is the next read-correctness
-  item; v2→v3 table migration rides slice V3 with the reader-first
-  precondition)*
+  — V1 DV read and V2 fixture coverage landed; v2→v3 table migration rides slice V3 with the reader-first precondition)*
 - `metadata_only` plans (count/min/max from Parquet stats), metadata cache tuning
 - variant type read/write, `lakehouse.map`/`struct` domain types (doc 05 v2)
 - Logical decoding from commit journal; `lakehouse.migrate_table` GA

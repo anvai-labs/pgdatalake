@@ -40,6 +40,7 @@ typedef struct LakehouseShared
 /* per-executor-node state */
 typedef struct LakehouseExecState
 {
+	MemoryContextCallback cleanup;
 	LakehouseOptions opts;
 	char	   *predicate_json; /* translated quals (slice 15) */
 	char	   *rte_selector;	/* time travel pin from fdw_private (slice 19) */
@@ -76,9 +77,8 @@ typedef struct LakehouseExecState
 
 	/*
 	 * Execution-time COUNT (spec 16 successor): one-row upper scan whose
-	 * answer is resolved in Begin — manifest sum when the delete-free proof
-	 * holds on the current snapshot, the ordinary-aggregate fallback
-	 * otherwise.
+	 * answer is resolved on first demand. Sum manifest counts for a proved
+	 * delete-free pin and count visible rows otherwise.
 	 */
 	bool		count_exec;
 	bool		count_done;
@@ -95,6 +95,7 @@ extern bool lakehouse_trivial_count_shape(Query *parse);
 extern void ExtractOptions(Oid foreigntableid, Oid checkAsUser, LakehouseOptions *opts);
 
 /* fdw_plan.c */
+extern bool lakehouse_rowgroup_pruning;
 extern void lakehouse_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 										Oid foreigntableid);
 extern void lakehouse_GetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,

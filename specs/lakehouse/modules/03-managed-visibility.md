@@ -369,11 +369,7 @@ detectable at scan_begin; the role-specific `purpose=read` credential
 mapping structurally prevents a definer view from widening admission
 (the invoker's identity admits), and the fresh-frame recheck rejects
 mapping rotation, revocation, prefix, region and option changes
-mid-scan. Bound COUNT keeps declining through
-`lakehouse_check_capture_read`. NOT IMPLEMENTED in this slice, tracked
-for the governed-reads band: the retained object lease / provider proof
-across portal lifetime, and distinct telemetry for the compatibility
-refusal, origin timeout and oversized-proof channels.
+mid-scan. Eligible bound COUNT now uses the same cut and the ordinary scan fallback. The retained object lease or equivalent provider proof across portal lifetime still needs qualification, along with separate telemetry for compatibility refusal, origin timeout and oversized proof.
 
 Use a v2 Lakekeeper table with parent pin `P` containing `[10]`. Hold one
 PostgreSQL snapshot before both source commits and another between them.

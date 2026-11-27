@@ -17,7 +17,7 @@ The stock PG19 fixture exercises an owner-rights view and a security-invoker vie
 
 Whole objects and ranges cached from a network store are reusable within one open storage handle, including its clones. A newly opened handle must fetch through the object store again, even when it uses the same credentials and object key. Cache keys contain a process-local handle identity and no raw credentials. This narrows reuse because bytes that remain immutable can still become inaccessible after a provider policy change. The bounded in-memory cache retains old entries until eviction. A fresh remote handle cannot reach those entries.
 
-A loopback S3 provider test warms an object and a range, observes two hits from a clone, then returns HTTP 403 on both reads from a fresh handle using the same credentials. The test records four HTTP requests and seven fetched bytes. The bound server pilot below adds a SQL fixture that warms two roots in one backend and checks both a database-side refusal and a fresh storage authorization failure. [Cache provider test](../../../src/backend/access/lakehouse/core/pgdatalake-core/src/cache.rs)
+The 2026-11-27 foundation audit restored handle scope in the shared storage layer. A loopback S3 provider test warms an object and a range, observes two hits from a clone, then returns HTTP 403 on both reads from a fresh handle using the same credentials. The test records four HTTP requests and seven fetched bytes. The bound server pilot below adds a SQL fixture that warms two roots in one backend and checks both a database-side refusal and a fresh storage authorization failure. [Cache provider test](../../../src/backend/access/lakehouse/core/pgdatalake-core/src/cache.rs)
 
 ## Bound server pilot
 

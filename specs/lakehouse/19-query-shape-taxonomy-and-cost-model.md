@@ -35,7 +35,7 @@ flowchart TD
 
 Hard ordering rules:
 
-1. **Telemetry before taxonomy**: no family is confirmed until its signature is measured on the full sweep; q4/q6 remain "suspected B" until instrumented.
+1. **Telemetry before taxonomy**: Keep the full-sweep classification provisional until its signatures are measured. Targeted q6 evidence supports correlated-aggregate pullup. The q4 profile shows repeated scans and large materialized inputs.
 2. **Registry before model**: an ONNX model may only rank remedy registry entries whose equivalence is statically proven (pullup shape-proven; hashed subplan to be proven in its slice). A category with no proven remedy contributes no model features.
 3. **Data before fit**: L1 fits only after the full labeled sweep (TPC-DS 99 + TPC-H 21) populates the dataset; L2 trains only if L1's residuals justify it (threshold: L1's wrong-variant rate ≥ 10% on the labeled sweep — the same quantity §7's L1 exit accepts below 10%).
 4. **Compiled model last**: ONNX enters the hot path only after L1 proves the decision is (a) needed per-statement and (b) expressible as the small feature vector in §6.3.
@@ -280,12 +280,14 @@ root: every un-ANALYZEd foreign table planned as core's rows=1000 default
 self-join planned as Nested Loop chains over multi-million-row inputs. The
 relsize slice grounds the cost model in Iceberg metadata:
 
-- `lakehouse.plan_rows_mode = metadata` (default): when a foreign table has
-  no catalog statistics (reltuples < 0), GetForeignRelSize sums the
-  snapshot's parquet record_counts through a metadata-only scan session and
-  caches it per backend (key: relid; failed fetches cached so a dead
-  endpoint costs one attempt per session). `lakehouse.plan_rows_mode =
-  default` retains the core default as escape hatch.
+- `lakehouse.plan_rows_mode = default` uses PostgreSQL catalog estimates.
+  Ordinary planning and plain FDW EXPLAIN perform no origin I/O. For an
+  isolated profile, a superuser can opt into `metadata` for an unbound
+  base foreign relation checked as the same role. This resolves the
+  requested snapshot and sums checked manifest row counts per plan. A
+  missing mapping, unavailable provider or invalid count leaves the
+  local estimate. Cancellation and other PostgreSQL errors propagate.
+  Use ANALYZE to persist serving estimates in the PostgreSQL catalog.
 - `lakehouse.plan_rows_scale` (PGC_SUSET, default 1.0): per-profile
   multiplier on metadata rows — the operator-facing L1 calibration knob.
   Tuning loop: run the labeled sweep with `--profile-id`, fold
@@ -297,24 +299,20 @@ relsize slice grounds the cost model in Iceberg metadata:
   AnalyzeForeignTable + AcquireSampleRows (PG20 hook signature):
   metadata relsize, then reservoir sampling (Algorithm R) over whole
   parquet tasks in randomized task order, streaming until 4x targrows
-  rows are seen so the replacement branch keeps the sample unbiased
-  across the cut. Task-level IO failures ereport ERROR (ANALYZE is
-  explicit maintenance — fail-fast, never a silent partial sample).
-  Explicit ANALYZE AND auto-analyze populate real per-column
+  rows are seen. The reservoir samples uniformly within the inspected
+  prefix. Random task order and a bounded prefix can bias table-wide
+  estimates for skewed file sizes and partitions. Task I/O errors abort
+  explicit ANALYZE. ANALYZE and auto-analyze populate per-column
   NDV/MCV/histograms into pg_statistic. Fixtures: 5000 rows / 7 distinct
-  grp values plans the qual at ~1/7 (~713 rows vs the 25 default-NDV
-  estimate pinned pre-ANALYZE); a 5-task/150k-row table exercises
+  grp values plans the qual at ~1/7 (~713 rows vs the local fallback of 1,000 rows before ANALYZE); a 5-task/150k-row table exercises
   multi-task advance + the reservoir branch. Stats tiering per profile:
   metadata bounds compose NDV for integer-like columns (§4b
   filterability tiers) as the zero-IO approximation; explicit ANALYZE
-  samples for exact stats — the composed tier lands as its own slice.
-- Fail-fast boundary (pre-existing contract, lakehouse.h): EXPLAIN runs
-  ExecutorStart(EXPLAIN_ONLY), and BeginForeignScan opens its session
-  unconditionally — an unreachable endpoint fails the statement at plan
-  time regardless of plan_rows_mode. The relsize fail-safe (decline to
-  core default) applies to metadata-fetch failures that occur BEFORE that
-  boundary (clamped rows, dead endpoint on a rel reached only through the
-  metadata path); the fixture pins both behaviors.
+  samples for approximate statistics — the composed tier lands as its own slice.
+- Normal execution and explicit ANALYZE surface origin failures. Plain
+  EXPLAIN skips scan initialization. Remote estimate mode can still contact
+  the origin while building a plan and may load delete data through the
+  existing scan constructor. Use it in an isolated profiling session.
 
 Canonical data law (2026-11-26): ONE Iceberg dataset copy lives in the
 dataserver3 Garage bucket `warehouse`; compute servers target it over the
@@ -340,3 +338,12 @@ remains SeaweedFS until the compose-swap slice lands.
 - No official TPC certification track; the DuckDB-over-same-S3 envelope run remains the external sanity bound (exploratory, documented).
 - No model training inside the server: training is offline tooling; the server only runs exported artifacts.
 - No per-query online learning: the loop is batch retrain from telemetry, receipt-gated.
+
+## Superseded
+
+The 2026-11-26 cardinality experiment made remote estimates the default
+and retained them by relation OID for the backend lifetime. The
+2026-11-27 audit restored the local serving default, restricted remote
+estimates to operators and removed the relation-only cache. Rebaseline
+written performance receipts with the effective estimates and cache
+scope recorded.

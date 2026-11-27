@@ -22,13 +22,13 @@ behaves, how to run the tests, and how to debug when it misbehaves.
 |---|---|
 | `fdw_plan.c` | FDW plan path: importable foreign tables, COUNT elision hooks, `lakehouse` reloption parsing |
 | `fdw.c` | FDW handler, scan state lifetime, session open/close wiring |
-| `fdw_exec.c` | FDW execution: first-demand open (EXPLAIN/LIMIT 0 do no I/O), batch iteration, `count_exec` upper-COUNT state |
+| `fdw_exec.c` | FDW execution: scan startup, batch iteration, explain-only handling, demand-time upper COUNT |
 | `batch_fill.c` | FFI batch → TupleTableSlot conversion (physical ordinals, delete filtering) |
 | `tableam.c` | **The managed TableAM** (~4.6k lines): scan lifecycle, bound-table gate, executor admission, the demand-time managed-cut install, staged/delta row serving, rescan, DML staging, evidence function |
 | `managed_credentials.c` | Loads credential material from a role's user mapping on the `lakehouse_publication_credentials` wrapper; purposes are exact-matched (`send` / `lookup` / `read`) — one purpose never serves another |
 | `managed_send.c` | Publication admission on the send side: claim intent, single-attempt submission helpers |
 | `managed_lookup.c` | Publication lookup/reconciliation after a lost catalog reply |
-| `managed_count.c` | Managed COUNT: the executor hook that serves exact counts without row transport (bound tables still decline there) |
+| `managed_count.c` | Managed COUNT and the correlated-aggregate planner rewrite. Eligible bound counts use the managed cut and otherwise fall back to the ordinary scan. |
 | `publisher.c` | The staged publication worker entry points (claims → provider append → ledger transition) |
 | `lakehouse_sql.c` | SQL-callable C functions that are not tied to scans |
 | `core/` | **Rust core** (`pgdatalake-core`): catalog/storage clients, scan planning, Parquet, and the FFI surface below |
@@ -63,11 +63,12 @@ functions. Key objects (as of 1.19):
 
 ### External (FDW) path
 
-`plan` (`fdw_plan.c`) builds a ForeignScan with `fdw_private` carrying the
-count-exec selector and table identity → `BeginForeignScan` (`fdw.c`) does
-**no I/O** → first `IterateForeignScan` (`fdw_exec.c`) opens the session,
-proves delete eligibility, resolves the pinned snapshot and only then reads
-manifests/Parquet. This is why `EXPLAIN` and `LIMIT 0` are zero-request.
+The FDW plans from PostgreSQL statistics by default. Plain EXPLAIN skips
+execution-time mapping and scan open. Normal execution resolves the
+effective mapping and opens the pinned session at BeginForeignScan.
+An eligible upper COUNT carries its selector into execution and opens
+its session on the first demand. An ordinary scan beneath LIMIT can be
+initialized before the executor asks for any rows.
 
 ### Managed (TableAM) path — the life of a bound scan
 

@@ -2,6 +2,20 @@
 
 ## Current dependency order
 
+The latest integrated core is public #99 at `569cd9b60c4`. Its
+native and Rust CI passed. Scoped table lookup now distinguishes
+missing or concealed tables (`42P01`), explicit refusal (`42501`),
+provider failure (`08000`) and an absent selected pin (`22023`).
+The downstream deployment lock remains on public `c104bd72f90`
+at service main `9b5ed0909198`.
+
+The [foundation audit](20-foundation-audit.md) records the candidate
+cache and planning repairs, scan ownership, release gates and working-day
+schedule. The next reader dependency is a shared immutable work
+description and cancellation while a provider request is outstanding.
+[Scoped lookup](modules/06b-scoped-read-handoff.md) ·
+[Reader ownership](modules/02-iceberg-reader.md#fdw-scan-ownership)
+
 Public #91 at `8765e97f4ba8015171178ff39067b6b47cdc1ded` qualifies separate
 fresh proof and original-snapshot payload access. Public #90 at
 `c104bd72f9058215ce5018f90c7a9d188aa8974a` bounds and reuses
@@ -23,10 +37,10 @@ PG19.0. The managed writer and its visibility proof can advance separately.
 | Stock reader, 01/02/06 | #53 supplies execution-time FDW COUNT and same-pin fallback. #54/#58/#61 cover effective mapping, enrolled root, real SQL logins, rotation and revocation. #70 runs the [TLS smoke](../../src/test/lakehouse/fixtures/stock-scoped-tls.sh) for those reads and reconnect on verified PG-wire with SCRAM. | The scoped reader now bounds catalog and metadata reads and reuses the approved observation for exact-pin planning. The ordinary external pilot needs a deployed client-network, login and grant-generation test. Governed provider identity follows its own gate. Preserve ordinary/pinned count and denied-sibling controls. [External client handoff](modules/10-downstream-handoff.md#external-postgresql-client-handoff) |
 | Governed tables, 01/02/06/08 | #67–69 define BI reuse, provider scope and a verifier for 12 positive SQL executions and six refusals. Current governed results come from synthetic evidence. | Implement and run one provider's protected plan on a real enrolled table. Require exact source pin, actual consumption, masks and distinct effective scopes. Only then qualify reuse and multiple readers. [Verifier](modules/06c-governed-published-read.md) |
 | Managed send and recovery, 01/04 | #75–79 qualified discovery, scoped credentials, bounded ledger loads, stale-work refusal and native lookup/finalize after WAL restart. #80 qualified a native WAL authorization hold with zero provider requests and a lookup-only receipt. #81 rejects assigned launcher XIDs, bounds ledger-lock waits and qualifies a process-local Rust prepare handle that can be dropped without a catalog POST. #83 adds the [C preparation ABI](modules/04b-scoped-send-admission.md#process-local-native-preparation-abi), which exposes the exact bounded proposal. #85’s opt-in native 1.14 diagnostic joins role-bound static Send credentials to it after closing the ledger transaction, then discards the proposal. Opt-in 1.16 [dispatches once](modules/04b-scoped-send-admission.md#native-one-shot-dispatch) through the live handle after durable authorization and proves both reply-loss barriers with the static mapping fixture. Opt-in 1.17 supplies separate purpose-checked native session credentials and rejects mapping rotation during preparation. | Qualify actual provider issuance, renewal and revocation, hard-disable fencing, bounded polling and primary promotion. Keep recovered attempts lookup-only. [Publisher handoff](modules/04b-scoped-send-admission.md#native-worker-integration) |
-| Managed read visibility, 01/03 | #80 qualified the compatible-pin selector under three PostgreSQL snapshots. #81 certifies bounded Iceberg v2 explicit-`main` parent links with real Lakekeeper metadata. #84 rewinds retained cursors and fixes a missing staged rescan result. Opt-in 1.15 persists a pristine enrollment anchor and reads finalized membership separately from the statement-visible segment IDs. At the lost-reply barrier the independent read-only verifier can now prove the unfinalized child from one observed catalog head, exact WAL proposal, bounded manifest digest and sealed membership. Opt-in 1.18 reads pending facts and original-snapshot overlay bytes through separate private scoped ledger accessors. The Rust/C ABI owns one scoped observation with certified pins and a consuming exact-pin plan. #93 (merged as lakehouse-dev `510a6dc94d5`, extensions 1.18→1.19) joins the cut into ordinary bound TableAM SQL: scan_begin admission, demand-time install with dual scope preflight, fresh-frame grant recheck (direct grant-row query under an explicit fresh snapshot — a VOLATILE SQL function body cannot honor a pushed snapshot), rescan retention, mid-window revocation refusal and the rotated-scope consistency error; all five drill cases green. The managed COUNT red case is landed (#95/#96, two slices) and the RC statement-isolation campaign (rc-statement-campaign case: fresh cut per statement, stable conservative fallback under external publications, portal-suspended self-join stall with M[v]² join parity and zero re-resolutions) plus the RR held-transaction counterpart (held-snapshot trio + rescan-retained-cut) are landed in the lost-reply drill — which now RUNS IN CI (build-and-test, #101: first CI run caught the count fast-path use-after-free, #100, on its maiden run); retained object lease / provider proof and distinct refusal/timeout telemetry remain gated bands. [Visibility contract](modules/03-managed-visibility.md#certified-retained-ancestry) |
+| Managed read visibility, 01/03 | #80 qualified the compatible-pin selector under three PostgreSQL snapshots. #81 certifies bounded Iceberg v2 explicit-`main` parent links with real Lakekeeper metadata. #84 rewinds retained cursors and fixes a missing staged rescan result. Opt-in 1.15 persists a pristine enrollment anchor and reads finalized membership separately from the statement-visible segment IDs. At the lost-reply barrier the independent read-only verifier can now prove the unfinalized child from one observed catalog head, exact WAL proposal, bounded manifest digest and sealed membership. Opt-in 1.18 reads pending facts and original-snapshot overlay bytes through separate private scoped ledger accessors. The Rust/C ABI owns one scoped observation with certified pins and a consuming exact-pin plan. Integration commit `510a6dc94d5` (1.18→1.19) joins the cut into ordinary bound TableAM SQL: scan_begin admission, demand-time install with dual scope preflight, fresh-frame grant recheck (direct grant-row query under an explicit fresh snapshot — a VOLATILE SQL function body cannot honor a pushed snapshot), rescan retention, mid-window revocation refusal and the rotated-scope consistency error; all five drill cases green. The managed COUNT red case is landed (#95/#96, two slices) and the RC statement-isolation campaign (rc-statement-campaign case: fresh cut per statement, stable conservative fallback under external publications, portal-suspended self-join stall with M[v]² join parity and zero re-resolutions) plus the RR held-transaction counterpart (held-snapshot trio + rescan-retained-cut) are landed in the lost-reply drill — which now RUNS IN CI (build-and-test, #101: first CI run caught the count fast-path use-after-free, #100, on its maiden run); retained object lease / provider proof and distinct refusal/timeout telemetry remain gated bands. [Visibility contract](modules/03-managed-visibility.md#certified-retained-ancestry) |
 | Cost and expansion, 02/08/09 | #60 defines per-catalog profiles. #62 qualifies pinned benchmark digests. #66 reduces one projected canary from 4,719 to 16 data range GETs. `scripts/perf/lakehouse_perf.py` (branch `feat/perf-harness`) now carries tpcds (with scale variants), tpch, scan and write suites. **Baseline receipts, release build @ #93 content**: TPC-H SF=1 q1–q10 medians 20.9/355.7/13.7/20.9/21.0/18.7/167.1/29.7/49.9/39.4 s (q2/q7 are the row-transport canaries); write suite: staged INSERT 464k rows/s (1M wide rows), publisher drain 4–10 s, direct-mode hot-path INSERT commit 484k rows/s, COW UPDATE ≈124 rows/s at 10k rows (the measured fragmentation trade of spec 18 §3b). | **SF10 q1 timeout DIAGNOSED 2026-11-24 (corrected)**: reproduces at SF=1. NOT an inlining problem — upstream never inlines multi-ref CTEs (A/B verified: a materialize-always barrier changed no plan). The cost driver is the correlated avg-subplan re-scanning the materialized CTE tuplestore per outer row (O(outer x ctr)); SF1 receipts with the barrier: q4 timeout, q5 8.8s, q6 timeout, q7 6.0s, q8 2.2s, q9 128.6s, q10 3.6s. Remedies are executor-side (memoized/hashed correlated subplans) or a query-shape rewrite. Measure cold/warm dashboard completeness and spend on a qualified profile before selecting an elastic floor or enabling persistent reuse. [Cost evidence](modules/08b-io-cost.md) |
 | COW mutation boundary, 05/18 | Spec 18 §3a–3c pin the routing contract (half-routed UPDATE, assert-ref commit, zero-row no-op, mixed-transaction identity, 0A000/55000/40001/40003 table), the fragmentation/maintenance caveat and the FDW write-refusal contract. `cow-boundary-check.py` pins all seven boundary cases green against the existing slice-28 implementation; the 55000-vs-0A000 unaddressable-row correction came from code reading. | DV write (V3), FDW external writes and M4 compaction remain the gated follow-up bands. [Boundary contracts](modules/05-iceberg-mutations.md#boundary-contracts-qualified-cow-profile--implemented) |
-| Correlated-agg pullup, 03 | **q1 FIXED 2026-11-24**: `pullup_cte_agg_sublinks` (planner hook, managed_count.c) rewrites the q1 shape — `c1.t > (SELECT avg(t)*k FROM ctr c2 WHERE c1.key = c2.key)` over a foreign-table CTE — into a grouped subquery joined INNER on the correlation keys (one grouped pass + hash probes = O(N+M) instead of O(outer×ctr) tuplestore rescans). Matcher declines fail-safe (SubPlan kept): volatile, non-equality correlation, group/having/limit/window/distinct/setops in the subselect, non-CTE or local-heap CTEs, parallel mode. Receipts (release build): **TPC-DS q1 SF=1 82.3s → 5.0s, SF=10 timeout (>1200s) → 4.2s**; EXPLAIN shows the `agg_pullup` grouped hash join with no SubPlan; `agg-pullup-check.py` pins the shape + decline control green; regress 11/11; PREPARE×7 identical across the custom→generic plan switch with the pullup retained. q4/q6 timeouts are NOT this shape — unchanged, separate diagnosis. | Executor-side memoized/hashed correlated subplans for declined shapes; q4/q6 diagnosis; drop the foreign-CTE gate once soak-proven. |
+| Correlated-agg pullup, 03 | **q1 FIXED 2026-11-24**: `pullup_cte_agg_sublinks` (planner hook, managed_count.c) rewrites the q1 shape — `c1.t > (SELECT avg(t)*k FROM ctr c2 WHERE c1.key = c2.key)` over a foreign-table CTE — into a grouped subquery joined INNER on the correlation keys (one grouped pass + hash probes = O(N+M) instead of O(outer×ctr) tuplestore rescans). Matcher declines fail-safe (SubPlan kept): volatile, non-equality correlation, group/having/limit/window/distinct/setops in the subselect, non-CTE or local-heap CTEs, parallel mode. Receipts (release build): **TPC-DS q1 SF=1 82.3s → 5.0s, SF=10 timeout (>1200s) → 4.2s**; EXPLAIN shows the `agg_pullup` grouped hash join with no SubPlan; `agg-pullup-check.py` pins the shape + decline control green; regress 11/11; PREPARE×7 identical across the custom→generic plan switch with the pullup retained. The second pullup accepts the direct foreign-table correlated shape in q6. q4 still needs repeated-scan and materialization work. | Diagnose each declined shape before extending rewrites. Rebaseline q1 and q6 with exact pins after the cache and estimate changes. |
 | Query-shape taxonomy and cost ladder, 19 | Spec 19 fixes the five-family pathology taxonomy (A correlated-agg subplan — q1 fixed by the pullup; B declined correlated subplans — q4/q6 suspected; C row transport — q2/q7; D overfetch — q9/q5; E foreign cardinality), the telemetry contract that makes families self-identifying (fingerprint + per-SubPlan counters + resources, `--telemetry` in the perf driver), the remedy registry (deterministic, equivalence-proven rewrites only), and the cost-model ladder ending in an ONNX-compiled variant selector (≤50 µs p99, fallback-to-L1 on load failure, embedded restricted-ONNX evaluator preferred over a full runtime). | Dependency order is binding: telemetry → taxonomy → registry → L1 regression fit → L2 compiled model; L2 trains only if L1 residuals justify it. First empirical rows land with the 99-query sweep. [Spec 19](19-query-shape-taxonomy-and-cost-model.md) |
 
 | Cross-profile capture, §6.4 (2026-11-26) | **dataserver3 profile stood up and first SF1 medians recorded** (32c Xeon E5-2630L v3, 30Gi, rotational RAID; Garage S3 replacing the twice-wedged SeaweedFS; lakekeeper seeded from the WSL2 catalog dump; same pinned SF1 snapshots). SF1 medians: q1 34.8s, q2 118.5s, q3 18.5s (WSL2 NVMe: 4.8/2.3/~7 — storage-bound ×7-50 as §6.4 predicted). **q6 completed in ~160s** on this profile with pullup-v2 (pre-v2: >1800s timeout) — family-A fix confirmed cross-profile. **q4 classified: NOT family A/B — it is family C/D** (3 materialized CTEs each independently re-scanning the same fact tables from object storage + a 3-way join of the materialized results; no correlated SubPlans). 2-3h on this profile. Collectors captured 195 table_stats + 4,959 column_stats rows across the sweep. | Scan-sharing across CTEs re-scanning the same fact tables is the q4 remedy (registry: C/D lane) — next slice after entry-2. Dataserver3 env recorded in memory: garage S3 on compose alias s3:9000 (no host binding — host:9000 is another service), lakekeeper seeded via full pg_dump (partial seed = broken FKs), datalake flag REQUIRED in meson setup, flex/bison/cbindgen needed, tmp cleaner eats /tmp files. |
@@ -34,7 +48,7 @@ PG19.0. The managed writer and its visibility proof can advance separately.
 
 1. [Stock published reader](modules/10-downstream-handoff.md#external-postgresql-client-handoff) delivers the independent read-only pilot. For hosted use, verify the deployed backend and complete the external grant-rotation and cancellation drill. Provisioning and hosted admission can proceed alongside managed work.
 2. Opt in to the one-shot 1.16 test boundary before joining [read-only discovery](modules/04b-scoped-send-admission.md#discovery-and-dispatch) and its scheduler. The scheduler consumes exact claim and grant inputs without gaining authority to resend a recovered proposal. Qualify separate provider-issued temporary Send and Lookup credentials through the opt-in credential adapter, a retiring writer fenced at the provider, and the source/intent WAL horizon on replacement. Reuse both reply-loss drills with the actual scheduler and deployment profile.
-3. Join the bounded catalog observation and the scoped ledger accessors with the read-only pending-head verifier in one native statement cut. Read proof under a fresh committed ledger snapshot and read row visibility and retained payloads under the original executor snapshot. Start with `[10]`, `[10,20]`, `[10,20,20]`, a missing compatible parent before any output, and rescan at the same exact pin. Keep the overlay COUNT shortcut, writer promotion, publication cadence, governed reads and fleet cost qualification gated independently.
+3. Qualify the bound managed cut and eligible COUNT with effective-role admission and an enforced object lifetime. Native SQL already joins the bounded observation, fresh committed proof and original-snapshot overlay. Repeat the lost-reply and rewind drill on the intended managed profile before opening a managed preview.
 
 ### One-shot native dispatch smoke for 1.16
 
@@ -84,7 +98,7 @@ forbidden-root requests. Single-sample SQL latencies were 25.048, 28.032
 and 24.333 ms. These are local Lakekeeper/S3 fixture observations.
 [Scoped observation interface](modules/01-catalog-storage.md)
 
-### Next managed visibility join
+### Historical pending-head verifier evidence
 
 At the accepted-reply-loss barrier, read the unique retained attempt and its
 sealed members under a fresh committed ledger snapshot. Verify the exact
@@ -98,8 +112,7 @@ ran before local finalization. One bounded metadata GET and three healthy
 manifest ranges supplied their proof. A fourth, corrupt range forced the
 safe parent overlay. Missing or mismatched local evidence avoided object
 I/O. Zero reader POSTs and unchanged attempt, ownership and member state
-held throughout. Keep bound SQL gated until chosen-pin schema and payload
-lifetime, whole-statement preflight and stable rescan pass.
+held throughout. The subsequent native SQL integration is tracked above.
 [Executor acceptance](modules/03-managed-visibility.md#sql-executor-acceptance)
 
 ### Scoped ledger reads for 1.18
@@ -120,7 +133,7 @@ and changed binding failed with `55000`. A byte cap failed with `54000`.
 A newer generation was refused under the held snapshot and the retired
 generation failed the fresh scope check. These accessors enable the
 [executor join](modules/03-managed-visibility.md#native-statement-cut-boundary).
-Ordinary bound scans still return `0A000`.
+At the 1.18 accessor revision, ordinary bound scans returned `0A000`.
 
 ### Native managed observation ABI
 
@@ -149,7 +162,7 @@ visible segments. One fixture POST and two authorized catalog GETs later,
 lookup proved the child and the ledger returned exact members `[2,3]`.
 Removing a receipt member in a rolled-back control returned the child to
 unknown. The SQL model verifies a conservative parent cut before local
-finalization. Bound TableAM still returns `0A000`.
+finalization. At this historical revision bound TableAM returned `0A000`.
 [Membership contract](modules/03-managed-visibility.md#certified-retained-ancestry)
 
 ### Evidence at #81
@@ -164,7 +177,7 @@ finalization. Bound TableAM still returns `0A000`.
   selector returned exact multisets `[10]`, `[10,20]` and `[10,20,20]` for
   parent `5524602987576199479` and child `6516738430694082503`. Missing and
   expired compatible parents refused the cut. These are model and provider
-  fixture receipts. Bound TableAM execution still returns `0A000`.
+  fixture receipts. At #81 the bound TableAM path returned `0A000`.
 - **Scope of measurement.** These are individual correctness observations.
   Apply the [cloud and runtime evidence rules](RULES.md#10-cloud-and-runtime-evidence)
   and the [smoke receipt format](10-testing.md#milestone-tdd-and-smoke-receipts)
@@ -204,14 +217,8 @@ Base `8ed4cbab0b0`. On upstream PG19.0 (`5c839a2a08b`), the original planner fai
 
 ## Milestone status
 
-| Milestone | Implementation | Release evidence still needed |
-|---|---|---|
-| **M0 Foundation** | Historically accepted at `milestone/m0` | Revalidate clean builds, extension install and supported upgrades at each candidate SHA. |
-| **M1 External reads** | FDW, REST/S3, pruning, typed scans, time travel and supported v2/v3 delete reads landed. Time-travel deparse + dump/restore landed 2026-11-21 (ruleutils re-emits the pin; `time_travel.sql` carries the acceptance test) | Independent result equivalence, delete combinations, parallel pinning, cancellation and resource limits. |
-| **M2 Managed writes** | Ordinary bound INSERT through opt-in one-shot native dispatch. Both reply-loss cases preserve exact WAL and lookup-only recovery on one primary. | Temporary credentials, scheduled polling, compatible executor scans and promoted-primary recovery. |
-| **M3 Semantics and cloud parity** | In progress. Ranged projection, cached bytes, lazy projected decode, and initial COUNT paths landed | Qualify COUNT and lazy reads. Close isolation, ADLS/GCS transport and auth, branch/tag/history semantics and the logical replication decision. |
-| **M4 Production hardening** | Design available for maintenance, statistics and execution tiers | Implement and qualify compaction, expiry, orphan safety, ANALYZE and bounded scan/publish resource use. |
-| **M5 Engine integrations** | Backlog | Compare independently against the same pinned dataset, permission scope, resource budgets and result digests. |
+The [current milestone matrix and Gantt/PERT schedule](20-foundation-audit.md#milestones-and-specification-conformance)
+track implementation, acceptance and ETA ranges from M0 through M5.
 
 ## Historical milestone evidence and work queue
 

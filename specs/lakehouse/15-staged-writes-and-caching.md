@@ -377,56 +377,28 @@ The lakehouse layer adds:
 
 ### 6.2 Layer 1: immutable-bytes block cache (the big win, and the safe one)
 
-**Decision D3.** Cache keyed by **(storage path, byte range)** with
-**capacity-based eviction only — no invalidation path exists**, because
-Iceberg data/manifest file paths are immutable (a rewrite produces a
-NEW path). This is the structural reason caching here is safe where
-caching a mutable store is not: a cached byte range for path P is
-correct for P forever.
-
-The current implementation uses a bounded in-process cache. Remote cache
-entries are reusable by an open storage handle and its clones. Reopening
-requires storage authorization through a fresh read. Measure the additional
-cold reads before designing cross-handle reuse. The disk-cache proposal
-below requires its own authorization and version checks.
+**Decision D3.** Keep immutable bytes in a capacity-bounded process-local
+cache. Network keys include the open storage handle, object key and byte
+range. Clones share the handle identity. A fresh handle re-establishes
+access with the object provider on its first read of a key or range.
+PostgreSQL permission checks authorize use of a SQL relation. The object
+provider makes its own access decision for the mapped credential. The
+local filesystem test profile keys entries by its configured root.
 [Read enrollment evidence](modules/06b-scoped-read-handoff.md#remote-byte-cache-authorization)
 
-- Scope: parquet data + puffin + avro metadata/manifest bytes fetched
-  by `storage.rs get_bytes/ranged reads` (13-review #2's ranged reads
-  are the prerequisite — implemented first if absent at build time).
-- Location: configurable directory (local NVMe / EBS gp3 volume),
-  size-capped (LRU), O_DIRECT-friendly contiguous extents; per-instance
-  (never shared across catalogs/warehouses — a path is only unique
-  within its warehouse; the cache namespace includes the warehouse id).
+Concurrent misses for one immutable key may complete separate requests.
+Count every completed fetch and charge the resident copy once. Skip empty
+and oversized entries before making a cache copy. Capacity accounts for
+resident payload bytes. Key and entry overhead and eviction cost still
+need a separate process memory and latency budget.
 
-**§6.2 amendment (2026-11-26, measurement-gated): cache identity is the
-LOCATION, not the handle.** The original handle-scoped keying
-(`remote:{handle-id}`) was reversed after the §6.3a measurement gate
-(`lakehouse.cache_stats` + cache-counters-check) measured cross-query
-hit ratio at literally ZERO — every SQL statement opens a fresh storage
-handle, so handle-scoped entries were unreachable by design and the
-block cache only ever served intra-query reuse. Remote cache identity
-is now `remote:{endpoint}|{bucket}` (components '|'-escaped so the
-separator is unambiguous; `http(s)` metadata locations key on
-`remote:{url}`; local unchanged: `local:{root}`).
-Soundness: cached immutable bytes carry no credential state and need no
-GET (§6.2's auth-freshness concern applies only to fresh GETs, which
-re-authorize through the opening handle's client exactly as before);
-SQL-layer authorization still gates every query at ExecutorStart before
-any storage access — the storage-credential revocation semantics now
-match PG's own shared_buffers behavior (a revoked role fails the SQL
-permission check, not the buffer read). Pinned by
-`remote_cache_is_location_scoped_and_credential_free` (same-location
-reopened handle = warm hits with zero store consults; different bucket =
-isolated scope, cold miss).
-
-- Security: cache files carry table DATA (RULES §6 class): directory
-  perms 0700, lives in PGDATA or operator-specified secure path, never
-  included in dumps; contents never logged.
-- Effect: repeat reads and multi-worker scans of the same table become
-  local-disk speed; this is where "frequently accessed data" wins come
-  from, and it composes with compaction (post-compaction cold files
-  repopulate the cache on first touch).
+Reuse a client within an authorized execution when the provider and object
+scope match. Cross-execution or disk reuse requires an independently
+approved authorization epoch, invalidation on provider policy changes,
+object identity or version, and a verified retention window. Measure live
+request counts, resident memory and exact result digests before enabling
+wider reuse. Treat cache files as table data and restrict their directory
+to the service identity.
 
 ### 6.3 Layer 2: metadata cache
 
@@ -675,3 +647,13 @@ written and failing (RULES §8).
   14's never-misread principle extends to delta merging (§3.4).
 - Doc 13 — perf #3's writer half (flush thresholds, spillable overlay)
   is subsumed by §3/§4; perf #1's GET-count goals are served by 6.3.
+
+
+## Superseded
+
+The 2026-11-26 amendment widened network cache identity to endpoint and
+bucket after measuring zero hits across separately opened handles. The
+2026-11-27 audit restored handle scope after a loopback provider proved
+that fresh clients could read warm bytes despite a provider-side denial.
+Earlier throughput receipts using the location cache describe that
+revision's behavior. Repeat them on the release candidate.

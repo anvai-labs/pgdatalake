@@ -1,10 +1,8 @@
-"""Planner-visible foreign-table relsize from Iceberg metadata (family E).
+"""Local FDW estimates and the opt-in operator metadata profile.
 
-An un-ANALYZEd foreign table must not plan as core's rows=1000 default:
-lakehouse.plan_rows_mode=metadata sums parquet record_counts at plan time
-(cached per session), so join/CTE cardinalities are real. Controls:
-mode=default keeps rows=1000; an unreachable endpoint degrades to the
-default (fail-safe decline), and repeat planning is served from the cache.
+Plain EXPLAIN with the default setting keeps the catalog estimate and
+succeeds with the origin offline. An opted-in operator can measure
+metadata estimates and provider failures fall back to local estimates.
 """
 
 import importlib
@@ -69,25 +67,23 @@ def main():
 
             query = "SELECT id FROM events"
 
-            # mode = default: core's rows=1000 default retained (the old
-            # behavior this slice replaces — pinned as the escape hatch)
-            sql(name, "SET lakehouse.plan_rows_mode = 'default'")
+            assert sql(name, "LOAD 'lakehouse'; SHOW lakehouse.plan_rows_mode") == "default"
             assert plan_rows(name, query, "default") == [1000]
 
-            # mode = metadata: the parquet record_count sum, no quals on top
+            # Opt-in uses the live metadata and applies the profile clamp.
             rows = plan_rows(name, query, "metadata")
-            assert len(rows) == 1 and 4000 <= rows[0] <= 6000, rows
+            assert rows == [5000], rows
 
-            # session cache: TWO EXPLAINs in ONE sql() call share one
-            # backend, so the second plan is served from planner_rows_cache
-            # (sql() opens a fresh psql per call — separate calls would
-            # prove data stability, not cache behavior)
-            both = sql(name, "SET lakehouse.plan_rows_mode = 'metadata'; "
-                             "EXPLAIN " + query + "; EXPLAIN " + query)
-            m = re.findall(r"rows=(\d+)", both)
-            assert len(m) == 2 and m[0] == m[1], (m, both)
-            rows = [int(m[0])]
-            assert 4000 <= rows[0] <= 6000, rows
+            role = name + "_reader"
+            sql(name, f"CREATE ROLE {role}; GRANT SELECT ON events TO {role}")
+            try:
+                sql(name, f"LOAD 'lakehouse'; SET ROLE {role}; SET lakehouse.plan_rows_mode = 'metadata'",
+                    error="42501")
+                plan = sql(name, "LOAD 'lakehouse'; SET lakehouse.plan_rows_mode = 'metadata'; "
+                                 f"SET ROLE {role}; EXPLAIN {query}")
+                assert re.findall(r"rows=(\d+)", plan) == ["1000"], plan
+            finally:
+                sql(name, f"REVOKE SELECT ON events FROM {role}; DROP ROLE {role}")
 
             # quals ride ON TOP of the metadata tuples: 5000 tuples with
             # no pg_statistic NDV applies core's DEFAULT_NUM_DISTINCT(200)
@@ -98,12 +94,10 @@ def main():
                           "metadata")
             assert r == [25], r
 
-            # fail-fast contract (lakehouse.h, pre-existing): an unreachable
-            # endpoint fails the statement at BeginForeignScan — EXPLAIN runs
-            # ExecutorStart(EXPLAIN_ONLY), so planning itself surfaces the
-            # connection error. Pinned so a silent change is visible.
-            err = sql(name, "EXPLAIN SELECT id FROM dead_events",
-                      error="08000: lakehouse: could not plan scan")
+            dead_query = "SELECT id FROM dead_events"
+            assert plan_rows(name, dead_query, "default") == [1000]
+            assert plan_rows(name, dead_query, "metadata") == [1000]
+            sql(name, dead_query, error="08000: lakehouse: could not plan scan")
 
             # fail-safe decline: metadata rows over the clamp are declined
             # and core's rows=1000 default is kept (clamp = 2000 < 5000);

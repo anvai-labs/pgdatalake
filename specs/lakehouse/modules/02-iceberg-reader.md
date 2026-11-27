@@ -16,3 +16,20 @@ For repeated dashboard work, use the [shared published reader and BI reuse contr
 - Exercise the shared `cow-delete-safe` vector using actual Parquet plus a delete fixture. Verify survivor IDs and ordinals. Cover position/equality/DV applicability, rename and nullable evolution, unknown delete features, large integer comparison and empty projection.
 - A cold `LIMIT 1` stops before fetching later row-group data. A later decode error fails a full scan and does not invalidate a short scan that never reaches it. Measure peak live decoded bytes as row groups increase.
 - Compare a full drain with the reference reader's typed values and multiset. Use the same task plan across worker modes. Test error and cancellation while a batch or native handle is live.
+
+
+## FDW scan ownership
+
+An FDW scan registers its native session and row reader with the executor
+query memory context before opening the session. Normal EndForeignScan
+unregisters the callback and releases the same resources. A context reset
+after SQL error or cancellation closes the row reader before freeing the
+session. Rewind replaces the row reader and retains the selected session.
+
+The stock and fork COUNT fixture forces a SQL projection error and
+cancellation with the ordinary row reader open, rolls back to a savepoint
+and reads the same pinned rows on the same backend. Debug evidence counts
+both context-reset releases. PostgreSQL checks interrupts before and
+after ordinary session open, task open and batch decode. Interruption
+while a blocking provider request is in flight still depends on the
+provider deadline.

@@ -31,6 +31,7 @@
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/json.h"
 #include "port/atomics.h"
@@ -43,8 +44,43 @@
 #include "batch_fill.h"
 #include "pg_datalake_core.h"
 
-extern bool lakehouse_cache_enabled;
-extern bool lakehouse_rowgroup_pruning;
+static void
+lakehouse_release_foreign_scan(LakehouseExecState *state)
+{
+	pg_datalake_rows_close(state->rows);
+	state->rows = NULL;
+	state->batch_valid = false;
+	pg_datalake_scan_free(state->session);
+	state->session = NULL;
+}
+
+static void
+lakehouse_reset_foreign_scan(void *arg)
+{
+	LakehouseExecState *state = arg;
+	bool		had_session = state->session != NULL;
+	bool		had_rows = state->rows != NULL;
+
+	lakehouse_release_foreign_scan(state);
+	if (had_session && had_rows)
+		elog(DEBUG1, "lakehouse: released FDW scan session and row reader during context reset");
+	else if (had_session)
+		elog(DEBUG1, "lakehouse: released FDW scan session during context reset");
+}
+
+/* The executor can discard this context without calling EndForeignScan. */
+static LakehouseExecState *
+lakehouse_create_foreign_scan_state(ForeignScanState *node)
+{
+	MemoryContext context = node->ss.ps.state->es_query_cxt;
+	LakehouseExecState *state = MemoryContextAllocZero(context, sizeof(*state));
+
+	state->cleanup.func = lakehouse_reset_foreign_scan;
+	state->cleanup.arg = state;
+	MemoryContextRegisterResetCallback(context, &state->cleanup);
+	node->fdw_state = state;
+	return state;
+}
 
 void
 lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
@@ -74,22 +110,25 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 			 * sum and fallback ALL happen on the first Iterate demand, so
 			 * plain EXPLAIN and LIMIT 0 do no scan work at all.
 			 */
-			state = (LakehouseExecState *) palloc0(sizeof(LakehouseExecState));
+			state = lakehouse_create_foreign_scan_state(node);
 			state->count_exec = true;
 			state->count_selector = pstrdup(sel);
 			state->count_ftid = (Oid) strtoul(strVal(lthird(fscan->fdw_private)),
 											  NULL, 10);
-			node->fdw_state = state;
 			return;
 		}
 	}
+
+	/* Explain-only initialization must not resolve a scan or mapping. */
+	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+		return;
 
 	tupdesc = RelationGetDescr(rel);
 
 	ExtractOptions(RelationGetRelid(rel),
 				   ((ForeignScan *) node->ss.ps.plan)->checkAsUser, &opts);
 
-	state = (LakehouseExecState *) palloc0(sizeof(LakehouseExecState));
+	state = lakehouse_create_foreign_scan_state(node);
 	state->natts = tupdesc->natts;
 	state->in_funcs = (FmgrInfo *) palloc0(tupdesc->natts * sizeof(FmgrInfo));
 	state->typioparams = (Oid *) palloc0(tupdesc->natts * sizeof(Oid));
@@ -162,13 +201,7 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 	}
 	pg_datalake_core_cache_stats(&state->cache_at_begin);
 
-	/*
-	 * per-statement measurement gates (spec 15 §6.3a): the cache gate
-	 * mirrors the session GUC into the Rust core (pass-through reads,
-	 * counters untouched); the pruning gate drops the predicate so row-group
-	 * pruning cannot fire for this scan
-	 */
-	pg_datalake_core_cache_set_enabled(lakehouse_cache_enabled);
+	/* Retain local quals when the measurement profile disables pruning. */
 	if (!lakehouse_rowgroup_pruning)
 		state->predicate_json = NULL;
 
@@ -185,12 +218,10 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 	/* predicate_json must be set on opts BEFORE OpenSession (slice 15) */
 	if (state->predicate_json != NULL)
 		state->opts.predicate_json = state->predicate_json;
+	CHECK_FOR_INTERRUPTS();
 	state->session = lakehouse_OpenSession(&state->opts, state->rte_selector);
+	CHECK_FOR_INTERRUPTS();
 	state->task_count = pg_datalake_scan_task_count(state->session);
-	state->rows = NULL;
-	state->current_task = 0;
-
-	node->fdw_state = state;
 }
 
 /*
@@ -198,7 +229,7 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
  * snapshot. The reader applies the same delete semantics as a normal scan.
  */
 static int64
-lakehouse_count_pinned_rows(ScanSession *session, uint64 tasks)
+lakehouse_count_pinned_rows(ScanSession * session, uint64 tasks)
 {
 	RowsHandle *volatile rows = NULL;
 	int64		count = 0;
@@ -343,11 +374,13 @@ lakehouse_IterateForeignScan(ForeignScanState *node)
 			errbuf[0] = '\0';
 			file = pg_datalake_scan_task_file(state->session,
 											  state->current_task);
+			CHECK_FOR_INTERRUPTS();
 			state->rows = pg_datalake_rows_open(state->session,
 												state->current_task,
 												state->projection_csv,
 												errbuf,
 												sizeof(errbuf));
+			CHECK_FOR_INTERRUPTS();
 			if (state->rows == NULL)
 				ereport(ERROR,
 						(errcode(ERRCODE_IO_ERROR),
@@ -370,9 +403,11 @@ lakehouse_IterateForeignScan(ForeignScanState *node)
 
 			if (!state->batch_valid || state->batch_cursor >= state->batch.live_count)
 			{
+				CHECK_FOR_INTERRUPTS();
 				next_err[0] = '\0';
 				nst = pg_datalake_rows_batch_next(state->rows, &state->batch,
 												  next_err, sizeof(next_err));
+				CHECK_FOR_INTERRUPTS();
 				if (nst == 2)
 					ereport(ERROR,
 							(errcode(ERRCODE_DATA_EXCEPTION),
@@ -421,7 +456,7 @@ lakehouse_IterateForeignScan(ForeignScanState *node)
 						continue;
 					}
 					{
-						const PgDatalakeBatchColumn *col =
+						const		PgDatalakeBatchColumn *col =
 							&state->batch.cols[pcol];
 
 						if (col->nulls[r])
@@ -671,10 +706,7 @@ lakehouse_InitializeWorkerForeignScan(ForeignScanState *node, shm_toc *toc,
 	 * state is only a defensive fallback.)
 	 */
 	if (state == NULL)
-	{
-		state = (LakehouseExecState *) palloc0(sizeof(LakehouseExecState));
-		node->fdw_state = state;
-	}
+		state = lakehouse_create_foreign_scan_state(node);
 	state->shared = shared;
 	if (shared->snapshot_id != 0)
 		lakehouse_repin_session(state, shared->snapshot_id);
@@ -751,14 +783,7 @@ lakehouse_EndForeignScan(ForeignScanState *node)
 	}
 #endif
 
-	if (state->rows != NULL)
-	{
-		pg_datalake_rows_close(state->rows);
-		state->rows = NULL;
-	}
-	if (state->session != NULL)
-	{
-		pg_datalake_scan_free(state->session);
-		state->session = NULL;
-	}
+	MemoryContextUnregisterResetCallback(GetMemoryChunkContext(state), &state->cleanup);
+	lakehouse_release_foreign_scan(state);
+	node->fdw_state = NULL;
 }
