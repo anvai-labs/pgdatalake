@@ -196,7 +196,13 @@ cte_stats_hook(PlannerInfo *root, RangeTblEntry *rte, AttrNumber attnum,
 	const char *colname;
 	ListCell   *lc;
 
-	if (rte->rtekind != RTE_CTE || cte_ndv_entries == NIL)
+	/*
+	 * Gate inside the hook too: the GUC-off planner path skips begin()/end()
+	 * entirely, so a stale (dangling) entries list from a prior planning
+	 * cycle must never be consulted while the gate is off (round-7 should-
+	 * fix 1). Superusers/instances may disable mid-session.
+	 */
+	if (!lakehouse_cte_stats_hook || cte_ndv_entries == NIL)
 		return false;
 	ctename = rte->ctename;
 	if (ctename == NULL)

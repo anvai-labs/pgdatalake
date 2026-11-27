@@ -166,7 +166,13 @@ lakehouse_batch_col_datum(const LakehouseBatchMap *map,
 				 * AdjustTimestampForTypmod (integer offsets/scales tables,
 				 * sign-split division) — byte-identical to timestamp_in.
 				 */
-				if (map->typmod >= 0 && map->typmod < 6)
+
+				/*
+				 * not-finite sentinels must survive unrounded (core guards
+				 * !TIMESTAMP_NOT_FINITE — round-7 item 2)
+				 */
+				if (map->typmod >= 0 && map->typmod < 6 && v != DT_NOBEGIN &&
+					v != DT_NOEND)
 				{
 					static const int64 offsets[6] = {
 						500000, 50000, 5000, 500, 50, 5
@@ -256,8 +262,15 @@ lakehouse_batch_col_datum(const LakehouseBatchMap *map,
 							(errcode(ERRCODE_STRING_DATA_RIGHT_TRUNCATION),
 							 errmsg("value too long for type character(%d)",
 									maxlen)));
-				t = (text *) palloc(VARHDRSZ + maxlen);
-				SET_VARSIZE(t, VARHDRSZ + maxlen);
+
+				/*
+				 * Data area = byte length + pad: the pad count is the
+				 * CHARACTER shortfall but the stored bytes are sp->len
+				 * (round-7 B2: maxlen-minus-charlen byte-math overflows the
+				 * allocation on multibyte input).
+				 */
+				t = (text *) palloc(VARHDRSZ + sp->len + (maxlen - chars));
+				SET_VARSIZE(t, VARHDRSZ + sp->len + (maxlen - chars));
 				memcpy(VARDATA(t), sp->ptr, sp->len);
 
 				/*

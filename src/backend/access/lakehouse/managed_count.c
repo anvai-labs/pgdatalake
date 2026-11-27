@@ -1236,14 +1236,22 @@ lakehouse_count_exec_planner(Query *parse, const char *query_string,
 	 * dies with this planning cycle.
 	 */
 	{
-		MemoryContext entries_ctx = AllocSetContextCreate(CurrentMemoryContext,
-														  "lakehouse cte ndv entries",
-														  ALLOCSET_SMALL_SIZES);
-		MemoryContext old_ctx = MemoryContextSwitchTo(entries_ctx);
-		List	   *entries = collect_cte_ndv_entries(parse);
+		extern bool lakehouse_cte_stats_hook;
 
-		MemoryContextSwitchTo(old_ctx);
-		lakehouse_cte_stats_hook_begin(entries, entries_ctx);
+		if (!lakehouse_cte_stats_hook)
+			goto cte_stats_done;
+		{
+			MemoryContext entries_ctx = AllocSetContextCreate(CurrentMemoryContext,
+															  "lakehouse cte ndv entries",
+															  ALLOCSET_SMALL_SIZES);
+			MemoryContext old_ctx = MemoryContextSwitchTo(entries_ctx);
+			List	   *entries = collect_cte_ndv_entries(parse);
+
+			MemoryContextSwitchTo(old_ctx);
+			lakehouse_cte_stats_hook_begin(entries, entries_ctx);
+		}
+cte_stats_done:;
+
 
 		{
 			PlannedStmt *result;
@@ -1255,6 +1263,7 @@ lakehouse_count_exec_planner(Query *parse, const char *query_string,
 				result = standard_planner(parse, query_string,
 										  cursorOptions, boundParams, es);
 			lakehouse_cte_stats_hook_end();
+			MemoryContextDelete(entries_ctx);
 			return result;
 		}
 	}

@@ -574,7 +574,12 @@ impl RowFilter {
                 .bools
                 .get(row)
                 .map(|x| i8::from(*x != 0).cmp(&i8::from(*b))),
-            _ => None,
+            // Undecidable (Text/Bytes spans under the crate's
+            // deny(unsafe_code); NaN partial_cmp None): KEEP — PG's local
+            // re-check decides. Round-7 B1: None fell through to the
+            // Eq/Lt/Gt arms as false, dropping every non-null row on text
+            // quals.
+            _ => return true,
         };
         match self {
             RowFilter::Eq { .. } => ord == Some(Equal),
