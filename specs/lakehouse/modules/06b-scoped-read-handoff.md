@@ -28,6 +28,13 @@ Provision a server for one enrolled table. Keep server ownership and the source 
 The reader checks the metadata object against the approved directory before opening storage. It compares the loaded UUID and exact table directory before opening manifests, then checks manifest lists, manifests, data and delete objects before use. Canonical S3 path components consist of ASCII letters, digits, periods, hyphens and underscores. Empty or dot segments and escaped components are outside the pilot profile. A bound read rejects a missing snapshot before manifests and never falls back to the latest snapshot. The pilot proves an exact pin within the enrolled table. Ref ancestry and the current service grant generation remain responsibilities of the joined admission gate. SQLSTATEs at the bound session boundary are `42501` for a denied object location, `55000` for a changed table UUID or root, `22023` for an absent snapshot, `0A000` for unsupported binding, and `08000` for provider or decode failure. A missing PostgreSQL role mapping still uses `42704`, separate from an absent snapshot. Option validation retains its existing SQLSTATEs.
 
 Bound scans load one [bounded metadata observation](01-catalog-storage.md#bounded-observation-for-enrolled-reads).
+The HTTP outcome determines the SQL result before storage opens. A catalog
+`404` yields `42P01` for a missing or concealed relation at the enrolled route.
+A catalog `401` or `403` yields `42501`. A catalog `5xx` or a transport failure
+yields `08000`. The client uses the enrolled route once and discards pointers
+in error bodies. A missing pin remains `22023` after a successful table
+observation. A new statement after recovery resolves the same configured pin.
+
 The same observation supplies the chosen snapshot, its manifest list and
 the current schema used for stock FDW compatibility. A malformed, oversized or stalled catalog response stops before
 any storage request. A metadata object that exceeds its wire or gzip
@@ -40,6 +47,14 @@ The native CI fixture runs on stock PostgreSQL and the fork. It creates two v2 t
 The same fixture remaps each role in turn to the other root’s valid S3 key. Each statement returns `08000` after one SeaweedFS HTTP 403 on its own enrolled metadata object. The recorder forwards the original SigV4 request and independently counts requests and fetched bytes. Switching to the replacement mapping reads the original pin and multiplicity using the replacement key, both in the warm backend and on a fresh connection. Dropping the mapping yields `42704` with zero catalog or storage requests for the affected prepared plans. The other role still reads its own pinned rows.
 
 The catalog recorder tests the mapped token and allowed route and uses live Lakekeeper responses. The fixture exercises provider prefix policy, SQL mapping rotation and revocation in a disposable, self-hosted profile. Service-issued grant generations and authenticated Lakekeeper, hosted login and cloud IAM qualification remain release gates. [Scoped read fixture](../../../src/test/lakehouse/fixtures/scoped-read-check.py)
+
+The 2026-11-27 stock PostgreSQL 19 release run used Lakekeeper, SeaweedFS and
+Trino 484. Trino independently matched the parent, child and sibling row
+multisets. HTTP 401, 403, 404, 500 and 503 recorder responses each stopped after
+one catalog request and zero object requests. Prepared reads exercised
+credential rotation and revocation. The running fixture's failed S3 key probe
+was isolated by starting Trino from the tracked catalog settings while
+retaining the same Lakekeeper and SeaweedFS services.
 
 ## Observation and decision
 

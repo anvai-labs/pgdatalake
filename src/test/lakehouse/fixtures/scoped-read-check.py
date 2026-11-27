@@ -96,6 +96,14 @@ def exercise(db, parent, child, prefix, route, enrolled):
         redirect_requests.append((method, path))
         return 403, [], b""
 
+    catalog_refusals = {
+        "catalog-hidden-or-missing": (404, "42P01"),
+        "catalog-unauthenticated": (401, "42501"),
+        "catalog-forbidden": (403, "42501"),
+        "catalog-damaged-publication": (500, "08000"),
+        "catalog-unavailable": (503, "08000"),
+    }
+
     with recorder(redirect_target) as forbidden:
         def catalog_response(method, path, _headers):
             catalog_requests.append((method, path))
@@ -108,6 +116,9 @@ def exercise(db, parent, child, prefix, route, enrolled):
             if case == "catalog-redirect":
                 return 307, [("Location", forbidden + route)], b""
             result = enrolled | {"config": {"s3.endpoint": forbidden, "s3.region": "wrong"}}
+            if case in catalog_refusals:
+                # An error status wins over a plausible pointer in the body.
+                return catalog_refusals[case][0], [], json.dumps(result).encode()
             if case == "sibling-metadata":
                 result["metadata-location"] = root + "-old/metadata/invalid.metadata.json"
             if case == "oversized-catalog":
@@ -204,6 +215,7 @@ def exercise(db, parent, child, prefix, route, enrolled):
                   flush=True)
 
             for case, sqlstate, expect_metadata in (
+                *((case, sqlstate, False) for case, (_, sqlstate) in catalog_refusals.items()),
                 ("sibling-metadata", "42501", False),
                 ("changed-uuid", "55000", True),
                 ("changed-root", "55000", True),
@@ -220,7 +232,7 @@ def exercise(db, parent, child, prefix, route, enrolled):
                 assert catalog_requests == [("GET", route)], (case, catalog_requests)
                 expected = [("GET", metadata_path)] if expect_metadata else []
                 assert object_requests == expected, (case, object_requests)
-                if case.startswith("oversized-"):
+                if case.startswith("oversized-") or case in catalog_refusals:
                     print(json.dumps({"case": case, "sqlstate": sqlstate, "pins": [str(parent), str(child)],
                                       "catalog_calls": len(catalog_requests), "object_calls": len(object_requests)},
                                      sort_keys=True), flush=True)

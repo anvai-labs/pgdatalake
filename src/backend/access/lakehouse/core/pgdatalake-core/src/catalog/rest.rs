@@ -123,6 +123,8 @@ pub enum RestError {
     /// 404 from loadTable/dropTable etc. — distinct because the caller can
     /// react (doc 03 §5: remote table deleted under us → rel invalid).
     NotFound(String),
+    /// Explicit authentication or authorization refusal from a scoped load.
+    Denied(String),
     /// commitTable returned 409 `CommitFailedException` — a requirement we
     /// sent failed server-side (concurrent commit won). The ONLY retryable
     /// error class (doc 03 §5): `commit_with_retry` re-plans from a fresh
@@ -137,6 +139,7 @@ impl std::fmt::Display for RestError {
         match self {
             RestError::Http(m) => write!(f, "REST catalog HTTP error: {m}"),
             RestError::NotFound(m) => write!(f, "REST catalog object not found: {m}"),
+            RestError::Denied(m) => write!(f, "REST catalog access denied: {m}"),
             RestError::Conflict(m) => {
                 write!(f, "REST catalog commit conflict (stale base): {m}")
             }
@@ -319,6 +322,17 @@ impl RestCatalog {
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND {
             return Err(RestError::NotFound(format!(
+                "GET {} -> {status}",
+                redact_url(&url)
+            )));
+        }
+        if self.scoped
+            && matches!(
+                status,
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+            )
+        {
+            return Err(RestError::Denied(format!(
                 "GET {} -> {status}",
                 redact_url(&url)
             )));
@@ -694,6 +708,37 @@ mod tests {
         let err = catalog.load_table(&["ns"], "gone").unwrap_err();
         server_thread.join().unwrap();
         assert!(matches!(err, RestError::NotFound(_)), "{err}");
+    }
+
+    #[test]
+    fn scoped_load_distinguishes_missing_table_from_unavailable_publication() {
+        for status in [404, 500] {
+            let fixture = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}", fixture.server_addr().to_ip().unwrap());
+            let worker = std::thread::spawn(move || {
+                let request = fixture
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(request.url(), "/v1/namespaces/ns/tables/events");
+                let response = tiny_http::Response::from_string(
+                    r#"{"metadata-location":"s3://warehouse/events/metadata/md.json"}"#,
+                )
+                .with_status_code(status);
+                request.respond(response).unwrap();
+            });
+
+            let catalog =
+                RestCatalog::new_scoped(&endpoint, Box::new(StaticToken("test".into()))).unwrap();
+            let error = catalog
+                .load_scoped_metadata_location(&["ns"], "events", None, 256, Duration::from_secs(2))
+                .unwrap_err();
+            worker.join().unwrap();
+            match (status, error) {
+                (404, RestError::NotFound(_)) | (500, RestError::Http(_)) => {}
+                (status, other) => panic!("unexpected error for {status}: {other}"),
+            }
+        }
     }
 
     #[test]

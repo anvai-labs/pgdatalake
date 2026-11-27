@@ -383,7 +383,7 @@ lakehouse_OpenSession(LakehouseOptions *opts, const char *rte_selector)
 	ScanSession *session;
 	char	   *sel_json;
 	PgDatalakeReadStatus status;
-	const PgDatalakeReadBinding *binding = NULL;
+	const		PgDatalakeReadBinding *binding = NULL;
 
 	if (opts->read_binding.expected_table_uuid != NULL ||
 		opts->read_binding.storage_root != NULL ||
@@ -435,6 +435,9 @@ lakehouse_OpenSession(LakehouseOptions *opts, const char *rte_selector)
 					break;
 				case ReadPinUnavailable:
 					sqlstate = ERRCODE_INVALID_PARAMETER_VALUE;
+					break;
+				case ReadCatalogNotFound:
+					sqlstate = ERRCODE_UNDEFINED_TABLE;
 					break;
 				case ReadUnsupported:
 					sqlstate = ERRCODE_FEATURE_NOT_SUPPORTED;
