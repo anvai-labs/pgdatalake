@@ -43,6 +43,9 @@
 #include "batch_fill.h"
 #include "pg_datalake_core.h"
 
+extern bool lakehouse_cache_enabled;
+extern bool lakehouse_rowgroup_pruning;
+
 void
 lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 {
@@ -158,6 +161,16 @@ lakehouse_BeginForeignScan(ForeignScanState *node, int eflags)
 		}
 	}
 	pg_datalake_core_cache_stats(&state->cache_at_begin);
+
+	/*
+	 * per-statement measurement gates (spec 15 §6.3a): the cache gate
+	 * mirrors the session GUC into the Rust core (pass-through reads,
+	 * counters untouched); the pruning gate drops the predicate so row-group
+	 * pruning cannot fire for this scan
+	 */
+	pg_datalake_core_cache_set_enabled(lakehouse_cache_enabled);
+	if (!lakehouse_rowgroup_pruning)
+		state->predicate_json = NULL;
 
 	state->opts = opts;
 	state->opts.endpoint = opts.endpoint ? pstrdup(opts.endpoint) : NULL;

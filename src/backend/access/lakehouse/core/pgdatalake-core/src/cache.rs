@@ -22,6 +22,36 @@ pub struct BlockCache {
     max_bytes: u64,
 }
 
+/// Runtime pass-through switch (spec 15 §6.3a measurement gate): when
+/// false, `cached_*` reads bypass the map entirely — no hits, no fills,
+/// no counter updates — so iterative A/B tests get true cold reads
+/// without restarts and without polluting measurement counters.
+/// Entries themselves are immutable (§6.2), so disabling never
+/// invalidates anything.
+static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Runtime gate for the measurement harness (C side reads
+/// `lakehouse.cache_enabled` per statement and mirrors it here).
+pub fn set_enabled(on: bool) {
+    ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn enabled() -> bool {
+    ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Wipe all entries and counters (diagnostics: measurement isolation for
+/// cold-warm A/B in one backend). Safe by §6.2 — a cleared entry is a
+/// miss, never a wrong answer.
+pub fn clear() {
+    let mut inner = global().inner.lock().unwrap();
+    inner.map.clear();
+    inner.used = 0;
+    inner.hits = 0;
+    inner.misses = 0;
+    inner.fetched = 0;
+}
+
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct CacheKey {
     storage: Arc<str>,
@@ -217,6 +247,9 @@ pub fn global() -> &'static BlockCache {
 /// manifest / manifest-list paths are immutable per snapshot — no
 /// invalidation path exists. Byte-identity with `io.get_bytes`.
 pub fn cached_get_bytes(io: &StorageIo, key: &str) -> Result<Vec<u8>, StorageError> {
+    if !enabled() {
+        return io.get_bytes(key);
+    }
     global().get_bytes(io, "", key)
 }
 
@@ -230,6 +263,9 @@ pub fn cached_get_range(
     offset: u64,
     len: u64,
 ) -> Result<Vec<u8>, StorageError> {
+    if !enabled() {
+        return io.get_range(key, offset, len);
+    }
     global().get_range(io, "", key, offset, len)
 }
 

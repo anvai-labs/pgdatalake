@@ -1674,6 +1674,27 @@ pub unsafe extern "C" fn pg_datalake_core_cache_stats(out: *mut PgDatalakeCacheS
     };
 }
 
+/// Runtime measurement gate (spec 15 §6.3a): false = pass-through reads
+/// (no cache fills, no counter updates). C mirrors
+/// `lakehouse.cache_enabled` here per statement.
+///
+/// # Safety
+/// No pointers; always safe.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_core_cache_set_enabled(on: bool) {
+    crate::cache::set_enabled(on);
+}
+
+/// Wipe entries + counters (measurement isolation for cold-warm A/B in
+/// one backend; a cleared entry is a miss, never a wrong answer — §6.2).
+///
+/// # Safety
+/// No pointers; always safe.
+#[no_mangle]
+pub unsafe extern "C" fn pg_datalake_core_cache_clear() {
+    crate::cache::clear();
+}
+
 /// Set the rollover threshold (P1, spec 15 §7.2): when the buffered
 /// rows' estimated bytes reach this size, `push()` rolls a file — one
 /// transaction then emits MANY size-bounded files in ONE snapshot

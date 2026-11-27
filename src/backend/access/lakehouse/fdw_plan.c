@@ -189,6 +189,8 @@ lakehouse_GetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 #define PLAN_ROWS_METADATA 1
 
 static int	lakehouse_plan_rows_mode = PLAN_ROWS_METADATA;
+bool		lakehouse_cache_enabled = true;
+bool		lakehouse_rowgroup_pruning = true;
 static double lakehouse_plan_rows_scale = 1.0;
 static double lakehouse_plan_rows_max = 1e12;
 
@@ -229,6 +231,20 @@ lakehouse_fdw_plan_guc_init(void)
 							 &lakehouse_plan_rows_scale,
 							 1.0, 0.0001, 1e6,
 							 PGC_SUSET, 0,
+							 NULL, NULL, NULL);
+	DefineCustomBoolVariable("lakehouse.cache_enabled",
+							 "Serve immutable-path reads through the per-backend block cache (off = pass-through: cold reads, counters untouched).",
+							 NULL,
+							 &lakehouse_cache_enabled,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+	DefineCustomBoolVariable("lakehouse.rowgroup_pruning",
+							 "Prune row groups by exact min/max statistics when a translated predicate exists (rows are always re-checked locally).",
+							 NULL,
+							 &lakehouse_rowgroup_pruning,
+							 true,
+							 PGC_USERSET, 0,
 							 NULL, NULL, NULL);
 	DefineCustomRealVariable("lakehouse.plan_rows_max",
 							 "Sanity clamp on metadata-derived row estimates.",
