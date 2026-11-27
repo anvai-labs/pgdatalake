@@ -40,6 +40,7 @@ typedef struct LakehouseShared
 /* per-executor-node state */
 typedef struct LakehouseExecState
 {
+	MemoryContextCallback cleanup;
 	LakehouseOptions opts;
 	char	   *predicate_json; /* translated quals (slice 15) */
 	char	   *rte_selector;	/* time travel pin from fdw_private (slice 19) */

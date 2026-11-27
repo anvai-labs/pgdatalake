@@ -2,12 +2,19 @@
 
 ## Current dependency order
 
-The 2026-11-27 baseline is public `fee55cb83e4` and downstream main
-`9b5ed0909198`. The [foundation audit](20-foundation-audit.md) records
-the completed joins, current safety repairs, open gates and working-day
-schedule. Public #97 and #98 brought planner, pruning and telemetry
-work onto the integration branch. The deployment lock qualifies the
-earlier stock package at `c104bd72f90`.
+The latest integrated core is public #99 at `569cd9b60c4`. Its
+native and Rust CI passed. Scoped table lookup now distinguishes
+missing or concealed tables (`42P01`), explicit refusal (`42501`),
+provider failure (`08000`) and an absent selected pin (`22023`).
+The downstream deployment lock remains on public `c104bd72f90`
+at service main `9b5ed0909198`.
+
+The [foundation audit](20-foundation-audit.md) records the candidate
+cache and planning repairs, scan ownership, release gates and working-day
+schedule. The next reader dependency is a shared immutable work
+description and cancellation while a provider request is outstanding.
+[Scoped lookup](modules/06b-scoped-read-handoff.md) ·
+[Reader ownership](modules/02-iceberg-reader.md#fdw-scan-ownership)
 
 Public #91 at `8765e97f4ba8015171178ff39067b6b47cdc1ded` qualifies separate
 fresh proof and original-snapshot payload access. Public #90 at

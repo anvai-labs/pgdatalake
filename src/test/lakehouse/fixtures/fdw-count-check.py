@@ -71,6 +71,50 @@ def check_view_mappings(db):
     assert actual.splitlines() == ["{10,20,30}", "3", "{10,20,30}", "3", "{10,20,30}"], actual
 
 
+def check_scan_abort_cleanup(db):
+    # Both failures occur after a row has reached SQL projection. Continue
+    # through a savepoint in the same session so backend exit cannot hide
+    # leaked foreign scan handles.
+    result = subprocess.run(
+        ["psql", "-XqAt", "-v", "ON_ERROR_STOP=1", "-d", db],
+        input=r"""
+            SET client_min_messages = debug1;
+            CREATE FUNCTION cancel_read(bigint) RETURNS bigint AS $body$
+            BEGIN
+                PERFORM pg_cancel_backend(pg_backend_pid());
+                PERFORM pg_sleep(1);
+                RETURN $1;
+            END
+            $body$ LANGUAGE plpgsql VOLATILE;
+            BEGIN;
+            SAVEPOINT before_read;
+            \set ON_ERROR_STOP off
+            SELECT 1 / (id - id) FROM old_rows;
+            \echo :SQLSTATE
+            \set ON_ERROR_STOP on
+            ROLLBACK TO before_read;
+            SELECT array_agg(id ORDER BY id) FROM old_rows;
+            \set ON_ERROR_STOP off
+            SELECT cancel_read(id) FROM old_rows;
+            \echo :SQLSTATE
+            \set ON_ERROR_STOP on
+            ROLLBACK TO before_read;
+            SELECT array_agg(id ORDER BY id) FROM old_rows;
+            COMMIT;
+        """,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+    rows = result.stdout.splitlines()
+    assert rows == ["22012", "{10,20,20,30}", "57014", "{10,20,20,30}"], result
+    cleanup = "released FDW scan session and row reader during context reset"
+    assert result.stderr.count(cleanup) == 2, result.stderr
+    print("FDW SQL error and cancellation released both handles before same-session retry",
+          flush=True)
+
+
 def check_ref_advance_during_fallback(db, table, history, child):
     loads = []
 
@@ -153,6 +197,7 @@ def main():
                   (table '{db}.events', snapshot_id '{parent}');
                 CREATE FOREIGN TABLE live_rows(id bigint) SERVER lake OPTIONS (table '{db}.events');
             """)
+            check_scan_abort_cleanup(db)
             # Keep the PG session and generic plan alive across a real external commit.
             delete = shlex.join(trino_command(f"DELETE FROM {table} WHERE seq=3"))
             reads = sql(db, rf"""

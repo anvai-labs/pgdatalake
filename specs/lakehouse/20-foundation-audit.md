@@ -42,7 +42,7 @@ linked to the runtime revision. [Original review](13-implementation-review.md) Â
 | --- | --- | --- |
 | **P0 Object authorization for cached bytes** | Imports and plans supply storage scope, but endpoint and bucket alone cannot represent a provider's access decision. The baseline served warm bytes from a fresh handle after the loopback provider switched to denying fresh reads. Two fills for one key also double-charged capacity, evicting a valid resident entry. | **Fixed in this pass.** Network cache reuse follows an open handle, including clones. A duplicate key gets one resident charge, and large entries skip the extra copy. Verify provider denial for a whole object and range, valid clone hits and exact byte accounting. [Scope](modules/06b-scoped-read-handoff.md#remote-byte-cache-authorization) Â· [Cache policy](15-staged-writes-and-caching.md#62-layer-1-immutable-bytes-block-cache-the-big-win-and-the-safe-one) |
 | **P1 FDW planning authority and outage behavior** | The recent sizing path made origin I/O the default, cached estimates and failures by relation OID for the session, and used a full scan constructor. An explain-only plan also opened its executor session. The baseline plain EXPLAIN failed with a disconnected catalog. Backend-lifetime storage of options retained temporary credential allocations. | **Fixed in this pass.** Default FDW planning uses catalog estimates. Plain EXPLAIN skips scan startup. Operator remote estimation is explicit, checks the effective role, preserves the requested pin and bounds intermediate lifetimes. Only expected connection and missing-mapping errors fall back. The cache switch applies immediately to upper COUNT as well as ordinary scans. [Estimate contract](19-query-shape-taxonomy-and-cost-model.md#65-l1-seam--planner-visible-foreign-table-cardinality-landed-2026-11-26) |
-| **P1 FDW lifecycle and parallel execution** | Ordinary FDW allocates native resources before row demand and closes them in EndForeignScan. Readiness for cancellation and native error recovery needs proof across initialization, iteration and abort. Fork workers get a snapshot number and independently assemble tasks before and during pin reconciliation. | **Next reader slice.** Register native ownership with executor lifetime and add cancel/error injection. Move work authorization and pinning into one shared immutable description with an explicit empty pin. Prove zero additional origin resolution on rewind and identical task coverage across workers after a ref movement. [Reader ownership](modules/02-iceberg-reader.md) |
+| **P1 FDW lifecycle and parallel execution** | Ordinary FDW allocates native resources before row demand and closes them in EndForeignScan. Readiness for cancellation and native error recovery needs proof across initialization, iteration and abort. Fork workers get a snapshot number and independently assemble tasks before and during pin reconciliation. | **Candidate cleanup implemented.** The stock and fork test injects a SQL error and cancellation while both handles are live. Next, move work authorization and pinning into one shared immutable description with an explicit empty pin. Prove zero additional origin resolution on rewind and identical task coverage across workers after a ref movement. [Reader ownership](modules/02-iceberg-reader.md) |
 | **P1 Managed SQL identity and retention** | Admission is relation and invoker scoped at TableAM scan startup. The current callback lacks the effective permission identity for redirected RTEs and the visible cut needs object retention through portal lifetime. Existing positioned proofs cover staged append test cases. | **Next managed slice.** Use an executor-owned context carrying the checked role and grant generation. Qualify a retained object horizon paired with the original executor snapshot. Cover redirected identity, revoked mapping, underlying expiry before output and portal lifetime under concurrent removal. [Managed visibility](modules/03-managed-visibility.md#sql-executor-acceptance) |
 | **P1 Durable scheduler and promotion** | The one-shot publication and foreground flush prove separate seams. Retiring credentials, scheduler admission, wakeup/backlog limits and one-primary promotion need joined tests. | **In progress by prerequisites.** Connect discovery to bounded oldest-due scheduling, keep unresolved attempts lookup-only, and prove publisher fencing and WAL floors on replacement. Track oldest confirmed commit age and retained-byte growth during an outage. [Scoped send](modules/04b-scoped-send-admission.md#discovery-and-dispatch) |
 | **P2 Cost attribution and scalable byte reuse** | Global counter deltas taken across a scan can include sibling scans in the same backend. The byte cache scans its map to select a victim and charges payload bytes. Sampled ANALYZE estimates can be biased on uneven file distributions. | **Pending.** Attribute request kinds and bytes to the owning execution. Measure map overhead, eviction cost, decoded RSS and blocked I/O. Reuse provider clients inside the authorized scan, then qualify skewed sampling and refresh. Audit cache eviction alternatives only after those measurements. [I/O measurements](modules/08b-io-cost.md) Â· [Sampling](19-query-shape-taxonomy-and-cost-model.md#65-l1-seam--planner-visible-foreign-table-cardinality-landed-2026-11-26) |
@@ -62,6 +62,25 @@ linked to the runtime revision. [Original review](13-implementation-review.md) Â
 These are local tests against a disposable Lakekeeper, SeaweedFS and Trino
 stack. Published performance results still need an exact-candidate
 baseline under the corrected authorization and estimate policies.
+
+## Integration follow-up
+
+Public #99 merged at `569cd9b60c44b1a1abb363a0ca9c9d6a32592dfc`.
+The merged tree matches the independently reviewed and CI-tested head.
+The local profiles preserve distinct scoped lookup failures and require
+zero object requests after catalog refusal. The audit candidate now
+builds on that revision. [Merged CI](https://github.com/anvai-labs/pgdatalake/actions/runs/46040291970) Â·
+[Scoped lookup spec](modules/06b-scoped-read-handoff.md)
+
+The candidate owns ordinary FDW sessions and row readers through the
+executor memory context. The pre-fix fixture observed `22012` and
+`57014` without the reset cleanup. Stock PG19 and the fork each released
+the two open handles on both error paths and returned `[10,20,20,30]`
+on both same-backend retries. The rebased Rust suite passed 179 tests
+with one manual benchmark ignored. The remaining reader work covers
+blocked provider waits, a shared immutable work description and worker
+memory and request budgets.
+[FDW ownership and regression](modules/02-iceberg-reader.md#fdw-scan-ownership)
 
 ## Gantt planning view
 
