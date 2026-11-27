@@ -116,7 +116,7 @@ make_fake_stats_tuple(AttrNumber attnum, float4 ndv)
 			values[i] = Float4GetDatum(0.0f);
 		else if (strcmp(name, "stawidth") == 0)
 			values[i] = Int32GetDatum(10);
-		else if (strcmp(name, "n_distinct") == 0)
+		else if (strcmp(name, "stadistinct") == 0)
 			values[i] = Float4GetDatum(ndv);
 		else if (strncmp(name, "n_mod_since_analyze", 19) == 0 ||
 				 strncmp(name, "n_inherited_since_analyze", 25) == 0 ||
