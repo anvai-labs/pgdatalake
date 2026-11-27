@@ -1202,7 +1202,9 @@ lakehouse_count_exec_planner(Query *parse, const char *query_string,
 {
 	Oid			relid = InvalidOid;
 	bool		bound = false;
+	MemoryContext entries_ctx = NULL;
 
+	extern bool lakehouse_cte_stats_hook;
 
 	elog(DEBUG1, "lakehouse count_exec: hook entered");
 	if (!count_exec_in_fallback && managed_count_wanted(parse, &relid,
@@ -1216,56 +1218,41 @@ lakehouse_count_exec_planner(Query *parse, const char *query_string,
 	if (lakehouse_agg_pullup_enabled)
 		pullup_cte_agg_sublinks(parse);
 
-	extern bool lakehouse_cte_stats_hook;
-
-	if (!lakehouse_cte_stats_hook)
-	{
-		if (prev_planner_hook != NULL)
-			return prev_planner_hook(parse, query_string, cursorOptions,
-									 boundParams, es);
-		return standard_planner(parse, query_string, cursorOptions,
-								boundParams, es);
-	}
-
 	/*
 	 * family-C/E planning input (spec 19 §6.5): synthesize statistics for
 	 * multiply-referenced CTE discriminator columns so the 6-way self-join
 	 * shapes cost Hash Joins, not Nested Loop chains (q4 DNF root cause —
 	 * CTE-output columns carry no pg_statistic). The collector walks the
 	 * parse's own equality literals; entries live in a dedicated context that
-	 * dies with this planning cycle.
+	 * dies with this planning cycle. Gated by lakehouse.cte_stats_hook —
+	 * off skips collect/begin so a failed planning cycle never consults stale
+	 * entries (round-7 should-fix 1).
 	 */
+	if (lakehouse_cte_stats_hook)
 	{
-		extern bool lakehouse_cte_stats_hook;
+		entries_ctx = AllocSetContextCreate(CurrentMemoryContext,
+											"lakehouse cte ndv entries",
+											ALLOCSET_SMALL_SIZES);
+		MemoryContext old_ctx = MemoryContextSwitchTo(entries_ctx);
+		List	   *entries = collect_cte_ndv_entries(parse);
 
-		if (!lakehouse_cte_stats_hook)
-			goto cte_stats_done;
-		{
-			MemoryContext entries_ctx = AllocSetContextCreate(CurrentMemoryContext,
-															  "lakehouse cte ndv entries",
-															  ALLOCSET_SMALL_SIZES);
-			MemoryContext old_ctx = MemoryContextSwitchTo(entries_ctx);
-			List	   *entries = collect_cte_ndv_entries(parse);
+		MemoryContextSwitchTo(old_ctx);
+		lakehouse_cte_stats_hook_begin(entries, entries_ctx);
+	}
 
-			MemoryContextSwitchTo(old_ctx);
-			lakehouse_cte_stats_hook_begin(entries, entries_ctx);
-		}
-cte_stats_done:;
+	{
+		PlannedStmt *result;
 
-
-		{
-			PlannedStmt *result;
-
-			if (prev_planner_hook != NULL)
-				result = prev_planner_hook(parse, query_string,
-										   cursorOptions, boundParams, es);
-			else
-				result = standard_planner(parse, query_string,
-										  cursorOptions, boundParams, es);
-			lakehouse_cte_stats_hook_end();
+		if (prev_planner_hook != NULL)
+			result = prev_planner_hook(parse, query_string,
+									   cursorOptions, boundParams, es);
+		else
+			result = standard_planner(parse, query_string,
+									  cursorOptions, boundParams, es);
+		lakehouse_cte_stats_hook_end();
+		if (entries_ctx != NULL)
 			MemoryContextDelete(entries_ctx);
-			return result;
-		}
+		return result;
 	}
 }
 
