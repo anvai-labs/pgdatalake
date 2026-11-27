@@ -406,7 +406,9 @@ LOCATION, not the handle.** The original handle-scoped keying
 hit ratio at literally ZERO — every SQL statement opens a fresh storage
 handle, so handle-scoped entries were unreachable by design and the
 block cache only ever served intra-query reuse. Remote cache identity
-is now `remote:{endpoint}|{bucket}` (local unchanged: `local:{root}`).
+is now `remote:{endpoint}|{bucket}` (components '|'-escaped so the
+separator is unambiguous; `http(s)` metadata locations key on
+`remote:{url}`; local unchanged: `local:{root}`).
 Soundness: cached immutable bytes carry no credential state and need no
 GET (§6.2's auth-freshness concern applies only to fresh GETs, which
 re-authorize through the opening handle's client exactly as before);

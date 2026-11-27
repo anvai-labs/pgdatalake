@@ -816,8 +816,17 @@ impl ParquetRows {
         // which for our flat tables equals the arrow field index.
         let mut row_groups_pruned = 0usize;
         let builder = if let Some(pred) = predicate {
+            // Position deletes are FILE-ABSOLUTE row positions (slice 20):
+            // with_row_groups changes the reader's STREAM positions, so a
+            // tombstone could miss its row (deleted rows surface) or hit
+            // an innocent one (live rows vanish) — round-4 review B1,
+            // live-verified repro. Equality deletes are value-based and
+            // survive pruning. Conservative gate: prune only while no
+            // position deletes exist for the file.
+            let deletes_safe = deletes.positions.is_empty();
             let md = builder.metadata();
-            let flat = md.num_row_groups() > 0
+            let flat = deletes_safe
+                && md.num_row_groups() > 0
                 && arrow_schema.fields().len() == md.row_group(0).columns().len();
             if flat {
                 let names: Vec<&str> = arrow_schema
@@ -1870,6 +1879,103 @@ mod tests {
     /// cells decode to PostgreSQL-input-compatible TEXT — ISO dates,
     /// `HH:MM:SS.ffffff` times, `\x`-prefixed bytea hex (previously raw
     /// integers / bare hex that the type input functions reject).
+    /// Round-4 review B1 repro: row-group pruning must NOT run when the
+    /// file has position deletes (tombstones are FILE-ABSOLUTE; pruned
+    /// groups shift the reader's stream positions). Two directions:
+    /// a tombstone targeting a row in a KEPT group must still delete it,
+    /// and a tombstone targeting a row in what WOULD have been the pruned
+    /// group must not delete an innocent row. The conservative gate keeps
+    /// all row groups whenever positions exist.
+    #[test]
+    fn row_group_pruning_disabled_with_position_deletes() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage::test_allow_local_stores();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int64, false),
+            ArrowField::new("grp", DataType::Utf8, false),
+        ]));
+        let file = std::fs::File::create(dir.path().join("rgd.parquet")).unwrap();
+        let mut w = ArrowWriter::try_new(
+            file,
+            schema.clone(),
+            Some(
+                WriterProperties::builder()
+                    .set_max_row_group_row_count(Some(50))
+                    .build(),
+            ),
+        )
+        .unwrap();
+        let ids: Vec<i64> = (1..=100).collect();
+        let grps: Vec<String> = ids.iter().map(|i| format!("g{}", (i - 1) / 50)).collect();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(ids.clone())),
+                Arc::new(StringArray::from(grps.clone())),
+            ],
+        )
+        .unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let io = StorageIo::open(
+            &crate::storage::Location::Local {
+                root: dir.path().to_str().unwrap().to_string(),
+            },
+            None,
+        )
+        .unwrap();
+        let ge60 = crate::scan::ScanPredicate::Ge {
+            field: "id".into(),
+            value: serde_json::json!(60),
+        };
+
+        // direction A: tombstone {55} targets id 56 in the KEPT region —
+        // with the gate, no pruning runs, the delete applies exactly, and
+        // id 56 does NOT leak
+        let mut rd = RowDeletes::default();
+        rd.positions.insert(55);
+        let mut rows =
+            ParquetRows::open_with_deletes(&io, "rgd.parquet", &["id"], rd, Some(&ge60)).unwrap();
+        assert_eq!(
+            rows.row_groups_pruned, 0,
+            "gate: no pruning with pos deletes"
+        );
+        let mut got = Vec::new();
+        while rows.next() {
+            match rows.value(0) {
+                CellValue::Int64(v) => got.push(v),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(got.len(), 99, "exactly id 56 is deleted");
+        assert!(!got.contains(&56));
+
+        // direction B: tombstone {5} targets id 6 in what WOULD have been
+        // the pruned group — the gate keeps the group, so id 6 survives
+        // pruning (the delete itself still applies: id 6 is absent)
+        let mut rd = RowDeletes::default();
+        rd.positions.insert(5);
+        let mut rows =
+            ParquetRows::open_with_deletes(&io, "rgd.parquet", &["id"], rd, Some(&ge60)).unwrap();
+        assert_eq!(rows.row_groups_pruned, 0);
+        let mut got = Vec::new();
+        while rows.next() {
+            match rows.value(0) {
+                CellValue::Int64(v) => got.push(v),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(got.len(), 99, "exactly id 6 is deleted");
+        assert!(!got.contains(&6));
+        assert!(got.contains(&56), "the would-be-pruned row survives");
+    }
+
     /// 2a (spec 15 §6.3a / doc 06 §1 step 5): row-group stats pruning.
     /// Two row groups (ids 1..=100, writer `max_row_group_size` = 50): a
     /// predicate provably empty for group 1 (id >= 60) must skip it —

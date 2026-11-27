@@ -1,7 +1,8 @@
 //! Bounded byte cache for immutable Iceberg objects (spec 15 §6.2).
-//! Remote entries belong to the open storage handle that fetched them.
-//! Clones can reuse its bytes. A new handle must fetch under its current
-//! storage authorization. Entries are evicted by capacity.
+//! Remote cache identity is the LOCATION (endpoint|bucket) — entries are
+//! immutable bytes valid across handle reopenings (§6.2 amendment
+//! 2026-11-26; SQL-layer authorization gates every query). Entries are
+//! evicted by capacity.
 
 use crate::storage::{StorageError, StorageIo};
 use std::collections::HashMap;
@@ -14,8 +15,8 @@ struct Entry {
 }
 
 /// Thread-safe LRU for object bytes and ranges. Keys include the storage
-/// handle, caller namespace, object key and range. Entries larger than
-/// the capacity pass through uncached.
+/// location scope, caller namespace, object key and range. Entries
+/// larger than the capacity pass through uncached.
 pub struct BlockCache {
     inner: Mutex<CacheInner>,
     max_bytes: u64,
