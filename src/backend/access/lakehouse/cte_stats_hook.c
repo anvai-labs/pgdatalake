@@ -31,6 +31,8 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "catalog/pg_statistic.h"
+#include "catalog/pg_type.h"
+#include "utils/array.h"
 #include "fmgr.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -76,7 +78,7 @@ static bool stats_hook_installed = false;
  * matches what selfuncs' heap_getattr reads.
  */
 static HeapTuple
-make_fake_stats_tuple(float4 ndv)
+make_fake_stats_tuple(AttrNumber attnum, float4 ndv)
 {
 	Relation	rel;
 	TupleDesc	tupdesc;
@@ -86,27 +88,53 @@ make_fake_stats_tuple(float4 ndv)
 	int			natt;
 
 	rel = table_open(StatisticRelationId, AccessShareLock);
-	tupdesc = CreateTupleDescCopyConstr(RelationGetDescr(rel));
+	tupdesc = CreateTupleDescCopy(RelationGetDescr(rel));
 	table_close(rel, AccessShareLock);
 
 	natt = tupdesc->natts;
 	values = (Datum *) palloc0(sizeof(Datum) * natt);
 	nulls = (bool *) palloc(sizeof(bool) * natt);
-	for (int i = 0; i < natt; i++)
-		nulls[i] = true;
 
+	/*
+	 * Fill EVERY column: the fixed columns with sensible values, and the five
+	 * varlen slots (stakind/staop/stacoll/stanumbers/stavalues) with kind-0 +
+	 * empty arrays. NULL varlen columns would crash syscache —
+	 * get_attstatsslot reads stavaluesN via SysCacheGetAttrNotNull in its
+	 * slot loop regardless of kind match (2026-11-27 CI failure).
+	 */
 	for (int i = 0; i < natt; i++)
 	{
 		const char *name = NameStr(TupleDescAttr(tupdesc, i)->attname);
 
-		if (strcmp(name, "stanullfrac") == 0)
-		{
+		if (strcmp(name, "starelid") == 0)
+			values[i] = ObjectIdGetDatum(0);
+		else if (strcmp(name, "staattnum") == 0)
+			values[i] = Int16GetDatum(attnum);
+		else if (strcmp(name, "stainherit") == 0)
+			values[i] = BoolGetDatum(false);
+		else if (strcmp(name, "stanullfrac") == 0)
 			values[i] = Float4GetDatum(0.0f);
+		else if (strcmp(name, "stawidth") == 0)
+			values[i] = Int32GetDatum(10);
+		else if (strcmp(name, "n_distinct") == 0)
+			values[i] = Float4GetDatum(ndv);
+		else if (strncmp(name, "n_mod_since_analyze", 19) == 0 ||
+				 strncmp(name, "n_inherited_since_analyze", 25) == 0 ||
+				 strncmp(name, "n_distinct_estimator", 20) == 0)
+			values[i] = Float4GetDatum(0.0f);
+		else if (strncmp(name, "stakind", 7) == 0)
+			values[i] = Int16GetDatum(0);
+		else if (strncmp(name, "staop", 5) == 0 ||
+				 strncmp(name, "stacoll", 7) == 0)
+			values[i] = ObjectIdGetDatum(0);
+		else if (strncmp(name, "stanumbers", 10) == 0)
+		{
+			values[i] = PointerGetDatum(construct_empty_array(FLOAT4OID));
 			nulls[i] = false;
 		}
-		else if (strcmp(name, "n_distinct") == 0)
+		else if (strncmp(name, "stavalues", 9) == 0)
 		{
-			values[i] = Float4GetDatum(ndv);
+			values[i] = PointerGetDatum(construct_empty_array(ANYELEMENTOID));
 			nulls[i] = false;
 		}
 	}
@@ -192,7 +220,7 @@ cte_stats_hook(PlannerInfo *root, RangeTblEntry *rte, AttrNumber attnum,
 		if (e->attnum == attnum && strcmp(e->colname, colname) == 0 &&
 			strcmp(e->ctename, ctename) == 0)
 		{
-			vardata->statsTuple = make_fake_stats_tuple((float4) e->ndv);
+			vardata->statsTuple = make_fake_stats_tuple(attnum, (float4) e->ndv);
 			vardata->freefunc = cte_stats_free;
 			return true;
 		}
