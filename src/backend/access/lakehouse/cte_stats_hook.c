@@ -69,6 +69,9 @@ void		lakehouse_cte_stats_hook_end(void);
 static get_relation_stats_hook_type prev_stats_hook = NULL;
 static bool stats_hook_installed = false;
 
+extern bool lakehouse_q4_pivot_enabled;
+
+
 /* synthetic pg_statistic tuple ------------------------------------------------ */
 
 /*
@@ -243,6 +246,13 @@ lakehouse_cte_stats_hook_init(void)
 		return;
 	stats_hook_installed = true;
 
+	DefineCustomBoolVariable("lakehouse.q4_pivot",
+							 "Fold per-reference discriminator quals of a multiply-referenced CTE into conditional aggregation (q4 DNF remedy, spec 19 §5 entry 3).",
+							 NULL,
+							 &lakehouse_q4_pivot_enabled,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
 	DefineCustomBoolVariable("lakehouse.cte_stats_hook",
 							 "Synthesize planner statistics for multiply-referenced CTE discriminator columns from equality literals in the reference quals (planning input only — changes cost estimates, never rows).",
 							 NULL,

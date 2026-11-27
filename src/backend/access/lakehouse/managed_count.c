@@ -85,6 +85,13 @@ static bool count_exec_in_fallback = false;
  */
 bool		lakehouse_agg_pullup_enabled = true;
 
+/*
+ * q4-pivot gate (spec 19 §5 registry entry 3): fold per-reference
+ * discriminator quals of a multiply-referenced CTE into conditional
+ * aggregation ( collapsing the 2^k self-join to a single scan + pivot).
+ */
+bool		lakehouse_q4_pivot_enabled = true;
+
 void
 lakehouse_agg_pullup_guc_init(void)
 {
@@ -1261,6 +1268,18 @@ install_lakehouse_count_exec(void)
 {
 	prev_planner_hook = planner_hook;
 	planner_hook = lakehouse_count_exec_planner;
+}
+
+void
+lakehouse_q4_pivot_guc_init(void)
+{
+	DefineCustomBoolVariable("lakehouse.q4_pivot",
+							 "Fold per-reference discriminator quals of a multiply-referenced CTE into conditional aggregation (spec 19 §5 entry 3).",
+							 NULL,
+							 &lakehouse_q4_pivot_enabled,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
 }
 
 /*

@@ -4670,6 +4670,9 @@ _PG_init(void)
 	/* spec 19 §6.5 (family C/E): CTE-output statistics hook */
 	lakehouse_cte_stats_hook_init();
 
+	/* spec 19 §5 entry 3: q4-pivot gate */
+	lakehouse_q4_pivot_guc_init();
+
 	/* spec 19 §5: correlated-agg pullup operator gate */
 	lakehouse_agg_pullup_guc_init();
 
