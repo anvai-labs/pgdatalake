@@ -36,6 +36,8 @@ typedef enum LakehouseFastTarget
 	LAKE_FAST_TEXT,
 	LAKE_FAST_VARCHAR,
 	LAKE_FAST_BYTEA,
+	LAKE_FAST_BPCHAR,
+	LAKE_FAST_NAME,
 } LakehouseFastTarget;
 
 typedef struct LakehouseBatchMap

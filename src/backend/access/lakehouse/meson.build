@@ -46,6 +46,7 @@ lakehouse_sources += files(
   'managed_count.c',
   'telemetry.c',
   'scan_stats.c',
+  'cte_stats_hook.c',
   'fdw_analyze.c',
 )
 
