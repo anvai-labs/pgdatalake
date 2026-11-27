@@ -1,0 +1,39 @@
+-- telemetry policy layers (spec 19 §4a-gate): SUSET = admin policy via
+-- config / ALTER SYSTEM / ALTER DATABASE / ALTER ROLE; superusers may
+-- flip per session. Users cannot SET it (error is session-authorized).
+-- another test may have created the extension; force a library load into
+-- THIS backend either way: extension GUCs register per backend at load.
+CREATE EXTENSION IF NOT EXISTS lakehouse;
+NOTICE:  extension "lakehouse" already exists, skipping
+SELECT lakehouse.version();
+          version           
+----------------------------
+ pgdatalake-core 0.1.0 (M0)
+(1 row)
+
+SHOW lakehouse.telemetry;
+ lakehouse.telemetry 
+---------------------
+ on
+(1 row)
+
+SET lakehouse.telemetry = off;
+SHOW lakehouse.telemetry;
+ lakehouse.telemetry 
+---------------------
+ off
+(1 row)
+
+RESET lakehouse.telemetry;
+SHOW lakehouse.telemetry;
+ lakehouse.telemetry 
+---------------------
+ on
+(1 row)
+
+SHOW lakehouse.telemetry_retention;
+ lakehouse.telemetry_retention 
+-------------------------------
+ 100000
+(1 row)
+
