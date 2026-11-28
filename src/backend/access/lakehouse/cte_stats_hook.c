@@ -69,9 +69,6 @@ void		lakehouse_cte_stats_hook_end(void);
 static get_relation_stats_hook_type prev_stats_hook = NULL;
 static bool stats_hook_installed = false;
 
-extern bool lakehouse_q4_pivot_enabled;
-
-
 /* synthetic pg_statistic tuple ------------------------------------------------ */
 
 /*

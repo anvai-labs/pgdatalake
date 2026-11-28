@@ -127,8 +127,100 @@ def main():
             assert out.strip() == out_off2.strip(), \
                 f"{label}: decline path changed results ({out!r} vs {out_off2!r})"
 
+        # ---- mixed branch types (real TPC-DS schemas mix numeric and
+        # double precision money columns): the set-op machinery coerces
+        # each branch's clone to the resolved CTE type
+        sql(name, """
+            CREATE TABLE m_a (cust int, yr int, amt numeric);
+            CREATE TABLE m_b (cust int, yr int, amt double precision);
+            INSERT INTO m_a VALUES (1,2001,10::numeric),(1,2002,20::numeric),
+                                   (2,2001,30::numeric);
+            INSERT INTO m_b VALUES (1,2001,100),(1,2002,200);
+        """)
+        mixed = """
+            WITH t AS (
+                SELECT cust, yr, sum(amt) ytotal, 'a'::text st FROM m_a GROUP BY cust, yr
+                UNION ALL
+                SELECT cust, yr, sum(amt) ytotal, 'b'::text st FROM m_b GROUP BY cust, yr)
+            SELECT t1.cust, t1.ytotal, t2.ytotal FROM t t1, t t2
+            WHERE t1.cust = t2.cust AND t1.st = 'a' AND t2.st = 'b'
+              AND t1.yr = 2001 AND t2.yr = 2002 + 0
+              AND t1.ytotal > 0 AND t2.ytotal > 0
+            ORDER BY t1.cust;
+        """
+        out_offm, _ = psql_both(name, "SET lakehouse.q4_pivot = off;\n" + mixed)
+        out_onm, err_onm = psql_both(
+            name, "SET client_min_messages = debug1;\n"
+                  "SET lakehouse.q4_pivot = on;\n" + mixed)
+        assert out_onm.strip() == "1|10|200", f"mixed-type fold wrong: {out_onm!r}"
+        assert out_onm.strip() == out_offm.strip(), "mixed-type A/B mismatch"
+        assert "q4-pivot: folded 2 references into 2 keys" in err_onm, err_onm
+
+        # ---- review round-8 regressions: each must either decline
+        # pre-mutation (gate on == gate off) or fold without changing rows
+
+        # blocker 1: non-trailing discriminator groupexpr (branch GROUP BY
+        # orders differ) — fold must decline, never half-mutate
+        blocker1 = """
+            WITH v AS (
+                SELECT cust, yr, sum(amt) ytotal FROM sales_a GROUP BY cust, yr
+                UNION ALL
+                SELECT cust, yr, sum(amt) ytotal FROM sales_b GROUP BY yr, cust)
+            SELECT count(*) FROM v t1, v t2
+            WHERE t1.cust = t2.cust AND t1.yr = 2001 AND t2.yr = 2002
+              AND t1.ytotal > 0 AND t2.ytotal > 0;
+        """
+        # blocker 2: ref's agg column consumed in HAVING / join ON /
+        # SubLink subselect — remap does not cover those locations
+        having_case = """
+            WITH cte AS (
+                SELECT cust, yr, sum(amt) ytotal FROM sales_a GROUP BY cust, yr)
+            SELECT count(*) FROM cte t1, cte t2
+            WHERE t1.cust = t2.cust AND t1.yr = 2001 AND t2.yr = 2002
+              AND t1.ytotal > 0
+            GROUP BY t1.cust HAVING sum(t1.ytotal) > 10;
+        """
+        on_case = """
+            WITH cte AS (
+                SELECT cust, yr, sum(amt) ytotal FROM sales_a GROUP BY cust, yr)
+            SELECT count(*) FROM cte t1 JOIN cte t2
+              ON t1.cust = t2.cust AND t2.ytotal < 50
+            WHERE t1.yr = 2001 AND t2.yr = 2002 AND t1.ytotal > 0;
+        """
+        sublink_case = """
+            WITH cte AS (
+                SELECT cust, yr, sum(amt) ytotal FROM sales_a GROUP BY cust, yr)
+            SELECT count(*) FROM cte t1
+            WHERE t1.yr = 2001 AND t1.ytotal > 0
+              AND EXISTS (SELECT 1 FROM sales_b b
+                          WHERE b.cust = t1.cust AND b.amt < t1.ytotal);
+        """
+        whole_row_case = """
+            WITH cte AS (
+                SELECT cust, yr, sum(amt) ytotal FROM sales_a GROUP BY cust, yr)
+            SELECT count(*) FROM cte t1, cte t2
+            WHERE t1.cust = t2.cust AND t1.yr = 2001 AND t2.yr = 2002
+              AND t1 > t2;
+        """
+        for label, q in {
+            "non-trailing groupexpr": blocker1,
+            "HAVING over agg col": having_case,
+            "join ON over agg col": on_case,
+            "SubLink interior agg col": sublink_case,
+            "whole-row ref": whole_row_case,
+        }.items():
+            out_on2, err_on2 = psql_both(
+                name, "SET client_min_messages = debug1;\n"
+                      "SET lakehouse.q4_pivot = on;\n" + q)
+            out_off2, _ = psql_both(
+                name, "SET lakehouse.q4_pivot = off;\n" + q)
+            assert out_on2.strip() == out_off2.strip(), \
+                f"{label}: gate A/B mismatch ({out_on2!r} vs {out_off2!r})"
+            # either declined pre-mutation, or (if folded) results held —
+            # the A/B equality above is the binding assertion
+
         print("q4-pivot-check: ok (oracle A/B equal, fold engaged, "
-              "declines preserved)")
+              "declines preserved, mixed types, r8 regressions)")
     finally:
         sql("postgres", f"DROP DATABASE {name}")
 
