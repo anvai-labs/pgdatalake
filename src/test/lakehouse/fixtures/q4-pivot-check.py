@@ -202,11 +202,21 @@ def main():
             WHERE t1.cust = t2.cust AND t1.yr = 2001 AND t2.yr = 2002
               AND t1 > t2;
         """
+        subselect_on_case = """
+            WITH cte AS (
+                SELECT cust, yr, sum(amt) ytotal FROM sales_a GROUP BY cust, yr)
+            SELECT count(*) FROM cte t1
+            WHERE t1.yr = 2001 AND t1.ytotal > 0
+              AND EXISTS (SELECT 1 FROM sales_a x1 JOIN sales_a x2
+                            ON x1.cust = x2.cust AND x2.amt < t1.ytotal
+                          WHERE x1.yr = 2002);
+        """
         for label, q in {
             "non-trailing groupexpr": blocker1,
             "HAVING over agg col": having_case,
             "join ON over agg col": on_case,
             "SubLink interior agg col": sublink_case,
+            "subselect ON over agg col": subselect_on_case,
             "whole-row ref": whole_row_case,
         }.items():
             out_on2, err_on2 = psql_both(

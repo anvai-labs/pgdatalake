@@ -1937,6 +1937,8 @@ typedef struct Q4BannedCtx
 								 * and whole-row uses are suspect */
 } Q4BannedCtx;
 
+static void q4_sweep_fromlist(Node *node, Q4BannedCtx *c);
+
 static bool
 q4_banned_var(Var *v, Q4BannedCtx *c)
 {
@@ -1994,10 +1996,16 @@ q4_banned_walker(Node *node, void *context)
 		c->depth++;
 		(void) expression_tree_walker((Node *) q->targetList,
 									  q4_banned_walker, c);
+		if (c->ok && q->havingQual != NULL)
+			(void) expression_tree_walker(q->havingQual,
+										  q4_banned_walker, c);
 		if (c->ok && q->jointree != NULL)
 		{
 			(void) expression_tree_walker(q->jointree->quals,
 										  q4_banned_walker, c);
+			/* outer refs are visible to ON quals inside subqueries too */
+			if (c->ok && q->jointree->fromlist != NIL)
+				q4_sweep_fromlist((Node *) q->jointree->fromlist, c);
 		}
 		c->depth--;
 		return true;
@@ -2055,7 +2063,6 @@ q4_pivot_apply(Query *parse)
 	List	   *leaves = NIL;
 	List	   *flat_quals = NIL;
 	List	   *remaining = NIL;
-	List	   *agg_entries = NIL;
 	ListCell   *lc;
 	ListCell   *lc2;
 	int			i;
@@ -2314,7 +2321,6 @@ q4_pivot_apply(Query *parse)
 					}
 				}
 			}
-			agg_entries = this_aggs;
 		}
 	}
 
