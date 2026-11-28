@@ -1514,7 +1514,15 @@ q4_check_walker(Node *node, void *context)
 {
 	Q4QualCheck *c = (Q4QualCheck *) context;
 
-	if (node == NULL || !c->ok)
+	/*
+	 * Walker-convention NULL handling: expression_tree_walker passes NULL
+	 * children (e.g. CASE without an outer expression) and a FALSE return
+	 * continues to the siblings — TRUE would silently abort the whole
+	 * traversal, hiding every Var after the NULL (the round-9 ds3 decline).
+	 */
+	if (node == NULL)
+		return false;
+	if (!c->ok)
 		return true;			/* stop on first violation */
 	if (IsA(node, Var))
 	{

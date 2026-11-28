@@ -229,8 +229,39 @@ def main():
             # either declined pre-mutation, or (if folded) results held —
             # the A/B equality above is the binding assertion
 
+        # ---- real-q4 shape: a reference whose aggregate is consumed ONLY
+        # inside a CASE ratio (no >0 guard) — the walker NULL-children
+        # convention regression (round-9 ds3 decline)
+        case_only = """
+            WITH year_total AS (
+                SELECT cust, yr, sum(amt) ytotal, 'a'::text sale_type
+                FROM sales_a GROUP BY cust, yr
+                UNION ALL
+                SELECT cust, yr, sum(amt) ytotal, 'b'::text sale_type
+                FROM sales_b GROUP BY cust, yr)
+            SELECT t1.cust, t1.ytotal, t2.ytotal
+            FROM year_total t1, year_total t2
+            WHERE t1.cust = t2.cust
+              AND t1.sale_type = 'a' AND t2.sale_type = 'b'
+              AND t1.yr = 2001 AND t2.yr = 2002
+              AND t1.ytotal > 0
+              AND CASE WHEN t1.ytotal > 0
+                       THEN t2.ytotal / t1.ytotal
+                       ELSE NULL END > 0
+            ORDER BY t1.cust;
+        """
+        out_off3, _ = psql_both(name, "SET lakehouse.q4_pivot = off;\n"
+                                     + case_only)
+        out_on3, err_on3 = psql_both(
+            name, "SET client_min_messages = debug1;\n"
+                  "SET lakehouse.q4_pivot = on;\n" + case_only)
+        assert "q4-pivot: folded 2 references into 2 keys" in err_on3, \
+            f"CASE-only shape must fold: {err_on3!r}"
+        assert out_on3.strip() == "1|10|200", f"CASE-only fold wrong: {out_on3!r}"
+        assert out_on3.strip() == out_off3.strip(), "CASE-only A/B mismatch"
+
         print("q4-pivot-check: ok (oracle A/B equal, fold engaged, "
-              "declines preserved, mixed types, r8 regressions)")
+              "declines preserved, mixed types, r8 regressions, CASE-only)")
     finally:
         sql("postgres", f"DROP DATABASE {name}")
 
