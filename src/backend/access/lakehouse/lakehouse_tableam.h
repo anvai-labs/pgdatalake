@@ -140,6 +140,7 @@ extern void lakehouse_column_stats_record(Oid relid, const char *ns_table,
 										  Relation rel);
 extern void lakehouse_telemetry_guc_init(void);
 extern void lakehouse_cte_stats_hook_init(void);
+extern void lakehouse_q4_pivot_guc_init(void);
 extern void lakehouse_cte_stats_hook_begin(List *entries,
 										   MemoryContext plan_ctx);
 extern void lakehouse_cte_stats_hook_end(void);

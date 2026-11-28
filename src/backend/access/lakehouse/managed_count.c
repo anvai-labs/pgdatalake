@@ -49,6 +49,7 @@
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "parser/parse_oper.h"
+#include "parser/parse_coerce.h"
 #include "utils/rel.h"
 #include "utils/rls.h"
 #include "utils/syscache.h"
@@ -84,6 +85,13 @@ static bool count_exec_in_fallback = false;
  * (the L2 doctrine: estimates and models never enable or disable rewrites).
  */
 bool		lakehouse_agg_pullup_enabled = true;
+
+/*
+ * q4-pivot gate (spec 19 §5 registry entry 3): fold per-reference
+ * discriminator quals of a multiply-referenced CTE into conditional
+ * aggregation ( collapsing the 2^k self-join to a single scan + pivot).
+ */
+bool		lakehouse_q4_pivot_enabled = true;
 
 void
 lakehouse_agg_pullup_guc_init(void)
@@ -312,6 +320,7 @@ static bool is_corr_equality(OpExpr *op, int outer_rtindex, int inner_rtindex,
 static bool match_agg_sublink_shape(SubLink *sl, Query *parse,
 									AggPullupContext *ctx);
 static void pullup_cte_agg_sublinks(Query *parse);
+static bool q4_pivot_apply(Query *parse);
 static Node *fix_corr_eq_vars(Node *node, void *context);
 static bool set_agg_varno_walker(Node *node, void *context);
 static Node *replace_sublink_mutator(Node *node, void *context);
@@ -1195,6 +1204,1690 @@ pullup_cte_agg_sublinks(Query *parse)
 	elog(DEBUG1, "lakehouse count_exec: pulled up correlated aggregate "
 		 "over CTE %s as rtable index %d", ctx.cte_name, ctx.new_rtindex);
 }
+
+/*---------------------------------------------------------------------------
+ * q4-pivot rewrite (spec 19 §5 entry 3, A2 phase 2 — supersedes the
+ * phase-1 detection-only matcher).
+ *
+ * The q4 shape (receipts in spec 19 §5 entry 3): a UNION ALL of grouped
+ * aggregate SELECTs, referenced once per (sale_type, year) pair — six
+ * references — each carrying per-reference discriminator quals
+ * (sale_type = 's', dyear = 2001 / 2001 + 1), a year_total > 0 guard,
+ * and CASE ratio quals over the aggregates. The CTE materializes ~1.12M
+ * rows and each reference scans it whole; because cost_ctescan excludes
+ * the build cost, the planner races to Nested-Loop chains regardless of
+ * how real the cardinality estimates get (A1 cte_stats_hook receipt:
+ * estimates improved, plan stayed NL, query DNF'd at 900s).
+ *
+ * The rewrite folds each reference's discriminator filter INTO the CTE
+ * aggregation as FILTERed aggregate clones — one clone per distinct
+ * fold key (deduped conjunction of discriminator conditions) x aggregate
+ * output — and coarsens GROUP BY by dropping the discriminator columns:
+ *
+ *   SUM(expr) FILTER (WHERE dyear = 2001 AND sale_type = 's')
+ *
+ * collapsing the CTE to one row per remaining group key with one column
+ * per (key, aggregate). Each reference's discriminator quals are then
+ * removed and its reads of an aggregate column are redirected to its
+ * key's FILTERed clone (attno = base_natts + keyidx * nagg + ordinal).
+ *
+ * Equivalence obligations (spec 19 §5 entry 3 table):
+ *   - SUM(expr) FILTER (WHERE p) over the coarsened groups = the exact
+ *     subset sum the original per-year scan saw, for non-DISTINCT,
+ *     non-FILTERed, non-ordered aggregates (validated per Aggref).
+ *   - Empty subsets: the original shape has no (group, year) row; the
+ *     pivot yields NULL. These behave identically ONLY under strict
+ *     propagation, so the validator requires every remaining qual that
+ *     touches a redirected column to be an AND-tree of strict operator
+ *     comparisons, decline COALESCE/NullTest/OR/NOT and any other
+ *     node that can absorb NULL (q4's CASE ratios are strict-comparison
+ *     operands, which is the allowed form), and require each reference
+ *     to consume its aggregate column in at least one remaining qual.
+ *   - GROUP BY coarsening is safe because every non-aggregate output
+ *     must already be a group key (or a constant) — validated.
+ *
+ * Everything is re-validated here in one pass BEFORE any mutation: any
+ * decline leaves the parse untouched (fail-safe; the ordinary plan runs).
+ *---------------------------------------------------------------------------
+ */
+typedef struct Q4DiscCond
+{
+	AttrNumber	attno;			/* CTE output attnum of discriminator column */
+	Node	   *rhs;			/* RHS expression (Var/Param/SubLink-free) */
+	Oid			opno;
+	Oid			opfuncid;
+	Oid			opresulttype;
+	Oid			opcollid;
+	Oid			inputcollid;
+} Q4DiscCond;
+
+typedef struct Q4RefInfo
+{
+	Index		rtindex;		/* rtable index of the CTE reference */
+	List	   *conds;			/* List of Q4DiscCond* (>= 1 after matching) */
+	int			keyidx;			/* deduplicated fold-key index */
+	bool		agg_in_quals;	/* a remapped agg Var occurs in a remaining
+								 * qual */
+} Q4RefInfo;
+
+typedef struct Q4PivotCtx
+{
+	CommonTableExpr *cte;
+	char	   *ctename;
+	int			base_natts;		/* CTE output width before appended columns */
+	List	   *agg_resnos;		/* AttrNumber list: resnos of agg columns */
+	int			nagg;
+	List	   *keys;			/* List of List-of-Q4DiscCond* (deduped) */
+	List	   *refs;			/* List of Q4RefInfo* */
+	List	   *disc_qual_ptrs; /* Node* list: outer quals to remove */
+	List	   *cond_exprs;		/* List of Node*: per-key leaf-side FILTER
+								 * conds */
+	List	   *new_types;		/* appended CTE column types */
+	List	   *new_typmods;
+	List	   *new_colls;
+	List	   *new_names;		/* appended column names */
+	List	   *leaves;			/* List of Query*: UNION-ALL branch SELECTs */
+	List	   *leaf_rtes;		/* List of RangeTblEntry*: branch subquery
+								 * RTEs */
+	List	   *leaf_aggs;		/* per-leaf List of agg TargetEntrys
+								 * (branch-native types: clones are per
+								 * branch) */
+} Q4PivotCtx;
+
+/* banned-node walker for RHS discriminator expressions */
+static bool
+q4_rhs_banned_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var) || IsA(node, Param) || IsA(node, SubLink) ||
+		IsA(node, Aggref) || IsA(node, WindowFunc) ||
+		IsA(node, CaseTestExpr) || IsA(node, SubscriptingRef))
+		return true;
+	return expression_tree_walker(node, q4_rhs_banned_walker, context);
+}
+
+/* flatten an AND-only quals tree into a list of conjunct nodes */
+static void
+q4_flatten_and(Node *node, List **out)
+{
+	if (node == NULL)
+		return;
+	if (IsA(node, BoolExpr) && ((BoolExpr *) node)->boolop == AND_EXPR)
+	{
+		ListCell   *lc;
+
+		foreach(lc, ((BoolExpr *) node)->args)
+			q4_flatten_and((Node *) lfirst(lc), out);
+	}
+	else
+		*out = lappend(*out, node);
+}
+
+static Node *
+q4_rebuild_and(List *quals)
+{
+	if (quals == NIL)
+		return NULL;
+	if (list_length(quals) == 1)
+		return (Node *) linitial(quals);
+	return (Node *) make_ands_explicit(quals);
+}
+
+/* collect every SetOperationStmt node in a set-op tree */
+static bool
+q4_collect_setops_walker(Node *node, List **out)
+{
+	if (node == NULL || !IsA(node, SetOperationStmt))
+		return false;
+	*out = lappend(*out, node);
+	{
+		SetOperationStmt *s = (SetOperationStmt *) node;
+
+		return q4_collect_setops_walker(s->larg, out) &&
+			q4_collect_setops_walker(s->rarg, out);
+	}
+}
+
+/*
+ * Collect the SELECT leaves of a UNION-ALL set-operation tree. This fork
+ * represents set-op leaves as rtable subqueries: children are
+ * RangeTblRefs over RTE_SUBQUERY entries (PG18 set-op representation).
+ * `scope` provides the rtable for RangeTblRef resolution.
+ */
+static bool
+q4_setop_leaves_walker(Node *node, Query *scope, Q4PivotCtx *ctx)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, SetOperationStmt))
+	{
+		SetOperationStmt *s = (SetOperationStmt *) node;
+
+		if (s->op != SETOP_UNION || !s->all)
+			return false;
+		return q4_setop_leaves_walker(s->larg, scope, ctx) &&
+			q4_setop_leaves_walker(s->rarg, scope, ctx);
+	}
+	if (IsA(node, RangeTblRef))
+	{
+		RangeTblEntry *rte = rt_fetch(((RangeTblRef *) node)->rtindex,
+									  scope->rtable);
+
+		if (rte->rtekind != RTE_SUBQUERY || rte->subquery == NULL)
+			return false;
+		ctx->leaf_rtes = lappend(ctx->leaf_rtes, rte);
+		if (rte->subquery->setOperations != NULL)
+			return q4_setop_leaves_walker(rte->subquery->setOperations,
+										  rte->subquery, ctx);
+		if (rte->subquery->commandType != CMD_SELECT)
+			return false;
+		ctx->leaves = lappend(ctx->leaves, rte->subquery);
+		return true;
+	}
+	return false;
+}
+
+/*
+ * Try to interpret `qual` as a discriminator condition of one of the
+ * references: Var(ref) op rhs with a Var/Param/SubLink-free rhs.
+ * Returns the matched reference and fills a Q4DiscCond, or NULL.
+ */
+static Q4RefInfo *
+q4_match_disc_qual(Node *qual, Q4PivotCtx *ctx, Q4DiscCond **out_cond)
+{
+	OpExpr	   *op;
+	Node	   *a,
+			   *b;
+	Var		   *var = NULL;
+	Node	   *rhs = NULL;
+	Q4RefInfo  *ri = NULL;
+	ListCell   *lc;
+	Q4DiscCond *cond;
+
+	*out_cond = NULL;
+	if (!IsA(qual, OpExpr) || list_length(((OpExpr *) qual)->args) != 2)
+		return NULL;
+	op = (OpExpr *) qual;
+	a = linitial(op->args);
+	b = lsecond(op->args);
+	while (a != NULL && IsA(a, RelabelType))
+		a = (Node *) ((RelabelType *) a)->arg;
+	while (b != NULL && IsA(b, RelabelType))
+		b = (Node *) ((RelabelType *) b)->arg;
+	if (IsA(a, Var) && !IsA(b, Var))
+	{
+		var = (Var *) a;
+		rhs = b;
+	}
+	else if (IsA(b, Var) && !IsA(a, Var))
+	{
+		var = (Var *) b;
+		rhs = a;
+	}
+	else
+		return NULL;
+
+	foreach(lc, ctx->refs)
+	{
+		Q4RefInfo  *r = (Q4RefInfo *) lfirst(lc);
+
+		if (r->rtindex == var->varno)
+		{
+			ri = r;
+			break;
+		}
+	}
+	if (ri == NULL)
+		return NULL;
+	/* aggregate outputs are redirected reads, not discriminator columns */
+	if (list_member_int(ctx->agg_resnos, var->varattno))
+		return NULL;
+	if (contain_var_clause(rhs) || contain_volatile_functions(rhs) ||
+		q4_rhs_banned_walker(rhs, NULL))
+		return NULL;
+
+	set_opfuncid(op);
+	cond = (Q4DiscCond *) palloc(sizeof(Q4DiscCond));
+	cond->attno = var->varattno;
+	cond->rhs = rhs;
+	cond->opno = op->opno;
+	cond->opfuncid = op->opfuncid;
+	cond->opresulttype = op->opresulttype;
+	cond->opcollid = op->opcollid;
+	cond->inputcollid = op->inputcollid;
+	*out_cond = cond;
+	return ri;
+}
+
+/* fold-key equality: same attnos/operators and equal(rhs) trees */
+static bool
+q4_conds_equal(List *c1, List *c2)
+{
+	ListCell   *lc1;
+	ListCell   *lc2;
+
+	if (list_length(c1) != list_length(c2))
+		return false;
+	forboth(lc1, c1, lc2, c2)
+	{
+		Q4DiscCond *a = (Q4DiscCond *) lfirst(lc1);
+		Q4DiscCond *b = (Q4DiscCond *) lfirst(lc2);
+
+		if (a->attno != b->attno || a->opno != b->opno ||
+			!equal(a->rhs, b->rhs))
+			return false;
+	}
+	return true;
+}
+
+/* validation state for one reference's remaining quals */
+typedef struct Q4QualCheck
+{
+	Index		rtindex;
+	List	   *disc_attnos;	/* AttrNumber list */
+	List	   *agg_attnos;		/* AttrNumber list */
+	bool		agg_seen;
+	bool		ok;
+} Q4QualCheck;
+
+static bool
+q4_has_special_walker(Node *node, void *context)
+{
+	Q4QualCheck *c = (Q4QualCheck *) context;
+
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+	{
+		Var		   *v = (Var *) node;
+
+		return v->varno == c->rtindex &&
+			(list_member_int(c->disc_attnos, v->varattno) ||
+			 list_member_int(c->agg_attnos, v->varattno));
+	}
+	return expression_tree_walker(node, q4_has_special_walker, context);
+}
+
+static bool
+q4_check_walker(Node *node, void *context)
+{
+	Q4QualCheck *c = (Q4QualCheck *) context;
+
+	/*
+	 * Walker-convention NULL handling: expression_tree_walker passes NULL
+	 * children (e.g. CASE without an outer expression) and a FALSE return
+	 * continues to the siblings — TRUE would silently abort the whole
+	 * traversal, hiding every Var after the NULL (the round-9 ds3 decline).
+	 */
+	if (node == NULL)
+		return false;
+	if (!c->ok)
+		return true;			/* stop on first violation */
+	if (IsA(node, Var))
+	{
+		Var		   *v = (Var *) node;
+
+		if (v->varno == c->rtindex)
+		{
+			/* whole-row reference: the folded CTE row changes shape */
+			if (v->varattno == InvalidAttrNumber)
+			{
+				c->ok = false;
+				return true;
+			}
+			if (list_member_int(c->disc_attnos, v->varattno))
+			{
+				/* discriminator read outside its removal qual */
+				c->ok = false;
+				return true;
+			}
+			if (list_member_int(c->agg_attnos, v->varattno))
+				c->agg_seen = true;
+		}
+		return false;
+	}
+	if (IsA(node, Const) || IsA(node, RelabelType) ||
+		IsA(node, CaseExpr) || IsA(node, CaseWhen))
+		return expression_tree_walker(node, q4_check_walker, context);
+	if (IsA(node, OpExpr) || IsA(node, ScalarArrayOpExpr))
+	{
+		/*
+		 * NULL from a redirected agg column must propagate and kill the row:
+		 * every operator feeding on it has to be strict (the CASE ratios are
+		 * consumed by strict comparisons — the allowed form).
+		 */
+		if (expression_tree_walker(node, q4_has_special_walker, c))
+		{
+			Oid			opfuncid = ((OpExpr *) node)->opfuncid;
+
+			if (IsA(node, ScalarArrayOpExpr))
+			{
+				ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) node;
+
+				if (saop->opfuncid == 0)
+					saop->opfuncid = get_opcode(saop->opno);
+				opfuncid = saop->opfuncid;
+			}
+			else
+			{
+				set_opfuncid((OpExpr *) node);
+				opfuncid = ((OpExpr *) node)->opfuncid;
+			}
+			if (!func_strict(opfuncid))
+			{
+				c->ok = false;
+				return true;
+			}
+		}
+		return expression_tree_walker(node, q4_check_walker, context);
+	}
+	if (IsA(node, BoolExpr))
+	{
+		if (((BoolExpr *) node)->boolop != AND_EXPR &&
+			expression_tree_walker(node, q4_has_special_walker, c))
+		{
+			/* OR/NOT can absorb a NULL (TRUE OR NULL = TRUE) */
+			c->ok = false;
+			return true;
+		}
+		return expression_tree_walker(node, q4_check_walker, context);
+	}
+
+	/*
+	 * anything else (Coalesce, NullTest, FuncExpr, ...) is declined when it
+	 * can touch a special Var — it may absorb NULLs
+	 */
+	if (expression_tree_walker(node, q4_has_special_walker, c))
+	{
+		c->ok = false;
+		return true;
+	}
+	return false;
+}
+
+/*
+ * Root requirement: a remaining qual touching a redirected column must
+ * be an AND-tree whose leaves are strict comparisons. A CASE at the root
+ * could return TRUE without consuming the NULL, emitting rows the
+ * original shape never had.
+ */
+static bool
+q4_qual_root_ok(Node *node)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, BoolExpr) && ((BoolExpr *) node)->boolop == AND_EXPR)
+	{
+		ListCell   *lc;
+
+		foreach(lc, ((BoolExpr *) node)->args)
+		{
+			if (!q4_qual_root_ok((Node *) lfirst(lc)))
+				return false;
+		}
+		return true;
+	}
+	return IsA(node, OpExpr) || IsA(node, ScalarArrayOpExpr);
+}
+
+/* does this leaf expression read the discriminator source Var? */
+static bool
+q4_leaf_reads_var_walker(Node *node, void *context)
+{
+	Var		   *dv = (Var *) context;
+
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+	{
+		Var		   *v = (Var *) node;
+
+		return v->varno == dv->varno && v->varattno == dv->varattno &&
+			v->vartype == dv->vartype;
+	}
+	return expression_tree_walker(node, q4_leaf_reads_var_walker, context);
+}
+
+static bool
+q4_leaf_reads_var(Node *node, Var *dv)
+{
+	return q4_leaf_reads_var_walker(node, (void *) dv);
+}
+
+/* remap Var(ref, agg_resno) -> Var(ref, FILTERed clone attno) */
+static Node *
+q4_remap_mutator(Node *node, void *context)
+{
+	Q4PivotCtx *ctx = (Q4PivotCtx *) context;
+
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, Var))
+	{
+		Var		   *v = (Var *) node;
+		ListCell   *lc;
+
+		foreach(lc, ctx->refs)
+		{
+			Q4RefInfo  *ri = (Q4RefInfo *) lfirst(lc);
+
+			if (ri->rtindex == v->varno)
+			{
+				ListCell   *lc2;
+				int			ord = 0;
+
+				foreach(lc2, ctx->agg_resnos)
+				{
+					if ((AttrNumber) lfirst_int(lc2) == v->varattno)
+					{
+						Var		   *nv = copyObject(v);
+
+						nv->varattno = ctx->base_natts +
+							ri->keyidx * ctx->nagg + ord + 1;
+						return (Node *) nv;
+					}
+					ord++;
+				}
+			}
+		}
+		return node;
+	}
+	return expression_tree_mutator(node, q4_remap_mutator, context);
+}
+
+/* does this expression read a redirected aggregate column of any ref? */
+static bool
+q4_reads_agg_walker(Node *node, void *context)
+{
+	Q4PivotCtx *ctx = (Q4PivotCtx *) context;
+
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+	{
+		Var		   *v = (Var *) node;
+		ListCell   *lc;
+
+		foreach(lc, ctx->refs)
+		{
+			Q4RefInfo  *ri = (Q4RefInfo *) lfirst(lc);
+
+			if (ri->rtindex == v->varno &&
+				list_member_int(ctx->agg_resnos, v->varattno))
+				return true;
+		}
+		return false;
+	}
+	return expression_tree_walker(node, q4_reads_agg_walker, context);
+}
+
+/*
+ * Validate one UNION-ALL leaf without mutating it. The discriminator
+ * output columns must be simple Vars or Consts; every aggregate output
+ * must be a clean (non-DISTINCT, non-FILTER, non-ordered, non-star)
+ * Aggref over non-volatile args. Returns the list of agg TargetEntrys.
+ */
+static bool
+q4_leaf_validate(Query *leaf, Q4PivotCtx *ctx, List **agg_entries_out)
+{
+	List	   *aggs = NIL;
+	List	   *disc_attnos = NIL;
+	ListCell   *lc;
+	ListCell   *lc2;
+
+	if (leaf->commandType != CMD_SELECT ||
+		leaf->groupClause == NIL || !leaf->hasAggs ||
+		leaf->hasWindowFuncs || leaf->hasDistinctOn ||
+		leaf->distinctClause != NIL ||
+		leaf->hasSubLinks || leaf->hasModifyingCTE ||
+		leaf->havingQual != NULL ||
+		leaf->limitOffset != NULL || leaf->limitCount != NULL ||
+		leaf->sortClause != NIL || leaf->setOperations != NULL ||
+		leaf->cteList != NIL)
+		return false;
+
+	/* the distinct discriminator attnos across all fold keys */
+	foreach(lc, ctx->keys)
+	{
+		foreach(lc2, (List *) lfirst(lc))
+		{
+			Q4DiscCond *c = (Q4DiscCond *) lfirst(lc2);
+
+			if (!list_member_int(disc_attnos, c->attno))
+				disc_attnos = lappend_int(disc_attnos, c->attno);
+		}
+	}
+
+	foreach(lc, leaf->targetList)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (te->resjunk)
+			continue;
+		if (IsA(te->expr, Aggref))
+		{
+			Aggref	   *agg = (Aggref *) te->expr;
+
+			if (agg->aggdistinct != NIL || agg->aggfilter != NULL ||
+				agg->aggorder != NIL || agg->aggdirectargs != NIL ||
+				agg->aggstar ||
+				contain_volatile_functions((Node *) agg->args))
+				return false;
+			aggs = lappend(aggs, te);
+			continue;
+		}
+		if (list_member_int(disc_attnos, te->resno))
+		{
+			/* discriminator output: simple Var or Const only */
+			if (!IsA(te->expr, Var) && !IsA(te->expr, Const))
+				return false;
+		}
+	}
+
+	*agg_entries_out = aggs;
+	return true;
+}
+
+/*
+ * Build one key's leaf-side FILTER condition from THIS leaf's own
+ * discriminator expressions. In this fork grouped outputs are GROUP Vars
+ * over the query's RTE_GROUP, and flatten_group_exprs explicitly does not
+ * descend into Aggref args or aggfilter — so the condition must use the
+ * underlying base expression from groupexprs, never the GROUP Var itself.
+ */
+static Node *
+q4_build_leaf_cond(Query *leaf, List *conds)
+{
+	Node	   *cond = NULL;
+	ListCell   *lc;
+
+	foreach(lc, conds)
+	{
+		Q4DiscCond *cnd = (Q4DiscCond *) lfirst(lc);
+		TargetEntry *te = list_nth(leaf->targetList, cnd->attno - 1);
+		Node	   *lhs = (Node *) te->expr;
+		OpExpr	   *o = makeNode(OpExpr);
+
+		if (IsA(lhs, Var))
+		{
+			Var		   *v = (Var *) lhs;
+			RangeTblEntry *rte = rt_fetch(v->varno, leaf->rtable);
+
+			if (rte->rtekind == RTE_GROUP)
+			{
+				Assert(v->varattno > 0 &&
+					   v->varattno <= list_length(rte->groupexprs));
+				lhs = copyObject((Node *) list_nth(rte->groupexprs,
+												   v->varattno - 1));
+			}
+		}
+
+		o->opno = cnd->opno;
+		o->opfuncid = cnd->opfuncid;
+		o->opresulttype = cnd->opresulttype;
+		o->opcollid = cnd->opcollid;
+		o->inputcollid = cnd->inputcollid;
+		o->location = -1;
+		o->args = list_make2(lhs, copyObject(cnd->rhs));
+		cond = cond == NULL ? (Node *) o
+			: (Node *) make_andclause(list_make2(cond, o));
+	}
+	return cond;
+}
+
+/*
+ * Pre-mutation check of the GROUP BY coarsening law: the discriminator
+ * group expressions may only be removed as a trailing suffix of the
+ * fork's RTE_GROUP groupexprs (GROUP Vars address them by position), and
+ * a leaf with hasGroupRTE must actually carry the GROUP RTE. Read-only;
+ * emits the same decline receipts the mutation phase would.
+ */
+static bool
+q4_leaf_coarsening_ok(Query *leaf, Q4PivotCtx *ctx)
+{
+	List	   *disc_attnos = NIL;
+	int			nexprs = 0;		/* groupexprs positions seen */
+	int			keep_exprs = -1;
+	bool		any_disc_group = false;
+	ListCell   *lc;
+	ListCell   *lc2;
+
+	foreach(lc, ctx->keys)
+	{
+		foreach(lc2, (List *) lfirst(lc))
+		{
+			Q4DiscCond *cnd = (Q4DiscCond *) lfirst(lc2);
+
+			if (!list_member_int(disc_attnos, cnd->attno))
+				disc_attnos = lappend_int(disc_attnos, cnd->attno);
+		}
+	}
+
+	foreach(lc, leaf->groupClause)
+	{
+		SortGroupClause *gc = lfirst_node(SortGroupClause, lc);
+		bool		is_disc = false;
+		ListCell   *lc3;
+
+		foreach(lc3, leaf->targetList)
+		{
+			TargetEntry *te = lfirst_node(TargetEntry, lc3);
+
+			if (te->ressortgroupref == gc->tleSortGroupRef &&
+				list_member_int(disc_attnos, te->resno))
+			{
+				is_disc = true;
+				break;
+			}
+		}
+		if (get_sortgroupclause_tle(gc, leaf->targetList) != NULL)
+			nexprs++;
+		if (is_disc)
+		{
+			any_disc_group = true;
+			if (keep_exprs < 0)
+				keep_exprs = nexprs - 1;
+		}
+		else if (keep_exprs >= 0)
+		{
+			elog(DEBUG1, "q4-pivot: declined: discriminator group expr is not trailing");
+			return false;
+		}
+	}
+
+	if (leaf->hasGroupRTE)
+	{
+		RangeTblEntry *grte = NULL;
+		ListCell   *lc3;
+
+		foreach(lc3, leaf->rtable)
+		{
+			RangeTblEntry *r = lfirst_node(RangeTblEntry, lc3);
+
+			if (r->rtekind == RTE_GROUP)
+			{
+				grte = r;
+				break;
+			}
+		}
+		if (grte == NULL)
+		{
+			elog(DEBUG1, "q4-pivot: declined: hasGroupRTE without GROUP RTE");
+			return false;
+		}
+		(void) any_disc_group;
+		(void) keep_exprs;
+	}
+	return true;
+}
+
+/*
+ * Sweep outer-level expression locations the remap does not cover and
+ * the validator does not walk: parse->havingQual, fromlist JoinExpr ON
+ * quals, and the interiors of SubLink subselects (expression_tree_walker
+ * does not descend into a SubLink's Query). Any Var belonging to one of
+ * our references (aggregate, discriminator, or whole-row column) in
+ * those positions would read the un-remapped or neutralized CTE after
+ * the fold — decline the whole rewrite. `depth` is the query level: our
+ * refs live at depth 0; inside a subselect they are varlevelsup >= 1.
+ */
+typedef struct Q4BannedCtx
+{
+	List	   *refs;			/* List of Q4RefInfo* */
+	List	   *banned_attnos;	/* union of disc + agg resnos (whole-row
+								 * checked separately) */
+	int			depth;
+	bool		ok;
+	bool		skip_depth0;	/* true when sweeping locations that ARE
+								 * remapped at depth 0 (remaining quals and
+								 * targetList): only their SubLink interiors
+								 * and whole-row uses are suspect */
+} Q4BannedCtx;
+
+static void q4_sweep_fromlist(Node *node, Q4BannedCtx *c);
+
+static bool
+q4_banned_var(Var *v, Q4BannedCtx *c)
+{
+	ListCell   *lc;
+
+	if (v->varlevelsup != c->depth)
+		return false;
+	foreach(lc, c->refs)
+	{
+		Q4RefInfo  *ri = (Q4RefInfo *) lfirst(lc);
+
+		if (ri->rtindex != v->varno)
+			continue;
+		/* whole-row reference: the folded CTE row is a different shape */
+		if (v->varattno == InvalidAttrNumber)
+			return true;
+
+		/*
+		 * depth-0 agg/disc reads in remaining quals and targetList are
+		 * remapped — only flag them in locations the remap never touches.
+		 */
+		if (c->skip_depth0 && c->depth == 0)
+			return false;
+		if (list_member_int(c->banned_attnos, v->varattno))
+			return true;
+	}
+	return false;
+}
+
+static bool
+q4_banned_walker(Node *node, void *context)
+{
+	Q4BannedCtx *c = (Q4BannedCtx *) context;
+
+	if (node == NULL || !c->ok)
+		return true;
+	if (IsA(node, Var))
+	{
+		if (q4_banned_var((Var *) node, c))
+		{
+			c->ok = false;
+			return true;
+		}
+		return false;
+	}
+	if (IsA(node, Query))
+	{
+		/*
+		 * A subselect Query: refs' columns reappear one level up. Only
+		 * descend into its expressions (its own rtable/ctes are a different
+		 * world; a same-indexed rel there is not ours).
+		 */
+		Query	   *q = (Query *) node;
+
+		c->depth++;
+		(void) expression_tree_walker((Node *) q->targetList,
+									  q4_banned_walker, c);
+		if (c->ok && q->havingQual != NULL)
+			(void) expression_tree_walker(q->havingQual,
+										  q4_banned_walker, c);
+		if (c->ok && q->jointree != NULL)
+		{
+			(void) expression_tree_walker(q->jointree->quals,
+										  q4_banned_walker, c);
+			/* outer refs are visible to ON quals inside subqueries too */
+			if (c->ok && q->jointree->fromlist != NIL)
+				q4_sweep_fromlist((Node *) q->jointree->fromlist, c);
+		}
+		c->depth--;
+		return true;
+	}
+	if (IsA(node, SubLink))
+	{
+		SubLink    *sl = (SubLink *) node;
+
+		(void) expression_tree_walker(sl->testexpr, q4_banned_walker, c);
+		if (c->ok && IsA(sl->subselect, Query))
+			(void) q4_banned_walker(sl->subselect, c);
+		return true;
+	}
+	return expression_tree_walker(node, q4_banned_walker, context);
+}
+
+/*
+ * Walk the fromlist for JoinExpr ON quals (depth 0) — RangeTblRef leaves
+ * carry no expressions; JoinExpr/FromExpr carry the ON quals we must
+ * sweep.
+ */
+static void
+q4_sweep_fromlist(Node *node, Q4BannedCtx *c)
+{
+	if (node == NULL || !c->ok)
+		return;
+	if (IsA(node, RangeTblRef))
+		return;
+	if (IsA(node, JoinExpr))
+	{
+		JoinExpr   *j = (JoinExpr *) node;
+
+		(void) expression_tree_walker(j->quals, q4_banned_walker, c);
+		q4_sweep_fromlist(j->larg, c);
+		q4_sweep_fromlist(j->rarg, c);
+		return;
+	}
+	if (IsA(node, FromExpr))
+	{
+		FromExpr   *f = (FromExpr *) node;
+		ListCell   *lc;
+
+		(void) expression_tree_walker(f->quals, q4_banned_walker, c);
+		foreach(lc, f->fromlist)
+			q4_sweep_fromlist((Node *) lfirst(lc), c);
+	}
+}
+
+static bool
+q4_pivot_apply(Query *parse)
+{
+	Q4PivotCtx	ctx;
+	CommonTableExpr *best_cte = NULL;
+	int			best_refs = 0;
+	List	   *leaves = NIL;
+	List	   *flat_quals = NIL;
+	List	   *remaining = NIL;
+	ListCell   *lc;
+	ListCell   *lc2;
+	int			i;
+	int			leafno;
+
+	if (parse->commandType != CMD_SELECT ||
+		parse->cteList == NIL ||
+		parse->jointree == NULL ||
+		parse->jointree->quals == NULL ||
+		parse->jointree->fromlist == NIL ||
+		parse->distinctClause != NIL ||
+		IsInParallelMode())
+	{
+		elog(DEBUG1, "q4-pivot: declined: outer query shape not supported");
+		return false;
+	}
+
+	memset(&ctx, 0, sizeof(ctx));
+
+	/* 1. pick the most-referenced non-recursive CTE with a Query body */
+	foreach(lc, parse->cteList)
+	{
+		CommonTableExpr *c = (CommonTableExpr *) lfirst(lc);
+
+		if (c->cterefcount < 2 || c->cterecursive)
+			continue;
+		if (!IsA(c->ctequery, Query) || c->aliascolnames != NIL)
+			continue;
+		if (c->cterefcount > best_refs)
+		{
+			best_refs = c->cterefcount;
+			best_cte = c;
+		}
+	}
+	if (best_cte == NULL)
+	{
+		elog(DEBUG1, "q4-pivot: declined: no multiply-referenced CTE candidate");
+		return false;
+	}
+	ctx.cte = best_cte;
+	ctx.ctename = best_cte->ctename;
+	ctx.base_natts = list_length(best_cte->ctecoltypes);
+
+	/* 2. leaves: a UNION-ALL tree of grouped SELECTs (or a single one) */
+	{
+		Query	   *cq = (Query *) best_cte->ctequery;
+
+		if (cq->setOperations != NULL)
+		{
+			if (!q4_setop_leaves_walker(cq->setOperations, cq, &ctx))
+			{
+				elog(DEBUG1, "q4-pivot: declined: set-op tree is not UNION ALL of SELECTs");
+				return false;
+			}
+		}
+		else
+			ctx.leaves = list_make1(cq);
+	}
+	leaves = ctx.leaves;
+
+	/*
+	 * Aggregate output resnos (tlist positions are identical across UNION ALL
+	 * branches). Needed BEFORE qual matching: quals over an aggregate output
+	 * column (q4's `year_total > 0` guards) are redirected reads, never
+	 * discriminator conditions — swallowing them would delete the guards
+	 * outright.
+	 */
+	{
+		Query	   *leaf0 = linitial(leaves);
+		ListCell   *lc0;
+
+		foreach(lc0, leaf0->targetList)
+		{
+			TargetEntry *te = lfirst_node(TargetEntry, lc0);
+
+			if (!te->resjunk && IsA(te->expr, Aggref))
+				ctx.agg_resnos = lappend_int(ctx.agg_resnos, te->resno);
+		}
+		ctx.nagg = list_length(ctx.agg_resnos);
+		if (ctx.nagg == 0)
+		{
+			elog(DEBUG1, "q4-pivot: declined: CTE has no aggregate outputs");
+			return false;
+		}
+	}
+
+	/* 3. references of this CTE in the rtable */
+	i = 1;
+	foreach(lc, parse->rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+		if (rte->rtekind == RTE_CTE && rte->ctename != NULL &&
+			strcmp(rte->ctename, ctx.ctename) == 0 && !rte->self_reference)
+		{
+			Q4RefInfo  *ri = (Q4RefInfo *) palloc0(sizeof(Q4RefInfo));
+
+			ri->rtindex = i;
+			ctx.refs = lappend(ctx.refs, ri);
+		}
+		i++;
+	}
+	if (list_length(ctx.refs) != best_cte->cterefcount || list_length(ctx.refs) < 2)
+	{
+		elog(DEBUG1, "q4-pivot: declined: reference count mismatch");
+		return false;
+	}
+
+	/*
+	 * ORDER BY over a redirected column would sort on the FILTERed clone's
+	 * attno while the SortGroupClause still references the original output —
+	 * simplest to decline that family.
+	 */
+	if (parse->sortClause != NIL)
+	{
+		foreach(lc, parse->sortClause)
+		{
+			SortGroupClause *gc = lfirst_node(SortGroupClause, lc);
+			ListCell   *lc3;
+
+			foreach(lc3, parse->targetList)
+			{
+				TargetEntry *te = lfirst_node(TargetEntry, lc3);
+
+				if (te->ressortgroupref == gc->tleSortGroupRef &&
+					q4_reads_agg_walker((Node *) te->expr, &ctx))
+				{
+					elog(DEBUG1, "q4-pivot: declined: ORDER BY over redirected aggregate");
+					return false;
+				}
+			}
+		}
+	}
+
+	/* 4. match discriminator quals per reference */
+	q4_flatten_and(parse->jointree->quals, &flat_quals);
+	foreach(lc, flat_quals)
+	{
+		Node	   *qual = (Node *) lfirst(lc);
+		Q4DiscCond *cond = NULL;
+		Q4RefInfo  *ri;
+
+		ri = q4_match_disc_qual(qual, &ctx, &cond);
+		if (ri != NULL)
+		{
+			ri->conds = lappend(ri->conds, cond);
+			ctx.disc_qual_ptrs = lappend(ctx.disc_qual_ptrs, qual);
+		}
+		else
+			remaining = lappend(remaining, qual);
+	}
+	foreach(lc, ctx.refs)
+	{
+		Q4RefInfo  *ri = (Q4RefInfo *) lfirst(lc);
+
+		if (ri->conds == NIL)
+		{
+			elog(DEBUG1, "q4-pivot: declined: reference %d has no discriminator qual",
+				 ri->rtindex);
+			return false;
+		}
+	}
+
+	/* 5. deduplicate fold keys */
+	foreach(lc, ctx.refs)
+	{
+		Q4RefInfo  *ri = (Q4RefInfo *) lfirst(lc);
+		ListCell   *lc3;
+		int			k = 0;
+
+		foreach(lc3, ctx.keys)
+		{
+			if (q4_conds_equal(ri->conds, (List *) lfirst(lc3)))
+			{
+				ri->keyidx = k;
+				break;
+			}
+			k++;
+		}
+		if (lc3 == NULL)
+		{
+			ctx.keys = lappend(ctx.keys, ri->conds);
+			ri->keyidx = list_length(ctx.keys) - 1;
+		}
+	}
+
+	/* 6. validate every leaf (no mutation yet) */
+	{
+		List	   *first_aggs = NIL;
+		bool		first = true;
+
+		foreach(lc, leaves)
+		{
+			Query	   *leaf = lfirst_node(Query, lc);
+			List	   *this_aggs = NIL;
+			ListCell   *lc3;
+			ListCell   *lc4;
+
+			if (!q4_leaf_validate(leaf, &ctx, &this_aggs))
+			{
+				elog(DEBUG1, "q4-pivot: declined: leaf shape not foldable");
+				return false;
+			}
+
+			/*
+			 * Pre-mutation coarsening checks (the mutation must never decline
+			 * midway): the discriminator group expressions may only be
+			 * removed as a trailing suffix of groupexprs, and a leaf with
+			 * hasGroupRTE must actually carry the GROUP RTE.
+			 */
+			if (!q4_leaf_coarsening_ok(leaf, &ctx))
+			{
+				return false;	/* receipt emitted by the check */
+			}
+
+			ctx.leaf_aggs = lappend(ctx.leaf_aggs, this_aggs);
+			if (first)
+			{
+				first = false;
+				first_aggs = this_aggs;
+			}
+			else
+			{
+				/*
+				 * Branch consistency: same agg count and resnos. Types may
+				 * differ across branches (real TPC-DS schemas mix double
+				 * precision and numeric money columns); the UNION already
+				 * resolved a common output type in ctecoltypes, and the
+				 * set-op machinery coerces each branch's clone to it —
+				 * exactly as it does for the original column. Decline any
+				 * branch type that is not implicitly coercible to that
+				 * resolved type.
+				 */
+				if (list_length(this_aggs) != list_length(first_aggs))
+				{
+					elog(DEBUG1, "q4-pivot: declined: agg count differs across branches");
+					return false;
+				}
+				forboth(lc3, first_aggs, lc4, this_aggs)
+				{
+					TargetEntry *a = lfirst_node(TargetEntry, lc3);
+					TargetEntry *b = lfirst_node(TargetEntry, lc4);
+					Aggref	   *aa = (Aggref *) a->expr;
+					Aggref	   *ba = (Aggref *) b->expr;
+					Oid			resolved;
+
+					Assert(a->resno >= 1 &&
+						   a->resno <= list_length(ctx.cte->ctecoltypes));
+					resolved = list_nth_oid(ctx.cte->ctecoltypes,
+											a->resno - 1);
+					if (!can_coerce_type(1, &ba->aggtype, &resolved,
+										 COERCION_IMPLICIT))
+					{
+						elog(DEBUG1, "q4-pivot: declined: branch agg type not coercible to resolved CTE type");
+						return false;
+					}
+				}
+			}
+		}
+	}
+
+
+	/*
+	 * agg resnos were captured from leaf0 before qual matching; nagg set
+	 * there
+	 */
+
+	/*
+	 * 7. validate remaining quals per reference: strict comparison
+	 * consumption of redirected columns, no discriminator reads, and at least
+	 * one redirected-column use per reference.
+	 */
+	foreach(lc, ctx.refs)
+	{
+		Q4RefInfo  *ri = (Q4RefInfo *) lfirst(lc);
+		Q4QualCheck check;
+		ListCell   *lc3;
+
+		check.rtindex = ri->rtindex;
+		check.disc_attnos = NIL;
+		check.agg_attnos = ctx.agg_resnos;
+		check.agg_seen = false;
+		check.ok = true;
+		foreach(lc3, ctx.keys)
+		{
+			foreach(lc2, (List *) lfirst(lc3))
+			{
+				Q4DiscCond *cnd = (Q4DiscCond *) lfirst(lc2);
+
+				if (!list_member_int(check.disc_attnos, cnd->attno))
+					check.disc_attnos = lappend_int(check.disc_attnos,
+													cnd->attno);
+			}
+		}
+		foreach(lc3, remaining)
+		{
+			Node	   *qual = (Node *) lfirst(lc3);
+
+			if (!expression_tree_walker(qual, q4_has_special_walker, &check))
+				continue;		/* qual does not touch this ref's columns */
+			if (!q4_qual_root_ok(qual))
+			{
+				elog(DEBUG1, "q4-pivot: declined: qual root not a strict comparison");
+				return false;
+			}
+			q4_check_walker(qual, &check);
+			if (!check.ok)
+			{
+				elog(DEBUG1, "q4-pivot: declined: non-strict or NULL-absorbing use of redirected column");
+				return false;
+			}
+		}
+		if (!check.agg_seen)
+		{
+			elog(DEBUG1, "q4-pivot: declined: reference %d never consumes its aggregate column",
+				 ri->rtindex);
+			return false;
+		}
+		ri->agg_in_quals = check.agg_seen;
+	}
+
+	/*
+	 * 7.5. sweep expression locations the validator/remap do not cover:
+	 * HAVING, JoinExpr ON quals, and SubLink subselect interiors. Also
+	 * decline whole-row references to our CTE (its row shape changes).
+	 * Pre-mutation: any hit declines the whole rewrite.
+	 */
+	{
+		Q4BannedCtx sweep;
+		ListCell   *lc3;
+
+		sweep.refs = ctx.refs;
+		sweep.banned_attnos = NIL;
+		sweep.depth = 0;
+		sweep.ok = true;
+		sweep.skip_depth0 = false;
+		foreach(lc3, ctx.keys)
+		{
+			foreach(lc2, (List *) lfirst(lc3))
+			{
+				Q4DiscCond *cnd = (Q4DiscCond *) lfirst(lc2);
+
+				if (!list_member_int(sweep.banned_attnos, cnd->attno))
+					sweep.banned_attnos = lappend_int(sweep.banned_attnos,
+													  cnd->attno);
+			}
+		}
+		foreach(lc3, ctx.agg_resnos)
+		{
+			if (!list_member_int(sweep.banned_attnos, lfirst_int(lc3)))
+				sweep.banned_attnos = lappend_int(sweep.banned_attnos,
+												  lfirst_int(lc3));
+		}
+
+		if (parse->havingQual != NULL)
+			(void) expression_tree_walker(parse->havingQual,
+										  q4_banned_walker, &sweep);
+		if (sweep.ok && parse->jointree->fromlist != NIL)
+			q4_sweep_fromlist((Node *) parse->jointree->fromlist, &sweep);
+		if (sweep.ok)
+		{
+			/*
+			 * Remaining quals and targetList ARE remapped at depth 0 —
+			 * sweep them only for unremapped uses: SubLink subselect
+			 * interiors and whole-row references.
+			 */
+			sweep.skip_depth0 = true;
+			foreach(lc3, remaining)
+			{
+				Node	   *qual = (Node *) lfirst(lc3);
+
+				(void) expression_tree_walker(qual, q4_banned_walker, &sweep);
+				if (!sweep.ok)
+					break;
+			}
+			if (sweep.ok)
+			{
+				foreach(lc3, parse->targetList)
+				{
+					TargetEntry *te = lfirst_node(TargetEntry, lc3);
+
+					(void) expression_tree_walker((Node *) te->expr,
+												  q4_banned_walker, &sweep);
+					if (!sweep.ok)
+						break;
+				}
+			}
+		}
+		if (!sweep.ok)
+		{
+			elog(DEBUG1, "q4-pivot: declined: ref column in HAVING / join ON / SubLink subselect / whole-row use");
+			return false;
+		}
+	}
+
+	/* 8. leaf-side validation of discriminator source columns */
+	{
+		List	   *disc_attnos = NIL;
+
+		foreach(lc, ctx.keys)
+		{
+			foreach(lc2, (List *) lfirst(lc))
+			{
+				Q4DiscCond *cnd = (Q4DiscCond *) lfirst(lc2);
+
+				if (!list_member_int(disc_attnos, cnd->attno))
+					disc_attnos = lappend_int(disc_attnos, cnd->attno);
+			}
+		}
+
+		foreach(lc, leaves)
+		{
+			Query	   *leaf = lfirst_node(Query, lc);
+			ListCell   *lc3;
+
+			foreach(lc3, disc_attnos)
+			{
+				AttrNumber	attno = (AttrNumber) lfirst_int(lc3);
+				TargetEntry *te;
+				Node	   *src;
+
+				if (attno < 1 || attno > list_length(leaf->targetList))
+				{
+					elog(DEBUG1, "q4-pivot: declined: discriminator attno out of range");
+					return false;
+				}
+				te = list_nth(leaf->targetList, attno - 1);
+				if (te->resno != attno)
+				{
+					elog(DEBUG1, "q4-pivot: declined: discriminator column is not a base column");
+					return false;
+				}
+				src = (Node *) te->expr;
+				if (IsA(src, Const))
+					continue;	/* constant column: no coarsening hazard */
+
+				/*
+				 * Var source: after the GROUP BY coarsening no other leaf
+				 * expression or qual may read this Var (its value would no
+				 * longer be constant within a group).
+				 */
+				if (!IsA(src, Var))
+				{
+					elog(DEBUG1, "q4-pivot: declined: discriminator column is not a base column");
+					return false;
+				}
+				else
+				{
+					Var		   *dv = (Var *) src;
+					ListCell   *lc4;
+
+					foreach(lc4, leaf->targetList)
+					{
+						TargetEntry *te2 = lfirst_node(TargetEntry, lc4);
+
+						if (te2->resno == attno)
+							continue;
+						if (q4_leaf_reads_var((Node *) te2->expr, dv))
+						{
+							elog(DEBUG1, "q4-pivot: declined: discriminator Var re-read in leaf output");
+							return false;
+						}
+					}
+					if (leaf->jointree->quals != NULL &&
+						q4_leaf_reads_var(leaf->jointree->quals, dv))
+					{
+						elog(DEBUG1, "q4-pivot: declined: discriminator Var re-read in leaf quals");
+						return false;
+					}
+				}
+			}
+		}
+	}
+
+	/*
+	 * 9/10. MUTATE the leaves: neutralize disc outputs, coarsen GROUP BY,
+	 * append FILTERed agg clones per key. The FILTER conditions are built PER
+	 * LEAF from that branch's own discriminator expressions — a const
+	 * discriminator like q4's sale_type differs per branch ('s'/'c'/'w'), and
+	 * sharing the first leaf's condition would contaminate every other
+	 * branch's clone columns.
+	 */
+	ctx.new_types = NIL;
+	ctx.new_typmods = NIL;
+	ctx.new_colls = NIL;
+	ctx.new_names = NIL;
+	leafno = 0;
+	foreach(lc, leaves)
+	{
+		Query	   *leaf = lfirst_node(Query, lc);
+		List	   *disc_attnos = NIL;
+		List	   *leaf_conds = NIL;	/* per-key FILTER conds */
+		ListCell   *lc3;
+		ListCell   *lc4;
+
+		foreach(lc3, ctx.keys)
+		{
+			foreach(lc2, (List *) lfirst(lc3))
+			{
+				Q4DiscCond *cnd = (Q4DiscCond *) lfirst(lc2);
+
+				if (!list_member_int(disc_attnos, cnd->attno))
+					disc_attnos = lappend_int(disc_attnos, cnd->attno);
+			}
+		}
+
+		/*
+		 * Build this leaf's per-key FILTER conditions FIRST: they read
+		 * groupexprs, which the GROUP BY coarsening below truncates.
+		 */
+		foreach(lc4, ctx.keys)
+			leaf_conds = lappend(leaf_conds,
+								 q4_build_leaf_cond(leaf,
+													(List *) lfirst(lc4)));
+
+		/*
+		 * Drop the discriminator GROUP BY items, keeping the fork's RTE_GROUP
+		 * machinery consistent: groupexprs mirror the GROUP BY traversal, and
+		 * GROUP Vars address them by position — so the discriminator
+		 * expressions may only be removed when they form a trailing suffix of
+		 * groupexprs (q4: d_year is the last GROUP BY item).
+		 */
+		{
+			List	   *kept = NIL;
+			int			nexprs = 0; /* groupexprs positions seen */
+			int			keep_exprs = -1;
+			ListCell   *lc4;
+
+			foreach(lc4, leaf->groupClause)
+			{
+				SortGroupClause *gc = lfirst_node(SortGroupClause, lc4);
+				bool		is_disc = false;
+				ListCell   *lc5;
+
+				foreach(lc5, leaf->targetList)
+				{
+					TargetEntry *te = lfirst_node(TargetEntry, lc5);
+
+					if (te->ressortgroupref == gc->tleSortGroupRef &&
+						list_member_int(disc_attnos, te->resno))
+					{
+						is_disc = true;
+						break;
+					}
+				}
+				if (get_sortgroupclause_tle(gc, leaf->targetList) != NULL)
+					nexprs++;
+				if (is_disc)
+				{
+					if (keep_exprs < 0)
+						keep_exprs = nexprs - 1;
+				}
+				else if (keep_exprs >= 0)
+				{
+					/* pre-checked in q4_leaf_coarsening_ok; unreachable */
+					elog(ERROR, "q4-pivot: internal: non-trailing discriminator group expr");
+				}
+				if (!is_disc)
+					kept = lappend(kept, gc);
+			}
+			leaf->groupClause = kept;
+
+			/* keep RTE_GROUP.groupexprs in sync with the shorter GROUP BY */
+			if (leaf->hasGroupRTE)
+			{
+				RangeTblEntry *grte = NULL;
+				ListCell   *lc5;
+
+				foreach(lc5, leaf->rtable)
+				{
+					RangeTblEntry *r = lfirst_node(RangeTblEntry, lc5);
+
+					if (r->rtekind == RTE_GROUP)
+					{
+						grte = r;
+						break;
+					}
+				}
+				if (grte == NULL)
+				{
+					/* pre-checked in q4_leaf_coarsening_ok; unreachable */
+					elog(ERROR, "q4-pivot: internal: hasGroupRTE without GROUP RTE");
+				}
+				if (keep_exprs >= 0)
+					grte->groupexprs = list_truncate(grte->groupexprs,
+													 keep_exprs);
+			}
+		}
+
+		foreach(lc3, leaf->targetList)
+		{
+			TargetEntry *te = lfirst_node(TargetEntry, lc3);
+
+			if (te->resjunk || !list_member_int(disc_attnos, te->resno))
+				continue;
+			if (IsA(te->expr, Var))
+			{
+				Var		   *v = (Var *) te->expr;
+
+				te->expr = (Expr *) makeNullConst(v->vartype, v->vartypmod,
+												  v->varcollid);
+				te->ressortgroupref = 0;
+			}
+			/* Const discriminator outputs (e.g. q4's sale_type) stay */
+		}
+
+		/* append FILTERed agg clones: one per (key, agg) */
+		{
+			int			k = 0;
+			ListCell   *lc4;
+			List	   *this_leaf_aggs = (List *) list_nth(ctx.leaf_aggs,
+														   leafno);
+
+			foreach(lc4, ctx.keys)
+			{
+				Node	   *cond_k = (Node *) list_nth(leaf_conds, k);
+				ListCell   *lc5;
+				int			i = 0;
+
+				/*
+				 * Clone THIS branch's own aggregates: resno positions are
+				 * identical across branches, but branch-native types differ
+				 * (numeric vs double precision money) and a foreign branch's
+				 * Aggref carries Vars over the wrong base relation.
+				 */
+				foreach(lc5, this_leaf_aggs)
+				{
+					TargetEntry *agg_te = lfirst_node(TargetEntry, lc5);
+					Aggref	   *na = (Aggref *) copyObject(agg_te->expr);
+					TargetEntry *new_te;
+					char	   *nm = psprintf("lh_q4sum_%d_%d", k, i);
+
+					na->aggfilter = (Expr *) cond_k;
+					new_te = makeTargetEntry((Expr *) na,
+											 list_length(leaf->targetList) + 1,
+											 nm, false);
+					leaf->targetList = lappend(leaf->targetList, new_te);
+					if (lc == list_head(leaves))
+					{
+						/*
+						 * Column metadata comes from the UNION's resolved
+						 * output type (ctecoltypes at the original agg
+						 * position) — branches with a different native agg
+						 * type (numeric vs double precision money columns)
+						 * are coerced by the set-op machinery, exactly as for
+						 * the original column.
+						 */
+						Assert(agg_te->resno >= 1 &&
+							   agg_te->resno <= list_length(ctx.cte->ctecoltypes));
+						ctx.new_types = lappend_oid(ctx.new_types,
+													list_nth_oid(ctx.cte->ctecoltypes,
+																 agg_te->resno - 1));
+						ctx.new_typmods = lappend_int(ctx.new_typmods,
+													  list_nth_int(ctx.cte->ctecoltypmods,
+																   agg_te->resno - 1));
+						ctx.new_colls = lappend_oid(ctx.new_colls,
+													list_nth_oid(ctx.cte->ctecolcollations,
+																 agg_te->resno - 1));
+						ctx.new_names = lappend(ctx.new_names,
+												makeString(pstrdup(nm)));
+					}
+					i++;
+				}
+				k++;
+			}
+		}
+		leafno++;
+	}
+
+	/* 11. CTE output metadata + reference RTE column lists */
+	{
+		Query	   *cq = (Query *) ctx.cte->ctequery;
+
+		/*
+		 * UNION-ALL branch planning projects per the SetOperationStmts' own
+		 * colTypes lists — extend every node in the tree or the appended
+		 * columns would be silently dropped by the Append projection.
+		 */
+		if (cq->setOperations != NULL)
+		{
+			List	   *setops = NIL;
+			Node	   *node;
+
+			(void) q4_collect_setops_walker(cq->setOperations, &setops);
+			foreach(lc, setops)
+			{
+				SetOperationStmt *s = lfirst_node(SetOperationStmt, lc);
+
+				s->colTypes = list_concat(s->colTypes, ctx.new_types);
+				s->colTypmods = list_concat(s->colTypmods, ctx.new_typmods);
+				s->colCollations = list_concat(s->colCollations,
+											   ctx.new_colls);
+			}
+
+			/*
+			 * A simple UNION ALL gets flattened into an appendrel by
+			 * flatten_simple_union_all, which clears setOperations: the CTE's
+			 * output then IS this query's targetlist (parse analysis built it
+			 * as Vars over the leftmost leaf). Extend it with matching Vars
+			 * or the appended columns vanish from the CTE's physical output.
+			 */
+			node = ((SetOperationStmt *) cq->setOperations)->larg;
+			while (node != NULL && IsA(node, SetOperationStmt))
+				node = ((SetOperationStmt *) node)->larg;
+			if (node == NULL || !IsA(node, RangeTblRef))
+			{
+				/* the leaf walk already required RangeTblRef leaves */
+				elog(ERROR, "q4-pivot: internal: no leftmost leaf for output extension");
+			}
+			{
+				int			leftmost_rti = ((RangeTblRef *) node)->rtindex;
+				int			resno = list_length(cq->targetList);
+				int			attno = ctx.base_natts + 1; /* first appended attno */
+				int			newidx = 0;
+				ListCell   *lc3;
+
+				foreach(lc3, ctx.new_names)
+				{
+					Var		   *v = makeVar(leftmost_rti,
+											(AttrNumber) attno,
+											list_nth_oid(ctx.new_types,
+														 newidx),
+											(AttrNumber) list_nth_int(ctx.new_typmods,
+																	  newidx),
+											list_nth_oid(ctx.new_colls,
+														 newidx),
+											0);
+					TargetEntry *te = makeTargetEntry((Expr *) v,
+													  ++resno,
+													  strVal(lfirst(lc3)),
+													  false);
+
+					cq->targetList = lappend(cq->targetList, te);
+					attno++;
+					newidx++;
+				}
+			}
+		}
+
+		ctx.cte->ctecoltypes = list_concat(ctx.cte->ctecoltypes,
+										   ctx.new_types);
+		ctx.cte->ctecoltypmods = list_concat(ctx.cte->ctecoltypmods,
+											 ctx.new_typmods);
+		ctx.cte->ctecolcollations = list_concat(ctx.cte->ctecolcollations,
+												ctx.new_colls);
+		if (ctx.cte->aliascolnames != NIL)
+			ctx.cte->aliascolnames = list_concat(ctx.cte->aliascolnames,
+												 ctx.new_names);
+
+		/*
+		 * UNION-ALL branch subquery RTEs and the outer CTE references carry
+		 * their own column metadata in this fork — extend all of them.
+		 */
+		foreach(lc, ctx.leaf_rtes)
+		{
+			RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+			ListCell   *lc3;
+
+			rte->coltypes = list_concat(rte->coltypes, ctx.new_types);
+			rte->coltypmods = list_concat(rte->coltypmods, ctx.new_typmods);
+			rte->colcollations = list_concat(rte->colcollations,
+											 ctx.new_colls);
+			foreach(lc3, ctx.new_names)
+			{
+				String	   *s = lfirst_node(String, lc3);
+
+				rte->eref->colnames = lappend(rte->eref->colnames,
+											  makeString(pstrdup(strVal(s))));
+			}
+		}
+		foreach(lc, ctx.refs)
+		{
+			Q4RefInfo  *ri = (Q4RefInfo *) lfirst(lc);
+			RangeTblEntry *rte = rt_fetch(ri->rtindex, parse->rtable);
+			ListCell   *lc3;
+
+			rte->coltypes = list_concat(rte->coltypes, ctx.new_types);
+			rte->coltypmods = list_concat(rte->coltypmods, ctx.new_typmods);
+			rte->colcollations = list_concat(rte->colcollations,
+											 ctx.new_colls);
+			foreach(lc3, ctx.new_names)
+			{
+				String	   *s = lfirst_node(String, lc3);
+
+				rte->eref->colnames = lappend(rte->eref->colnames,
+											  makeString(pstrdup(strVal(s))));
+			}
+		}
+	}
+
+	/* 12. outer query: drop discriminator quals, remap agg reads */
+	{
+		List	   *remapped = NIL;
+		ListCell   *lc3;
+
+		foreach(lc3, remaining)
+		{
+			Node	   *qual = (Node *) lfirst(lc3);
+
+			remapped = lappend(remapped,
+							   q4_remap_mutator(qual, &ctx));
+		}
+		parse->jointree->quals = q4_rebuild_and(remapped);
+
+		foreach(lc3, parse->targetList)
+		{
+			TargetEntry *te = lfirst_node(TargetEntry, lc3);
+
+			te->expr = (Expr *) q4_remap_mutator((Node *) te->expr, &ctx);
+		}
+	}
+
+	elog(DEBUG1, "q4-pivot: folded %d references into %d keys over CTE %s",
+		 list_length(ctx.refs), list_length(ctx.keys), ctx.ctename);
+	return true;
+}
+
 static PlannedStmt *
 lakehouse_count_exec_planner(Query *parse, const char *query_string,
 							 int cursorOptions, ParamListInfo boundParams,
@@ -1217,6 +2910,10 @@ lakehouse_count_exec_planner(Query *parse, const char *query_string,
 
 	if (lakehouse_agg_pullup_enabled)
 		pullup_cte_agg_sublinks(parse);
+
+	if (lakehouse_q4_pivot_enabled && q4_pivot_apply(parse))
+		ereport(DEBUG1,
+				(errmsg("lakehouse count_exec: q4-pivot fold applied")));
 
 	/*
 	 * family-C/E planning input (spec 19 §6.5): synthesize statistics for
@@ -1261,6 +2958,18 @@ install_lakehouse_count_exec(void)
 {
 	prev_planner_hook = planner_hook;
 	planner_hook = lakehouse_count_exec_planner;
+}
+
+void
+lakehouse_q4_pivot_guc_init(void)
+{
+	DefineCustomBoolVariable("lakehouse.q4_pivot",
+							 "Fold per-reference discriminator quals of a multiply-referenced CTE into conditional aggregation (spec 19 §5 entry 3).",
+							 NULL,
+							 &lakehouse_q4_pivot_enabled,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
 }
 
 /*
