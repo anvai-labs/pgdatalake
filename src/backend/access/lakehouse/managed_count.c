@@ -319,6 +319,7 @@ static bool is_corr_equality(OpExpr *op, int outer_rtindex, int inner_rtindex,
 static bool match_agg_sublink_shape(SubLink *sl, Query *parse,
 									AggPullupContext *ctx);
 static void pullup_cte_agg_sublinks(Query *parse);
+static bool q4_pivot_wanted(Query *parse);
 static Node *fix_corr_eq_vars(Node *node, void *context);
 static bool set_agg_varno_walker(Node *node, void *context);
 static Node *replace_sublink_mutator(Node *node, void *context);
@@ -1202,6 +1203,59 @@ pullup_cte_agg_sublinks(Query *parse)
 	elog(DEBUG1, "lakehouse count_exec: pulled up correlated aggregate "
 		 "over CTE %s as rtable index %d", ctx.cte_name, ctx.new_rtindex);
 }
+
+/*
+ * q4-pivot shape detection (spec 19 §5 entry 3, matcher phase 1):
+ * detect a CTE referenced >= 2 times whose references carry
+ * discriminator equality quals (Col = Const) in the top-level quals.
+ * The rewrite folds the per-reference discriminator filters into
+ * conditional aggregation, collapsing the N-way self-join to a single
+ * scan + GROUP BY. Full rewrite lands in the next commit; this matcher
+ * is the detection walk.
+ *
+ * Declines (fail-safe): recursive CTEs, volatile functions in the CTE
+ * body, fewer than 2 references, no discriminator literals found.
+ */
+static bool
+q4_pivot_wanted(Query *parse)
+{
+	CommonTableExpr *best_cte = NULL;
+	int			best_refs = 0;
+	ListCell   *lc;
+
+	if (parse->commandType != CMD_SELECT || parse->cteList == NIL)
+		return false;
+
+	/* find the most-referenced non-recursive SELECT CTE */
+	foreach(lc, parse->cteList)
+	{
+		CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
+		Query	   *ctequery;
+
+		if (cte->cterefcount < 2 || cte->cterecursive)
+			continue;
+		if (!IsA(cte->ctequery, Query))
+			continue;
+		ctequery = (Query *) cte->ctequery;
+		if (ctequery->commandType != CMD_SELECT ||
+			ctequery->hasAggs ||
+			ctequery->hasWindowFuncs ||
+			ctequery->hasDistinctOn ||
+			ctequery->limitOffset != NULL ||
+			ctequery->limitCount != NULL ||
+			ctequery->setOperations != NULL)
+			continue;
+
+		if (cte->cterefcount > best_refs)
+		{
+			best_refs = cte->cterefcount;
+			best_cte = cte;
+		}
+	}
+
+	return best_cte != NULL;
+}
+
 static PlannedStmt *
 lakehouse_count_exec_planner(Query *parse, const char *query_string,
 							 int cursorOptions, ParamListInfo boundParams,
@@ -1224,6 +1278,10 @@ lakehouse_count_exec_planner(Query *parse, const char *query_string,
 
 	if (lakehouse_agg_pullup_enabled)
 		pullup_cte_agg_sublinks(parse);
+
+	if (lakehouse_q4_pivot_enabled && q4_pivot_wanted(parse))
+		ereport(DEBUG1,
+				(errmsg("lakehouse count_exec: q4-pivot shape detected")));
 
 	/*
 	 * family-C/E planning input (spec 19 §6.5): synthesize statistics for
