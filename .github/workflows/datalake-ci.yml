@@ -238,6 +238,7 @@ jobs:
           python3 src/test/lakehouse/fixtures/analyze-check.py
           python3 src/test/lakehouse/fixtures/cache-counters-check.py
           python3 src/test/lakehouse/fixtures/q4-cte-stats-check.py
+          python3 src/test/lakehouse/fixtures/q4-pivot-check.py
           python3 src/test/lakehouse/fixtures/telemetry-stats-check.py
           python3 src/test/lakehouse/fixtures/scan-stats-check.py
           python3 src/test/lakehouse/fixtures/publication-ledger-load-check.py
